@@ -1,0 +1,358 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  DIOXUS_CLI_VERSION: "0.7.9"
+  RUST_BACKTRACE: "1"
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  desktop:
+    name: Desktop | ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            id: macos
+            os: macos-14
+            platform_flag: --macos
+            bundle_args: --package-types macos --package-types dmg
+          - name: Windows
+            id: windows
+            os: windows-latest
+            platform_flag: --windows
+            bundle_args: --package-types msi --package-types nsis
+          - name: Linux
+            id: linux
+            os: ubuntu-24.04
+            platform_flag: --linux
+            bundle_args: --package-types appimage --package-types deb
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            desktop-file-utils \
+            libayatana-appindicator3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config
+
+      - name: Install MinGW for the Windows Go bridge
+        if: runner.os == 'Windows'
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: packages/singbox/bridge/go.mod
+          cache-dependency-path: packages/singbox/bridge/go.sum
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.id }}
+          cache-all-crates: true
+
+      - name: Install Dioxus CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
+
+      - name: Build ${{ matrix.name }} packages
+        shell: bash
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          dx bundle \
+            --package desktop \
+            ${{ matrix.platform_flag }} \
+            --release \
+            --locked \
+            --out-dir "dist/${{ matrix.id }}" \
+            ${{ matrix.bundle_args }}
+
+      - name: Verify desktop packages
+        shell: bash
+        run: |
+          case "${{ matrix.id }}" in
+            macos)
+              test -n "$(find dist/macos -type d -name '*.app' -print -quit)"
+              test -n "$(find dist/macos -type f -name '*.dmg' -print -quit)"
+              ;;
+            windows)
+              test -n "$(find dist/windows -type f -name '*.msi' -print -quit)"
+              test -n "$(find dist/windows -type f -name '*.exe' -print -quit)"
+              ;;
+            linux)
+              test -n "$(find dist/linux -type f -name '*.AppImage' -print -quit)"
+              test -n "$(find dist/linux -type f -name '*.deb' -print -quit)"
+              ;;
+          esac
+
+      - name: Upload ${{ matrix.name }} artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: kitty-pro-${{ matrix.id }}
+          path: dist/${{ matrix.id }}/**
+          if-no-files-found: error
+          retention-days: 14
+
+  web:
+    name: Web | ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            id: linux-x86_64
+            os: ubuntu-24.04
+            archive_name: Kitty-Pro-web-linux-x86_64
+          - name: macOS
+            id: macos
+            os: macos-14
+            archive_name: Kitty-Pro-web-macos
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install Web build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen build-essential pkg-config
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: packages/singbox/bridge/go.mod
+          cache-dependency-path: packages/singbox/bridge/go.sum
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: web-${{ matrix.id }}
+          cache-all-crates: true
+
+      - name: Install Dioxus CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
+
+      - name: Build fullstack Web package
+        shell: bash
+        run: |
+          dx build \
+            --package web \
+            --web \
+            --fullstack true \
+            --release \
+            --debug-symbols false \
+            --locked
+
+      - name: Assemble Web archive
+        shell: bash
+        run: |
+          web_output="target/dx/web/release/web"
+          test -x "$web_output/server"
+          test -f "$web_output/public/index.html"
+
+          mkdir -p dist/web/package
+          cp "$web_output/server" dist/web/package/kitty-pro-web-server
+          cp -R "$web_output/public" dist/web/package/public
+          printf '%s\n' \
+            'Run: ./kitty-pro-web-server' \
+            'Default address: http://127.0.0.1:8080' \
+            'Set IP and PORT environment variables to change the listen address.' \
+            > dist/web/package/README.txt
+          archive="dist/web/${{ matrix.archive_name }}.tar.gz"
+          tar -C dist/web/package -czf "$archive" .
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 "$archive" > "$archive.sha256"
+          else
+            sha256sum "$archive" > "$archive.sha256"
+          fi
+
+      - name: Upload Web artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: kitty-pro-web-${{ matrix.id }}
+          path: |
+            dist/web/${{ matrix.archive_name }}.tar.gz
+            dist/web/${{ matrix.archive_name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Android | arm64-v8a
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
+      ANDROID_NATIVE_API_LEVEL: "24"
+      ANDROID_NDK_VERSION: "27.2.12479018"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and NDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: packages/singbox/bridge/go.mod
+          cache-dependency-path: packages/singbox/bridge/go.sum
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Cache Rust and Gradle builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64-v8a
+          cache-all-crates: true
+
+      - name: Cache Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Dioxus CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
+
+      - name: Configure optional Android release signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "No Android signing secrets found; the APK will use a generated debug certificate."
+            exit 0
+          fi
+
+          keystore="$RUNNER_TEMP/kitty-pro-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          echo "ANDROID_KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build Android APK
+        shell: bash
+        run: ./scripts/build-android-apk.sh
+
+      - name: Create APK checksum
+        shell: bash
+        run: |
+          sha256sum dist/android/Kitty-Pro-arm64-v8a.apk \
+            > dist/android/Kitty-Pro-arm64-v8a.apk.sha256
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: kitty-pro-android-arm64-v8a
+          path: |
+            dist/android/Kitty-Pro-arm64-v8a.apk
+            dist/android/Kitty-Pro-arm64-v8a.apk.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  github-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - desktop
+      - web
+      - android
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/**/*.dmg
+            release-assets/**/*.msi
+            release-assets/**/*.exe
+            release-assets/**/*.AppImage
+            release-assets/**/*.deb
+            release-assets/**/*.tar.gz
+            release-assets/**/*.sha256
+            release-assets/**/*.apk

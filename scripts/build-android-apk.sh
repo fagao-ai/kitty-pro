@@ -3,12 +3,52 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}}"
-ndk_root="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
-java_home="${JAVA_HOME:-/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home}"
-build_tools="$sdk_root/build-tools/35.0.0"
+ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${NDK_HOME:-}}}"
+java_home="${JAVA_HOME:-}"
+build_tools_version="${ANDROID_BUILD_TOOLS_VERSION:-35.0.0}"
+build_tools="$sdk_root/build-tools/$build_tools_version"
 output_dir="$repo_root/dist/android"
 stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/kitty-pro-apk.XXXXXX")"
-keystore="${ANDROID_DEBUG_KEYSTORE:-$HOME/.android/debug.keystore}"
+build_variant="${ANDROID_BUILD_VARIANT:-release}"
+
+if [[ -z "$java_home" ]]; then
+    apple_silicon_java_home="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+    intel_java_home="/usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+    if [[ -d "$apple_silicon_java_home" ]]; then
+        java_home="$apple_silicon_java_home"
+    elif [[ -d "$intel_java_home" ]]; then
+        java_home="$intel_java_home"
+    elif [[ "$(uname -s)" == "Darwin" ]] &&
+        detected_java_home="$(/usr/libexec/java_home -v 17 2>/dev/null)"; then
+        java_home="$detected_java_home"
+    elif command -v java >/dev/null 2>&1; then
+        java_home="$(dirname -- "$(dirname -- "$(readlink -f "$(command -v java)")")")"
+    fi
+fi
+
+if [[ -z "$ndk_root" && -d "$sdk_root/ndk" ]]; then
+    ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d -print | sort | tail -n 1)"
+fi
+if [[ -z "$ndk_root" && -d /opt/homebrew/share/android-ndk ]]; then
+    ndk_root="/opt/homebrew/share/android-ndk"
+fi
+if [[ ! -d "$build_tools" && -d "$sdk_root/build-tools" ]]; then
+    build_tools="$(find "$sdk_root/build-tools" -mindepth 1 -maxdepth 1 -type d -print | sort | tail -n 1)"
+fi
+
+if [[ -n "${ANDROID_KEYSTORE_PATH:-}" ]]; then
+    keystore="$ANDROID_KEYSTORE_PATH"
+    keystore_alias="${ANDROID_KEY_ALIAS:?ANDROID_KEY_ALIAS is required with ANDROID_KEYSTORE_PATH}"
+    keystore_password="${ANDROID_KEYSTORE_PASSWORD:?ANDROID_KEYSTORE_PASSWORD is required with ANDROID_KEYSTORE_PATH}"
+    key_password="${ANDROID_KEY_PASSWORD:-$keystore_password}"
+    generate_debug_keystore=false
+else
+    keystore="${ANDROID_DEBUG_KEYSTORE:-$HOME/.android/debug.keystore}"
+    keystore_alias="androiddebugkey"
+    keystore_password="android"
+    key_password="android"
+    generate_debug_keystore=true
+fi
 
 cleanup() {
     rm -rf "$stage_dir"
@@ -34,17 +74,21 @@ export ANDROID_NDK_HOME="$ndk_root"
 export ANDROID_NDK_ROOT="$ndk_root"
 export PATH="$java_home/bin:$sdk_root/platform-tools:$build_tools:$PATH"
 
-if [[ ! -f "$keystore" ]]; then
+if [[ "$generate_debug_keystore" == true && ! -f "$keystore" ]]; then
     mkdir -p "$(dirname -- "$keystore")"
     keytool -genkeypair \
         -keystore "$keystore" \
-        -storepass android \
-        -keypass android \
-        -alias androiddebugkey \
+        -storepass "$keystore_password" \
+        -keypass "$key_password" \
+        -alias "$keystore_alias" \
         -keyalg RSA \
         -keysize 2048 \
         -validity 10000 \
         -dname "CN=Android Debug,O=Android,C=US"
+fi
+if [[ ! -f "$keystore" ]]; then
+    echo "Android keystore does not exist: $keystore" >&2
+    exit 1
 fi
 
 cd "$repo_root"
@@ -94,12 +138,27 @@ fi
 core_stage="$android_project/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$core_stage"
 cp "$core_library" "$core_stage/libkitty_singbox.so"
+case "$build_variant" in
+    debug)
+        gradle_task=assembleDebug
+        gradle_options=()
+        source_apk="$android_project/app/build/outputs/apk/debug/app-debug.apk"
+        ;;
+    release)
+        gradle_task=assembleRelease
+        gradle_options=(-x lintVitalRelease)
+        source_apk="$android_project/app/build/outputs/apk/release/app-release-unsigned.apk"
+        ;;
+    *)
+        echo "Unsupported Android build variant: $build_variant" >&2
+        exit 1
+        ;;
+esac
 (
     cd "$android_project"
-    ./gradlew --no-daemon :app:assembleDebug
+    ./gradlew --no-daemon ":app:$gradle_task" "${gradle_options[@]}"
 )
 
-source_apk="$android_project/app/build/outputs/apk/debug/app-debug.apk"
 if [[ ! -f "$source_apk" ]]; then
     echo "Gradle did not produce an Android APK" >&2
     exit 1
@@ -112,9 +171,9 @@ signed_apk="$output_dir/Kitty-Pro-arm64-v8a.apk"
 zipalign -f -p 4 "$source_apk" "$unsigned_apk"
 apksigner sign \
     --ks "$keystore" \
-    --ks-key-alias androiddebugkey \
-    --ks-pass pass:android \
-    --key-pass pass:android \
+    --ks-key-alias "$keystore_alias" \
+    --ks-pass "pass:$keystore_password" \
+    --key-pass "pass:$key_password" \
     --out "$signed_apk" \
     "$unsigned_apk"
 apksigner verify --verbose --print-certs "$signed_apk"
