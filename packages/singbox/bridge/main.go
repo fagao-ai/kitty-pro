@@ -71,21 +71,34 @@ func start(configContent string) (*instance, error) {
 		_ = service.Close()
 		return nil, err
 	}
-	trafficURL := ""
-	trafficAuthToken := ""
-	if options.Experimental != nil && options.Experimental.ClashAPI != nil {
-		clashAPI := options.Experimental.ClashAPI
-		if clashAPI.ExternalController != "" {
-			trafficURL = "http://" + clashAPI.ExternalController + "/connections"
-			trafficAuthToken = clashAPI.Secret
-		}
-	}
+	trafficURL, trafficAuthToken := trafficEndpointFromOptions(options)
 	return &instance{
 		box:              service,
 		cancel:           cancel,
 		trafficURL:       trafficURL,
 		trafficAuthToken: trafficAuthToken,
 	}, nil
+}
+
+func trafficEndpoint(configContent string) (string, string, error) {
+	ctx := include.Context(context.Background())
+	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(configContent))
+	if err != nil {
+		return "", "", err
+	}
+	trafficURL, trafficAuthToken := trafficEndpointFromOptions(options)
+	return trafficURL, trafficAuthToken, nil
+}
+
+func trafficEndpointFromOptions(options option.Options) (string, string) {
+	if options.Experimental == nil || options.Experimental.ClashAPI == nil {
+		return "", ""
+	}
+	clashAPI := options.Experimental.ClashAPI
+	if clashAPI.ExternalController == "" {
+		return "", ""
+	}
+	return "http://" + clashAPI.ExternalController + "/connections", clashAPI.Secret
 }
 
 //export kitty_singbox_start

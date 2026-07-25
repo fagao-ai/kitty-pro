@@ -51,17 +51,17 @@ pub struct SystemProxyStatus {
     pub detail: String,
 }
 
-#[get("/api/profile")]
+#[cfg_attr(not(target_os = "android"), get("/api/profile"))]
 pub async fn load_profile() -> Result<AppProfile, ServerFnError> {
     load_native_profile()
 }
 
-#[post("/api/profile")]
+#[cfg_attr(not(target_os = "android"), post("/api/profile"))]
 pub async fn save_profile(profile: AppProfile) -> Result<(), ServerFnError> {
     save_native_profile(&profile)
 }
 
-#[post("/api/subscriptions/preview")]
+#[cfg_attr(not(target_os = "android"), post("/api/subscriptions/preview"))]
 pub async fn preview_subscription(source: String) -> Result<ParseReport, ServerFnError> {
     let source = source.trim().to_string();
     if source.is_empty() {
@@ -76,12 +76,12 @@ pub async fn preview_subscription(source: String) -> Result<ParseReport, ServerF
     Ok(proxy_core::parse_subscription(&content))
 }
 
-#[post("/api/core/status")]
+#[cfg_attr(not(target_os = "android"), post("/api/core/status"))]
 pub async fn core_status() -> Result<ApiCoreStatus, ServerFnError> {
     native_core_status()
 }
 
-#[post("/api/core/toggle")]
+#[cfg_attr(not(target_os = "android"), post("/api/core/toggle"))]
 pub async fn set_core_enabled(
     enabled: bool,
     request: Option<ConnectionRequest>,
@@ -89,30 +89,30 @@ pub async fn set_core_enabled(
     toggle_native_core(enabled, request)
 }
 
-#[get("/api/core/traffic")]
+#[cfg_attr(not(target_os = "android"), get("/api/core/traffic"))]
 pub async fn core_traffic() -> Result<CoreTraffic, ServerFnError> {
     native_core_traffic()
 }
 
-#[post("/api/core/latency")]
+#[cfg_attr(not(target_os = "android"), post("/api/core/latency"))]
 pub async fn measure_node_latency(
     nodes: Vec<ProxyNode>,
 ) -> Result<Vec<NodeLatency>, ServerFnError> {
     measure_native_latency(nodes).await
 }
 
-#[get("/api/system-proxy/status")]
+#[cfg_attr(not(target_os = "android"), get("/api/system-proxy/status"))]
 pub async fn system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
     native_system_proxy_status()
 }
 
-#[post("/api/system-proxy")]
+#[cfg_attr(not(target_os = "android"), post("/api/system-proxy"))]
 pub async fn set_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
     set_native_system_proxy(enabled)
 }
 
 #[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
     use futures_util::stream::{self, StreamExt};
 
@@ -133,12 +133,57 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
 }
 
 #[allow(dead_code)]
+#[cfg(target_os = "android")]
+async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
+    if nodes.is_empty() {
+        return Err(ServerFnError::new("没有可探测的节点"));
+    }
+    if nodes.len() > MAX_LATENCY_NODES {
+        return Err(ServerFnError::new(format!(
+            "单次最多探测 {MAX_LATENCY_NODES} 个节点"
+        )));
+    }
+
+    let node_tags = nodes
+        .iter()
+        .map(|node| node.tag.clone())
+        .collect::<Vec<_>>();
+    let request = ConnectionRequest {
+        nodes,
+        selected_tag: node_tags.first().cloned().unwrap_or_default(),
+        mode: TunnelMode::Global,
+        tun: false,
+    };
+    let mut config = proxy_core::build_singbox_config(&request, &SingBoxOptions::default());
+    config["inbounds"] = serde_json::json!([]);
+    config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
+    let config = serde_json::to_string(&config)
+        .map_err(|error| ServerFnError::new(format!("序列化 Android 探测配置失败: {error}")))?;
+    tokio::task::spawn_blocking(move || {
+        singbox::android::probe(&config, &node_tags, LATENCY_CHECK_URL)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|result| NodeLatency {
+                        tag: result.tag,
+                        latency_ms: result.latency_ms,
+                        error: result.error,
+                    })
+                    .collect()
+            })
+            .map_err(|error| ServerFnError::new(error.to_string()))
+    })
+    .await
+    .map_err(|error| ServerFnError::new(format!("Android 探测任务失败: {error}")))?
+}
+
+#[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
 async fn measure_native_latency(_nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
     Err(ServerFnError::new("浏览器目标不能直接运行节点延迟探测"))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 async fn measure_one_node(node: ProxyNode) -> NodeLatency {
     let tag = node.tag.clone();
     match probe_node_latency(node).await {
@@ -147,15 +192,15 @@ async fn measure_one_node(node: ProxyNode) -> NodeLatency {
             latency_ms: Some(latency_ms),
             error: None,
         },
-        Err(_) => NodeLatency {
+        Err(error) => NodeLatency {
             tag,
             latency_ms: None,
-            error: Some("探测超时或节点不可用".to_string()),
+            error: Some(error.to_string()),
         },
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 async fn probe_node_latency(node: ProxyNode) -> Result<u64, ServerFnError> {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -265,9 +310,9 @@ async fn download_subscription(_url: &str) -> Result<String, ServerFnError> {
 }
 
 #[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
-    use singbox::{unavailable_status, CoreState, SingBox};
+    use singbox::{unavailable_status, SingBox};
 
     let mut guard = core_slot()
         .lock()
@@ -284,16 +329,31 @@ fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
             Err(_) => unavailable_status(),
         }
     };
+    Ok(api_core_status(status))
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
+    singbox::android::status()
+        .map(api_core_status)
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn api_core_status(status: singbox::CoreStatus) -> ApiCoreStatus {
+    use singbox::CoreState;
+
     let state = match status.state {
         CoreState::Unavailable => "unavailable",
         CoreState::Stopped => "stopped",
         CoreState::Running => "running",
     };
-    Ok(ApiCoreStatus {
+    ApiCoreStatus {
         state: state.to_string(),
         version: status.version,
         note: status.platform_note,
-    })
+    }
 }
 
 #[allow(dead_code)]
@@ -354,11 +414,18 @@ fn save_native_profile(_profile: &AppProfile) -> Result<(), ServerFnError> {
     Err(ServerFnError::new("浏览器端不能直接写入本地配置"))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn profile_path() -> Result<std::path::PathBuf, ServerFnError> {
     let directories = directories::ProjectDirs::from("com", "kitty", "kitty-pro")
         .ok_or_else(|| ServerFnError::new("无法确定本地配置目录"))?;
     Ok(directories.data_local_dir().join("profile.json"))
+}
+
+#[cfg(target_os = "android")]
+fn profile_path() -> Result<std::path::PathBuf, ServerFnError> {
+    singbox::android::files_dir()
+        .map(|directory| directory.join("profile.json"))
+        .map_err(|error| ServerFnError::new(error.to_string()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -385,7 +452,7 @@ fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
 }
 
 #[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn toggle_native_core(
     enabled: bool,
     request: Option<ConnectionRequest>,
@@ -440,7 +507,38 @@ fn toggle_native_core(
 }
 
 #[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(target_os = "android")]
+fn toggle_native_core(
+    enabled: bool,
+    request: Option<ConnectionRequest>,
+) -> Result<ApiCoreStatus, ServerFnError> {
+    if !enabled {
+        singbox::android::stop().map_err(|error| ServerFnError::new(error.to_string()))?;
+        return native_core_status();
+    }
+
+    let mut request = request.ok_or_else(|| ServerFnError::new("缺少连接配置"))?;
+    if request.nodes.is_empty() {
+        return Err(ServerFnError::new("请先导入并选择一个节点"));
+    }
+    // Android always owns the TUN through VpnService. A loopback mixed proxy
+    // alone would not route device traffic.
+    request.tun = true;
+    let options = SingBoxOptions {
+        traffic_api_port: Some(allocate_loopback_port()?),
+        traffic_api_secret: Some(generate_traffic_api_secret()?),
+        ..SingBoxOptions::default()
+    };
+    let mut config = proxy_core::build_singbox_config(&request, &options);
+    config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
+    let config = serde_json::to_string(&config)
+        .map_err(|error| ServerFnError::new(format!("序列化 Android VPN 配置失败: {error}")))?;
+    singbox::android::start(&config).map_err(|error| ServerFnError::new(error.to_string()))?;
+    native_core_status()
+}
+
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
     let guard = core_slot()
         .lock()
@@ -457,6 +555,18 @@ fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
     let traffic = core
         .traffic()
         .map_err(|error| ServerFnError::new(error.to_string()))?;
+    Ok(CoreTraffic {
+        upload_total: traffic.upload_total,
+        download_total: traffic.download_total,
+        active_connections: traffic.active_connections,
+    })
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
+    let traffic =
+        singbox::android::traffic().map_err(|error| ServerFnError::new(error.to_string()))?;
     Ok(CoreTraffic {
         upload_total: traffic.upload_total,
         download_total: traffic.download_total,
@@ -842,7 +952,7 @@ fn read_system_proxy_backup(path: &std::path::Path) -> Result<MacSystemProxyBack
 }
 
 #[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn core_slot() -> &'static std::sync::Mutex<Option<singbox::SingBox>> {
     use std::sync::{Mutex, OnceLock};
 

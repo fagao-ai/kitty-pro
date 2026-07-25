@@ -13,6 +13,7 @@ use proxy_core::{
 use std::collections::HashMap;
 
 const APP_CSS: Asset = asset!("/assets/styling/app.css");
+const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppView {
@@ -108,6 +109,31 @@ pub fn ProxyApp(platform: String) -> Element {
                     core_state.set("unavailable".to_string());
                     core_note.set(Some(error.to_string()));
                 }
+            }
+        });
+    });
+
+    #[cfg(target_os = "android")]
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                match api::core_status().await {
+                    Ok(status) => {
+                        let is_running = status.state == "running";
+                        connected.set(is_running);
+                        if is_running && notice().as_deref() == Some(ANDROID_VPN_WAITING_NOTICE) {
+                            notice.set(Some("Android VPN 已连接".to_string()));
+                        }
+                        core_state.set(status.state);
+                        core_version.set(status.version);
+                        core_note.set(status.note);
+                    }
+                    Err(error) => {
+                        core_state.set("unavailable".to_string());
+                        core_note.set(Some(error.to_string()));
+                    }
+                }
+                wait_for_traffic_tick().await;
             }
         });
     });
@@ -510,7 +536,7 @@ fn OverviewView(
     mut connected: Signal<bool>,
     mut core_busy: Signal<bool>,
     mut core_state: Signal<String>,
-    core_note: Signal<Option<String>>,
+    mut core_note: Signal<Option<String>>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
     connection_allowed: bool,
@@ -581,12 +607,16 @@ fn OverviewView(
                         });
                         match api::set_core_enabled(target, request).await {
                             Ok(status) => {
-                                connected.set(status.state == "running");
+                                let is_running = status.state == "running";
+                                connected.set(is_running);
                                 core_state.set(status.state);
-                                notice.set(Some(if target {
+                                core_note.set(status.note);
+                                notice.set(Some(if !target {
+                                    "连接已断开".to_string()
+                                } else if is_running {
                                     "sing-box 已启动".to_string()
                                 } else {
-                                    "连接已断开".to_string()
+                                    ANDROID_VPN_WAITING_NOTICE.to_string()
                                 }));
                             }
                             Err(error) => notice.set(Some(error.to_string())),
@@ -617,6 +647,7 @@ fn OverviewView(
                             title: "累计下载 {format_data_amount(traffic.download_total)}",
                             "{format_data_rate(traffic.download_bytes_per_second)}"
                         }
+                        small { class: "traffic-total", "累计 {format_data_amount(traffic.download_total)}" }
                     }
                     div {
                         span { class: "metric-icon upload", Icon { icon: LdArrowUp, width: 16, height: 16 } }
@@ -625,6 +656,7 @@ fn OverviewView(
                             title: "累计上传 {format_data_amount(traffic.upload_total)}",
                             "{format_data_rate(traffic.upload_bytes_per_second)}"
                         }
+                        small { class: "traffic-total", "累计 {format_data_amount(traffic.upload_total)}" }
                     }
                 }
                 div { class: "traffic-chart",

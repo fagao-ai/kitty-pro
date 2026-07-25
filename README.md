@@ -51,6 +51,21 @@ dx serve --package desktop --desktop --open false --interactive false
 
 The desktop shell links and calls the same `singbox` Rust API locally.
 
+## Build an Android APK
+
+On macOS, install Go 1.24, OpenJDK 17, the Android SDK command-line tools,
+and Android NDK. The build script uses the Homebrew defaults, but honors
+`JAVA_HOME`, `ANDROID_SDK_ROOT`, and `ANDROID_NDK_HOME` when they are set.
+
+```sh
+./scripts/build-android-apk.sh
+```
+
+The result is an arm64-v8a APK for Android 7.0 and later at
+`dist/android/Kitty-Pro-arm64-v8a.apk`. It contains both the Dioxus JNI
+library and the embedded sing-box Go library, then is aligned and signed with
+the local Android debug certificate for direct device installation.
+
 ## Verification
 
 ```sh

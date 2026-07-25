@@ -1,0 +1,10 @@
+[application]
+name = "Kitty Pro"
+default_platform = "android"
+
+[bundle]
+identifier = "com.kitty.pro"
+publisher = "Kitty Pro"
+category = "Utility"
+short_description = "A cross-platform sing-box proxy client."
+long_description = "Kitty Pro is a Dioxus proxy client backed by an embedded sing-box core."

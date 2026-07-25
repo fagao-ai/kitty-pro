@@ -36,7 +36,7 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         inbounds.push(json!({
             "type": "tun",
             "tag": "tun-in",
-            "address": ["172.19.0.1/30"],
+            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
             "auto_route": true,
             "strict_route": true,
             "stack": "system",
@@ -69,16 +69,26 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
     };
     let rules = match request.mode {
         TunnelMode::Rule => vec![
-            json!({ "protocol": "dns", "action": "hijack-dns" }),
+            json!({ "port": 53, "action": "hijack-dns" }),
             json!({ "ip_is_private": true, "outbound": "direct" }),
         ],
-        TunnelMode::Global | TunnelMode::Direct => Vec::new(),
+        TunnelMode::Global | TunnelMode::Direct => {
+            vec![json!({ "port": 53, "action": "hijack-dns" })]
+        }
     };
 
     let mut config = json!({
         "log": {
             "level": options.log_level,
             "timestamp": true,
+        },
+        "dns": {
+            "servers": [{
+                "type": "tls",
+                "tag": "dns-direct",
+                "server": "1.1.1.1",
+            }],
+            "final": "dns-direct",
         },
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -244,6 +254,8 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert_eq!(config["outbounds"][2]["type"], "selector");
         assert_eq!(config["inbounds"][1]["type"], "tun");
         assert_eq!(config["route"]["final"], "proxy");
+        assert_eq!(config["route"]["rules"][0]["port"], 53);
+        assert_eq!(config["dns"]["final"], "dns-direct");
         assert_eq!(
             config["experimental"]["clash_api"]["external_controller"],
             "127.0.0.1:17891"

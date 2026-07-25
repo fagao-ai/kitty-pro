@@ -7,6 +7,7 @@ const DEFAULT_PROXY: &str = "http://100.64.0.2:11080";
 fn main() {
     println!("cargo:rerun-if-changed=bridge/go.mod");
     println!("cargo:rerun-if-changed=bridge/main.go");
+    println!("cargo:rerun-if-changed=bridge/android_bridge.go");
     println!("cargo:rerun-if-env-changed=HTTP_PROXY");
     println!("cargo:rerun-if-env-changed=HTTPS_PROXY");
     println!("cargo:rerun-if-env-changed=ALL_PROXY");
@@ -21,10 +22,11 @@ fn main() {
     if target_os == "wasm" {
         return;
     }
-    if !matches!(target_os.as_str(), "macos" | "linux" | "windows") {
-        panic!(
-            "embedded sing-box for {target_os} must be built through the mobile libbox pipeline"
-        );
+    if !matches!(
+        target_os.as_str(),
+        "android" | "macos" | "linux" | "windows"
+    ) {
+        panic!("embedded sing-box is not supported for target OS: {target_os}");
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
@@ -32,17 +34,21 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing output dir"));
     let archive = if target_os == "windows" {
         out_dir.join("kitty_singbox.lib")
+    } else if target_os == "android" {
+        out_dir.join("libkitty_singbox.so")
     } else {
         out_dir.join("libkitty_singbox.a")
     };
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("missing Cargo target arch");
     let go_arch = match target_arch.as_str() {
         "aarch64" => "arm64",
+        "arm" => "arm",
         "x86_64" => "amd64",
         "x86" => "386",
         other => panic!("unsupported embedded sing-box architecture: {other}"),
     };
     let go_os = match target_os.as_str() {
+        "android" => "android",
         "macos" => "darwin",
         "windows" => "windows",
         "linux" => "linux",
@@ -55,6 +61,15 @@ fn main() {
         .current_dir(&bridge_dir)
         .env("GOOS", go_os)
         .env("GOARCH", go_arch);
+
+    if target_os == "android" {
+        command
+            .env("CGO_ENABLED", "1")
+            .env("CC", android_clang(&target_arch));
+        if target_arch == "arm" {
+            command.env("GOARM", "7");
+        }
+    }
 
     // The bridge can download Go modules on a clean developer or CI machine.
     // Respect an explicitly configured proxy, otherwise use the workspace proxy.
@@ -70,14 +85,20 @@ fn main() {
         command.env("MACOSX_DEPLOYMENT_TARGET", "11.0");
     }
 
+    let build_mode = if target_os == "android" {
+        "c-shared"
+    } else {
+        "c-archive"
+    };
     let status = command
         .args([
             "build",
-            "-buildmode=c-archive",
+            "-buildmode",
+            build_mode,
             "-tags",
             "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0",
             "-ldflags",
-            "-X github.com/sagernet/sing-box/constant.Version=kitty-pro-embedded",
+            "-checklinkname=0 -X github.com/sagernet/sing-box/constant.Version=kitty-pro-embedded",
             "-o",
         ])
         .arg(&archive)
@@ -89,7 +110,11 @@ fn main() {
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=kitty_singbox");
+    if target_os == "android" {
+        println!("cargo:rustc-link-lib=dylib=kitty_singbox");
+    } else {
+        println!("cargo:rustc-link-lib=static=kitty_singbox");
+    }
     if target_os == "macos" {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Security");
@@ -100,6 +125,90 @@ fn main() {
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=resolv");
     }
+    if target_os == "android" {
+        println!("cargo:rustc-link-lib=android");
+        println!("cargo:rustc-link-lib=log");
+    }
+}
+
+fn android_clang(target_arch: &str) -> PathBuf {
+    let target = match target_arch {
+        "aarch64" => "aarch64-linux-android",
+        "arm" => "armv7a-linux-androideabi",
+        "x86_64" => "x86_64-linux-android",
+        "x86" => "i686-linux-android",
+        other => panic!("unsupported Android architecture: {other}"),
+    };
+    let target_key = target.replace('-', "_");
+    for variable in [
+        format!("CC_{target_key}"),
+        format!(
+            "CARGO_TARGET_{}_LINKER",
+            target.to_ascii_uppercase().replace('-', "_")
+        ),
+    ] {
+        if let Some(path) = env::var_os(&variable) {
+            return PathBuf::from(path);
+        }
+    }
+
+    let ndk_root = [
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK_ROOT",
+        "NDK_HOME",
+        "DX_ANDROID_NDK_HOME",
+    ]
+    .into_iter()
+    .find_map(|variable| env::var_os(variable).map(PathBuf::from))
+    .or_else(|| {
+        #[cfg(target_os = "macos")]
+        {
+            Some(PathBuf::from("/opt/homebrew/share/android-ndk"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    })
+    .expect("set ANDROID_NDK_HOME to build the embedded Android sing-box core");
+    let host_tag = if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "darwin-arm64"
+        } else {
+            "darwin-x86_64"
+        }
+    } else if cfg!(target_os = "linux") {
+        "linux-x86_64"
+    } else {
+        panic!("set a target-specific C compiler when building Android from this host")
+    };
+    let api_level = env::var("ANDROID_NATIVE_API_LEVEL").unwrap_or_else(|_| "24".to_string());
+    let compiler = ndk_root
+        .join("toolchains")
+        .join("llvm")
+        .join("prebuilt")
+        .join(host_tag)
+        .join("bin")
+        .join(format!("{target}{api_level}-clang"));
+    if compiler.is_file() {
+        return compiler;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let rosetta_compiler = ndk_root
+            .join("toolchains")
+            .join("llvm")
+            .join("prebuilt")
+            .join("darwin-x86_64")
+            .join("bin")
+            .join(format!("{target}{api_level}-clang"));
+        if rosetta_compiler.is_file() {
+            return rosetta_compiler;
+        }
+    }
+
+    panic!("Android NDK compiler was not found: {}", compiler.display());
 }
 
 fn go_executable() -> PathBuf {

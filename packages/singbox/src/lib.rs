@@ -9,6 +9,9 @@ use proxy_core::{build_singbox_config, ConnectionRequest, SingBoxOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(target_os = "android")]
+pub mod android;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoreState {
@@ -62,6 +65,8 @@ pub enum CoreError {
     TrafficUnavailable(String),
     #[error("配置序列化失败: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Android VPN 服务错误: {0}")]
+    AndroidVpn(String),
 }
 
 #[derive(Debug)]
@@ -218,6 +223,24 @@ mod ffi {
         fn kitty_singbox_last_error() -> *mut c_char;
         fn kitty_singbox_traffic(handle: u64) -> *mut c_char;
         fn kitty_singbox_free_string(value: *mut c_char);
+        #[cfg(target_os = "android")]
+        fn kitty_singbox_android_start(
+            config_content: *const c_char,
+            tun_fd: std::os::raw::c_int,
+            data_path: *const c_char,
+        ) -> *mut c_char;
+        #[cfg(target_os = "android")]
+        fn kitty_singbox_android_stop() -> *mut c_char;
+        #[cfg(target_os = "android")]
+        fn kitty_singbox_android_traffic() -> *mut c_char;
+        #[cfg(target_os = "android")]
+        fn kitty_singbox_android_probe(
+            config_content: *const c_char,
+            node_tags_json: *const c_char,
+            probe_url: *const c_char,
+            data_path: *const c_char,
+            result: *mut *mut c_char,
+        ) -> *mut c_char;
     }
 
     pub fn start(config: &str) -> Result<u64, CoreError> {
@@ -249,6 +272,60 @@ mod ffi {
         Ok(payload)
     }
 
+    #[cfg(target_os = "android")]
+    pub fn android_start(config: &str, tun_fd: i32, data_path: &str) -> Result<(), CoreError> {
+        let config = CString::new(config)
+            .map_err(|_| CoreError::InvalidConfig("配置中包含 NUL 字符".to_string()))?;
+        let data_path = CString::new(data_path)
+            .map_err(|_| CoreError::AndroidVpn("应用数据目录包含 NUL 字符".to_string()))?;
+        let error =
+            unsafe { kitty_singbox_android_start(config.as_ptr(), tun_fd, data_path.as_ptr()) };
+        take_optional_error(error)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_stop() -> Result<(), CoreError> {
+        take_optional_error(unsafe { kitty_singbox_android_stop() })
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_traffic() -> Result<String, CoreError> {
+        let payload = take_string(unsafe { kitty_singbox_android_traffic() });
+        if payload.is_empty() {
+            return Err(CoreError::TrafficUnavailable(last_error()));
+        }
+        Ok(payload)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_probe(
+        config: &str,
+        node_tags_json: &str,
+        probe_url: &str,
+        data_path: &str,
+    ) -> Result<String, CoreError> {
+        let config = CString::new(config)
+            .map_err(|_| CoreError::InvalidConfig("配置中包含 NUL 字符".to_string()))?;
+        let node_tags_json = CString::new(node_tags_json)
+            .map_err(|_| CoreError::AndroidVpn("节点标识包含 NUL 字符".to_string()))?;
+        let probe_url = CString::new(probe_url)
+            .map_err(|_| CoreError::AndroidVpn("探测地址包含 NUL 字符".to_string()))?;
+        let data_path = CString::new(data_path)
+            .map_err(|_| CoreError::AndroidVpn("应用数据目录包含 NUL 字符".to_string()))?;
+        let mut result = std::ptr::null_mut();
+        let error = unsafe {
+            kitty_singbox_android_probe(
+                config.as_ptr(),
+                node_tags_json.as_ptr(),
+                probe_url.as_ptr(),
+                data_path.as_ptr(),
+                &mut result,
+            )
+        };
+        take_optional_error(error)?;
+        Ok(take_string(result))
+    }
+
     fn last_error() -> String {
         let message = take_string(unsafe { kitty_singbox_last_error() });
         if message.is_empty() {
@@ -267,6 +344,14 @@ mod ffi {
             .into_owned();
         unsafe { kitty_singbox_free_string(value) };
         result
+    }
+
+    #[cfg(target_os = "android")]
+    fn take_optional_error(value: *mut c_char) -> Result<(), CoreError> {
+        if value.is_null() {
+            return Ok(());
+        }
+        Err(CoreError::AndroidVpn(take_string(value)))
     }
 }
 

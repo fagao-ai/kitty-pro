@@ -561,7 +561,7 @@ body {
 .traffic-values > div {
   display: grid;
   grid-template-columns: 32px 1fr;
-  grid-template-rows: auto auto;
+  grid-template-rows: auto auto auto;
   column-gap: 9px;
 }
 
@@ -569,7 +569,7 @@ body {
   display: grid;
   width: 32px;
   height: 32px;
-  grid-row: 1 / 3;
+  grid-row: 1 / 4;
   place-items: center;
   border-radius: 7px;
 }
@@ -595,6 +595,14 @@ body {
 .traffic-values strong {
   margin-top: 3px;
   font-size: 15px;
+}
+
+.traffic-total {
+  margin-top: 2px;
+  color: var(--text-faint);
+  font-size: 8px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .traffic-chart {
@@ -1272,6 +1280,8 @@ body {
 @media (max-width: 760px) {
   .proxy-app {
     display: block;
+    height: 100dvh;
+    overflow: hidden;
   }
 
   .sidebar {
@@ -1280,8 +1290,11 @@ body {
 
   .main-content {
     width: 100%;
+    height: calc(100dvh - 86px - env(safe-area-inset-bottom));
     margin: 0;
-    padding: 18px 14px 96px;
+    padding: 18px 14px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   .topbar {
