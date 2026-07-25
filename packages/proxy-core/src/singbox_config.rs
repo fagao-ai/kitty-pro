@@ -2,6 +2,11 @@ use crate::{ConnectionRequest, ProxyAuth, ProxyNode, ProxyProtocol, TunnelMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+const CHINA_GEOSITE_RULE_SET_URL: &str =
+    "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs";
+const CHINA_GEOIP_RULE_SET_URL: &str =
+    "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingBoxOptions {
     pub mixed_port: u16,
@@ -70,11 +75,35 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
     let rules = match request.mode {
         TunnelMode::Rule => vec![
             json!({ "port": 53, "action": "hijack-dns" }),
-            json!({ "ip_is_private": true, "outbound": "direct" }),
+            json!({ "action": "sniff" }),
+            json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }),
+            json!({ "rule_set": "geosite-cn", "action": "route", "outbound": "direct" }),
+            json!({ "rule_set": "geoip-cn", "action": "route", "outbound": "direct" }),
         ],
         TunnelMode::Global | TunnelMode::Direct => {
             vec![json!({ "port": 53, "action": "hijack-dns" })]
         }
+    };
+    let rule_sets = match request.mode {
+        TunnelMode::Rule => vec![
+            json!({
+                "type": "remote",
+                "tag": "geosite-cn",
+                "format": "binary",
+                "url": CHINA_GEOSITE_RULE_SET_URL,
+                "download_detour": "direct",
+                "update_interval": "168h",
+            }),
+            json!({
+                "type": "remote",
+                "tag": "geoip-cn",
+                "format": "binary",
+                "url": CHINA_GEOIP_RULE_SET_URL,
+                "download_detour": "direct",
+                "update_interval": "168h",
+            }),
+        ],
+        TunnelMode::Global | TunnelMode::Direct => Vec::new(),
     };
 
     let mut config = json!({
@@ -95,6 +124,7 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         "route": {
             "auto_detect_interface": true,
             "rules": rules,
+            "rule_set": rule_sets,
             "final": route_final,
         },
     });
@@ -228,7 +258,7 @@ mod tests {
     use crate::parse_subscription;
 
     #[test]
-    fn builds_selector_and_protocol_outbounds() {
+    fn builds_selector_protocol_outbounds_and_china_split_rules() {
         let nodes = parse_subscription(
             "hysteria2://secret@hy.example.com:443?sni=hy.example.com#Fast\n\
 vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security=tls&sni=vl.example.com#Backup",
@@ -255,10 +285,51 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert_eq!(config["inbounds"][1]["type"], "tun");
         assert_eq!(config["route"]["final"], "proxy");
         assert_eq!(config["route"]["rules"][0]["port"], 53);
+        assert_eq!(config["route"]["rules"][1]["action"], "sniff");
+        assert_eq!(
+            config["route"]["rules"][2]["ip_is_private"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(config["route"]["rules"][3]["rule_set"], "geosite-cn");
+        assert_eq!(config["route"]["rules"][4]["rule_set"], "geoip-cn");
+        assert_eq!(config["route"]["rule_set"][0]["type"], "remote");
+        assert_eq!(config["route"]["rule_set"][0]["format"], "binary");
+        assert_eq!(config["route"]["rule_set"][0]["download_detour"], "direct");
+        assert_eq!(
+            config["route"]["rule_set"][1]["url"],
+            CHINA_GEOIP_RULE_SET_URL
+        );
         assert_eq!(config["dns"]["final"], "dns-direct");
         assert_eq!(
             config["experimental"]["clash_api"]["external_controller"],
             "127.0.0.1:17891"
         );
+    }
+
+    #[test]
+    fn global_and_direct_modes_do_not_load_split_rule_sets() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",
+        )
+        .nodes;
+
+        for (mode, expected_final) in [
+            (TunnelMode::Global, "proxy"),
+            (TunnelMode::Direct, "direct"),
+        ] {
+            let request = ConnectionRequest {
+                selected_tag: nodes[0].tag.clone(),
+                nodes: nodes.clone(),
+                mode,
+                tun: false,
+            };
+            let config = build_singbox_config(&request, &SingBoxOptions::default());
+
+            assert_eq!(config["route"]["final"], expected_final);
+            assert_eq!(config["route"]["rules"].as_array().map(Vec::len), Some(1));
+            assert!(config["route"]["rule_set"]
+                .as_array()
+                .is_some_and(Vec::is_empty));
+        }
     }
 }

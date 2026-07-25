@@ -383,7 +383,7 @@ mod tests {
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
-            mode: proxy_core::TunnelMode::Rule,
+            mode: proxy_core::TunnelMode::Direct,
             tun: false,
         };
         let target_listener =
