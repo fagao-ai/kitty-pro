@@ -81,6 +81,7 @@ cp "$android_source/MainActivity.kt" "$android_project/app/src/main/kotlin/dev/d
 mkdir -p "$android_project/app/src/main/kotlin/com/kitty/pro"
 cp "$android_source/KittyVpnBridge.kt" "$android_project/app/src/main/kotlin/com/kitty/pro/KittyVpnBridge.kt"
 cp "$android_source/KittyVpnService.kt" "$android_project/app/src/main/kotlin/com/kitty/pro/KittyVpnService.kt"
+cp -R "$android_source/res/." "$android_project/app/src/main/res/"
 
 # Dioxus bundles the Rust JNI library, but not the extra shared object emitted
 # by the Go c-shared bridge. Place it in the Gradle JNI source set before APK

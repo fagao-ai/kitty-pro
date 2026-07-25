@@ -2,6 +2,11 @@
 name = "desktop"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+[[bin]]
+name = "kitty-pro"
+path = "src/main.rs"
 
 [dependencies]
 dioxus = { workspace = true, features = ["router", "fullstack"] }

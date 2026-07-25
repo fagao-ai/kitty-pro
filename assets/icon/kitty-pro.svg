@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Kitty Pro</title>
+  <desc id="desc">A white cat face with connected proxy nodes on an emerald background.</desc>
+  <rect x="64" y="64" width="896" height="896" rx="224" fill="#137a61"/>
+  <path fill="#f5fcf9" d="M254 392 292 188l145 111c24-7 49-11 75-11s51 4 75 11l145-111 38 204c48 55 74 124 74 198 0 147-137 254-332 254S180 737 180 590c0-74 26-143 74-198Z"/>
+  <path fill="#0e654f" d="m326 323-17-87 82 63c-23 6-44 14-65 24Zm372 0 17-87-82 63c23 6 44 14 65 24Z"/>
+  <ellipse cx="382" cy="494" rx="42" ry="50" fill="#162327"/>
+  <ellipse cx="642" cy="494" rx="42" ry="50" fill="#162327"/>
+  <circle cx="367" cy="478" r="11" fill="#f5fcf9"/>
+  <circle cx="627" cy="478" r="11" fill="#f5fcf9"/>
+  <path d="M382 637 512 701l130-64" fill="none" stroke="#0e654f" stroke-width="27" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="382" cy="637" r="38" fill="#316fa3"/>
+  <circle cx="512" cy="701" r="43" fill="#b94e4e"/>
+  <circle cx="642" cy="637" r="38" fill="#316fa3"/>
+</svg>

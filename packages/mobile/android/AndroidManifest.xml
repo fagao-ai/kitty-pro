@@ -7,15 +7,16 @@
     <application
         android:allowNativeHeapPointerTagging="false"
         android:extractNativeLibs="true"
-        android:icon="@mipmap/ic_launcher"
-        android:label="@string/app_name"
+        android:icon="@mipmap/kitty_launcher"
+        android:label="@string/kitty_app_name"
         android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@mipmap/kitty_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
             android:configChanges="orientation|screenLayout|screenSize|keyboardHidden"
             android:exported="true"
-            android:label="@string/app_name"
+            android:label="@string/kitty_app_name"
             android:name="dev.dioxus.main.MainActivity">
             <meta-data android:name="android.app.lib_name" android:value="main" />
             <meta-data android:name="android.app.func_name" android:value="ANativeActivity_onCreate" />
