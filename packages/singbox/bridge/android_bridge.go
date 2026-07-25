@@ -39,6 +39,8 @@ var androidSetup = struct {
 	err error
 }{}
 
+var androidLogs bridgeLogBuffer
+
 func startAndroid(configContent string, tunFD int32, dataPath string) error {
 	if tunFD <= 0 {
 		return errors.New("Android VPN did not provide a TUN file descriptor")
@@ -46,6 +48,7 @@ func startAndroid(configContent string, tunFD int32, dataPath string) error {
 	if err := setupAndroid(dataPath); err != nil {
 		return err
 	}
+	androidLogs.reset()
 
 	server, err := libbox.NewCommandServer(&androidCommandHandler{}, &androidPlatform{tunFD: tunFD})
 	if err != nil {
@@ -87,6 +90,7 @@ func setupAndroid(dataPath string) error {
 			TempPath:        filepath.Join(dataPath, "tmp"),
 			FixAndroidStack: true,
 			LogMaxLines:     256,
+			Debug:           true,
 		})
 	})
 	if androidSetup.err != nil {
@@ -196,6 +200,15 @@ func androidTraffic() ([]byte, error) {
 	}).traffic()
 }
 
+//export kitty_singbox_android_logs
+func kitty_singbox_android_logs(cursor C.uint64_t) *C.char {
+	result, err := androidLogs.snapshotJSON(uint64(cursor))
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	return C.CString(string(result))
+}
+
 type androidCommandHandler struct{}
 
 func (*androidCommandHandler) ServiceStop() error   { return nil }
@@ -204,7 +217,9 @@ func (*androidCommandHandler) GetSystemProxyStatus() (*libbox.SystemProxyStatus,
 	return &libbox.SystemProxyStatus{Available: false, Enabled: false}, nil
 }
 func (*androidCommandHandler) SetSystemProxyEnabled(bool) error { return nil }
-func (*androidCommandHandler) WriteDebugMessage(string)         {}
+func (*androidCommandHandler) WriteDebugMessage(message string) {
+	androidLogs.writeFormattedMessage(message)
+}
 
 type androidPlatform struct {
 	tunFD int32

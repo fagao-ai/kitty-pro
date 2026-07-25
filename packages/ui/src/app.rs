@@ -1,10 +1,12 @@
-use api::{CoreTraffic, NodeLatency, SystemProxyStatus};
+use api::{
+    CoreLogEntry, CoreTraffic, NodeLatency, RouteDecision, RouteTargetKind, SystemProxyStatus,
+};
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
     LdActivity, LdArrowDown, LdArrowUp, LdChevronRight, LdCircleAlert, LdCircleCheck, LdClock3,
     LdGauge, LdGlobe, LdInfo, LdLanguages, LdMoon, LdNetwork, LdPlus, LdPower, LdRadioTower,
-    LdRefreshCw, LdRoute, LdSearch, LdServer, LdSettings, LdShieldCheck, LdSun, LdTrash2, LdWifi,
-    LdX, LdZap,
+    LdRefreshCw, LdRoute, LdScrollText, LdSearch, LdServer, LdSettings, LdShieldCheck, LdSun,
+    LdTrash2, LdWifi, LdX, LdZap,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
@@ -20,7 +22,16 @@ enum AppView {
     Overview,
     Nodes,
     Subscriptions,
+    Logs,
     Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFilter {
+    Routes,
+    All,
+    Direct,
+    Proxy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +73,7 @@ impl AppView {
             Self::Overview => "概览",
             Self::Nodes => "节点",
             Self::Subscriptions => "订阅",
+            Self::Logs => "日志",
             Self::Settings => "设置",
         }
     }
@@ -92,6 +104,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let latency_results = use_signal(HashMap::<String, NodeLatency>::new);
     let latency_busy = use_signal(|| false);
     let mut traffic = use_signal(TrafficDisplay::default);
+    let mut core_logs = use_signal(Vec::<CoreLogEntry>::new);
     let mut profile_loaded = use_signal(|| false);
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
     let system_proxy_busy = use_signal(|| false);
@@ -224,6 +237,30 @@ pub fn ProxyApp(platform: String) -> Element {
         });
     });
 
+    use_effect(move || {
+        if core_state() != "running" {
+            return;
+        }
+        core_logs.write().clear();
+        spawn(async move {
+            let mut cursor = 0;
+            while core_state() == "running" {
+                if let Ok(batch) = api::core_logs(cursor).await {
+                    cursor = batch.next_cursor;
+                    if !batch.entries.is_empty() {
+                        let mut stored = core_logs.write();
+                        stored.extend(batch.entries);
+                        if stored.len() > 500 {
+                            let excess = stored.len() - 500;
+                            stored.drain(..excess);
+                        }
+                    }
+                }
+                wait_for_traffic_tick().await;
+            }
+        });
+    });
+
     let current_view = active_view();
     let filtered_nodes: Vec<ProxyNode> = {
         let needle = search().to_ascii_lowercase();
@@ -254,6 +291,7 @@ pub fn ProxyApp(platform: String) -> Element {
                     NavItem { view: AppView::Overview, active_view }
                     NavItem { view: AppView::Nodes, active_view }
                     NavItem { view: AppView::Subscriptions, active_view }
+                    NavItem { view: AppView::Logs, active_view }
                     NavItem { view: AppView::Settings, active_view }
                 }
                 div { class: "sidebar-footer",
@@ -349,6 +387,9 @@ pub fn ProxyApp(platform: String) -> Element {
                             notice,
                         }
                     },
+                    AppView::Logs => rsx! {
+                        LogsView { logs: core_logs, connected }
+                    },
                     AppView::Settings => rsx! {
                         SettingsView {
                             platform: platform.clone(),
@@ -370,6 +411,7 @@ pub fn ProxyApp(platform: String) -> Element {
                 NavItem { view: AppView::Overview, active_view }
                 NavItem { view: AppView::Nodes, active_view }
                 NavItem { view: AppView::Subscriptions, active_view }
+                NavItem { view: AppView::Logs, active_view }
                 NavItem { view: AppView::Settings, active_view }
             }
 
@@ -522,6 +564,7 @@ fn NavItem(view: AppView, mut active_view: Signal<AppView>) -> Element {
                 AppView::Overview => rsx! { Icon { icon: LdGauge, width: 20, height: 20 } },
                 AppView::Nodes => rsx! { Icon { icon: LdServer, width: 20, height: 20 } },
                 AppView::Subscriptions => rsx! { Icon { icon: LdRadioTower, width: 20, height: 20 } },
+                AppView::Logs => rsx! { Icon { icon: LdScrollText, width: 20, height: 20 } },
                 AppView::Settings => rsx! { Icon { icon: LdSettings, width: 20, height: 20 } },
             }
             span { "{view.title()}" }
@@ -1086,6 +1129,191 @@ fn SubscriptionRow(
                 Icon { icon: LdTrash2, width: 17, height: 17 }
             }
         }
+    }
+}
+
+#[component]
+fn LogsView(mut logs: Signal<Vec<CoreLogEntry>>, connected: Signal<bool>) -> Element {
+    let mut filter = use_signal(|| LogFilter::Routes);
+    let mut search = use_signal(String::new);
+    let stored = logs();
+    let route_count = stored.iter().filter(|entry| entry.route.is_some()).count();
+    let direct_count = stored
+        .iter()
+        .filter(|entry| {
+            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Direct)
+        })
+        .count();
+    let proxy_count = stored
+        .iter()
+        .filter(|entry| {
+            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Proxy)
+        })
+        .count();
+    let query = search().trim().to_ascii_lowercase();
+    let visible_logs: Vec<CoreLogEntry> = stored
+        .iter()
+        .rev()
+        .filter(|entry| log_matches_filter(entry, filter()))
+        .filter(|entry| log_matches_search(entry, &query))
+        .cloned()
+        .collect();
+    let visible_count = visible_logs.len();
+
+    rsx! {
+        section { class: "workspace-section log-workspace glass-surface",
+            div { class: "workspace-toolbar log-toolbar",
+                div {
+                    p { class: "eyebrow", "CORE LOGS" }
+                    h2 { "连接日志" }
+                    span { "{route_count} 条路由 · {stored.len()} 条记录" }
+                }
+                div { class: "toolbar-controls log-toolbar-actions",
+                    span {
+                        class: if connected() { "status-badge online" } else { "status-badge" },
+                        if connected() { "实时采集" } else { "已停止" }
+                    }
+                    button {
+                        class: "icon-button glass-control danger",
+                        title: "清空日志",
+                        disabled: stored.is_empty(),
+                        onclick: move |_| logs.write().clear(),
+                        Icon { icon: LdTrash2, width: 17, height: 17 }
+                    }
+                }
+            }
+            div { class: "log-controls",
+                div { class: "log-segmented-control", aria_label: "日志筛选",
+                    button {
+                        class: if filter() == LogFilter::Routes { "active" } else { "" },
+                        onclick: move |_| filter.set(LogFilter::Routes),
+                        "路由 {route_count}"
+                    }
+                    button {
+                        class: if filter() == LogFilter::All { "active" } else { "" },
+                        onclick: move |_| filter.set(LogFilter::All),
+                        "全部 {stored.len()}"
+                    }
+                    button {
+                        class: if filter() == LogFilter::Direct { "active" } else { "" },
+                        onclick: move |_| filter.set(LogFilter::Direct),
+                        "直连 {direct_count}"
+                    }
+                    button {
+                        class: if filter() == LogFilter::Proxy { "active" } else { "" },
+                        onclick: move |_| filter.set(LogFilter::Proxy),
+                        "代理 {proxy_count}"
+                    }
+                }
+                label { class: "search-field log-search",
+                    Icon { icon: LdSearch, width: 17, height: 17 }
+                    input {
+                        value: search,
+                        placeholder: "搜索域名、IP、节点",
+                        oninput: move |event| search.set(event.value()),
+                    }
+                }
+            }
+            if visible_logs.is_empty() {
+                div { class: "large-empty log-empty",
+                    span { class: "empty-icon", Icon { icon: LdScrollText, width: 27, height: 27 } }
+                    strong {
+                        if connected() { "暂无匹配日志" } else { "连接后显示日志" }
+                    }
+                }
+            } else {
+                div { class: "log-list", aria_label: "内核日志",
+                    div { class: "log-table-header",
+                        span { "时间" }
+                        span { "路由" }
+                        span { "目标" }
+                        span { "出口" }
+                    }
+                    for entry in visible_logs {
+                        LogRow { entry }
+                    }
+                }
+                div { class: "log-list-footer", "当前显示 {visible_count} 条" }
+            }
+        }
+    }
+}
+
+#[component]
+fn LogRow(entry: CoreLogEntry) -> Element {
+    let level_class = format!("log-level {}", entry.level);
+    let level_label = entry.level.to_ascii_uppercase();
+    let route = entry.route.clone();
+    let has_route = route.is_some();
+
+    rsx! {
+        div { class: if has_route { "log-row route-entry" } else { "log-row raw-entry" },
+            time { class: "log-time", "{entry.timestamp}" }
+            if let Some(route) = route {
+                span {
+                    class: match route.decision {
+                        RouteDecision::Direct => "route-decision direct",
+                        RouteDecision::Proxy => "route-decision proxy",
+                    },
+                    {route_decision_label(route.decision)}
+                }
+                div { class: "log-target", title: route.target.clone(),
+                    strong { "{route.host}" }
+                    small {
+                        {route_target_kind_label(route.target_kind)}
+                        if let Some(port) = route.port {
+                            " · {port}"
+                        }
+                    }
+                }
+                div { class: "log-outbound", title: route.outbound_tag.clone(),
+                    strong { "{route.outbound_tag}" }
+                    small { "{route.outbound_type}" }
+                }
+                code { class: "log-message", "{entry.message}" }
+            } else {
+                span { class: level_class, "{level_label}" }
+                code { class: "log-message raw-message", "{entry.message}" }
+            }
+        }
+    }
+}
+
+fn log_matches_filter(entry: &CoreLogEntry, filter: LogFilter) -> bool {
+    match filter {
+        LogFilter::Routes => entry.route.is_some(),
+        LogFilter::All => true,
+        LogFilter::Direct => {
+            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Direct)
+        }
+        LogFilter::Proxy => {
+            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Proxy)
+        }
+    }
+}
+
+fn log_matches_search(entry: &CoreLogEntry, query: &str) -> bool {
+    if query.is_empty() || entry.message.to_ascii_lowercase().contains(query) {
+        return true;
+    }
+    entry.route.as_ref().is_some_and(|route| {
+        route.host.to_ascii_lowercase().contains(query)
+            || route.outbound_tag.to_ascii_lowercase().contains(query)
+            || route.outbound_type.to_ascii_lowercase().contains(query)
+    })
+}
+
+fn route_decision_label(decision: RouteDecision) -> &'static str {
+    match decision {
+        RouteDecision::Direct => "直连",
+        RouteDecision::Proxy => "代理",
+    }
+}
+
+fn route_target_kind_label(kind: RouteTargetKind) -> &'static str {
+    match kind {
+        RouteTargetKind::Domain => "域名",
+        RouteTargetKind::Ip => "IP",
     }
 }
 

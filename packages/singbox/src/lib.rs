@@ -35,6 +35,20 @@ pub struct TrafficStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub sequence: u64,
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogBatch {
+    pub next_cursor: u64,
+    pub entries: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformCapabilities {
     pub embedded_core: bool,
     pub requires_mobile_vpn_bridge: bool,
@@ -63,6 +77,8 @@ pub enum CoreError {
     NotRunning,
     #[error("读取嵌入式 sing-box 流量失败: {0}")]
     TrafficUnavailable(String),
+    #[error("读取嵌入式 sing-box 日志失败: {0}")]
+    LogsUnavailable(String),
     #[error("配置序列化失败: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Android VPN 服务错误: {0}")]
@@ -184,6 +200,19 @@ impl SingBox {
         #[cfg(not(feature = "embedded-core"))]
         Err(CoreError::EmbeddedCoreUnavailable)
     }
+
+    pub fn logs(&self, cursor: u64) -> Result<LogBatch, CoreError> {
+        #[cfg(feature = "embedded-core")]
+        {
+            let handle = self.handle.ok_or(CoreError::NotRunning)?;
+            let payload = ffi::logs(handle, cursor)?;
+            return serde_json::from_str(&payload)
+                .map_err(|error| CoreError::LogsUnavailable(error.to_string()));
+        }
+
+        #[cfg(not(feature = "embedded-core"))]
+        Err(CoreError::EmbeddedCoreUnavailable)
+    }
 }
 
 impl Drop for SingBox {
@@ -222,6 +251,7 @@ mod ffi {
         fn kitty_singbox_version() -> *mut c_char;
         fn kitty_singbox_last_error() -> *mut c_char;
         fn kitty_singbox_traffic(handle: u64) -> *mut c_char;
+        fn kitty_singbox_logs(handle: u64, cursor: u64) -> *mut c_char;
         fn kitty_singbox_free_string(value: *mut c_char);
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_start(
@@ -233,6 +263,8 @@ mod ffi {
         fn kitty_singbox_android_stop() -> *mut c_char;
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_traffic() -> *mut c_char;
+        #[cfg(target_os = "android")]
+        fn kitty_singbox_android_logs(cursor: u64) -> *mut c_char;
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_probe(
             config_content: *const c_char,
@@ -272,6 +304,14 @@ mod ffi {
         Ok(payload)
     }
 
+    pub fn logs(handle: u64, cursor: u64) -> Result<String, CoreError> {
+        let payload = take_string(unsafe { kitty_singbox_logs(handle, cursor) });
+        if payload.is_empty() {
+            return Err(CoreError::LogsUnavailable(last_error()));
+        }
+        Ok(payload)
+    }
+
     #[cfg(target_os = "android")]
     pub fn android_start(config: &str, tun_fd: i32, data_path: &str) -> Result<(), CoreError> {
         let config = CString::new(config)
@@ -293,6 +333,15 @@ mod ffi {
         let payload = take_string(unsafe { kitty_singbox_android_traffic() });
         if payload.is_empty() {
             return Err(CoreError::TrafficUnavailable(last_error()));
+        }
+        Ok(payload)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_logs(cursor: u64) -> Result<String, CoreError> {
+        let payload = take_string(unsafe { kitty_singbox_android_logs(cursor) });
+        if payload.is_empty() {
+            return Err(CoreError::LogsUnavailable(last_error()));
         }
         Ok(payload)
     }
@@ -443,6 +492,12 @@ mod tests {
         let traffic = core.traffic().expect("traffic counters should be readable");
         assert!(traffic.upload_total > 0);
         assert!(traffic.download_total > 0);
+        let logs = core.logs(0).expect("core logs should be readable");
+        assert!(logs.next_cursor > 0);
+        assert!(logs.entries.iter().any(|entry| {
+            entry.message.contains("outbound/direct[direct]")
+                && entry.message.contains(&format!("127.0.0.1:{target_port}"))
+        }));
         core.stop().expect("embedded core should stop");
     }
 

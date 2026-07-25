@@ -39,6 +39,46 @@ pub struct CoreTraffic {
     pub active_connections: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteDecision {
+    Direct,
+    Proxy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteTargetKind {
+    Domain,
+    Ip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteLogDetail {
+    pub decision: RouteDecision,
+    pub target: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub target_kind: RouteTargetKind,
+    pub outbound_type: String,
+    pub outbound_tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreLogEntry {
+    pub sequence: u64,
+    pub timestamp: String,
+    pub level: String,
+    pub message: String,
+    pub route: Option<RouteLogDetail>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreLogBatch {
+    pub next_cursor: u64,
+    pub entries: Vec<CoreLogEntry>,
+}
+
 /// Status of the operating system proxy managed by Kitty Pro.
 ///
 /// The proxy endpoint itself remains fixed to the local sing-box mixed
@@ -92,6 +132,11 @@ pub async fn set_core_enabled(
 #[cfg_attr(not(target_os = "android"), get("/api/core/traffic"))]
 pub async fn core_traffic() -> Result<CoreTraffic, ServerFnError> {
     native_core_traffic()
+}
+
+#[cfg_attr(not(target_os = "android"), post("/api/core/logs"))]
+pub async fn core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
+    native_core_logs(cursor)
 }
 
 #[cfg_attr(not(target_os = "android"), post("/api/core/latency"))]
@@ -580,6 +625,118 @@ fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
     Ok(CoreTraffic::default())
 }
 
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
+    let guard = core_slot()
+        .lock()
+        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    let Some(core) = guard.as_ref() else {
+        return Ok(CoreLogBatch {
+            next_cursor: cursor,
+            entries: Vec::new(),
+        });
+    };
+    if !core
+        .is_running()
+        .map_err(|error| ServerFnError::new(error.to_string()))?
+    {
+        return Ok(CoreLogBatch {
+            next_cursor: cursor,
+            entries: Vec::new(),
+        });
+    }
+    core.logs(cursor)
+        .map(normalize_log_batch)
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
+    singbox::android::logs(cursor)
+        .map(normalize_log_batch)
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
+    Ok(CoreLogBatch {
+        next_cursor: cursor,
+        entries: Vec::new(),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn normalize_log_batch(batch: singbox::LogBatch) -> CoreLogBatch {
+    CoreLogBatch {
+        next_cursor: batch.next_cursor,
+        entries: batch
+            .entries
+            .into_iter()
+            .map(|entry| CoreLogEntry {
+                sequence: entry.sequence,
+                timestamp: entry.timestamp,
+                level: entry.level,
+                route: parse_route_log(&entry.message),
+                message: entry.message,
+            })
+            .collect(),
+    }
+}
+
+fn parse_route_log(message: &str) -> Option<RouteLogDetail> {
+    let component = message.split_once("outbound/")?.1;
+    let type_end = component.find('[')?;
+    let outbound_type = component[..type_end].trim();
+    let tag_start = type_end + 1;
+    let tag_end = component[tag_start..].find(']')? + tag_start;
+    let outbound_tag = component[tag_start..tag_end].trim();
+    let detail = component[tag_end + 1..].trim_start_matches(':').trim();
+    let target_start = detail.find("connection to ")? + "connection to ".len();
+    let target = detail[target_start..].trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    let (host, port) = split_route_target(target);
+    let target_kind = if host.parse::<std::net::IpAddr>().is_ok() {
+        RouteTargetKind::Ip
+    } else {
+        RouteTargetKind::Domain
+    };
+    Some(RouteLogDetail {
+        decision: if outbound_type == "direct" || outbound_tag == "direct" {
+            RouteDecision::Direct
+        } else {
+            RouteDecision::Proxy
+        },
+        target: target.to_string(),
+        host,
+        port,
+        target_kind,
+        outbound_type: outbound_type.to_string(),
+        outbound_tag: outbound_tag.to_string(),
+    })
+}
+
+fn split_route_target(target: &str) -> (String, Option<u16>) {
+    if let Some(ipv6) = target.strip_prefix('[') {
+        if let Some((host, port)) = ipv6.split_once("]:") {
+            return (host.to_string(), port.parse().ok());
+        }
+    }
+    if let Some((host, port)) = target.rsplit_once(':') {
+        if !host.is_empty() {
+            if let Ok(port) = port.parse() {
+                return (host.to_string(), Some(port));
+            }
+        }
+    }
+    (target.to_string(), None)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn allocate_loopback_port() -> Result<u16, ServerFnError> {
     use std::net::TcpListener;
@@ -958,4 +1115,52 @@ fn core_slot() -> &'static std::sync::Mutex<Option<singbox::SingBox>> {
 
     static CORE: OnceLock<Mutex<Option<singbox::SingBox>>> = OnceLock::new();
     CORE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_direct_domain_route_log() {
+        let route = parse_route_log(
+            "INFO[0001] [12 0ms] outbound/direct[direct]: outbound connection to www.baidu.com:443",
+        )
+        .expect("direct route should be parsed");
+
+        assert_eq!(route.decision, RouteDecision::Direct);
+        assert_eq!(route.host, "www.baidu.com");
+        assert_eq!(route.port, Some(443));
+        assert_eq!(route.target_kind, RouteTargetKind::Domain);
+        assert_eq!(route.outbound_tag, "direct");
+    }
+
+    #[test]
+    fn parses_proxy_ip_and_ipv6_route_logs() {
+        let proxy = parse_route_log(
+            "INFO[0002] outbound/vless[subscription-1-edge]: outbound packet connection to 8.8.8.8:53",
+        )
+        .expect("proxy route should be parsed");
+        assert_eq!(proxy.decision, RouteDecision::Proxy);
+        assert_eq!(proxy.host, "8.8.8.8");
+        assert_eq!(proxy.port, Some(53));
+        assert_eq!(proxy.target_kind, RouteTargetKind::Ip);
+        assert_eq!(proxy.outbound_type, "vless");
+
+        let ipv6 = parse_route_log(
+            "INFO[0003] outbound/direct[direct]: outbound connection to [2001:db8::1]:443",
+        )
+        .expect("IPv6 route should be parsed");
+        assert_eq!(ipv6.host, "2001:db8::1");
+        assert_eq!(ipv6.port, Some(443));
+        assert_eq!(ipv6.target_kind, RouteTargetKind::Ip);
+    }
+
+    #[test]
+    fn ignores_non_outbound_log_lines() {
+        assert!(parse_route_log(
+            "INFO[0001] inbound/mixed[mixed-in]: inbound connection to example.com:443"
+        )
+        .is_none());
+    }
 }

@@ -12,6 +12,7 @@ import (
 	stdjson "encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -20,6 +21,7 @@ import (
 	CBox "github.com/sagernet/sing-box/constant"
 	_ "github.com/sagernet/sing-box/experimental/clashapi"
 	"github.com/sagernet/sing-box/include"
+	boxlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 )
@@ -29,6 +31,119 @@ type instance struct {
 	cancel           context.CancelFunc
 	trafficURL       string
 	trafficAuthToken string
+	logs             *bridgeLogBuffer
+}
+
+const bridgeLogLimit = 500
+
+type bridgeLogEntry struct {
+	Sequence  uint64 `json:"sequence"`
+	Timestamp string `json:"timestamp"`
+	Level     string `json:"level"`
+	Message   string `json:"message"`
+}
+
+type bridgeLogBatch struct {
+	NextCursor uint64           `json:"next_cursor"`
+	Entries    []bridgeLogEntry `json:"entries"`
+}
+
+type bridgeLogBuffer struct {
+	sync.Mutex
+	nextSequence uint64
+	entries      []bridgeLogEntry
+}
+
+func (b *bridgeLogBuffer) WriteMessage(level boxlog.Level, message string) {
+	// Connection routing decisions are logged at info level. Keeping more
+	// verbose debug/trace output would quickly evict the useful entries.
+	if level > boxlog.LevelInfo {
+		return
+	}
+	b.append(boxlog.FormatLevel(level), message)
+}
+
+func (b *bridgeLogBuffer) writeFormattedMessage(message string) {
+	level := inferFormattedLogLevel(message)
+	if level == "debug" || level == "trace" {
+		return
+	}
+	b.append(level, message)
+}
+
+func (b *bridgeLogBuffer) append(level string, message string) {
+	b.Lock()
+	defer b.Unlock()
+	b.nextSequence++
+	entry := bridgeLogEntry{
+		Sequence:  b.nextSequence,
+		Timestamp: time.Now().Format("15:04:05.000"),
+		Level:     level,
+		Message:   stripANSI(strings.TrimSpace(message)),
+	}
+	if len(b.entries) == bridgeLogLimit {
+		copy(b.entries, b.entries[1:])
+		b.entries[len(b.entries)-1] = entry
+	} else {
+		b.entries = append(b.entries, entry)
+	}
+}
+
+func (b *bridgeLogBuffer) reset() {
+	b.Lock()
+	b.nextSequence = 0
+	b.entries = nil
+	b.Unlock()
+}
+
+func (b *bridgeLogBuffer) snapshot(cursor uint64) bridgeLogBatch {
+	b.Lock()
+	defer b.Unlock()
+	if cursor > b.nextSequence {
+		cursor = 0
+	}
+	entries := make([]bridgeLogEntry, 0)
+	for _, entry := range b.entries {
+		if entry.Sequence > cursor {
+			entries = append(entries, entry)
+		}
+	}
+	return bridgeLogBatch{
+		NextCursor: b.nextSequence,
+		Entries:    entries,
+	}
+}
+
+func (b *bridgeLogBuffer) snapshotJSON(cursor uint64) ([]byte, error) {
+	return stdjson.Marshal(b.snapshot(cursor))
+}
+
+func inferFormattedLogLevel(message string) string {
+	message = strings.ToUpper(stripANSI(strings.TrimSpace(message)))
+	for _, level := range []string{"PANIC", "FATAL", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"} {
+		if strings.HasPrefix(message, level) || strings.Contains(message, " "+level+"[") {
+			return strings.ToLower(level)
+		}
+	}
+	return "info"
+}
+
+func stripANSI(message string) string {
+	clean := make([]byte, 0, len(message))
+	for index := 0; index < len(message); index++ {
+		if message[index] == 0x1b && index+1 < len(message) && message[index+1] == '[' {
+			index += 2
+			for index < len(message) {
+				if message[index] >= 0x40 && message[index] <= 0x7e {
+					break
+				}
+				index++
+			}
+			continue
+		}
+		clean = append(clean, message[index])
+	}
+	return string(clean)
 }
 
 var state = struct {
@@ -58,6 +173,7 @@ func start(configContent string) (*instance, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
+	logs := &bridgeLogBuffer{}
 	service, err := box.New(box.Options{
 		Context: ctx,
 		Options: options,
@@ -66,6 +182,29 @@ func start(configContent string) (*instance, error) {
 		cancel()
 		return nil, err
 	}
+	logFactory, observable := service.LogFactory().(boxlog.ObservableFactory)
+	if !observable {
+		cancel()
+		_ = service.Close()
+		return nil, &bridgeError{message: "sing-box observable logs are not available"}
+	}
+	logSubscription, logDone, err := logFactory.Subscribe()
+	if err != nil {
+		cancel()
+		_ = service.Close()
+		return nil, err
+	}
+	go func() {
+		defer logFactory.UnSubscribe(logSubscription)
+		for {
+			select {
+			case entry := <-logSubscription:
+				logs.WriteMessage(entry.Level, entry.Message)
+			case <-logDone:
+				return
+			}
+		}
+	}()
 	if err = service.Start(); err != nil {
 		cancel()
 		_ = service.Close()
@@ -77,6 +216,7 @@ func start(configContent string) (*instance, error) {
 		cancel:           cancel,
 		trafficURL:       trafficURL,
 		trafficAuthToken: trafficAuthToken,
+		logs:             logs,
 	}, nil
 }
 
@@ -205,6 +345,24 @@ func kitty_singbox_traffic(handle C.uint64_t) *C.char {
 		return nil
 	}
 	result, err := service.traffic()
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	setLastError(nil)
+	return C.CString(string(result))
+}
+
+//export kitty_singbox_logs
+func kitty_singbox_logs(handle C.uint64_t, cursor C.uint64_t) *C.char {
+	state.Lock()
+	service, found := state.instances[uint64(handle)]
+	state.Unlock()
+	if !found {
+		setLastError(&bridgeError{message: "sing-box instance is not running"})
+		return nil
+	}
+	result, err := service.logs.snapshotJSON(uint64(cursor))
 	if err != nil {
 		setLastError(err)
 		return nil
