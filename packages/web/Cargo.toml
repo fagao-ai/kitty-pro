@@ -1,0 +1,17 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dioxus = { workspace = true, features = ["router", "fullstack", "web"] }
+ui = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dioxus = { workspace = true, features = ["router", "fullstack", "server"] }
+ui = { workspace = true, features = ["server"] }
+
+[features]
+default = []
+web = []
+server = ["ui/server"]

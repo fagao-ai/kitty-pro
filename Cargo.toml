@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "packages/ui",
+    "packages/web",
+    "packages/desktop",
+    "packages/mobile",
+    "packages/api",
+    "packages/proxy-core",
+    "packages/singbox",
+]
+
+[workspace.dependencies]
+dioxus = { version = "0.7.1" }
+
+# workspace
+ui = { path = "packages/ui" }
+api = { path = "packages/api" }
+proxy-core = { path = "packages/proxy-core" }
+singbox = { path = "packages/singbox" }
