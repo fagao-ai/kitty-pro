@@ -146,7 +146,9 @@ case "$build_variant" in
         ;;
     release)
         gradle_task=assembleRelease
-        gradle_options=(-x lintVitalRelease)
+        # Keep release signing and packaging deterministic on constrained CI
+        # runners; code shrinking is optional for this distributable APK.
+        gradle_options=(-x lintVitalRelease -x minifyReleaseWithR8)
         source_apk="$android_project/app/build/outputs/apk/release/app-release-unsigned.apk"
         ;;
     *)
