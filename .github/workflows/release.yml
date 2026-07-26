@@ -145,8 +145,14 @@ jobs:
               mkdir -p dist/windows
               cp target/x86_64-pc-windows-gnu/release/kitty-pro.exe dist/windows/Kitty-Pro.exe
               cp -R assets dist/windows/assets
-              7z a -tzip -mx=9 dist/windows/Kitty-Pro-windows-x86_64.zip \
-                dist/windows/Kitty-Pro.exe dist/windows/assets >/dev/null
+              (
+                cd dist/windows
+                7z a -tzip -mx=9 Kitty-Pro-windows-x86_64.zip \
+                  Kitty-Pro.exe assets >/dev/null
+                sha256sum Kitty-Pro.exe > Kitty-Pro.exe.sha256
+                sha256sum Kitty-Pro-windows-x86_64.zip \
+                  > Kitty-Pro-windows-x86_64.zip.sha256
+              )
             else
               build_status=${PIPESTATUS[0]}
             fi
@@ -193,6 +199,15 @@ jobs:
             windows)
               test -n "$(find dist/windows -type f -name '*.exe' -print -quit)"
               test -n "$(find dist/windows -type f -name '*.zip' -print -quit)"
+              objdump -p dist/windows/Kitty-Pro.exe \
+                | grep -Eq 'Subsystem.*Windows GUI'
+              if objdump -p dist/windows/Kitty-Pro.exe \
+                  | grep -Eqi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)[^ ]*\.dll'; then
+                echo 'Windows package depends on an unbundled MinGW runtime DLL' >&2
+                exit 1
+              fi
+              7z l dist/windows/Kitty-Pro-windows-x86_64.zip \
+                | grep -Eq '(^|[[:space:]])Kitty-Pro\.exe([[:space:]]|$)'
               ;;
             linux)
               test -n "$(find dist/linux -type f -name '*.AppImage' -print -quit)"

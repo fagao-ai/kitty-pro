@@ -834,10 +834,27 @@ fn toggle_native_core(
     ))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 const SYSTEM_PROXY_HOST: &str = "127.0.0.1";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 const SYSTEM_PROXY_PORT: u16 = 7890;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_INTERNET_SETTINGS: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+#[cfg(target_os = "linux")]
+const LINUX_PROXY_KEYS: &[(&str, &str)] = &[
+    ("org.gnome.system.proxy", "mode"),
+    ("org.gnome.system.proxy", "use-same-proxy"),
+    ("org.gnome.system.proxy.http", "enabled"),
+    ("org.gnome.system.proxy.http", "host"),
+    ("org.gnome.system.proxy.http", "port"),
+    ("org.gnome.system.proxy.https", "host"),
+    ("org.gnome.system.proxy.https", "port"),
+    ("org.gnome.system.proxy.socks", "host"),
+    ("org.gnome.system.proxy.socks", "port"),
+];
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -861,6 +878,27 @@ struct MacServiceProxyBackup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MacSystemProxyBackup {
     services: Vec<MacServiceProxyBackup>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WindowsSystemProxyBackup {
+    proxy_enabled: Option<u32>,
+    proxy_server: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LinuxProxySettingBackup {
+    schema: String,
+    key: String,
+    value: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LinuxSystemProxyBackup {
+    settings: Vec<LinuxProxySettingBackup>,
 }
 
 #[cfg(target_os = "macos")]
@@ -895,7 +933,70 @@ fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
     })
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
+    let backup = windows_proxy_settings()?;
+    let proxy_enabled = backup.proxy_enabled.unwrap_or(0) != 0;
+    let proxy_server = backup.proxy_server.unwrap_or_default();
+    let enabled = proxy_enabled && is_kitty_windows_proxy(&proxy_server);
+    let detail = if enabled {
+        "已设置 Windows 系统代理 127.0.0.1:7890".to_string()
+    } else if proxy_enabled {
+        "系统当前使用其他代理，Kitty Pro 未接管".to_string()
+    } else {
+        "未启用系统代理".to_string()
+    };
+    Ok(SystemProxyStatus {
+        supported: true,
+        enabled,
+        detail,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
+    if let Some(detail) = linux_proxy_unavailable_reason() {
+        return Ok(SystemProxyStatus {
+            supported: false,
+            enabled: false,
+            detail,
+        });
+    }
+
+    let mode = linux_gsettings_get("org.gnome.system.proxy", "mode")?;
+    let http_enabled = linux_gsettings_get("org.gnome.system.proxy.http", "enabled")?;
+    let http_host = linux_gsettings_get("org.gnome.system.proxy.http", "host")?;
+    let http_port = linux_gsettings_get("org.gnome.system.proxy.http", "port")?;
+    let https_host = linux_gsettings_get("org.gnome.system.proxy.https", "host")?;
+    let https_port = linux_gsettings_get("org.gnome.system.proxy.https", "port")?;
+    let socks_host = linux_gsettings_get("org.gnome.system.proxy.socks", "host")?;
+    let socks_port = linux_gsettings_get("org.gnome.system.proxy.socks", "port")?;
+    let enabled = gvariant_string(&mode) == "manual"
+        && http_enabled == "true"
+        && [http_host, https_host, socks_host]
+            .iter()
+            .all(|host| gvariant_string(host) == SYSTEM_PROXY_HOST)
+        && [http_port, https_port, socks_port]
+            .iter()
+            .all(|port| port == &SYSTEM_PROXY_PORT.to_string());
+    let detail = if enabled {
+        "已设置 GNOME 系统代理 127.0.0.1:7890".to_string()
+    } else if gvariant_string(&mode) == "manual" {
+        "GNOME 当前使用其他手动代理，Kitty Pro 未接管".to_string()
+    } else {
+        "未启用系统代理".to_string()
+    };
+    Ok(SystemProxyStatus {
+        supported: true,
+        enabled,
+        detail,
+    })
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+))]
 fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
     Ok(SystemProxyStatus {
         supported: false,
@@ -973,7 +1074,91 @@ fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnE
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
+    if enabled {
+        ensure_core_is_running()?;
+        let backup_path = system_proxy_backup_path()?;
+        if backup_path.exists() {
+            let current = native_system_proxy_status()?;
+            if current.enabled {
+                return Ok(current);
+            }
+            return Err(ServerFnError::new(
+                "检测到未恢复的系统代理备份，请先关闭系统代理",
+            ));
+        }
+
+        let backup = windows_proxy_settings()?;
+        write_system_proxy_backup(&backup)?;
+        if let Err(error) = apply_kitty_windows_proxy() {
+            let _ = restore_windows_proxy_backup(&backup);
+            let _ = std::fs::remove_file(&backup_path);
+            return Err(error);
+        }
+        native_system_proxy_status()
+    } else {
+        let backup_path = system_proxy_backup_path()?;
+        let backup: WindowsSystemProxyBackup = read_system_proxy_backup(&backup_path)?;
+        restore_windows_proxy_backup(&backup)?;
+        std::fs::remove_file(&backup_path)
+            .map_err(|error| ServerFnError::new(format!("清理代理备份失败: {error}")))?;
+        native_system_proxy_status()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
+    if let Some(detail) = linux_proxy_unavailable_reason() {
+        return Err(ServerFnError::new(detail));
+    }
+
+    if enabled {
+        ensure_core_is_running()?;
+        let backup_path = system_proxy_backup_path()?;
+        if backup_path.exists() {
+            let current = native_system_proxy_status()?;
+            if current.enabled {
+                return Ok(current);
+            }
+            return Err(ServerFnError::new(
+                "检测到未恢复的系统代理备份，请先关闭系统代理",
+            ));
+        }
+
+        let backup = LinuxSystemProxyBackup {
+            settings: LINUX_PROXY_KEYS
+                .iter()
+                .map(|(schema, key)| {
+                    Ok(LinuxProxySettingBackup {
+                        schema: (*schema).to_string(),
+                        key: (*key).to_string(),
+                        value: linux_gsettings_get(schema, key)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ServerFnError>>()?,
+        };
+        write_system_proxy_backup(&backup)?;
+        if let Err(error) = apply_kitty_linux_proxy() {
+            let _ = restore_linux_proxy_backup(&backup);
+            let _ = std::fs::remove_file(&backup_path);
+            return Err(error);
+        }
+        native_system_proxy_status()
+    } else {
+        let backup_path = system_proxy_backup_path()?;
+        let backup: LinuxSystemProxyBackup = read_system_proxy_backup(&backup_path)?;
+        restore_linux_proxy_backup(&backup)?;
+        std::fs::remove_file(&backup_path)
+            .map_err(|error| ServerFnError::new(format!("清理代理备份失败: {error}")))?;
+        native_system_proxy_status()
+    }
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+))]
 fn set_native_system_proxy(_enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
     Err(ServerFnError::new("当前平台尚未实现系统代理适配"))
 }
@@ -984,7 +1169,7 @@ fn set_native_system_proxy(_enabled: bool) -> Result<SystemProxyStatus, ServerFn
     Err(ServerFnError::new("浏览器目标不能直接修改系统代理"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn ensure_core_is_running() -> Result<(), ServerFnError> {
     use singbox::CoreState;
 
@@ -997,6 +1182,257 @@ fn ensure_core_is_running() -> Result<(), ServerFnError> {
     let status = core.status();
     if status.state != CoreState::Running {
         return Err(ServerFnError::new("请先建立连接，再启用系统代理"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_internet_settings(access: u32) -> Result<winreg::RegKey, ServerFnError> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(WINDOWS_INTERNET_SETTINGS, access)
+        .map_err(|error| ServerFnError::new(format!("无法读取 Windows 系统代理: {error}")))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_proxy_settings() -> Result<WindowsSystemProxyBackup, ServerFnError> {
+    use std::io::ErrorKind;
+    use winreg::enums::KEY_READ;
+
+    let settings = windows_internet_settings(KEY_READ)?;
+    let proxy_enabled = match settings.get_value("ProxyEnable") {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ServerFnError::new(format!(
+                "读取 Windows ProxyEnable 失败: {error}"
+            )))
+        }
+    };
+    let proxy_server = match settings.get_value("ProxyServer") {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ServerFnError::new(format!(
+                "读取 Windows ProxyServer 失败: {error}"
+            )))
+        }
+    };
+    Ok(WindowsSystemProxyBackup {
+        proxy_enabled,
+        proxy_server,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn is_kitty_windows_proxy(server: &str) -> bool {
+    let endpoint = format!("{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT}");
+    if !server.contains('=') {
+        return server.eq_ignore_ascii_case(&endpoint);
+    }
+
+    let mut http = false;
+    let mut https = false;
+    let mut socks = false;
+    for entry in server.split(';') {
+        let Some((scheme, value)) = entry.trim().split_once('=') else {
+            continue;
+        };
+        if !value.trim().eq_ignore_ascii_case(&endpoint) {
+            continue;
+        }
+        match scheme.trim().to_ascii_lowercase().as_str() {
+            "http" => http = true,
+            "https" => https = true,
+            "socks" => socks = true,
+            _ => {}
+        }
+    }
+    http && https && socks
+}
+
+#[cfg(target_os = "windows")]
+fn apply_kitty_windows_proxy() -> Result<(), ServerFnError> {
+    use winreg::enums::{KEY_READ, KEY_WRITE};
+
+    let settings = windows_internet_settings(KEY_READ | KEY_WRITE)?;
+    let endpoint = format!("{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT}");
+    let server = format!("http={endpoint};https={endpoint};socks={endpoint}");
+    settings
+        .set_value("ProxyServer", &server)
+        .and_then(|_| settings.set_value("ProxyEnable", &1u32))
+        .map_err(|error| ServerFnError::new(format!("设置 Windows 系统代理失败: {error}")))?;
+    notify_windows_proxy_changed()
+}
+
+#[cfg(target_os = "windows")]
+fn restore_windows_proxy_backup(backup: &WindowsSystemProxyBackup) -> Result<(), ServerFnError> {
+    use std::io::ErrorKind;
+    use winreg::enums::{KEY_READ, KEY_WRITE};
+
+    let settings = windows_internet_settings(KEY_READ | KEY_WRITE)?;
+    match backup.proxy_server.as_ref() {
+        Some(value) => settings.set_value("ProxyServer", value),
+        None => settings.delete_value("ProxyServer"),
+    }
+    .or_else(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+    .map_err(|error| ServerFnError::new(format!("恢复 Windows ProxyServer 失败: {error}")))?;
+    match backup.proxy_enabled {
+        Some(value) => settings.set_value("ProxyEnable", &value),
+        None => settings.delete_value("ProxyEnable"),
+    }
+    .or_else(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+    .map_err(|error| ServerFnError::new(format!("恢复 Windows ProxyEnable 失败: {error}")))?;
+    notify_windows_proxy_changed()
+}
+
+#[cfg(target_os = "windows")]
+fn notify_windows_proxy_changed() -> Result<(), ServerFnError> {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+
+    const INTERNET_OPTION_REFRESH: u32 = 37;
+    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
+
+    #[link(name = "wininet")]
+    extern "system" {
+        fn InternetSetOptionW(
+            internet: *mut c_void,
+            option: u32,
+            buffer: *mut c_void,
+            buffer_length: u32,
+        ) -> i32;
+    }
+
+    let settings_changed =
+        unsafe { InternetSetOptionW(null_mut(), INTERNET_OPTION_SETTINGS_CHANGED, null_mut(), 0) };
+    let refreshed =
+        unsafe { InternetSetOptionW(null_mut(), INTERNET_OPTION_REFRESH, null_mut(), 0) };
+    if settings_changed == 0 || refreshed == 0 {
+        return Err(ServerFnError::new(format!(
+            "通知 Windows 刷新系统代理失败: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proxy_unavailable_reason() -> Option<String> {
+    use std::process::Command;
+
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .or_else(|_| std::env::var("DESKTOP_SESSION"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !desktop.contains("gnome") && !desktop.contains("unity") {
+        return Some("当前 Linux 桌面不是 GNOME/Unity，无法安全修改系统代理".to_string());
+    }
+    match Command::new("gsettings").arg("--version").output() {
+        Ok(output) if output.status.success() => None,
+        _ => Some("当前系统缺少可用的 gsettings，无法修改 GNOME 系统代理".to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gsettings_get(schema: &str, key: &str) -> Result<String, ServerFnError> {
+    use std::process::Command;
+
+    let output = Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .map_err(|error| ServerFnError::new(format!("无法读取 GNOME 系统代理: {error}")))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ServerFnError::new(if message.is_empty() {
+            format!("读取 GNOME 系统代理 {schema} {key} 失败")
+        } else {
+            format!("读取 GNOME 系统代理失败: {message}")
+        }));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gsettings_set(schema: &str, key: &str, value: &str) -> Result<(), ServerFnError> {
+    use std::process::Command;
+
+    let output = Command::new("gsettings")
+        .args(["set", schema, key, value])
+        .output()
+        .map_err(|error| ServerFnError::new(format!("无法设置 GNOME 系统代理: {error}")))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ServerFnError::new(if message.is_empty() {
+            format!("设置 GNOME 系统代理 {schema} {key} 失败")
+        } else {
+            format!("设置 GNOME 系统代理失败: {message}")
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn gvariant_string(value: &str) -> &str {
+    value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(value)
+}
+
+#[cfg(target_os = "linux")]
+fn apply_kitty_linux_proxy() -> Result<(), ServerFnError> {
+    let host = format!("'{SYSTEM_PROXY_HOST}'");
+    let port = SYSTEM_PROXY_PORT.to_string();
+    for (schema, key, value) in [
+        ("org.gnome.system.proxy", "use-same-proxy", "false"),
+        ("org.gnome.system.proxy.http", "enabled", "true"),
+        ("org.gnome.system.proxy.http", "host", host.as_str()),
+        ("org.gnome.system.proxy.http", "port", port.as_str()),
+        ("org.gnome.system.proxy.https", "host", host.as_str()),
+        ("org.gnome.system.proxy.https", "port", port.as_str()),
+        ("org.gnome.system.proxy.socks", "host", host.as_str()),
+        ("org.gnome.system.proxy.socks", "port", port.as_str()),
+    ] {
+        linux_gsettings_set(schema, key, value)?;
+    }
+    linux_gsettings_set("org.gnome.system.proxy", "mode", "'manual'")
+}
+
+#[cfg(target_os = "linux")]
+fn restore_linux_proxy_backup(backup: &LinuxSystemProxyBackup) -> Result<(), ServerFnError> {
+    for setting in backup
+        .settings
+        .iter()
+        .filter(|setting| !(setting.schema == "org.gnome.system.proxy" && setting.key == "mode"))
+    {
+        linux_gsettings_set(&setting.schema, &setting.key, &setting.value)?;
+    }
+    if let Some(mode) = backup
+        .settings
+        .iter()
+        .find(|setting| setting.schema == "org.gnome.system.proxy" && setting.key == "mode")
+    {
+        linux_gsettings_set(&mode.schema, &mode.key, &mode.value)?;
     }
     Ok(())
 }
@@ -1128,7 +1564,7 @@ fn run_networksetup(arguments: &[&str]) -> Result<String, ServerFnError> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn system_proxy_backup_path() -> Result<std::path::PathBuf, ServerFnError> {
     let profile = profile_path()?;
     let parent = profile
@@ -1137,8 +1573,8 @@ fn system_proxy_backup_path() -> Result<std::path::PathBuf, ServerFnError> {
     Ok(parent.join("system-proxy-backup.json"))
 }
 
-#[cfg(target_os = "macos")]
-fn write_system_proxy_backup(backup: &MacSystemProxyBackup) -> Result<(), ServerFnError> {
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn write_system_proxy_backup<T: Serialize>(backup: &T) -> Result<(), ServerFnError> {
     use std::io::Write;
 
     let path = system_proxy_backup_path()?;
@@ -1160,12 +1596,55 @@ fn write_system_proxy_backup(backup: &MacSystemProxyBackup) -> Result<(), Server
         .map_err(|error| ServerFnError::new(format!("保存代理备份失败: {error}")))
 }
 
-#[cfg(target_os = "macos")]
-fn read_system_proxy_backup(path: &std::path::Path) -> Result<MacSystemProxyBackup, ServerFnError> {
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn read_system_proxy_backup<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, ServerFnError> {
     let bytes = std::fs::read(path)
         .map_err(|error| ServerFnError::new(format!("没有可恢复的系统代理备份: {error}")))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| ServerFnError::new(format!("系统代理备份损坏: {error}")))
+}
+
+/// Restore any operating-system proxy managed by Kitty Pro, then stop the
+/// embedded core. Desktop launchers call this during normal event-loop
+/// teardown so users are not left with a dead loopback proxy after exit.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub fn shutdown_native_runtime() -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    match system_proxy_backup_path() {
+        Ok(path) if path.exists() => {
+            if let Err(error) = set_native_system_proxy(false) {
+                errors.push(format!("恢复系统代理失败: {error}"));
+            }
+        }
+        Ok(_) => {}
+        Err(error) => errors.push(format!("读取系统代理备份路径失败: {error}")),
+    }
+
+    match core_slot().lock() {
+        Ok(mut guard) => {
+            if let Some(core) = guard.as_mut() {
+                match core.is_running() {
+                    Ok(true) => {
+                        if let Err(error) = core.stop() {
+                            errors.push(format!("停止 sing-box 内核失败: {error}"));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => errors.push(format!("读取 sing-box 状态失败: {error}")),
+                }
+            }
+        }
+        Err(_) => errors.push("sing-box 状态锁已损坏".to_string()),
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
 }
 
 #[allow(dead_code)]

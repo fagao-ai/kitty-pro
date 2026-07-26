@@ -17,5 +17,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 singbox = { workspace = true }
 tokio = { version = "1", features = ["rt"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.55"
+
 [features]
 server = ["dioxus/server"]

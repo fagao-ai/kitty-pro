@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(feature = "desktop", target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 #[cfg(feature = "desktop")]
 use dioxus::desktop::{
     icon_from_memory,
@@ -28,7 +33,12 @@ fn main() {
     let config = Config::new()
         .with_window(WindowBuilder::new().with_title("Kitty Pro"))
         .with_icon(window_icon)
-        .with_close_behaviour(WindowCloseBehaviour::WindowHides);
+        .with_close_behaviour(WindowCloseBehaviour::WindowHides)
+        .with_custom_event_handler(|event, _| {
+            if matches!(event, dioxus::desktop::tao::event::Event::LoopDestroyed) {
+                let _ = api::shutdown_native_runtime();
+            }
+        });
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
@@ -76,6 +86,7 @@ fn use_desktop_tray() {
             window.set_focus();
         }
         TRAY_QUIT_ID => {
+            let _ = api::shutdown_native_runtime();
             window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
             window.close();
         }

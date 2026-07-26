@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
+import dev.dioxus.main.R
 import java.util.concurrent.atomic.AtomicBoolean
 
 class KittyVpnService : VpnService() {
@@ -161,7 +162,7 @@ class KittyVpnService : VpnService() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Kitty Pro")
             .setContentText("VPN connection is active")
-            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setSmallIcon(R.drawable.kitty_notification)
             .setOngoing(true)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
