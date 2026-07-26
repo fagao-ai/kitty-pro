@@ -34,16 +34,19 @@ jobs:
             id: macos
             os: macos-14
             platform_flag: --macos
+            target_args: ""
             bundle_args: --package-types macos --package-types dmg
           - name: Windows
             id: windows
             os: windows-latest
             platform_flag: --windows
+            target_args: --target x86_64-pc-windows-gnu
             bundle_args: --package-types msi --package-types nsis
           - name: Linux
             id: linux
             os: ubuntu-24.04
             platform_flag: --linux
+            target_args: ""
             bundle_args: --package-types appimage --package-types deb
     steps:
       - name: Checkout source
@@ -96,6 +99,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
+      - name: Install Windows GNU target
+        if: matrix.id == 'windows'
+        shell: bash
+        run: rustup target add x86_64-pc-windows-gnu
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
         with:
@@ -117,6 +125,7 @@ jobs:
           if ! dx bundle \
               --package desktop \
               ${{ matrix.platform_flag }} \
+              ${{ matrix.target_args }} \
               --release \
               --locked \
               --out-dir "dist/${{ matrix.id }}" \
