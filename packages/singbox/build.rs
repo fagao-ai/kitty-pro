@@ -71,11 +71,17 @@ fn main() {
         }
     }
 
-    // The bridge can download Go modules on a clean developer or CI machine.
-    // Respect an explicitly configured proxy, otherwise use the workspace proxy.
-    for variable in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
-        if env::var_os(variable).is_none() {
-            command.env(variable, DEFAULT_PROXY);
+    // The workspace proxy is useful on the developer network, but it is not
+    // reachable from public CI runners. Keep it opt-in for CI while retaining
+    // the local default; `KITTY_USE_DEFAULT_PROXY=1` can force it anywhere.
+    let use_default_proxy = env::var("KITTY_USE_DEFAULT_PROXY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or_else(|_| env::var_os("CI").is_none());
+    if use_default_proxy {
+        for variable in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            if env::var_os(variable).is_none() {
+                command.env(variable, DEFAULT_PROXY);
+            }
         }
     }
     if env::var_os("GOPROXY").is_none() {

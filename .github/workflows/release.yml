@@ -17,6 +17,7 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   DIOXUS_CLI_VERSION: "0.7.9"
+  KITTY_USE_DEFAULT_PROXY: "0"
   RUST_BACKTRACE: "1"
   RUST_VERSION: "1.97.1"
 
@@ -68,9 +69,17 @@ jobs:
 
       - name: Install MinGW for the Windows Go bridge
         if: runner.os == 'Windows'
-        uses: egor-tensin/setup-mingw@v2
+        uses: msys2/setup-msys2@v2
         with:
-          platform: x64
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'C:/msys64/mingw64/bin' >> "$GITHUB_PATH"
 
       - name: Install Go
         uses: actions/setup-go@v6
