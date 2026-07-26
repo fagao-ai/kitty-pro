@@ -91,17 +91,35 @@ pub struct SystemProxyStatus {
     pub detail: String,
 }
 
-#[cfg_attr(not(target_os = "android"), get("/api/profile"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    get("/api/profile")
+)]
 pub async fn load_profile() -> Result<AppProfile, ServerFnError> {
     load_native_profile()
 }
 
-#[cfg_attr(not(target_os = "android"), post("/api/profile"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/profile")
+)]
 pub async fn save_profile(profile: AppProfile) -> Result<(), ServerFnError> {
     save_native_profile(&profile)
 }
 
-#[cfg_attr(not(target_os = "android"), post("/api/subscriptions/preview"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/subscriptions/preview")
+)]
 pub async fn preview_subscription(source: String) -> Result<ParseReport, ServerFnError> {
     let source = source.trim().to_string();
     if source.is_empty() {
@@ -116,12 +134,24 @@ pub async fn preview_subscription(source: String) -> Result<ParseReport, ServerF
     Ok(proxy_core::parse_subscription(&content))
 }
 
-#[cfg_attr(not(target_os = "android"), post("/api/core/status"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/status")
+)]
 pub async fn core_status() -> Result<ApiCoreStatus, ServerFnError> {
     native_core_status()
 }
 
-#[cfg_attr(not(target_os = "android"), post("/api/core/toggle"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/toggle")
+)]
 pub async fn set_core_enabled(
     enabled: bool,
     request: Option<ConnectionRequest>,
@@ -129,29 +159,59 @@ pub async fn set_core_enabled(
     toggle_native_core(enabled, request)
 }
 
-#[cfg_attr(not(target_os = "android"), get("/api/core/traffic"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    get("/api/core/traffic")
+)]
 pub async fn core_traffic() -> Result<CoreTraffic, ServerFnError> {
     native_core_traffic()
 }
 
-#[cfg_attr(not(target_os = "android"), post("/api/core/logs"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/logs")
+)]
 pub async fn core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
     native_core_logs(cursor)
 }
 
-#[cfg_attr(not(target_os = "android"), post("/api/core/latency"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/latency")
+)]
 pub async fn measure_node_latency(
     nodes: Vec<ProxyNode>,
 ) -> Result<Vec<NodeLatency>, ServerFnError> {
     measure_native_latency(nodes).await
 }
 
-#[cfg_attr(not(target_os = "android"), get("/api/system-proxy/status"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    get("/api/system-proxy/status")
+)]
 pub async fn system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
     native_system_proxy_status()
 }
 
-#[cfg_attr(not(target_os = "android"), post("/api/system-proxy"))]
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/system-proxy")
+)]
 pub async fn set_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
     set_native_system_proxy(enabled)
 }
@@ -1120,6 +1180,22 @@ fn core_slot() -> &'static std::sync::Mutex<Option<singbox::SingBox>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+    #[test]
+    fn native_subscription_preview_runs_in_process() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("native test runtime should start");
+        let report = runtime
+            .block_on(preview_subscription(
+                "trojan://password@example.com:443#Direct".to_string(),
+            ))
+            .expect("native subscription preview should not require an HTTP backend");
+
+        assert_eq!(report.nodes.len(), 1);
+        assert_eq!(report.nodes[0].protocol, proxy_core::ProxyProtocol::Trojan);
+    }
 
     #[test]
     fn parses_direct_domain_route_log() {
