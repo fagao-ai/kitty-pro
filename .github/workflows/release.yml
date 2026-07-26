@@ -137,6 +137,8 @@ jobs:
               tail -n 120 "$log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            failure_tail="$(tail -n 40 "$log" | tr '\r\n' ' ' | cut -c1-8000)"
+            echo "::error title=${{ matrix.name }} build output::$failure_tail"
             exit 1
           fi
 
@@ -351,6 +353,8 @@ jobs:
               tail -n 120 "$log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            failure_tail="$(tail -n 40 "$log" | tr '\r\n' ' ' | cut -c1-8000)"
+            echo "::error title=Android build output::$failure_tail"
             exit 1
           fi
 
