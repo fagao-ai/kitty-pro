@@ -10,6 +10,17 @@ build_tools="$sdk_root/build-tools/$build_tools_version"
 output_dir="$repo_root/dist/android"
 stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/kitty-pro-apk.XXXXXX")"
 build_variant="${ANDROID_BUILD_VARIANT:-release}"
+android_rust_target="${ANDROID_RUST_TARGET:-aarch64-linux-android}"
+
+case "$android_rust_target" in
+    aarch64-linux-android)
+        android_abi=arm64-v8a
+        ;;
+    *)
+        echo "Unsupported Android Rust target: $android_rust_target" >&2
+        exit 1
+        ;;
+esac
 
 if [[ -z "$java_home" ]]; then
     apple_silicon_java_home="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
@@ -95,6 +106,7 @@ cd "$repo_root"
 dx bundle \
     --package kitty-pro \
     --android \
+    --target "$android_rust_target" \
     --package-types apk \
     --release \
     --out-dir "$stage_dir"
@@ -117,6 +129,17 @@ if ! grep -q 'namespace = "dev\.dioxus\.main"' "$gradle_build_file"; then
     exit 1
 fi
 
+# Skipping R8 while the generated release build has minification enabled also
+# skips the task that emits classes.dex. Disable minification explicitly so
+# Gradle follows its normal non-minified release Dex pipeline.
+perl -0pi -e 's/(getByName\("release"\)\s*\{\s*)isMinifyEnabled\s*=\s*true/${1}isMinifyEnabled = false/' \
+    "$gradle_build_file"
+if ! perl -0ne '$found = 1 if /getByName\("release"\)\s*\{\s*isMinifyEnabled\s*=\s*false/; END { exit !$found }' \
+    "$gradle_build_file"; then
+    echo "Unable to disable Android release minification" >&2
+    exit 1
+fi
+
 # Dioxus owns the WebView shell. Overlay the VPN service and manifest before
 # asking Gradle to produce the actual application package.
 android_source="$repo_root/packages/mobile/android"
@@ -128,16 +151,28 @@ cp "$android_source/KittyVpnService.kt" "$android_project/app/src/main/kotlin/co
 cp -R "$android_source/res/." "$android_project/app/src/main/res/"
 
 # Dioxus bundles the Rust JNI library, but not the extra shared object emitted
-# by the Go c-shared bridge. Place it in the Gradle JNI source set before APK
-# assembly so Android's loader can resolve libmain.so's dependency.
-core_library="$(find "$repo_root/target" -type f \
+# by the Go c-shared bridge. Keep both libraries in the same ABI directory so
+# Android can load libmain.so and resolve its sing-box dependency.
+jni_root="$android_project/app/src/main/jniLibs"
+main_library="$jni_root/$android_abi/libmain.so"
+if [[ ! -f "$main_library" ]]; then
+    echo "Dioxus did not produce $android_abi/libmain.so" >&2
+    exit 1
+fi
+for abi_dir in "$jni_root"/*; do
+    if [[ -d "$abi_dir" && "$(basename -- "$abi_dir")" != "$android_abi" ]]; then
+        rm -rf -- "$abi_dir"
+    fi
+done
+
+core_library="$(find "$repo_root/target/$android_rust_target" -type f \
     -path '*/build/singbox-*/out/libkitty_singbox.so' \
     -print 2>/dev/null | tail -n 1)"
 if [[ -z "$core_library" ]]; then
     echo "The embedded sing-box Android library was not produced" >&2
     exit 1
 fi
-core_stage="$android_project/app/src/main/jniLibs/arm64-v8a"
+core_stage="$jni_root/$android_abi"
 mkdir -p "$core_stage"
 cp "$core_library" "$core_stage/libkitty_singbox.so"
 case "$build_variant" in
@@ -148,9 +183,7 @@ case "$build_variant" in
         ;;
     release)
         gradle_task=assembleRelease
-        # Keep release signing and packaging deterministic on constrained CI
-        # runners; code shrinking is optional for this distributable APK.
-        gradle_options=(-x lintVitalRelease -x minifyReleaseWithR8)
+        gradle_options=(-x lintVitalRelease)
         source_apk="$android_project/app/build/outputs/apk/release/app-release-unsigned.apk"
         ;;
     *)
@@ -181,5 +214,26 @@ apksigner sign \
     --out "$signed_apk" \
     "$unsigned_apk"
 apksigner verify --verbose --print-certs "$signed_apk"
+
+apk_entries="$(unzip -Z1 "$signed_apk")"
+if ! grep -Eq '^classes([0-9]+)?\.dex$' <<<"$apk_entries"; then
+    echo "Signed APK does not contain classes.dex" >&2
+    exit 1
+fi
+for library in \
+    "lib/$android_abi/libmain.so" \
+    "lib/$android_abi/libkitty_singbox.so"; do
+    if ! grep -Fxq "$library" <<<"$apk_entries"; then
+        echo "Signed APK does not contain $library" >&2
+        exit 1
+    fi
+done
+unexpected_main_libraries="$(grep -E '^lib/[^/]+/libmain\.so$' <<<"$apk_entries" | \
+    grep -Fvx "lib/$android_abi/libmain.so" || true)"
+if [[ -n "$unexpected_main_libraries" ]]; then
+    echo "Signed APK contains libmain.so for an unexpected ABI:" >&2
+    echo "$unexpected_main_libraries" >&2
+    exit 1
+fi
 
 echo "APK: $signed_apk"
