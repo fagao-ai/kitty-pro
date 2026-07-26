@@ -112,7 +112,7 @@ fi
 # source namespace with the Dioxus runtime package.
 gradle_build_file="$android_project/app/build.gradle.kts"
 perl -0pi -e 's/namespace\s*=\s*"[^"]+"/namespace = "dev.dioxus.main"/' "$gradle_build_file"
-if ! rg -q 'namespace = "dev\.dioxus\.main"' "$gradle_build_file"; then
+if ! grep -q 'namespace = "dev\.dioxus\.main"' "$gradle_build_file"; then
     echo "Unable to configure the Dioxus Android namespace" >&2
     exit 1
 fi

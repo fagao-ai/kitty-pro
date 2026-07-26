@@ -139,7 +139,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             failure_tail="$(
               {
-                (rg -i 'error|failed|undefined reference|cannot find|not found' "$log" || true) | tail -n 60
+                (grep -Ei 'error|failed|undefined reference|cannot find|not found' "$log" || true) | tail -n 60
                 tail -n 40 "$log"
               } | tr '\r\n' ' ' | cut -c1-8000
             )"
@@ -360,7 +360,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             failure_tail="$(
               {
-                (rg -i 'error|failed|undefined reference|cannot find|not found' "$log" || true) | tail -n 60
+                (grep -Ei 'error|failed|undefined reference|cannot find|not found' "$log" || true) | tail -n 60
                 tail -n 40 "$log"
               } | tr '\r\n' ' ' | cut -c1-8000
             )"
