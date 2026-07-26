@@ -127,6 +127,7 @@ jobs:
               ${{ matrix.platform_flag }} \
               ${{ matrix.target_args }} \
               --release \
+              --verbose \
               --locked \
               --out-dir "dist/${{ matrix.id }}" \
               ${{ matrix.bundle_args }} 2>&1 | tee "$log"; then
