@@ -217,28 +217,7 @@ pub async fn set_system_proxy(enabled: bool) -> Result<SystemProxyStatus, Server
 }
 
 #[allow(dead_code)]
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
-    use futures_util::stream::{self, StreamExt};
-
-    if nodes.is_empty() {
-        return Err(ServerFnError::new("没有可探测的节点"));
-    }
-    if nodes.len() > MAX_LATENCY_NODES {
-        return Err(ServerFnError::new(format!(
-            "单次最多探测 {MAX_LATENCY_NODES} 个节点"
-        )));
-    }
-
-    Ok(stream::iter(nodes)
-        .map(measure_one_node)
-        .buffered(4)
-        .collect()
-        .await)
-}
-
-#[allow(dead_code)]
-#[cfg(target_os = "android")]
+#[cfg(not(target_arch = "wasm32"))]
 async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
     if nodes.is_empty() {
         return Err(ServerFnError::new("没有可探测的节点"));
@@ -260,12 +239,13 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
         tun: false,
     };
     let mut config = proxy_core::build_singbox_config(&request, &SingBoxOptions::default());
+    config["log"]["level"] = serde_json::Value::String("error".to_string());
     config["inbounds"] = serde_json::json!([]);
     config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
     let config = serde_json::to_string(&config)
-        .map_err(|error| ServerFnError::new(format!("序列化 Android 探测配置失败: {error}")))?;
+        .map_err(|error| ServerFnError::new(format!("序列化探测配置失败: {error}")))?;
     tokio::task::spawn_blocking(move || {
-        singbox::android::probe(&config, &node_tags, LATENCY_CHECK_URL)
+        singbox::probe_outbounds(&config, &node_tags, LATENCY_CHECK_URL)
             .map(|results| {
                 results
                     .into_iter()
@@ -279,90 +259,13 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
             .map_err(|error| ServerFnError::new(error.to_string()))
     })
     .await
-    .map_err(|error| ServerFnError::new(format!("Android 探测任务失败: {error}")))?
+    .map_err(|error| ServerFnError::new(format!("节点探测任务失败: {error}")))?
 }
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
 async fn measure_native_latency(_nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
     Err(ServerFnError::new("浏览器目标不能直接运行节点延迟探测"))
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-async fn measure_one_node(node: ProxyNode) -> NodeLatency {
-    let tag = node.tag.clone();
-    match probe_node_latency(node).await {
-        Ok(latency_ms) => NodeLatency {
-            tag,
-            latency_ms: Some(latency_ms),
-            error: None,
-        },
-        Err(error) => NodeLatency {
-            tag,
-            latency_ms: None,
-            error: Some(error.to_string()),
-        },
-    }
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-async fn probe_node_latency(node: ProxyNode) -> Result<u64, ServerFnError> {
-    use std::net::TcpListener;
-    use std::time::{Duration, Instant};
-
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|error| ServerFnError::new(format!("分配探测端口失败: {error}")))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| ServerFnError::new(format!("读取探测端口失败: {error}")))?
-        .port();
-    drop(listener);
-
-    let selected_tag = node.tag.clone();
-    let request = ConnectionRequest {
-        nodes: vec![node],
-        selected_tag,
-        mode: TunnelMode::Global,
-        tun: false,
-    };
-    let options = SingBoxOptions {
-        mixed_port: port,
-        listen: "127.0.0.1".to_string(),
-        log_level: "error".to_string(),
-        traffic_api_port: None,
-        traffic_api_secret: None,
-    };
-    let mut core =
-        singbox::SingBox::new().map_err(|error| ServerFnError::new(error.to_string()))?;
-    core.start(&request, &options)
-        .map_err(|error| ServerFnError::new(error.to_string()))?;
-
-    let probe = async {
-        let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
-            .map_err(|error| ServerFnError::new(format!("创建探测代理失败: {error}")))?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .proxy(proxy)
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(12))
-            .build()
-            .map_err(|error| ServerFnError::new(format!("创建探测客户端失败: {error}")))?;
-        let started = Instant::now();
-        client
-            .get(LATENCY_CHECK_URL)
-            .send()
-            .await
-            .map_err(|error| ServerFnError::new(format!("节点请求失败: {error}")))?
-            .error_for_status()
-            .map_err(|error| ServerFnError::new(format!("探测地址返回错误: {error}")))?;
-        Ok::<u64, ServerFnError>(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
-    }
-    .await;
-
-    let stop = core.stop();
-    let latency_ms = probe?;
-    stop.map_err(|error| ServerFnError::new(error.to_string()))?;
-    Ok(latency_ms)
 }
 
 #[allow(dead_code)]
@@ -1674,6 +1577,32 @@ mod tests {
 
         assert_eq!(report.nodes.len(), 1);
         assert_eq!(report.nodes[0].protocol, proxy_core::ProxyProtocol::Trojan);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+    #[test]
+    #[ignore = "requires KITTY_TEST_SUBSCRIPTION_URL and live network access"]
+    fn live_native_latency_probe_returns_without_aborting() {
+        let source = std::env::var("KITTY_TEST_SUBSCRIPTION_URL")
+            .expect("set KITTY_TEST_SUBSCRIPTION_URL to a live subscription");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("native test runtime should start");
+        let results = runtime.block_on(async move {
+            let mut report = preview_subscription(source).await?;
+            report.nodes.truncate(8);
+            if report.nodes.is_empty() {
+                return Err(ServerFnError::new("订阅没有可探测的节点"));
+            }
+            measure_node_latency(report.nodes).await
+        });
+        let results = results.expect("live node probe should return per-node results");
+
+        assert!(!results.is_empty());
+        assert!(results
+            .iter()
+            .all(|result| result.latency_ms.is_some() || result.error.is_some()));
     }
 
     #[test]

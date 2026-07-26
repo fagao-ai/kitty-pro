@@ -18,6 +18,7 @@ import (
 	"unsafe"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/common/urltest"
 	CBox "github.com/sagernet/sing-box/constant"
 	_ "github.com/sagernet/sing-box/experimental/clashapi"
 	"github.com/sagernet/sing-box/include"
@@ -182,29 +183,31 @@ func start(configContent string) (*instance, error) {
 		cancel()
 		return nil, err
 	}
-	logFactory, observable := service.LogFactory().(boxlog.ObservableFactory)
-	if !observable {
-		cancel()
-		_ = service.Close()
-		return nil, &bridgeError{message: "sing-box observable logs are not available"}
-	}
-	logSubscription, logDone, err := logFactory.Subscribe()
-	if err != nil {
-		cancel()
-		_ = service.Close()
-		return nil, err
-	}
-	go func() {
-		defer logFactory.UnSubscribe(logSubscription)
-		for {
-			select {
-			case entry := <-logSubscription:
-				logs.WriteMessage(entry.Level, entry.Message)
-			case <-logDone:
-				return
-			}
+	if options.Experimental != nil && options.Experimental.ClashAPI != nil {
+		logFactory, observable := service.LogFactory().(boxlog.ObservableFactory)
+		if !observable {
+			cancel()
+			_ = service.Close()
+			return nil, &bridgeError{message: "sing-box observable logs are not available"}
 		}
-	}()
+		logSubscription, logDone, subscribeErr := logFactory.Subscribe()
+		if subscribeErr != nil {
+			cancel()
+			_ = service.Close()
+			return nil, subscribeErr
+		}
+		go func() {
+			defer logFactory.UnSubscribe(logSubscription)
+			for {
+				select {
+				case entry := <-logSubscription:
+					logs.WriteMessage(entry.Level, entry.Message)
+				case <-logDone:
+					return
+				}
+			}
+		}()
+	}
 	if err = service.Start(); err != nil {
 		cancel()
 		_ = service.Close()
@@ -218,6 +221,64 @@ func start(configContent string) (*instance, error) {
 		trafficAuthToken: trafficAuthToken,
 		logs:             logs,
 	}, nil
+}
+
+type probeResult struct {
+	Tag       string `json:"tag"`
+	LatencyMS uint64 `json:"latency_ms,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func probe(configContent string, nodeTags []string, probeURL string) (results []probeResult, err error) {
+	service, err := start(configContent)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		service.cancel()
+		if closeErr := service.box.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("close sing-box probe: %w", closeErr)
+		}
+	}()
+
+	results = make([]probeResult, len(nodeTags))
+	var waitGroup sync.WaitGroup
+	semaphore := make(chan struct{}, 8)
+	for index, tag := range nodeTags {
+		index := index
+		tag := tag
+		results[index].Tag = tag
+		outbound, loaded := service.box.Outbound().Outbound(tag)
+		if !loaded {
+			results[index].Error = fmt.Sprintf("probe outbound not found: %s", tag)
+			continue
+		}
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					results[index].Error = fmt.Sprintf("sing-box probe panic: %v", recovered)
+				}
+			}()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			delay, probeErr := urltest.URLTest(ctx, probeURL, outbound)
+			if probeErr != nil {
+				results[index].Error = probeErr.Error()
+				return
+			}
+			results[index].LatencyMS = uint64(delay)
+		}()
+	}
+	waitGroup.Wait()
+	return results, nil
+}
+
+func recoveredError(operation string, recovered any) error {
+	return fmt.Errorf("%s panic: %v", operation, recovered)
 }
 
 func trafficEndpoint(configContent string) (string, string, error) {
@@ -242,7 +303,13 @@ func trafficEndpointFromOptions(options option.Options) (string, string) {
 }
 
 //export kitty_singbox_start
-func kitty_singbox_start(configContent *C.char) C.uint64_t {
+func kitty_singbox_start(configContent *C.char) (result C.uint64_t) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setLastError(recoveredError("start sing-box", recovered))
+			result = 0
+		}
+	}()
 	if configContent == nil {
 		setLastError(&bridgeError{message: "missing sing-box configuration"})
 		return 0
@@ -263,7 +330,13 @@ func kitty_singbox_start(configContent *C.char) C.uint64_t {
 }
 
 //export kitty_singbox_stop
-func kitty_singbox_stop(handle C.uint64_t) C.int {
+func kitty_singbox_stop(handle C.uint64_t) (result C.int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setLastError(recoveredError("stop sing-box", recovered))
+			result = 0
+		}
+	}()
 	state.Lock()
 	service, found := state.instances[uint64(handle)]
 	if found {
@@ -336,7 +409,13 @@ func (service *instance) traffic() ([]byte, error) {
 }
 
 //export kitty_singbox_traffic
-func kitty_singbox_traffic(handle C.uint64_t) *C.char {
+func kitty_singbox_traffic(handle C.uint64_t) (result *C.char) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setLastError(recoveredError("read sing-box traffic", recovered))
+			result = nil
+		}
+	}()
 	state.Lock()
 	service, found := state.instances[uint64(handle)]
 	state.Unlock()
@@ -344,17 +423,23 @@ func kitty_singbox_traffic(handle C.uint64_t) *C.char {
 		setLastError(&bridgeError{message: "sing-box instance is not running"})
 		return nil
 	}
-	result, err := service.traffic()
+	payload, err := service.traffic()
 	if err != nil {
 		setLastError(err)
 		return nil
 	}
 	setLastError(nil)
-	return C.CString(string(result))
+	return C.CString(string(payload))
 }
 
 //export kitty_singbox_logs
-func kitty_singbox_logs(handle C.uint64_t, cursor C.uint64_t) *C.char {
+func kitty_singbox_logs(handle C.uint64_t, cursor C.uint64_t) (result *C.char) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setLastError(recoveredError("read sing-box logs", recovered))
+			result = nil
+		}
+	}()
 	state.Lock()
 	service, found := state.instances[uint64(handle)]
 	state.Unlock()
@@ -362,13 +447,40 @@ func kitty_singbox_logs(handle C.uint64_t, cursor C.uint64_t) *C.char {
 		setLastError(&bridgeError{message: "sing-box instance is not running"})
 		return nil
 	}
-	result, err := service.logs.snapshotJSON(uint64(cursor))
+	payload, err := service.logs.snapshotJSON(uint64(cursor))
 	if err != nil {
 		setLastError(err)
 		return nil
 	}
 	setLastError(nil)
-	return C.CString(string(result))
+	return C.CString(string(payload))
+}
+
+//export kitty_singbox_probe
+func kitty_singbox_probe(configContent *C.char, nodeTagsJSON *C.char, probeURL *C.char, resultOut **C.char) (errorOut *C.char) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			errorOut = C.CString(recoveredError("probe sing-box outbounds", recovered).Error())
+		}
+	}()
+	if configContent == nil || nodeTagsJSON == nil || probeURL == nil || resultOut == nil {
+		return C.CString("missing sing-box probe parameters")
+	}
+	*resultOut = nil
+	var nodeTags []string
+	if err := stdjson.Unmarshal([]byte(C.GoString(nodeTagsJSON)), &nodeTags); err != nil {
+		return C.CString(fmt.Sprintf("decode sing-box probe tags: %v", err))
+	}
+	results, err := probe(C.GoString(configContent), nodeTags, C.GoString(probeURL))
+	if err != nil {
+		return C.CString(err.Error())
+	}
+	payload, err := stdjson.Marshal(results)
+	if err != nil {
+		return C.CString(fmt.Sprintf("encode sing-box probe results: %v", err))
+	}
+	*resultOut = C.CString(string(payload))
+	return nil
 }
 
 //export kitty_singbox_version

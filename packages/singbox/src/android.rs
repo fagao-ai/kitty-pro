@@ -1,6 +1,6 @@
 //! Android `VpnService` bridge for the embedded sing-box core.
 
-use crate::{ffi, CoreError, CoreState, CoreStatus, LogBatch, TrafficStats};
+use crate::{ffi, CoreError, CoreState, CoreStatus, LogBatch, ProbeResult, TrafficStats};
 use jni::{
     objects::{JClass, JObject, JString, JValue},
     sys::{jint, jstring},
@@ -92,13 +92,6 @@ pub fn traffic() -> Result<TrafficStats, CoreError> {
 pub fn logs(cursor: u64) -> Result<LogBatch, CoreError> {
     let payload = ffi::android_logs(cursor)?;
     serde_json::from_str(&payload).map_err(|error| CoreError::LogsUnavailable(error.to_string()))
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ProbeResult {
-    pub tag: String,
-    pub latency_ms: Option<u64>,
-    pub error: Option<String>,
 }
 
 pub fn probe(

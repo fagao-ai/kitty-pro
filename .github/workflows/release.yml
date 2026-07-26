@@ -124,6 +124,17 @@ jobs:
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
+      - name: Test Windows embedded core bridge
+        if: matrix.id == 'windows'
+        shell: bash
+        run: |
+          (cd packages/singbox/bridge && go test ./...)
+          cargo test \
+            --package singbox \
+            --target x86_64-pc-windows-gnu \
+            --release \
+            --locked
+
       - name: Build ${{ matrix.name }} packages
         shell: bash
         env:

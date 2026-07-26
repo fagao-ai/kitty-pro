@@ -49,6 +49,13 @@ pub struct LogBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeResult {
+    pub tag: String,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformCapabilities {
     pub embedded_core: bool,
     pub requires_mobile_vpn_bridge: bool,
@@ -79,6 +86,8 @@ pub enum CoreError {
     TrafficUnavailable(String),
     #[error("读取嵌入式 sing-box 日志失败: {0}")]
     LogsUnavailable(String),
+    #[error("sing-box 节点探测失败: {0}")]
+    ProbeUnavailable(String),
     #[error("配置序列化失败: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Android VPN 服务错误: {0}")]
@@ -223,6 +232,31 @@ impl Drop for SingBox {
     }
 }
 
+pub fn probe_outbounds(
+    config: &str,
+    node_tags: &[String],
+    probe_url: &str,
+) -> Result<Vec<ProbeResult>, CoreError> {
+    #[cfg(all(feature = "embedded-core", target_os = "android"))]
+    {
+        return android::probe(config, node_tags, probe_url);
+    }
+
+    #[cfg(all(feature = "embedded-core", not(target_os = "android")))]
+    {
+        let node_tags = serde_json::to_string(node_tags)?;
+        let payload = ffi::probe(config, &node_tags, probe_url)?;
+        return serde_json::from_str(&payload)
+            .map_err(|error| CoreError::ProbeUnavailable(error.to_string()));
+    }
+
+    #[cfg(not(feature = "embedded-core"))]
+    {
+        let _ = (config, node_tags, probe_url);
+        Err(CoreError::EmbeddedCoreUnavailable)
+    }
+}
+
 pub fn unavailable_status() -> CoreStatus {
     let capabilities = PlatformCapabilities::current();
     let platform_note = if capabilities.browser_control_only {
@@ -252,6 +286,13 @@ mod ffi {
         fn kitty_singbox_last_error() -> *mut c_char;
         fn kitty_singbox_traffic(handle: u64) -> *mut c_char;
         fn kitty_singbox_logs(handle: u64, cursor: u64) -> *mut c_char;
+        #[cfg(not(target_os = "android"))]
+        fn kitty_singbox_probe(
+            config_content: *const c_char,
+            node_tags_json: *const c_char,
+            probe_url: *const c_char,
+            result: *mut *mut c_char,
+        ) -> *mut c_char;
         fn kitty_singbox_free_string(value: *mut c_char);
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_start(
@@ -308,6 +349,35 @@ mod ffi {
         let payload = take_string(unsafe { kitty_singbox_logs(handle, cursor) });
         if payload.is_empty() {
             return Err(CoreError::LogsUnavailable(last_error()));
+        }
+        Ok(payload)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn probe(config: &str, node_tags_json: &str, probe_url: &str) -> Result<String, CoreError> {
+        let config = CString::new(config)
+            .map_err(|_| CoreError::InvalidConfig("配置中包含 NUL 字符".to_string()))?;
+        let node_tags_json = CString::new(node_tags_json)
+            .map_err(|_| CoreError::ProbeUnavailable("节点标识包含 NUL 字符".to_string()))?;
+        let probe_url = CString::new(probe_url)
+            .map_err(|_| CoreError::ProbeUnavailable("探测地址包含 NUL 字符".to_string()))?;
+        let mut result = std::ptr::null_mut();
+        let error = unsafe {
+            kitty_singbox_probe(
+                config.as_ptr(),
+                node_tags_json.as_ptr(),
+                probe_url.as_ptr(),
+                &mut result,
+            )
+        };
+        if !error.is_null() {
+            return Err(CoreError::ProbeUnavailable(take_string(error)));
+        }
+        let payload = take_string(result);
+        if payload.is_empty() {
+            return Err(CoreError::ProbeUnavailable(
+                "sing-box 探测没有返回结果".to_string(),
+            ));
         }
         Ok(payload)
     }
@@ -419,6 +489,27 @@ mod tests {
     }
 
     #[test]
+    fn embedded_probe_without_clash_api_returns_node_errors() {
+        let config = serde_json::json!({
+            "log": { "level": "error" },
+            "inbounds": [],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "auto_detect_interface": false, "final": "direct" },
+        });
+        let results = probe_outbounds(
+            &serde_json::to_string(&config).expect("probe config should serialize"),
+            &["missing".to_string()],
+            "https://www.gstatic.com/generate_204",
+        )
+        .expect("probe without Clash API should return a result instead of aborting");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tag, "missing");
+        assert!(results[0].latency_ms.is_none());
+        assert!(results[0].error.is_some());
+    }
+
+    #[test]
     fn embedded_core_starts_without_an_external_executable() {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
@@ -453,9 +544,7 @@ mod tests {
                 )
                 .expect("local HTTP listener should respond");
         });
-        let mixed_port = available_loopback_port();
-        let traffic_port = available_loopback_port();
-        assert_ne!(mixed_port, traffic_port);
+        let (mixed_port, traffic_port) = available_loopback_ports();
         let options = SingBoxOptions {
             mixed_port,
             listen: "127.0.0.1".to_string(),
@@ -501,11 +590,22 @@ mod tests {
         core.stop().expect("embedded core should stop");
     }
 
-    fn available_loopback_port() -> u16 {
-        std::net::TcpListener::bind(("127.0.0.1", 0))
-            .expect("temporary listener should bind")
-            .local_addr()
-            .expect("temporary listener should expose its port")
-            .port()
+    fn available_loopback_ports() -> (u16, u16) {
+        let mixed = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("temporary mixed listener should bind");
+        let traffic = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("temporary traffic listener should bind");
+        let ports = (
+            mixed
+                .local_addr()
+                .expect("temporary mixed listener should expose its port")
+                .port(),
+            traffic
+                .local_addr()
+                .expect("temporary traffic listener should expose its port")
+                .port(),
+        );
+        drop((mixed, traffic));
+        ports
     }
 }

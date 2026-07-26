@@ -49,3 +49,36 @@ func TestBridgeLogBufferKeepsOnlyNewestEntries(t *testing.T) {
 		t.Fatalf("log buffer did not retain the newest entries: %+v", batch)
 	}
 }
+
+func TestStartWithoutClashAPIDoesNotSubscribeLogs(t *testing.T) {
+	config := `{
+		"log":{"level":"error"},
+		"inbounds":[],
+		"outbounds":[{"type":"direct","tag":"direct"}],
+		"route":{"auto_detect_interface":false,"final":"direct"}
+	}`
+	service, err := start(config)
+	if err != nil {
+		t.Fatalf("start config without Clash API: %v", err)
+	}
+	service.cancel()
+	if err = service.box.Close(); err != nil {
+		t.Fatalf("close config without Clash API: %v", err)
+	}
+}
+
+func TestProbeReturnsMissingOutboundAsNodeError(t *testing.T) {
+	config := `{
+		"log":{"level":"error"},
+		"inbounds":[],
+		"outbounds":[{"type":"direct","tag":"direct"}],
+		"route":{"auto_detect_interface":false,"final":"direct"}
+	}`
+	results, err := probe(config, []string{"missing"}, "https://www.gstatic.com/generate_204")
+	if err != nil {
+		t.Fatalf("probe config without Clash API: %v", err)
+	}
+	if len(results) != 1 || results[0].Tag != "missing" || results[0].Error == "" {
+		t.Fatalf("unexpected missing outbound result: %+v", results)
+	}
+}
