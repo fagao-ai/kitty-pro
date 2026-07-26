@@ -103,6 +103,11 @@ if [[ ! -f "$keystore" ]]; then
 fi
 
 cd "$repo_root"
+android_project="$repo_root/target/dx/kitty-pro/release/android/app"
+# This directory is generated output. Previous runs overlay Kotlin sources and
+# change its namespace, so reusing it makes the next Dioxus build compile a
+# half-customized project.
+rm -rf -- "$android_project"
 dx bundle \
     --package kitty-pro \
     --android \
@@ -111,7 +116,6 @@ dx bundle \
     --release \
     --out-dir "$stage_dir"
 
-android_project="$repo_root/target/dx/kitty-pro/release/android/app"
 if [[ ! -x "$android_project/gradlew" ]]; then
     echo "Dioxus did not produce an Android Gradle project" >&2
     exit 1

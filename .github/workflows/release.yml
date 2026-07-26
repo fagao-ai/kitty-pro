@@ -144,11 +144,10 @@ jobs:
               build_status=0
               mkdir -p dist/windows
               cp target/x86_64-pc-windows-gnu/release/kitty-pro.exe dist/windows/Kitty-Pro.exe
-              cp -R assets dist/windows/assets
               (
                 cd dist/windows
                 7z a -tzip -mx=9 Kitty-Pro-windows-x86_64.zip \
-                  Kitty-Pro.exe assets >/dev/null
+                  Kitty-Pro.exe >/dev/null
                 sha256sum Kitty-Pro.exe > Kitty-Pro.exe.sha256
                 sha256sum Kitty-Pro-windows-x86_64.zip \
                   > Kitty-Pro-windows-x86_64.zip.sha256
@@ -204,6 +203,13 @@ jobs:
               if objdump -p dist/windows/Kitty-Pro.exe \
                   | grep -Eqi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)[^ ]*\.dll'; then
                 echo 'Windows package depends on an unbundled MinGW runtime DLL' >&2
+                exit 1
+              fi
+              grep -aFq '.proxy-app' dist/windows/Kitty-Pro.exe
+              if grep -aFq \
+                  'This should be replaced by dx as part of the build process' \
+                  dist/windows/Kitty-Pro.exe; then
+                echo 'Windows executable still contains unresolved Dioxus asset paths' >&2
                 exit 1
               fi
               7z l dist/windows/Kitty-Pro-windows-x86_64.zip \

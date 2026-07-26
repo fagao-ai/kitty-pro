@@ -14,7 +14,7 @@ use proxy_core::{
 };
 use std::collections::HashMap;
 
-const APP_CSS: Asset = asset!("/assets/styling/app.css");
+const APP_CSS: &str = include_str!("../assets/styling/app.css");
 const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,7 +282,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let connection_allowed = !nodes().is_empty() && core_state() != "unavailable";
 
     rsx! {
-        document::Link { rel: "stylesheet", href: APP_CSS }
+        document::Style { "{APP_CSS}" }
         div { class: root_class,
             div { class: "ambient-grid" }
             aside { class: "sidebar glass-surface",

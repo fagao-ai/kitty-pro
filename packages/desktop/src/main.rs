@@ -15,7 +15,7 @@ use dioxus::desktop::{
 use dioxus::prelude::*;
 use ui::ProxyApp;
 
-const MAIN_CSS: Asset = asset!("/assets/main.css");
+const MAIN_CSS: &str = include_str!("../assets/main.css");
 #[cfg(feature = "desktop")]
 const APP_ICON: &[u8] = include_bytes!("../../../assets/icon/kitty-pro-256.png");
 #[cfg(all(feature = "desktop", target_os = "macos"))]
@@ -56,7 +56,7 @@ fn App() -> Element {
     use_desktop_tray();
 
     rsx! {
-        document::Link { rel: "stylesheet", href: MAIN_CSS }
+        document::Style { "{MAIN_CSS}" }
         ProxyApp { platform: "Desktop".to_string() }
     }
 }
