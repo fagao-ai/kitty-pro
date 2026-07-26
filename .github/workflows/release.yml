@@ -127,7 +127,26 @@ jobs:
         run: |
           set -o pipefail
           log="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-build.log"
-          if ! dx bundle \
+          if [[ "${{ matrix.id }}" == "windows" ]]; then
+            # dx bundle currently fails inside its Windows GNU workspace
+            # wrapper before exposing the underlying compiler diagnostics.
+            if cargo build \
+                --package desktop \
+                --features desktop \
+                --target x86_64-pc-windows-gnu \
+                --release \
+                --locked \
+                2>&1 | tee "$log"; then
+              build_status=0
+              mkdir -p dist/windows
+              cp target/x86_64-pc-windows-gnu/release/kitty-pro.exe dist/windows/Kitty-Pro.exe
+              cp -R assets dist/windows/assets
+              7z a -tzip -mx=9 dist/windows/Kitty-Pro-windows-x86_64.zip \
+                dist/windows/Kitty-Pro.exe dist/windows/assets >/dev/null
+            else
+              build_status=${PIPESTATUS[0]}
+            fi
+          elif dx bundle \
               --package desktop \
               ${{ matrix.platform_flag }} \
               ${{ matrix.target_args }} \
@@ -136,16 +155,22 @@ jobs:
               --locked \
               --out-dir "dist/${{ matrix.id }}" \
               ${{ matrix.bundle_args }} 2>&1 | tee "$log"; then
+            build_status=0
+          else
+            build_status=${PIPESTATUS[0]}
+          fi
+          if [[ "$build_status" -ne 0 ]]; then
             {
               echo "### ${{ matrix.name }} build failure"
               echo
               echo '```text'
+              grep -Ein 'error|failed|panic|undefined reference|cannot find|not found|go:' "$log" | head -n 120 || true
               tail -n 120 "$log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
             failure_tail="$(
               {
-                (grep -Ei 'error|failed|undefined reference|cannot find|not found' "$log" || true) | tail -n 60
+                (grep -Ei 'error|failed|panic|undefined reference|cannot find|not found|go:' "$log" || true) | head -n 80
                 tail -n 40 "$log"
               } | tr '\r\n' ' ' | cut -c1-8000
             )"
@@ -162,8 +187,8 @@ jobs:
               test -n "$(find dist/macos -type f -name '*.dmg' -print -quit)"
               ;;
             windows)
-              test -n "$(find dist/windows -type f -name '*.msi' -print -quit)"
               test -n "$(find dist/windows -type f -name '*.exe' -print -quit)"
+              test -n "$(find dist/windows -type f -name '*.zip' -print -quit)"
               ;;
             linux)
               test -n "$(find dist/linux -type f -name '*.AppImage' -print -quit)"
@@ -414,8 +439,8 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-assets/**/*.dmg
-            release-assets/**/*.msi
             release-assets/**/*.exe
+            release-assets/**/*.zip
             release-assets/**/*.AppImage
             release-assets/**/*.deb
             release-assets/**/*.tar.gz
