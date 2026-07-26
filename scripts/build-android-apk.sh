@@ -130,7 +130,9 @@ cp -R "$android_source/res/." "$android_project/app/src/main/res/"
 # Dioxus bundles the Rust JNI library, but not the extra shared object emitted
 # by the Go c-shared bridge. Place it in the Gradle JNI source set before APK
 # assembly so Android's loader can resolve libmain.so's dependency.
-core_library="$(find "$repo_root/target/aarch64-linux-android" -type f -path '*/build/singbox-*/out/libkitty_singbox.so' -print | tail -n 1)"
+core_library="$(find "$repo_root/target" -type f \
+    -path '*/build/singbox-*/out/libkitty_singbox.so' \
+    -print 2>/dev/null | tail -n 1)"
 if [[ -z "$core_library" ]]; then
     echo "The embedded sing-box Android library was not produced" >&2
     exit 1
