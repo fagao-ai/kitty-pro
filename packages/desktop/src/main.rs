@@ -28,6 +28,38 @@ const TRAY_SHOW_ID: &str = "kitty-show";
 const TRAY_QUIT_ID: &str = "kitty-quit";
 
 #[cfg(feature = "desktop")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayCommand {
+    Show,
+    Quit,
+}
+
+#[cfg(feature = "desktop")]
+fn tray_command(id: &str) -> Option<TrayCommand> {
+    match id {
+        TRAY_SHOW_ID => Some(TrayCommand::Show),
+        TRAY_QUIT_ID => Some(TrayCommand::Quit),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn execute_tray_command(
+    command: TrayCommand,
+    show_window: impl FnOnce(),
+    shutdown_runtime: impl FnOnce(),
+    exit_process: impl FnOnce(),
+) {
+    match command {
+        TrayCommand::Show => show_window(),
+        TrayCommand::Quit => {
+            shutdown_runtime();
+            exit_process();
+        }
+    }
+}
+
+#[cfg(feature = "desktop")]
 fn main() {
     let window_icon = icon_from_memory(APP_ICON).expect("embedded application icon must be valid");
     let config = Config::new()
@@ -80,16 +112,70 @@ fn use_desktop_tray() {
         tray
     });
 
-    let _tray_menu_handler = use_tray_menu_event_handler(move |event| match event.id.as_ref() {
-        TRAY_SHOW_ID => {
-            window.set_visible(true);
-            window.set_focus();
-        }
-        TRAY_QUIT_ID => {
-            let _ = api::shutdown_native_runtime();
-            window.set_close_behavior(WindowCloseBehaviour::WindowCloses);
-            window.close();
-        }
-        _ => {}
+    let _tray_menu_handler = use_tray_menu_event_handler(move |event| {
+        let Some(command) = tray_command(event.id.as_ref()) else {
+            return;
+        };
+
+        execute_tray_command(
+            command,
+            || {
+                window.set_visible(true);
+                window.set_focus();
+            },
+            || {
+                if let Err(error) = api::shutdown_native_runtime() {
+                    eprintln!("failed to clean up the native runtime before exit: {error}");
+                }
+            },
+            || std::process::exit(0),
+        );
     });
+}
+
+#[cfg(all(test, feature = "desktop"))]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn tray_ids_map_to_expected_commands() {
+        assert_eq!(tray_command(TRAY_SHOW_ID), Some(TrayCommand::Show));
+        assert_eq!(tray_command(TRAY_QUIT_ID), Some(TrayCommand::Quit));
+        assert_eq!(tray_command("unknown"), None);
+    }
+
+    #[test]
+    fn quit_command_cleans_up_before_exiting() {
+        let sequence = Cell::new(0);
+
+        execute_tray_command(
+            TrayCommand::Quit,
+            || panic!("quit must not show the window"),
+            || {
+                assert_eq!(sequence.get(), 0);
+                sequence.set(1);
+            },
+            || {
+                assert_eq!(sequence.get(), 1);
+                sequence.set(2);
+            },
+        );
+
+        assert_eq!(sequence.get(), 2);
+    }
+
+    #[test]
+    fn show_command_does_not_shutdown_or_exit() {
+        let shown = Cell::new(false);
+
+        execute_tray_command(
+            TrayCommand::Show,
+            || shown.set(true),
+            || panic!("show must not shut down the runtime"),
+            || panic!("show must not exit the process"),
+        );
+
+        assert!(shown.get());
+    }
 }
