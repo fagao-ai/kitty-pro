@@ -32,7 +32,12 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
     let bridge_dir = manifest_dir.join("bridge");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing output dir"));
-    let archive = if target_os == "windows" {
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let archive = if target_os == "windows" && target_env == "gnu" {
+        // The GNU linker used by x86_64-pc-windows-gnu does not discover
+        // MSVC-style .lib files when Cargo links `static=kitty_singbox`.
+        out_dir.join("libkitty_singbox.a")
+    } else if target_os == "windows" {
         out_dir.join("kitty_singbox.lib")
     } else if target_os == "android" {
         out_dir.join("libkitty_singbox.so")
