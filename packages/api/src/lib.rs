@@ -1,9 +1,11 @@
 //! Shared fullstack APIs used by web, desktop, and mobile shells.
 
 use dioxus::prelude::*;
-use proxy_core::{AppProfile, ConnectionRequest, ParseReport, ProxyNode};
+use proxy_core::{AppProfile, ConnectionRequest, ParseReport, ProxyNode, RuleSetCachePaths};
 #[cfg(not(target_arch = "wasm32"))]
-use proxy_core::{SingBoxOptions, TunnelMode};
+use proxy_core::{
+    SingBoxOptions, TunnelMode, CHINA_GEOIP_RULE_SET_URL, CHINA_GEOSITE_RULE_SET_URL,
+};
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -17,6 +19,14 @@ const MAX_LATENCY_NODES: usize = 32;
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
 const LATENCY_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
+
+#[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_RULE_SET_BYTES: usize = 8 * 1024 * 1024;
+
+#[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+const RULE_SET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiCoreStatus {
@@ -78,6 +88,11 @@ pub struct CoreLogEntry {
 pub struct CoreLogBatch {
     pub next_cursor: u64,
     pub entries: Vec<CoreLogEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleSetUpdateResult {
+    pub updated: bool,
 }
 
 /// Status of the operating system proxy managed by Kitty Pro.
@@ -159,8 +174,13 @@ pub async fn set_core_enabled(
     enabled: bool,
     request: Option<ConnectionRequest>,
 ) -> Result<ApiCoreStatus, ServerFnError> {
+    let rule_set_cache = if enabled {
+        prepare_rule_set_cache_for_request(request.as_ref()).await?
+    } else {
+        None
+    };
     run_native_blocking("sing-box 状态切换任务失败", move || {
-        toggle_native_core(enabled, request)
+        toggle_native_core(enabled, request, rule_set_cache)
     })
     .await
 }
@@ -178,11 +198,23 @@ pub async fn restart_core(request: ConnectionRequest) -> Result<ApiCoreStatus, S
     }
     proxy_core::validate_custom_rules(&request.custom_rules)
         .map_err(|error| ServerFnError::new(format!("自定义规则无效: {error}")))?;
+    let rule_set_cache = prepare_rule_set_cache_for_request(Some(&request)).await?;
     run_native_blocking("sing-box 重启任务失败", move || {
-        toggle_native_core(false, None)?;
-        toggle_native_core(true, Some(request))
+        toggle_native_core(false, None, None)?;
+        toggle_native_core(true, Some(request), rule_set_cache)
     })
     .await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/rules/update")
+)]
+pub async fn update_rule_sets(force: bool) -> Result<RuleSetUpdateResult, ServerFnError> {
+    native_update_rule_sets(force).await
 }
 
 #[cfg_attr(
@@ -384,6 +416,457 @@ async fn download_subscription(_url: &str) -> Result<String, ServerFnError> {
     Err(ServerFnError::new("订阅下载只能由原生服务端执行"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn rule_set_update_lock() -> &'static tokio::sync::Mutex<()> {
+    use std::sync::OnceLock;
+
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn prepare_rule_set_cache_for_request(
+    request: Option<&ConnectionRequest>,
+) -> Result<Option<RuleSetCachePaths>, ServerFnError> {
+    if request.map(|request| request.mode) != Some(TunnelMode::Rule) {
+        return Ok(None);
+    }
+    let paths = native_rule_set_cache_paths()?;
+    let check_paths = paths.clone();
+    if run_native_blocking("检查规则缓存失败", move || {
+        native_rule_set_cache_ready(&check_paths)
+    })
+    .await?
+    {
+        return Ok(Some(paths));
+    }
+
+    let _guard = rule_set_update_lock().lock().await;
+    let check_paths = paths.clone();
+    if !run_native_blocking("检查规则缓存失败", move || {
+        native_rule_set_cache_ready(&check_paths)
+    })
+    .await?
+    {
+        download_and_install_rule_sets(paths.clone()).await?;
+    }
+    Ok(Some(paths))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+async fn prepare_rule_set_cache_for_request(
+    _request: Option<&ConnectionRequest>,
+) -> Result<Option<RuleSetCachePaths>, ServerFnError> {
+    Ok(None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn native_update_rule_sets(force: bool) -> Result<RuleSetUpdateResult, ServerFnError> {
+    let _guard = rule_set_update_lock().lock().await;
+    let paths = native_rule_set_cache_paths()?;
+    if !force {
+        let check_paths = paths.clone();
+        let current = run_native_blocking("检查规则缓存失败", move || {
+            native_rule_set_cache_current(&check_paths)
+        })
+        .await?;
+        if current {
+            return Ok(RuleSetUpdateResult { updated: false });
+        }
+    }
+    download_and_install_rule_sets(paths).await?;
+    Ok(RuleSetUpdateResult { updated: true })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+async fn native_update_rule_sets(_force: bool) -> Result<RuleSetUpdateResult, ServerFnError> {
+    Err(ServerFnError::new("浏览器端不能直接更新分流规则"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn download_and_install_rule_sets(paths: RuleSetCachePaths) -> Result<(), ServerFnError> {
+    use std::time::Duration;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("kitty-pro/0.1")
+        .build()
+        .map_err(|error| ServerFnError::new(format!("创建规则下载客户端失败: {error}")))?;
+    let geosite_download =
+        download_rule_set(client.clone(), CHINA_GEOSITE_RULE_SET_URL, "域名分流规则");
+    let geoip_download = download_rule_set(client, CHINA_GEOIP_RULE_SET_URL, "IP 分流规则");
+    let (geosite, geoip) = tokio::try_join!(geosite_download, geoip_download)?;
+    run_native_blocking("保存规则缓存失败", move || {
+        install_rule_set_cache(&paths, &geosite, &geoip)
+    })
+    .await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn download_rule_set(
+    client: reqwest::Client,
+    url: &'static str,
+    label: &'static str,
+) -> Result<Vec<u8>, ServerFnError> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| ServerFnError::new(format!("下载{label}失败: {error}")))?
+        .error_for_status()
+        .map_err(|error| ServerFnError::new(format!("{label}服务返回错误: {error}")))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_RULE_SET_BYTES as u64)
+    {
+        return Err(ServerFnError::new(format!("{label}超过 8 MiB 限制")));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| ServerFnError::new(format!("读取{label}失败: {error}")))?;
+    if bytes.is_empty() || bytes.len() > MAX_RULE_SET_BYTES {
+        return Err(ServerFnError::new(format!("{label}大小无效")));
+    }
+    Ok(bytes.to_vec())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_rule_set_cache_paths() -> Result<RuleSetCachePaths, ServerFnError> {
+    let profile = profile_path()?;
+    let directory = profile
+        .parent()
+        .ok_or_else(|| ServerFnError::new("无法确定规则缓存目录"))?
+        .join("rules");
+    let geosite = directory.join("geosite-cn.srs");
+    let geoip = directory.join("geoip-cn.srs");
+    Ok(RuleSetCachePaths {
+        geosite: geosite
+            .to_str()
+            .ok_or_else(|| ServerFnError::new("域名规则缓存路径不是有效 UTF-8"))?
+            .to_string(),
+        geoip: geoip
+            .to_str()
+            .ok_or_else(|| ServerFnError::new("IP 规则缓存路径不是有效 UTF-8"))?
+            .to_string(),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_rule_set_cache_ready(paths: &RuleSetCachePaths) -> Result<bool, ServerFnError> {
+    let geosite = std::path::Path::new(&paths.geosite);
+    let geoip = std::path::Path::new(&paths.geoip);
+    recover_rule_set_transaction(geosite, geoip)?;
+    if !geosite.is_file() || !geoip.is_file() {
+        return Ok(false);
+    }
+    Ok(singbox::validate_rule_set_file(geosite).is_ok()
+        && singbox::validate_rule_set_file(geoip).is_ok())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_rule_set_cache_current(paths: &RuleSetCachePaths) -> Result<bool, ServerFnError> {
+    if !native_rule_set_cache_ready(paths)? {
+        return Ok(false);
+    }
+    for path in [&paths.geosite, &paths.geoip] {
+        let age = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .map_err(|error| ServerFnError::new(format!("读取规则缓存时间失败: {error}")))?;
+        if age > RULE_SET_CACHE_TTL {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_rule_set_cache(
+    paths: &RuleSetCachePaths,
+    geosite_content: &[u8],
+    geoip_content: &[u8],
+) -> Result<(), ServerFnError> {
+    use std::io::Write;
+
+    let geosite = std::path::Path::new(&paths.geosite);
+    let geoip = std::path::Path::new(&paths.geoip);
+    let directory = geosite
+        .parent()
+        .ok_or_else(|| ServerFnError::new("域名规则缓存目录无效"))?;
+    if geoip.parent() != Some(directory) {
+        return Err(ServerFnError::new("规则缓存文件不在同一目录"));
+    }
+    std::fs::create_dir_all(directory)
+        .map_err(|error| ServerFnError::new(format!("创建规则缓存目录失败: {error}")))?;
+    recover_rule_set_transaction(geosite, geoip)?;
+
+    let geosite_temp = directory.join(".geosite-cn.pending.tmp");
+    let geoip_temp = directory.join(".geoip-cn.pending.tmp");
+    let write_result = (|| -> std::io::Result<()> {
+        for (path, content) in [
+            (geosite_temp.as_path(), geosite_content),
+            (geoip_temp.as_path(), geoip_content),
+        ] {
+            let mut file = create_private_file(path)?;
+            file.write_all(content)?;
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&geosite_temp);
+        let _ = std::fs::remove_file(&geoip_temp);
+        return Err(ServerFnError::new(format!("保存规则临时文件失败: {error}")));
+    }
+    if let Err(error) = singbox::validate_rule_set_file(&geosite_temp)
+        .and_then(|_| singbox::validate_rule_set_file(&geoip_temp))
+    {
+        let _ = std::fs::remove_file(&geosite_temp);
+        let _ = std::fs::remove_file(&geoip_temp);
+        return Err(ServerFnError::new(error.to_string()));
+    }
+
+    let geosite_backup = rule_set_backup_path(geosite);
+    let geoip_backup = rule_set_backup_path(geoip);
+    let geosite_existed = geosite.exists();
+    let geoip_existed = geoip.exists();
+    let transaction = rule_set_transaction_path(directory);
+    let committed = rule_set_commit_path(directory);
+    let state = RuleSetInstallTransaction {
+        geosite_existed,
+        geoip_existed,
+    };
+    if let Err(error) = write_rule_set_transaction(&transaction, &state) {
+        let _ = std::fs::remove_file(&geosite_temp);
+        let _ = std::fs::remove_file(&geoip_temp);
+        return Err(ServerFnError::new(format!("创建规则更新事务失败: {error}")));
+    }
+
+    if let Err(error) = stage_rule_set_backup(geosite, &geosite_backup)
+        .and_then(|_| stage_rule_set_backup(geoip, &geoip_backup))
+        .and_then(|_| std::fs::rename(&geosite_temp, geosite))
+        .and_then(|_| std::fs::rename(&geoip_temp, geoip))
+        .and_then(|_| write_rule_set_commit(&committed))
+    {
+        let rollback_result = rollback_rule_set_pair(geosite, geoip, &state);
+        let _ = std::fs::remove_file(&geosite_temp);
+        let _ = std::fs::remove_file(&geoip_temp);
+        if rollback_result.is_ok() {
+            let _ = std::fs::remove_file(&transaction);
+            let _ = std::fs::remove_file(&committed);
+        }
+        if let Err(rollback_error) = rollback_result {
+            return Err(ServerFnError::new(format!(
+                "替换规则缓存失败: {error}；回滚失败: {rollback_error}"
+            )));
+        }
+        return Err(ServerFnError::new(format!("替换规则缓存失败: {error}")));
+    }
+    finish_rule_set_transaction(geosite, geoip)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Serialize, Deserialize)]
+struct RuleSetInstallTransaction {
+    geosite_existed: bool,
+    geoip_existed: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rule_set_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("srs.backup")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rule_set_transaction_path(directory: &std::path::Path) -> std::path::PathBuf {
+    directory.join(".rule-set-install.json")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rule_set_commit_path(directory: &std::path::Path) -> std::path::PathBuf {
+    directory.join(".rule-set-install.committed")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_rule_set_transaction(
+    path: &std::path::Path,
+    state: &RuleSetInstallTransaction,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let content = serde_json::to_vec(state).map_err(std::io::Error::other)?;
+    let mut file = create_private_file(path)?;
+    file.write_all(&content)?;
+    file.sync_all()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_rule_set_commit(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = create_private_file(path)?;
+    file.write_all(b"committed")?;
+    file.sync_all()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stage_rule_set_backup(path: &std::path::Path, backup: &std::path::Path) -> std::io::Result<()> {
+    if path.exists() {
+        std::fs::rename(path, backup)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn restore_rule_set_backup(
+    path: &std::path::Path,
+    backup: &std::path::Path,
+) -> std::io::Result<()> {
+    if backup.exists() {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::rename(backup, path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rollback_rule_set_install(
+    path: &std::path::Path,
+    backup: &std::path::Path,
+    existed: bool,
+) -> std::io::Result<()> {
+    if backup.exists() {
+        return restore_rule_set_backup(path, backup);
+    }
+    if !existed && path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rollback_rule_set_pair(
+    geosite: &std::path::Path,
+    geoip: &std::path::Path,
+    state: &RuleSetInstallTransaction,
+) -> std::io::Result<()> {
+    let geosite_result = rollback_rule_set_install(
+        geosite,
+        &rule_set_backup_path(geosite),
+        state.geosite_existed,
+    );
+    let geoip_result =
+        rollback_rule_set_install(geoip, &rule_set_backup_path(geoip), state.geoip_existed);
+    geosite_result.and(geoip_result)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finish_rule_set_transaction(
+    geosite: &std::path::Path,
+    geoip: &std::path::Path,
+) -> Result<(), ServerFnError> {
+    let directory = geosite
+        .parent()
+        .ok_or_else(|| ServerFnError::new("域名规则缓存目录无效"))?;
+    for path in [rule_set_backup_path(geosite), rule_set_backup_path(geoip)] {
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|error| ServerFnError::new(format!("清理旧规则缓存备份失败: {error}")))?;
+        }
+    }
+    let transaction = rule_set_transaction_path(directory);
+    if transaction.exists() {
+        std::fs::remove_file(&transaction)
+            .map_err(|error| ServerFnError::new(format!("清理规则更新事务失败: {error}")))?;
+    }
+    let committed = rule_set_commit_path(directory);
+    if committed.exists() {
+        std::fs::remove_file(committed)
+            .map_err(|error| ServerFnError::new(format!("完成规则更新事务失败: {error}")))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn recover_rule_set_transaction(
+    geosite: &std::path::Path,
+    geoip: &std::path::Path,
+) -> Result<(), ServerFnError> {
+    let directory = geosite
+        .parent()
+        .ok_or_else(|| ServerFnError::new("域名规则缓存目录无效"))?;
+    if geoip.parent() != Some(directory) {
+        return Err(ServerFnError::new("规则缓存文件不在同一目录"));
+    }
+    let transaction = rule_set_transaction_path(directory);
+    let committed = rule_set_commit_path(directory);
+    if transaction.exists() {
+        if committed.exists() {
+            return finish_rule_set_transaction(geosite, geoip);
+        }
+        let content = std::fs::read(&transaction)
+            .map_err(|error| ServerFnError::new(format!("读取规则更新事务失败: {error}")))?;
+        let state: RuleSetInstallTransaction = match serde_json::from_slice(&content) {
+            Ok(state) => state,
+            Err(error)
+                if !rule_set_backup_path(geosite).exists()
+                    && !rule_set_backup_path(geoip).exists() =>
+            {
+                std::fs::remove_file(&transaction).map_err(|remove_error| {
+                    ServerFnError::new(format!(
+                        "规则更新事务损坏: {error}；清理失败: {remove_error}"
+                    ))
+                })?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(ServerFnError::new(format!("规则更新事务损坏: {error}")));
+            }
+        };
+        rollback_rule_set_pair(geosite, geoip, &state)
+            .map_err(|error| ServerFnError::new(format!("恢复规则缓存失败: {error}")))?;
+        let _ = std::fs::remove_file(directory.join(".geosite-cn.pending.tmp"));
+        let _ = std::fs::remove_file(directory.join(".geoip-cn.pending.tmp"));
+        std::fs::remove_file(&transaction)
+            .map_err(|error| ServerFnError::new(format!("清理规则更新事务失败: {error}")))?;
+    } else {
+        // Compatibility with caches written before pair transactions were introduced.
+        recover_rule_set_backup(geosite)?;
+        recover_rule_set_backup(geoip)?;
+    }
+    if committed.exists() {
+        std::fs::remove_file(committed)
+            .map_err(|error| ServerFnError::new(format!("清理规则提交标记失败: {error}")))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn recover_rule_set_backup(path: &std::path::Path) -> Result<(), ServerFnError> {
+    let backup = rule_set_backup_path(path);
+    if !backup.exists() {
+        return Ok(());
+    }
+    if path.exists() && singbox::validate_rule_set_file(path).is_ok() {
+        std::fs::remove_file(backup)
+            .map_err(|error| ServerFnError::new(format!("清理旧规则备份失败: {error}")))?;
+        return Ok(());
+    }
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|error| ServerFnError::new(format!("移除损坏规则缓存失败: {error}")))?;
+    }
+    std::fs::rename(backup, path)
+        .map_err(|error| ServerFnError::new(format!("恢复规则缓存失败: {error}")))
+}
+
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
@@ -531,6 +1014,7 @@ fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
 fn toggle_native_core(
     enabled: bool,
     request: Option<ConnectionRequest>,
+    rule_set_cache: Option<RuleSetCachePaths>,
 ) -> Result<ApiCoreStatus, ServerFnError> {
     use proxy_core::SingBoxOptions;
     use singbox::SingBox;
@@ -572,6 +1056,7 @@ fn toggle_native_core(
     let options = SingBoxOptions {
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
+        rule_set_cache,
         ..SingBoxOptions::default()
     };
     core.start(&request, &options)
@@ -586,6 +1071,7 @@ fn toggle_native_core(
 fn toggle_native_core(
     enabled: bool,
     request: Option<ConnectionRequest>,
+    rule_set_cache: Option<RuleSetCachePaths>,
 ) -> Result<ApiCoreStatus, ServerFnError> {
     if !enabled {
         singbox::android::stop().map_err(|error| ServerFnError::new(error.to_string()))?;
@@ -604,6 +1090,7 @@ fn toggle_native_core(
     let options = SingBoxOptions {
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
+        rule_set_cache,
         ..SingBoxOptions::default()
     };
     let mut config = proxy_core::build_singbox_config(&request, &options);
@@ -834,6 +1321,7 @@ fn generate_traffic_api_secret() -> Result<String, ServerFnError> {
 fn toggle_native_core(
     _enabled: bool,
     _request: Option<ConnectionRequest>,
+    _rule_set_cache: Option<RuleSetCachePaths>,
 ) -> Result<ApiCoreStatus, ServerFnError> {
     Err(ServerFnError::new(
         "浏览器目标不能直接运行嵌入式 sing-box 内核",
@@ -1665,6 +2153,99 @@ fn core_slot() -> &'static std::sync::Mutex<Option<singbox::SingBox>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct TestDirectory(std::path::PathBuf);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "kitty-pro-{label}-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("test directory should be created");
+            Self(path)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unfinished_rule_set_transaction_restores_both_old_files() {
+        let directory = TestDirectory::new("rule-set-rollback");
+        let geosite = directory.0.join("geosite-cn.srs");
+        let geoip = directory.0.join("geoip-cn.srs");
+        std::fs::write(&geosite, b"old geosite").expect("old geosite should be written");
+        std::fs::write(&geoip, b"old geoip").expect("old geoip should be written");
+        std::fs::rename(&geosite, rule_set_backup_path(&geosite))
+            .expect("geosite backup should be staged");
+        std::fs::rename(&geoip, rule_set_backup_path(&geoip))
+            .expect("geoip backup should be staged");
+        std::fs::write(&geosite, b"new geosite").expect("new geosite should be installed");
+        std::fs::write(&geoip, b"new geoip").expect("new geoip should be installed");
+        write_rule_set_transaction(
+            &rule_set_transaction_path(&directory.0),
+            &RuleSetInstallTransaction {
+                geosite_existed: true,
+                geoip_existed: true,
+            },
+        )
+        .expect("transaction should be written");
+
+        recover_rule_set_transaction(&geosite, &geoip)
+            .expect("unfinished transaction should roll back");
+
+        assert_eq!(std::fs::read(&geosite).unwrap(), b"old geosite");
+        assert_eq!(std::fs::read(&geoip).unwrap(), b"old geoip");
+        assert!(!rule_set_backup_path(&geosite).exists());
+        assert!(!rule_set_backup_path(&geoip).exists());
+        assert!(!rule_set_transaction_path(&directory.0).exists());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn committed_rule_set_transaction_keeps_both_new_files() {
+        let directory = TestDirectory::new("rule-set-commit");
+        let geosite = directory.0.join("geosite-cn.srs");
+        let geoip = directory.0.join("geoip-cn.srs");
+        std::fs::write(rule_set_backup_path(&geosite), b"old geosite")
+            .expect("geosite backup should be written");
+        std::fs::write(rule_set_backup_path(&geoip), b"old geoip")
+            .expect("geoip backup should be written");
+        std::fs::write(&geosite, b"new geosite").expect("new geosite should be installed");
+        std::fs::write(&geoip, b"new geoip").expect("new geoip should be installed");
+        write_rule_set_transaction(
+            &rule_set_transaction_path(&directory.0),
+            &RuleSetInstallTransaction {
+                geosite_existed: true,
+                geoip_existed: true,
+            },
+        )
+        .expect("transaction should be written");
+        write_rule_set_commit(&rule_set_commit_path(&directory.0))
+            .expect("commit marker should be written");
+
+        recover_rule_set_transaction(&geosite, &geoip)
+            .expect("committed transaction should finish cleanup");
+
+        assert_eq!(std::fs::read(&geosite).unwrap(), b"new geosite");
+        assert_eq!(std::fs::read(&geoip).unwrap(), b"new geoip");
+        assert!(!rule_set_backup_path(&geosite).exists());
+        assert!(!rule_set_backup_path(&geoip).exists());
+        assert!(!rule_set_transaction_path(&directory.0).exists());
+        assert!(!rule_set_commit_path(&directory.0).exists());
+    }
 
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
     #[test]

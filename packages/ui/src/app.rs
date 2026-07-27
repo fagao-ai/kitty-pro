@@ -20,6 +20,7 @@ use std::collections::HashMap;
 const APP_CSS: &str = include_str!("../assets/styling/app.css");
 const BRAND_ICON_SVG: &str = include_str!("../assets/kitty-pro.svg");
 const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
+const RULE_SET_UPDATE_CHECK_SECS: u64 = 6 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppView {
@@ -88,6 +89,16 @@ async fn wait_for_traffic_tick() {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn wait_for_rule_set_update_check() {
+    gloo_timers::future::TimeoutFuture::new((RULE_SET_UPDATE_CHECK_SECS * 1_000) as u32).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn wait_for_rule_set_update_check() {
+    tokio::time::sleep(std::time::Duration::from_secs(RULE_SET_UPDATE_CHECK_SECS)).await;
+}
+
 impl AppView {
     fn title(self) -> &'static str {
         match self {
@@ -116,6 +127,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut selected_tag = use_signal(String::new);
     let mut subscriptions = use_signal(Vec::<Subscription>::new);
     let mut custom_rules = use_signal(Vec::<CustomRule>::new);
+    let rule_sets_busy = use_signal(|| false);
     let mut tunnel_mode = use_signal(|| TunnelMode::Rule);
     let mut tun_enabled = use_signal(|| false);
     let mut import_open = use_signal(|| false);
@@ -184,6 +196,15 @@ pub fn ProxyApp(platform: String) -> Element {
             match api::system_proxy_status().await {
                 Ok(status) => system_proxy.set(SystemProxyLoadState::Ready(status)),
                 Err(error) => system_proxy.set(SystemProxyLoadState::Failed(error.to_string())),
+            }
+        });
+    });
+
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                let _ = api::update_rule_sets(false).await;
+                wait_for_rule_set_update_check().await;
             }
         });
     });
@@ -517,6 +538,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             rules: custom_rules,
                             connected,
                             tunnel_mode,
+                            rule_sets_busy,
                             notice,
                         }
                     },
@@ -1304,6 +1326,7 @@ fn RulesView(
     mut rules: Signal<Vec<CustomRule>>,
     connected: Signal<bool>,
     tunnel_mode: Signal<TunnelMode>,
+    mut rule_sets_busy: Signal<bool>,
     mut notice: Signal<Option<String>>,
 ) -> Element {
     let mut editor_open = use_signal(|| false);
@@ -1348,12 +1371,34 @@ fn RulesView(
                     }
                     p { "{enabled_count} 条启用 · {total} 条规则" }
                 }
-                button {
-                    class: "primary-button compact",
-                    disabled: total >= MAX_CUSTOM_RULES,
-                    onclick: move |_| open_new_editor(),
-                    Icon { icon: LdPlus, width: 17, height: 17 }
-                    span { "添加规则" }
+                div { class: "toolbar-controls rules-toolbar-actions",
+                    button {
+                        class: "secondary-button compact",
+                        title: "立即更新分流规则",
+                        aria_busy: rule_sets_busy(),
+                        disabled: rule_sets_busy(),
+                        onclick: move |_| async move {
+                            rule_sets_busy.set(true);
+                            match api::update_rule_sets(true).await {
+                                Ok(_) => notice.set(Some("分流规则已更新".to_string())),
+                                Err(error) => notice.set(Some(format!("分流规则更新失败: {error}"))),
+                            }
+                            rule_sets_busy.set(false);
+                        },
+                        if rule_sets_busy() {
+                            span { class: "spinner" }
+                        } else {
+                            Icon { icon: LdRefreshCw, width: 17, height: 17 }
+                        }
+                        span { class: "rules-refresh-label", "更新规则" }
+                    }
+                    button {
+                        class: "primary-button compact",
+                        disabled: total >= MAX_CUSTOM_RULES,
+                        onclick: move |_| open_new_editor(),
+                        Icon { icon: LdPlus, width: 17, height: 17 }
+                        span { "添加规则" }
+                    }
                 }
             }
 

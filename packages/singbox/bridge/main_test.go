@@ -1,10 +1,27 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	boxlog "github.com/sagernet/sing-box/log"
 )
+
+func TestValidateRuleSetFileRejectsInvalidContent(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "invalid-*.srs")
+	if err != nil {
+		t.Fatalf("create invalid rule set: %v", err)
+	}
+	if _, err = file.WriteString("not a sing-box rule set"); err != nil {
+		t.Fatalf("write invalid rule set: %v", err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatalf("close invalid rule set: %v", err)
+	}
+	if err = validateRuleSetFile(file.Name()); err == nil {
+		t.Fatal("invalid rule set unexpectedly passed validation")
+	}
+}
 
 func TestBridgeLogBufferReturnsIncrementalInfoLogs(t *testing.T) {
 	var logs bridgeLogBuffer

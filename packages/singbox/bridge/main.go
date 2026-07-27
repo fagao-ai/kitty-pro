@@ -8,10 +8,12 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"context"
 	stdjson "encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,7 @@ import (
 	"unsafe"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/common/srs"
 	"github.com/sagernet/sing-box/common/urltest"
 	CBox "github.com/sagernet/sing-box/constant"
 	_ "github.com/sagernet/sing-box/experimental/clashapi"
@@ -164,6 +167,15 @@ func stripANSI(message string) string {
 		clean = append(clean, message[index])
 	}
 	return string(clean)
+}
+
+func validateRuleSetFile(path string) error {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	_, err = srs.Read(bytes.NewReader(content), false)
+	return err
 }
 
 var state = struct {
@@ -493,6 +505,22 @@ func kitty_singbox_set_log_enabled(handle C.uint64_t, enabled C.int) (result C.i
 	service.logs.setEnabled(enabled != 0)
 	setLastError(nil)
 	return 1
+}
+
+//export kitty_singbox_validate_rule_set_file
+func kitty_singbox_validate_rule_set_file(path *C.char) (result *C.char) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = C.CString(recoveredError("validate sing-box rule set", recovered).Error())
+		}
+	}()
+	if path == nil {
+		return C.CString("missing sing-box rule-set path")
+	}
+	if err := validateRuleSetFile(C.GoString(path)); err != nil {
+		return C.CString(err.Error())
+	}
+	return nil
 }
 
 //export kitty_singbox_probe

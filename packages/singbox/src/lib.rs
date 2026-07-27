@@ -86,6 +86,8 @@ pub enum CoreError {
     TrafficUnavailable(String),
     #[error("读取嵌入式 sing-box 日志失败: {0}")]
     LogsUnavailable(String),
+    #[error("sing-box 规则集无效: {0}")]
+    RuleSetInvalid(String),
     #[error("sing-box 节点探测失败: {0}")]
     ProbeUnavailable(String),
     #[error("配置序列化失败: {0}")]
@@ -270,6 +272,19 @@ pub fn probe_outbounds(
     }
 }
 
+pub fn validate_rule_set_file(path: &std::path::Path) -> Result<(), CoreError> {
+    #[cfg(feature = "embedded-core")]
+    {
+        return ffi::validate_rule_set_file(path);
+    }
+
+    #[cfg(not(feature = "embedded-core"))]
+    {
+        let _ = path;
+        Err(CoreError::EmbeddedCoreUnavailable)
+    }
+}
+
 pub fn unavailable_status() -> CoreStatus {
     let capabilities = PlatformCapabilities::current();
     let platform_note = if capabilities.browser_control_only {
@@ -300,6 +315,7 @@ mod ffi {
         fn kitty_singbox_traffic(handle: u64) -> *mut c_char;
         fn kitty_singbox_logs(handle: u64, cursor: u64) -> *mut c_char;
         fn kitty_singbox_set_log_enabled(handle: u64, enabled: i32) -> i32;
+        fn kitty_singbox_validate_rule_set_file(path: *const c_char) -> *mut c_char;
         #[cfg(not(target_os = "android"))]
         fn kitty_singbox_probe(
             config_content: *const c_char,
@@ -374,6 +390,20 @@ mod ffi {
             return Err(CoreError::LogsUnavailable(last_error()));
         }
         Ok(())
+    }
+
+    pub fn validate_rule_set_file(path: &std::path::Path) -> Result<(), CoreError> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| CoreError::RuleSetInvalid("规则文件路径不是有效 UTF-8".to_string()))?;
+        let path = CString::new(path)
+            .map_err(|_| CoreError::RuleSetInvalid("规则文件路径包含 NUL 字符".to_string()))?;
+        let error = unsafe { kitty_singbox_validate_rule_set_file(path.as_ptr()) };
+        if error.is_null() {
+            Ok(())
+        } else {
+            Err(CoreError::RuleSetInvalid(take_string(error)))
+        }
     }
 
     #[cfg(not(target_os = "android"))]
@@ -580,6 +610,7 @@ mod tests {
             log_level: "error".to_string(),
             traffic_api_port: Some(traffic_port),
             traffic_api_secret: Some("test-traffic-secret".to_string()),
+            rule_set_cache: None,
         };
         let mut core = SingBox::new().expect("embedded core should be linked");
 

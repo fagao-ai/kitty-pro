@@ -6,10 +6,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::net::IpAddr;
 
-const CHINA_GEOSITE_RULE_SET_URL: &str =
+pub const CHINA_GEOSITE_RULE_SET_URL: &str =
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs";
-const CHINA_GEOIP_RULE_SET_URL: &str =
+pub const CHINA_GEOIP_RULE_SET_URL: &str =
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleSetCachePaths {
+    pub geosite: String,
+    pub geoip: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingBoxOptions {
@@ -20,6 +26,9 @@ pub struct SingBoxOptions {
     pub traffic_api_port: Option<u16>,
     /// Per-process authentication for the internal traffic endpoint.
     pub traffic_api_secret: Option<String>,
+    /// Validated local rule-set files. Local rule sets are watched by
+    /// sing-box and reloaded when the updater atomically replaces them.
+    pub rule_set_cache: Option<RuleSetCachePaths>,
 }
 
 impl Default for SingBoxOptions {
@@ -30,6 +39,7 @@ impl Default for SingBoxOptions {
             log_level: "info".to_string(),
             traffic_api_port: None,
             traffic_api_secret: None,
+            rule_set_cache: None,
         }
     }
 }
@@ -95,8 +105,22 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         rules.push(json!({ "rule_set": "geosite-cn", "action": "route", "outbound": "direct" }));
         rules.push(json!({ "rule_set": "geoip-cn", "action": "route", "outbound": "direct" }));
     }
-    let rule_sets = match request.mode {
-        TunnelMode::Rule => vec![
+    let rule_sets = match (request.mode, options.rule_set_cache.as_ref()) {
+        (TunnelMode::Rule, Some(paths)) => vec![
+            json!({
+                "type": "local",
+                "tag": "geosite-cn",
+                "format": "binary",
+                "path": paths.geosite,
+            }),
+            json!({
+                "type": "local",
+                "tag": "geoip-cn",
+                "format": "binary",
+                "path": paths.geoip,
+            }),
+        ],
+        (TunnelMode::Rule, None) => vec![
             json!({
                 "type": "remote",
                 "tag": "geosite-cn",
@@ -114,7 +138,7 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
                 "update_interval": "168h",
             }),
         ],
-        TunnelMode::Global | TunnelMode::Direct => Vec::new(),
+        (TunnelMode::Global | TunnelMode::Direct, _) => Vec::new(),
     };
 
     let mut config = json!({
@@ -384,6 +408,43 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
                 .as_array()
                 .is_some_and(Vec::is_empty));
         }
+    }
+
+    #[test]
+    fn uses_validated_local_rule_set_cache_when_available() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            mode: TunnelMode::Rule,
+            tun: false,
+            custom_rules: Vec::new(),
+        };
+        let config = build_singbox_config(
+            &request,
+            &SingBoxOptions {
+                rule_set_cache: Some(RuleSetCachePaths {
+                    geosite: "/app-data/rules/geosite-cn.srs".to_string(),
+                    geoip: "/app-data/rules/geoip-cn.srs".to_string(),
+                }),
+                ..SingBoxOptions::default()
+            },
+        );
+
+        assert_eq!(config["route"]["rule_set"][0]["type"], "local");
+        assert_eq!(
+            config["route"]["rule_set"][0]["path"],
+            "/app-data/rules/geosite-cn.srs"
+        );
+        assert_eq!(config["route"]["rule_set"][1]["type"], "local");
+        assert_eq!(
+            config["route"]["rule_set"][1]["path"],
+            "/app-data/rules/geoip-cn.srs"
+        );
+        assert!(config["route"]["rule_set"][0]["url"].is_null());
     }
 
     #[test]

@@ -415,6 +415,10 @@ body {
   min-height: 38px;
 }
 
+.secondary-button.compact {
+  min-height: 38px;
+}
+
 .notice-bar {
   display: flex;
   min-height: 40px;
@@ -1197,6 +1201,10 @@ body {
   margin: 5px 0 0;
   color: var(--text-faint);
   font-size: 10px;
+}
+
+.rules-toolbar-actions {
+  flex-wrap: nowrap;
 }
 
 .section-title-line {
@@ -2295,6 +2303,19 @@ body {
 
   .topbar-actions {
     gap: 6px;
+  }
+
+  .rules-toolbar-actions {
+    gap: 6px;
+  }
+
+  .rules-toolbar-actions .secondary-button.compact {
+    width: 38px;
+    padding: 0;
+  }
+
+  .rules-refresh-label {
+    display: none;
   }
 
   .log-collection-toggle {
