@@ -9,12 +9,14 @@ import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import dev.dioxus.main.R
 import java.util.concurrent.atomic.AtomicBoolean
 
 class KittyVpnService : VpnService() {
     companion object {
+        private const val TAG = "KittyVpnService"
         const val CONFIG_EXTRA = "config"
         private const val CHANNEL_ID = "kitty-pro-vpn"
         private const val NOTIFICATION_ID = 1001
@@ -74,6 +76,7 @@ class KittyVpnService : VpnService() {
             if (error.isNullOrBlank()) {
                 KittyVpnBridge.updateState("running")
             } else {
+                Log.e(TAG, "Embedded sing-box failed to start: $error")
                 KittyVpnBridge.updateState("error: $error")
                 shutdownCore()
                 stopSelf()
