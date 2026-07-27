@@ -17,6 +17,8 @@ use dioxus::desktop::{
 use dioxus::desktop::{tao::event::Event, use_wry_event_handler};
 use dioxus::prelude::*;
 use ui::ProxyApp;
+#[cfg(feature = "desktop")]
+use ui::APP_CSS;
 
 const MAIN_CSS: &str = include_str!("../assets/main.css");
 #[cfg(feature = "desktop")]
@@ -79,6 +81,7 @@ fn main() {
     let config = Config::new()
         .with_window(WindowBuilder::new().with_title("Kitty Pro"))
         .with_icon(window_icon)
+        .with_custom_head(format!("<style>{MAIN_CSS}\n{APP_CSS}</style>"))
         .with_close_behaviour(WindowCloseBehaviour::WindowHides)
         .with_custom_event_handler(|event, _| {
             if matches!(event, dioxus::desktop::tao::event::Event::LoopDestroyed) {

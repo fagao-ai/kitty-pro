@@ -128,7 +128,7 @@ pub struct SystemProxyStatus {
     get("/api/profile")
 )]
 pub async fn load_profile() -> Result<AppProfile, ServerFnError> {
-    load_native_profile()
+    run_native_blocking("读取本地配置任务失败", load_native_profile).await
 }
 
 #[cfg_attr(
@@ -139,7 +139,10 @@ pub async fn load_profile() -> Result<AppProfile, ServerFnError> {
     post("/api/profile")
 )]
 pub async fn save_profile(profile: AppProfile) -> Result<(), ServerFnError> {
-    save_native_profile(&profile)
+    run_native_blocking("保存本地配置任务失败", move || {
+        save_native_profile(&profile)
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -162,7 +165,10 @@ pub async fn preview_subscription(source: String) -> Result<ParseReport, ServerF
     } else {
         source
     };
-    Ok(proxy_core::parse_subscription(&content))
+    run_native_blocking("解析订阅任务失败", move || {
+        Ok(proxy_core::parse_subscription(&content))
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -173,7 +179,7 @@ pub async fn preview_subscription(source: String) -> Result<ParseReport, ServerF
     post("/api/core/status")
 )]
 pub async fn core_status() -> Result<ApiCoreStatus, ServerFnError> {
-    native_core_status()
+    run_native_blocking("读取 sing-box 状态任务失败", native_core_status).await
 }
 
 #[cfg_attr(
@@ -238,7 +244,10 @@ pub async fn update_rule_sets(force: bool) -> Result<RuleSetUpdateResult, Server
     post("/api/config-script/validate")
 )]
 pub async fn validate_config_script(request: ConnectionRequest) -> Result<(), ServerFnError> {
-    validate_native_config_script(request)
+    run_native_blocking("校验配置脚本任务失败", move || {
+        validate_native_config_script(request)
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -251,7 +260,10 @@ pub async fn validate_config_script(request: ConnectionRequest) -> Result<(), Se
 pub async fn preview_proxy_groups(
     request: ConnectionRequest,
 ) -> Result<Vec<ProxyGroup>, ServerFnError> {
-    preview_native_proxy_groups(request)
+    run_native_blocking("生成代理组预览任务失败", move || {
+        preview_native_proxy_groups(request)
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -262,7 +274,10 @@ pub async fn preview_proxy_groups(
     post("/api/proxy-groups/select")
 )]
 pub async fn select_proxy_group(group: String, outbound: String) -> Result<(), ServerFnError> {
-    select_native_proxy_group(group, outbound)
+    run_native_blocking("切换代理组任务失败", move || {
+        select_native_proxy_group(group, outbound)
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -273,7 +288,7 @@ pub async fn select_proxy_group(group: String, outbound: String) -> Result<(), S
     get("/api/core/traffic")
 )]
 pub async fn core_traffic() -> Result<CoreTraffic, ServerFnError> {
-    native_core_traffic()
+    run_native_blocking("读取 sing-box 流量任务失败", native_core_traffic).await
 }
 
 #[cfg_attr(
@@ -284,7 +299,10 @@ pub async fn core_traffic() -> Result<CoreTraffic, ServerFnError> {
     post("/api/core/logs")
 )]
 pub async fn core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
-    native_core_logs(cursor)
+    run_native_blocking("读取 sing-box 日志任务失败", move || {
+        native_core_logs(cursor)
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -295,7 +313,10 @@ pub async fn core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
     post("/api/core/logs/collection")
 )]
 pub async fn set_core_log_collection(enabled: bool) -> Result<(), ServerFnError> {
-    native_set_core_log_collection(enabled)
+    run_native_blocking("切换 sing-box 日志采集任务失败", move || {
+        native_set_core_log_collection(enabled)
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -330,7 +351,10 @@ pub async fn start_node_latency(nodes: Vec<ProxyNode>) -> Result<u64, ServerFnEr
     post("/api/core/latency/poll")
 )]
 pub async fn poll_node_latency(session_id: u64) -> Result<LatencyProbeSnapshot, ServerFnError> {
-    poll_native_latency_session(session_id)
+    run_native_blocking("读取节点测速任务失败", move || {
+        poll_native_latency_session(session_id)
+    })
+    .await
 }
 
 #[cfg_attr(

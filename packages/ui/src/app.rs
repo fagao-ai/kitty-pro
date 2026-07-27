@@ -17,7 +17,8 @@ use proxy_core::{
 };
 use std::collections::HashMap;
 
-const APP_CSS: &str = include_str!("../assets/styling/app.css");
+use crate::APP_CSS;
+
 const BRAND_ICON_SVG: &str = include_str!("../assets/kitty-pro.svg");
 const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
 const RULE_SET_UPDATE_CHECK_SECS: u64 = 6 * 60 * 60;
@@ -163,6 +164,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
     let system_proxy_busy = use_signal(|| false);
 
+    #[cfg(not(target_os = "android"))]
     use_effect(move || {
         spawn(async move {
             match api::core_status().await {

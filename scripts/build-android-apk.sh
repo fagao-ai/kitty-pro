@@ -15,6 +15,8 @@ android_rust_target="${ANDROID_RUST_TARGET:-aarch64-linux-android}"
 case "$android_rust_target" in
     aarch64-linux-android)
         android_abi=arm64-v8a
+        android_clang_target=aarch64-linux-android24
+        android_sysroot_triple=aarch64-linux-android
         ;;
     *)
         echo "Unsupported Android Rust target: $android_rust_target" >&2
@@ -84,6 +86,31 @@ export ANDROID_SDK_ROOT="$sdk_root"
 export ANDROID_NDK_HOME="$ndk_root"
 export ANDROID_NDK_ROOT="$ndk_root"
 export PATH="$java_home/bin:$sdk_root/platform-tools:$build_tools:$PATH"
+
+ndk_prebuilt=""
+for candidate in "$ndk_root"/toolchains/llvm/prebuilt/*; do
+    if [[ -d "$candidate/sysroot/usr/include/$android_sysroot_triple" ]]; then
+        ndk_prebuilt="$candidate"
+        break
+    fi
+done
+if [[ -z "$ndk_prebuilt" ]]; then
+    echo "Missing Android NDK sysroot for $android_sysroot_triple" >&2
+    exit 1
+fi
+
+# rquickjs generates bindings for Android at build time. Point bindgen at the
+# NDK headers so host SDK headers (notably macOS headers) cannot leak into the
+# cross-compilation.
+bindgen_args_variable="BINDGEN_EXTRA_CLANG_ARGS_${android_rust_target//-/_}"
+if [[ -z "${!bindgen_args_variable:-}" ]]; then
+    bindgen_sysroot="$ndk_prebuilt/sysroot"
+    bindgen_args="--sysroot='$bindgen_sysroot' --target=$android_clang_target \
+-I'$bindgen_sysroot/usr/include' \
+-I'$bindgen_sysroot/usr/include/$android_sysroot_triple'"
+    printf -v "$bindgen_args_variable" '%s' "$bindgen_args"
+    export "$bindgen_args_variable"
+fi
 
 if [[ "$generate_debug_keystore" == true && ! -f "$keystore" ]]; then
     mkdir -p "$(dirname -- "$keystore")"
@@ -169,11 +196,53 @@ for abi_dir in "$jni_root"/*; do
     fi
 done
 
-core_library="$(find "$repo_root/target/$android_rust_target" -type f \
-    -path '*/build/singbox-*/out/libkitty_singbox.so' \
-    -print 2>/dev/null | tail -n 1)"
+llvm_nm=""
+for candidate in "$ndk_root"/toolchains/llvm/prebuilt/*/bin/llvm-nm; do
+    if [[ -x "$candidate" ]]; then
+        llvm_nm="$candidate"
+        break
+    fi
+done
+if [[ -z "$llvm_nm" ]]; then
+    echo "Missing Android NDK llvm-nm" >&2
+    exit 1
+fi
+
+# Cargo can retain multiple hashed singbox build directories. Filesystem order
+# is not build order, so selecting the last path can package an older bridge
+# whose C ABI no longer matches libmain.so. Derive the complete ABI contract
+# from libmain.so, then choose the newest build output that satisfies it.
+required_core_symbols="$(
+    "$llvm_nm" -D --undefined-only "$main_library" |
+        awk '$NF ~ /^kitty_singbox_/ { print $NF }' |
+        sort -u
+)"
+if [[ -z "$required_core_symbols" ]]; then
+    echo "Dioxus libmain.so does not import the embedded sing-box ABI" >&2
+    exit 1
+fi
+core_library=""
+while IFS= read -r -d '' candidate; do
+    defined_symbols="$(
+        "$llvm_nm" -D --defined-only "$candidate" |
+            awk '$NF ~ /^kitty_singbox_/ { print $NF }' |
+            sort -u
+    )"
+    compatible=true
+    while IFS= read -r symbol; do
+        if ! grep -Fxq "$symbol" <<<"$defined_symbols"; then
+            compatible=false
+            break
+        fi
+    done <<<"$required_core_symbols"
+    if [[ "$compatible" == true ]] &&
+        { [[ -z "$core_library" ]] || [[ "$candidate" -nt "$core_library" ]]; }; then
+        core_library="$candidate"
+    fi
+done < <(find "$repo_root/target/$android_rust_target" -type f \
+    -path '*/build/singbox-*/out/libkitty_singbox.so' -print0 2>/dev/null)
 if [[ -z "$core_library" ]]; then
-    echo "The embedded sing-box Android library was not produced" >&2
+    echo "No ABI-compatible embedded sing-box Android library was produced" >&2
     exit 1
 fi
 core_stage="$jni_root/$android_abi"
