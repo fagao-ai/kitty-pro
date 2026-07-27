@@ -107,6 +107,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut dark_mode = use_signal(|| false);
     let mut connected = use_signal(|| false);
     let core_busy = use_signal(|| false);
+    let mut core_restarting = use_signal(|| false);
     let mut core_state = use_signal(|| "checking".to_string());
     let mut core_version = use_signal(|| None::<String>);
     let mut core_note = use_signal(|| None::<String>);
@@ -327,6 +328,59 @@ pub fn ProxyApp(platform: String) -> Element {
                             strong { {core_state_label(&core_state())} }
                             small { {core_version().unwrap_or_else(|| platform.clone())} }
                         }
+                        button {
+                            class: "core-restart-button",
+                            title: if core_restarting() { "正在重启内核" } else { "重启内核" },
+                            aria_label: "重启内核",
+                            aria_busy: core_restarting(),
+                            disabled: !connected() || core_busy() || core_restarting(),
+                            onclick: move |_| async move {
+                                core_restarting.set(true);
+                                let request = ConnectionRequest {
+                                    nodes: nodes(),
+                                    selected_tag: selected_tag(),
+                                    mode: tunnel_mode(),
+                                    tun: tun_enabled(),
+                                    custom_rules: custom_rules(),
+                                };
+                                match api::restart_core(request).await {
+                                    Ok(status) => {
+                                        let is_running = status.state == "running";
+                                        connected.set(is_running);
+                                        core_state.set(status.state);
+                                        core_version.set(status.version);
+                                        core_note.set(status.note);
+                                        notice.set(Some(if is_running {
+                                            "sing-box 内核已重启".to_string()
+                                        } else {
+                                            ANDROID_VPN_WAITING_NOTICE.to_string()
+                                        }));
+                                    }
+                                    Err(error) => {
+                                        notice.set(Some(format!("内核重启失败: {error}")));
+                                        match api::core_status().await {
+                                            Ok(status) => {
+                                                connected.set(status.state == "running");
+                                                core_state.set(status.state);
+                                                core_version.set(status.version);
+                                                core_note.set(status.note);
+                                            }
+                                            Err(status_error) => {
+                                                connected.set(false);
+                                                core_state.set("unavailable".to_string());
+                                                core_note.set(Some(status_error.to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                                core_restarting.set(false);
+                            },
+                            if core_restarting() {
+                                span { class: "spinner" }
+                            } else {
+                                Icon { icon: LdRefreshCw, width: 15, height: 15 }
+                            }
+                        }
                     }
                 }
             }
@@ -382,6 +436,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             selected_tag,
                             connected,
                             core_busy,
+                            core_restarting,
                             core_state,
                             core_note,
                             tunnel_mode,
@@ -619,6 +674,7 @@ fn OverviewView(
     selected_tag: Signal<String>,
     mut connected: Signal<bool>,
     mut core_busy: Signal<bool>,
+    core_restarting: Signal<bool>,
     mut core_state: Signal<String>,
     mut core_note: Signal<Option<String>>,
     tunnel_mode: Signal<TunnelMode>,
@@ -632,7 +688,11 @@ fn OverviewView(
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
     let is_connected = connected();
     let is_core_busy = core_busy();
-    let status_title = if is_core_busy {
+    let is_core_restarting = core_restarting();
+    let is_core_action_busy = is_core_busy || is_core_restarting;
+    let status_title = if is_core_restarting {
+        "正在重启"
+    } else if is_core_busy {
         if is_connected {
             "正在断开"
         } else {
@@ -648,7 +708,9 @@ fn OverviewView(
         .map(|node| node.name.as_str())
         .unwrap_or("未选择节点");
     let mode_name = mode_label(tunnel_mode());
-    let note = if is_core_busy {
+    let note = if is_core_restarting {
+        "正在重启 sing-box 内核，请稍候".to_string()
+    } else if is_core_busy {
         if is_connected {
             "正在停止 sing-box 内核".to_string()
         } else {
@@ -674,10 +736,10 @@ fn OverviewView(
 
     rsx! {
         div { class: "overview-grid",
-            section { class: if is_core_busy { "connection-panel glass-surface busy" } else if is_connected { "connection-panel glass-surface connected" } else { "connection-panel glass-surface" },
+            section { class: if is_core_action_busy { "connection-panel glass-surface busy" } else if is_connected { "connection-panel glass-surface connected" } else { "connection-panel glass-surface" },
                 div { class: "connection-copy",
                     div { class: "status-line", role: "status", aria_live: "polite",
-                        span { class: if is_core_busy { "busy-dot" } else if is_connected { "live-dot" } else { "idle-dot" } }
+                        span { class: if is_core_action_busy { "busy-dot" } else if is_connected { "live-dot" } else { "idle-dot" } }
                         span { "{status_title}" }
                     }
                     h2 { "{node_name}" }
@@ -694,10 +756,10 @@ fn OverviewView(
                     }
                 }
                 button {
-                    class: if is_core_busy && is_connected { "power-button active loading" } else if is_core_busy { "power-button loading" } else if is_connected { "power-button active" } else { "power-button" },
-                    title: if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
-                    aria_busy: is_core_busy,
-                    disabled: is_core_busy || (!is_connected && !connection_allowed),
+                    class: if is_core_action_busy && is_connected { "power-button active loading" } else if is_core_action_busy { "power-button loading" } else if is_connected { "power-button active" } else { "power-button" },
+                    title: if is_core_restarting { "正在重启内核" } else if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
+                    aria_busy: is_core_action_busy,
+                    disabled: is_core_action_busy || (!is_connected && !connection_allowed),
                     onclick: move |_| async move {
                         let target = !connected();
                         core_busy.set(true);
@@ -726,7 +788,7 @@ fn OverviewView(
                         }
                         core_busy.set(false);
                     },
-                    if is_core_busy {
+                    if is_core_action_busy {
                         span { class: "spinner large" }
                     } else {
                         Icon { icon: LdPower, width: 32, height: 32 }

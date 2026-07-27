@@ -170,6 +170,26 @@ pub async fn set_core_enabled(
         not(any(target_os = "android", target_os = "ios")),
         any(target_arch = "wasm32", feature = "server")
     ),
+    post("/api/core/restart")
+)]
+pub async fn restart_core(request: ConnectionRequest) -> Result<ApiCoreStatus, ServerFnError> {
+    if request.nodes.is_empty() {
+        return Err(ServerFnError::new("请先导入并选择一个节点"));
+    }
+    proxy_core::validate_custom_rules(&request.custom_rules)
+        .map_err(|error| ServerFnError::new(format!("自定义规则无效: {error}")))?;
+    run_native_blocking("sing-box 重启任务失败", move || {
+        toggle_native_core(false, None)?;
+        toggle_native_core(true, Some(request))
+    })
+    .await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
     get("/api/core/traffic")
 )]
 pub async fn core_traffic() -> Result<CoreTraffic, ServerFnError> {

@@ -205,6 +205,38 @@ body {
   padding: 6px 8px;
 }
 
+.core-chip > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.core-restart-button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  padding: 0;
+  color: var(--text-faint);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  transition: color 160ms ease, background 160ms ease, border-color 160ms ease;
+}
+
+.core-restart-button:hover:not(:disabled),
+.core-restart-button:focus-visible {
+  color: var(--accent-strong);
+  border-color: var(--border);
+  background: var(--surface-soft);
+}
+
+.core-restart-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.44;
+}
+
 .core-chip strong,
 .core-chip small {
   display: block;
@@ -216,7 +248,7 @@ body {
 }
 
 .core-chip small {
-  max-width: 140px;
+  max-width: 100%;
   margin-top: 3px;
   overflow: hidden;
   color: var(--text-faint);
