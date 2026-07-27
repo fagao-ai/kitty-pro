@@ -10,8 +10,11 @@ use dioxus::desktop::{
         init_tray_icon,
         menu::{Menu, MenuItem, PredefinedMenuItem},
     },
-    use_tray_menu_event_handler, use_window, Config, WindowBuilder, WindowCloseBehaviour,
+    use_tray_menu_event_handler, use_window, Config, DesktopContext, WindowBuilder,
+    WindowCloseBehaviour,
 };
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+use dioxus::desktop::{tao::event::Event, use_wry_event_handler};
 use dioxus::prelude::*;
 use ui::ProxyApp;
 
@@ -57,6 +60,17 @@ fn execute_tray_command(
             exit_process();
         }
     }
+}
+
+#[cfg(feature = "desktop")]
+fn show_desktop_window(window: &DesktopContext) {
+    window.set_visible(true);
+    window.set_focus();
+}
+
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+fn should_show_window_on_reopen<T: 'static>(event: &Event<'_, T>) -> bool {
+    matches!(event, Event::Reopen { .. })
 }
 
 #[cfg(feature = "desktop")]
@@ -112,6 +126,16 @@ fn use_desktop_tray() {
         tray
     });
 
+    #[cfg(target_os = "macos")]
+    let _reopen_event_handler = {
+        let window = window.clone();
+        use_wry_event_handler(move |event, _| {
+            if should_show_window_on_reopen(event) {
+                show_desktop_window(&window);
+            }
+        })
+    };
+
     let _tray_menu_handler = use_tray_menu_event_handler(move |event| {
         let Some(command) = tray_command(event.id.as_ref()) else {
             return;
@@ -119,10 +143,7 @@ fn use_desktop_tray() {
 
         execute_tray_command(
             command,
-            || {
-                window.set_visible(true);
-                window.set_focus();
-            },
+            || show_desktop_window(&window),
             || {
                 if let Err(error) = api::shutdown_native_runtime() {
                     eprintln!("failed to clean up the native runtime before exit: {error}");

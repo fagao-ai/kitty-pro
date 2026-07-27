@@ -156,7 +156,10 @@ pub async fn set_core_enabled(
     enabled: bool,
     request: Option<ConnectionRequest>,
 ) -> Result<ApiCoreStatus, ServerFnError> {
-    toggle_native_core(enabled, request)
+    run_native_blocking("sing-box 状态切换任务失败", move || {
+        toggle_native_core(enabled, request)
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -202,7 +205,7 @@ pub async fn measure_node_latency(
     get("/api/system-proxy/status")
 )]
 pub async fn system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
-    native_system_proxy_status()
+    run_native_blocking("系统代理状态读取任务失败", native_system_proxy_status).await
 }
 
 #[cfg_attr(
@@ -213,7 +216,36 @@ pub async fn system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
     post("/api/system-proxy")
 )]
 pub async fn set_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
-    set_native_system_proxy(enabled)
+    run_native_blocking("系统代理设置任务失败", move || {
+        set_native_system_proxy(enabled)
+    })
+    .await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_native_blocking<T, F>(
+    failure_message: &'static str,
+    operation: F,
+) -> Result<T, ServerFnError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ServerFnError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| ServerFnError::new(format!("{failure_message}: {error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+async fn run_native_blocking<T, F>(
+    _failure_message: &'static str,
+    operation: F,
+) -> Result<T, ServerFnError>
+where
+    F: FnOnce() -> Result<T, ServerFnError>,
+{
+    operation()
 }
 
 #[allow(dead_code)]
@@ -1577,6 +1609,22 @@ mod tests {
 
         assert_eq!(report.nodes.len(), 1);
         assert_eq!(report.nodes[0].protocol, proxy_core::ProxyProtocol::Trojan);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_blocking_operations_run_off_the_calling_thread() {
+        let calling_thread = std::thread::current().id();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("native test runtime should start");
+        let operation_thread = runtime
+            .block_on(run_native_blocking("test task failed", || {
+                Ok::<_, ServerFnError>(std::thread::current().id())
+            }))
+            .expect("blocking operation should complete");
+
+        assert_ne!(calling_thread, operation_thread);
     }
 
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]

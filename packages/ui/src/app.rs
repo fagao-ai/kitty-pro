@@ -15,6 +15,7 @@ use proxy_core::{
 use std::collections::HashMap;
 
 const APP_CSS: &str = include_str!("../assets/styling/app.css");
+const BRAND_ICON: Asset = asset!("/assets/kitty-pro.svg");
 const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,9 +542,7 @@ pub fn ProxyApp(platform: String) -> Element {
 fn Brand() -> Element {
     rsx! {
         div { class: "brand",
-            div { class: "brand-mark", aria_hidden: "true",
-                Icon { icon: LdShieldCheck, width: 24, height: 24 }
-            }
+            img { class: "brand-mark", src: BRAND_ICON, alt: "", aria_hidden: "true" }
             div {
                 strong { "Kitty Pro" }
                 small { "SING-BOX CLIENT" }
@@ -588,7 +587,15 @@ fn OverviewView(
     mut notice: Signal<Option<String>>,
 ) -> Element {
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
-    let status_title = if connected() {
+    let is_connected = connected();
+    let is_core_busy = core_busy();
+    let status_title = if is_core_busy {
+        if is_connected {
+            "正在断开"
+        } else {
+            "正在启动"
+        }
+    } else if is_connected {
         "已连接"
     } else {
         "未连接"
@@ -598,13 +605,21 @@ fn OverviewView(
         .map(|node| node.name.as_str())
         .unwrap_or("未选择节点");
     let mode_name = mode_label(tunnel_mode());
-    let note = core_note().unwrap_or_else(|| {
-        if core_state() == "checking" {
-            "正在检查 sing-box".to_string()
+    let note = if is_core_busy {
+        if is_connected {
+            "正在停止 sing-box 内核".to_string()
         } else {
-            "sing-box 已就绪".to_string()
+            "正在启动 sing-box 内核，请稍候".to_string()
         }
-    });
+    } else {
+        core_note().unwrap_or_else(|| {
+            if core_state() == "checking" {
+                "正在检查 sing-box".to_string()
+            } else {
+                "sing-box 已就绪".to_string()
+            }
+        })
+    };
     let selected_latency = selected_node.as_ref().and_then(|node| {
         latency_results()
             .get(&node.tag)
@@ -616,10 +631,10 @@ fn OverviewView(
 
     rsx! {
         div { class: "overview-grid",
-            section { class: if connected() { "connection-panel glass-surface connected" } else { "connection-panel glass-surface" },
+            section { class: if is_core_busy { "connection-panel glass-surface busy" } else if is_connected { "connection-panel glass-surface connected" } else { "connection-panel glass-surface" },
                 div { class: "connection-copy",
-                    div { class: "status-line",
-                        span { class: if connected() { "live-dot" } else { "idle-dot" } }
+                    div { class: "status-line", role: "status", aria_live: "polite",
+                        span { class: if is_core_busy { "busy-dot" } else if is_connected { "live-dot" } else { "idle-dot" } }
                         span { "{status_title}" }
                     }
                     h2 { "{node_name}" }
@@ -636,9 +651,10 @@ fn OverviewView(
                     }
                 }
                 button {
-                    class: if connected() { "power-button active" } else { "power-button" },
-                    title: if connected() { "断开连接" } else { "建立连接" },
-                    disabled: core_busy() || (!connected() && !connection_allowed),
+                    class: if is_core_busy && is_connected { "power-button active loading" } else if is_core_busy { "power-button loading" } else if is_connected { "power-button active" } else { "power-button" },
+                    title: if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
+                    aria_busy: is_core_busy,
+                    disabled: is_core_busy || (!is_connected && !connection_allowed),
                     onclick: move |_| async move {
                         let target = !connected();
                         core_busy.set(true);
@@ -666,7 +682,7 @@ fn OverviewView(
                         }
                         core_busy.set(false);
                     },
-                    if core_busy() {
+                    if is_core_busy {
                         span { class: "spinner large" }
                     } else {
                         Icon { icon: LdPower, width: 32, height: 32 }
@@ -1338,16 +1354,25 @@ fn SettingsView(
     let proxy_ready = proxy_status.is_some();
     let proxy_supported = proxy_status.as_ref().is_some_and(|status| status.supported);
     let proxy_enabled = proxy_status.as_ref().is_some_and(|status| status.enabled);
-    let proxy_detail = proxy_status
-        .as_ref()
-        .map(|status| status.detail.clone())
-        .unwrap_or_else(|| {
-            if proxy_loading {
-                "正在读取系统代理状态".to_string()
-            } else {
-                "无法读取系统代理状态".to_string()
-            }
-        });
+    let proxy_busy = system_proxy_busy();
+    let proxy_detail = if proxy_busy {
+        if proxy_enabled {
+            "正在恢复启用前的系统代理设置".to_string()
+        } else {
+            "正在应用到系统网络服务".to_string()
+        }
+    } else {
+        proxy_status
+            .as_ref()
+            .map(|status| status.detail.clone())
+            .unwrap_or_else(|| {
+                if proxy_loading {
+                    "正在读取系统代理状态".to_string()
+                } else {
+                    "无法读取系统代理状态".to_string()
+                }
+            })
+    };
     let enable_allowed = core_state() == "running";
 
     rsx! {
@@ -1383,8 +1408,11 @@ fn SettingsView(
                         h2 { "系统代理" }
                     }
                     span {
-                        class: if proxy_enabled { "status-badge online" } else { "status-badge" },
-                        if proxy_loading { "读取中" }
+                        class: if proxy_busy { "status-badge pending" } else if proxy_enabled { "status-badge online" } else { "status-badge" },
+                        role: "status",
+                        aria_live: "polite",
+                        if proxy_busy { "设置中" }
+                        else if proxy_loading { "读取中" }
                         else if proxy_enabled { "已启用" }
                         else if proxy_error.is_some() { "读取失败" }
                         else { "未启用" }
@@ -1396,15 +1424,17 @@ fn SettingsView(
                         strong { "使用本地 mixed 代理" }
                         small { "127.0.0.1:7890；{proxy_detail}" }
                     }
-                    if proxy_loading {
-                        span { class: "switch switch-loading",
+                    if proxy_loading || proxy_busy {
+                        span { class: if proxy_enabled { "switch switch-loading active" } else { "switch switch-loading" },
+                            aria_busy: "true",
+                            aria_label: if proxy_busy { "正在设置系统代理" } else { "正在读取系统代理状态" },
                             span { class: "spinner" }
                         }
                     } else {
                         input {
                             r#type: "checkbox",
                             checked: proxy_enabled,
-                            disabled: system_proxy_busy() || !proxy_ready || !proxy_supported || (!proxy_enabled && !enable_allowed),
+                            disabled: !proxy_ready || !proxy_supported || (!proxy_enabled && !enable_allowed),
                             onchange: move |event| {
                                 let enabled = event.checked();
                                 async move {

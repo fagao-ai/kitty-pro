@@ -119,16 +119,13 @@ body {
 }
 
 .brand-mark {
-  display: grid;
+  display: block;
   width: 38px;
   height: 38px;
   flex: 0 0 38px;
-  place-items: center;
-  color: #f4fbf8;
-  border: 1px solid rgba(255, 255, 255, 0.24);
   border-radius: 8px;
-  background: #17755f;
-  box-shadow: 0 8px 20px rgba(23, 117, 95, 0.22);
+  object-fit: contain;
+  box-shadow: 0 8px 20px rgba(234, 88, 12, 0.14);
 }
 
 .brand strong,
@@ -428,6 +425,11 @@ body {
   background: color-mix(in srgb, var(--surface) 88%, var(--accent-soft));
 }
 
+.connection-panel.busy {
+  border-left-color: var(--amber);
+  background: color-mix(in srgb, var(--surface) 90%, var(--amber-soft));
+}
+
 .connection-copy {
   min-width: 0;
 }
@@ -442,7 +444,8 @@ body {
 }
 
 .live-dot,
-.idle-dot {
+.idle-dot,
+.busy-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -452,6 +455,12 @@ body {
 .live-dot {
   background: var(--accent);
   box-shadow: 0 0 0 4px var(--accent-soft);
+}
+
+.busy-dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 4px var(--amber-soft);
+  animation: status-pulse 1.2s ease-in-out infinite;
 }
 
 .connection-copy h2 {
@@ -524,6 +533,11 @@ body {
   border-color: var(--accent);
   background: #17755f;
   box-shadow: 0 14px 36px rgba(19, 122, 97, 0.28), inset 0 0 0 8px rgba(255, 255, 255, 0.12);
+}
+
+.power-button.loading {
+  border-color: var(--amber);
+  cursor: wait;
 }
 
 .traffic-panel {
@@ -1195,6 +1209,12 @@ body {
   background: var(--coral-soft);
 }
 
+.status-badge.pending {
+  color: var(--amber);
+  border-color: rgba(182, 106, 32, 0.18);
+  background: var(--amber-soft);
+}
+
 .setting-row {
   display: flex;
   min-height: 62px;
@@ -1324,6 +1344,14 @@ body {
 
 .switch-loading .spinner {
   color: var(--text-muted);
+}
+
+.switch-loading.active {
+  background: var(--accent);
+}
+
+.switch-loading.active .spinner {
+  color: #f5fcf9;
 }
 
 .toggle-row input:checked + .switch {
