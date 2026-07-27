@@ -128,6 +128,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let latency_results = use_signal(HashMap::<String, NodeLatency>::new);
     let latency_busy = use_signal(|| false);
     let mut traffic = use_signal(TrafficDisplay::default);
+    let mut traffic_poll_generation = use_signal(|| 0_u64);
     let mut core_logs = use_signal(Vec::<CoreLogEntry>::new);
     let mut core_log_cursor = use_signal(|| 0_u64);
     let mut log_poll_generation = use_signal(|| 0_u64);
@@ -228,15 +229,33 @@ pub fn ProxyApp(platform: String) -> Element {
     });
 
     use_effect(move || {
-        if core_state() != "running" {
+        let running = core_state() == "running";
+        let overview_visible = active_view() == AppView::Overview;
+        let generation = {
+            let mut current = traffic_poll_generation.write();
+            *current = current.wrapping_add(1);
+            *current
+        };
+        if !running {
             traffic.set(TrafficDisplay::default());
+            return;
+        }
+        if !overview_visible {
             return;
         }
         spawn(async move {
             let mut previous = None::<CoreTraffic>;
-            let mut history = Vec::new();
-            while core_state() == "running" {
+            let mut history = traffic.peek().history.clone();
+            while *traffic_poll_generation.peek() == generation
+                && core_state.peek().as_str() == "running"
+                && *active_view.peek() == AppView::Overview
+            {
                 if let Ok(current) = api::core_traffic().await {
+                    if *traffic_poll_generation.peek() != generation
+                        || *active_view.peek() != AppView::Overview
+                    {
+                        break;
+                    }
                     let (upload_bytes_per_second, download_bytes_per_second) = previous
                         .map(|last| {
                             (
