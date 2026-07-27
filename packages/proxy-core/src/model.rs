@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
+use thiserror::Error;
+
+pub const MAX_CUSTOM_RULES: usize = 256;
+const MAX_CUSTOM_RULE_VALUE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -137,6 +142,148 @@ pub enum TunnelMode {
     Direct,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomRuleAction {
+    Direct,
+    Proxy,
+    Block,
+}
+
+impl CustomRuleAction {
+    pub fn outbound(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy => "proxy",
+            Self::Block => "block",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomRuleMatch {
+    Domain,
+    DomainSuffix,
+    DomainKeyword,
+    IpCidr,
+}
+
+impl CustomRuleMatch {
+    pub fn singbox_field(self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+            Self::DomainSuffix => "domain_suffix",
+            Self::DomainKeyword => "domain_keyword",
+            Self::IpCidr => "ip_cidr",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomRule {
+    pub id: u64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub match_type: CustomRuleMatch,
+    pub value: String,
+    pub action: CustomRuleAction,
+}
+
+impl CustomRule {
+    pub fn normalized(mut self) -> Result<Self, CustomRuleValidationError> {
+        self.value = normalize_custom_rule_value(self.match_type, &self.value)?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CustomRuleValidationError {
+    #[error("规则内容不能为空")]
+    Empty,
+    #[error("规则内容不能超过 {MAX_CUSTOM_RULE_VALUE_BYTES} 字节")]
+    TooLong,
+    #[error("域名格式无效")]
+    InvalidDomain,
+    #[error("域名关键字不能包含空白、路径或 URL scheme")]
+    InvalidDomainKeyword,
+    #[error("CIDR 格式无效，请输入类似 192.168.0.0/16 或 2001:db8::/32")]
+    InvalidCidr,
+    #[error("自定义规则不能超过 {MAX_CUSTOM_RULES} 条")]
+    TooManyRules,
+    #[error("规则 ID 必须唯一且不能为 0")]
+    InvalidId,
+    #[error("已存在相同的匹配规则")]
+    Duplicate,
+}
+
+pub fn normalize_custom_rule_value(
+    match_type: CustomRuleMatch,
+    value: &str,
+) -> Result<String, CustomRuleValidationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CustomRuleValidationError::Empty);
+    }
+    if value.len() > MAX_CUSTOM_RULE_VALUE_BYTES {
+        return Err(CustomRuleValidationError::TooLong);
+    }
+
+    match match_type {
+        CustomRuleMatch::Domain | CustomRuleMatch::DomainSuffix => {
+            let value = if match_type == CustomRuleMatch::DomainSuffix {
+                value
+                    .strip_prefix("*.")
+                    .or_else(|| value.strip_prefix('.'))
+                    .unwrap_or(value)
+            } else {
+                value
+            };
+            let value = value.trim_end_matches('.');
+            match url::Host::parse(value) {
+                Ok(url::Host::Domain(domain)) if !domain.is_empty() => Ok(domain),
+                _ => Err(CustomRuleValidationError::InvalidDomain),
+            }
+        }
+        CustomRuleMatch::DomainKeyword => {
+            if value.chars().any(char::is_whitespace)
+                || value.contains("://")
+                || value.contains('/')
+                || value.contains('\\')
+            {
+                return Err(CustomRuleValidationError::InvalidDomainKeyword);
+            }
+            Ok(value.to_lowercase())
+        }
+        CustomRuleMatch::IpCidr => value
+            .parse::<ipnet::IpNet>()
+            .map(|network| network.trunc().to_string())
+            .map_err(|_| CustomRuleValidationError::InvalidCidr),
+    }
+}
+
+pub fn validate_custom_rules(rules: &[CustomRule]) -> Result<(), CustomRuleValidationError> {
+    if rules.len() > MAX_CUSTOM_RULES {
+        return Err(CustomRuleValidationError::TooManyRules);
+    }
+    let mut ids = HashSet::with_capacity(rules.len());
+    let mut matches = HashSet::with_capacity(rules.len());
+    for rule in rules {
+        if rule.id == 0 || !ids.insert(rule.id) {
+            return Err(CustomRuleValidationError::InvalidId);
+        }
+        let value = normalize_custom_rule_value(rule.match_type, &rule.value)?;
+        if !matches.insert((rule.match_type, value)) {
+            return Err(CustomRuleValidationError::Duplicate);
+        }
+    }
+    Ok(())
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionRequest {
     pub nodes: Vec<ProxyNode>,
@@ -145,6 +292,8 @@ pub struct ConnectionRequest {
     pub mode: TunnelMode,
     #[serde(default)]
     pub tun: bool,
+    #[serde(default)]
+    pub custom_rules: Vec<CustomRule>,
 }
 
 /// A subscription together with its last successful parse result.
@@ -189,6 +338,8 @@ pub struct AppProfile {
     pub tun_enabled: bool,
     #[serde(default)]
     pub dark_mode: bool,
+    #[serde(default)]
+    pub custom_rules: Vec<CustomRule>,
 }
 
 impl Default for AppProfile {
@@ -200,6 +351,7 @@ impl Default for AppProfile {
             tunnel_mode: TunnelMode::Rule,
             tun_enabled: false,
             dark_mode: false,
+            custom_rules: Vec::new(),
         }
     }
 }
@@ -230,6 +382,13 @@ mod tests {
             }],
             selected_tag: node.tag,
             dark_mode: true,
+            custom_rules: vec![CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::DomainSuffix,
+                value: "example.com".to_string(),
+                action: CustomRuleAction::Direct,
+            }],
             ..AppProfile::default()
         };
 
@@ -240,5 +399,63 @@ mod tests {
 
         assert_eq!(restored, profile);
         assert_eq!(restored.subscriptions[0].node_count(), 1);
+        assert_eq!(restored.custom_rules.len(), 1);
+    }
+
+    #[test]
+    fn custom_rule_values_are_normalized_and_validated() {
+        assert_eq!(
+            normalize_custom_rule_value(CustomRuleMatch::DomainSuffix, "*.Example.COM."),
+            Ok("example.com".to_string())
+        );
+        assert_eq!(
+            normalize_custom_rule_value(CustomRuleMatch::IpCidr, "192.168.8.9/24"),
+            Ok("192.168.8.0/24".to_string())
+        );
+        assert!(
+            normalize_custom_rule_value(CustomRuleMatch::Domain, "https://example.com").is_err()
+        );
+        assert!(normalize_custom_rule_value(CustomRuleMatch::IpCidr, "192.168.0.1").is_err());
+    }
+
+    #[test]
+    fn custom_rule_ids_must_be_unique() {
+        let rule = CustomRule {
+            id: 7,
+            enabled: true,
+            match_type: CustomRuleMatch::Domain,
+            value: "example.com".to_string(),
+            action: CustomRuleAction::Proxy,
+        };
+        assert!(validate_custom_rules(&[rule.clone()]).is_ok());
+        assert_eq!(
+            validate_custom_rules(&[rule.clone(), rule]),
+            Err(CustomRuleValidationError::InvalidId)
+        );
+    }
+
+    #[test]
+    fn normalized_custom_rule_matches_must_be_unique() {
+        let rules = [
+            CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::DomainSuffix,
+                value: "*.Example.com".to_string(),
+                action: CustomRuleAction::Proxy,
+            },
+            CustomRule {
+                id: 2,
+                enabled: false,
+                match_type: CustomRuleMatch::DomainSuffix,
+                value: "example.com.".to_string(),
+                action: CustomRuleAction::Direct,
+            },
+        ];
+
+        assert_eq!(
+            validate_custom_rules(&rules),
+            Err(CustomRuleValidationError::Duplicate)
+        );
     }
 }

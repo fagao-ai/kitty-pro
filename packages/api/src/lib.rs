@@ -44,6 +44,7 @@ pub struct CoreTraffic {
 pub enum RouteDecision {
     Direct,
     Proxy,
+    Block,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +270,7 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
         selected_tag: node_tags.first().cloned().unwrap_or_default(),
         mode: TunnelMode::Global,
         tun: false,
+        custom_rules: Vec::new(),
     };
     let mut config = proxy_core::build_singbox_config(&request, &SingBoxOptions::default());
     config["log"]["level"] = serde_json::Value::String("error".to_string());
@@ -564,6 +566,8 @@ fn toggle_native_core(
     // Android always owns the TUN through VpnService. A loopback mixed proxy
     // alone would not route device traffic.
     request.tun = true;
+    proxy_core::validate_custom_rules(&request.custom_rules)
+        .map_err(|error| ServerFnError::new(format!("自定义规则无效: {error}")))?;
     let options = SingBoxOptions {
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
@@ -704,6 +708,8 @@ fn parse_route_log(message: &str) -> Option<RouteLogDetail> {
     Some(RouteLogDetail {
         decision: if outbound_type == "direct" || outbound_tag == "direct" {
             RouteDecision::Direct
+        } else if outbound_type == "block" || outbound_tag == "block" {
+            RouteDecision::Block
         } else {
             RouteDecision::Proxy
         },
@@ -1686,6 +1692,17 @@ mod tests {
         assert_eq!(ipv6.host, "2001:db8::1");
         assert_eq!(ipv6.port, Some(443));
         assert_eq!(ipv6.target_kind, RouteTargetKind::Ip);
+    }
+
+    #[test]
+    fn parses_block_route_log() {
+        let route = parse_route_log(
+            "INFO[0004] outbound/block[block]: outbound connection to ads.example.com:443",
+        )
+        .expect("block route should be parsed");
+
+        assert_eq!(route.decision, RouteDecision::Block);
+        assert_eq!(route.outbound_tag, "block");
     }
 
     #[test]

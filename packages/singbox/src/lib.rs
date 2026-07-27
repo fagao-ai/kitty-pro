@@ -5,7 +5,7 @@
 //! host application, so no `sing-box` executable is spawned or discovered at
 //! runtime.
 
-use proxy_core::{build_singbox_config, ConnectionRequest, SingBoxOptions};
+use proxy_core::{build_singbox_config, validate_custom_rules, ConnectionRequest, SingBoxOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -142,6 +142,8 @@ impl SingBox {
             if self.handle.is_some() {
                 return Err(CoreError::AlreadyRunning);
             }
+            validate_custom_rules(&request.custom_rules)
+                .map_err(|error| CoreError::InvalidConfig(error.to_string()))?;
             let config = build_singbox_config(request, options);
             let content = serde_json::to_string(&config)?;
             let handle = ffi::start(&content)?;
@@ -525,6 +527,7 @@ mod tests {
             nodes,
             mode: proxy_core::TunnelMode::Direct,
             tun: false,
+            custom_rules: Vec::new(),
         };
         let target_listener =
             TcpListener::bind(("127.0.0.1", 0)).expect("local HTTP listener should bind");

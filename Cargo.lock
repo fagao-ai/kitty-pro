@@ -4256,6 +4256,7 @@ name = "proxy-core"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ipnet",
  "percent-encoding",
  "serde",
  "serde_json",

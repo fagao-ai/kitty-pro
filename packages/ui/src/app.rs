@@ -3,14 +3,17 @@ use api::{
 };
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
-    LdActivity, LdArrowDown, LdArrowUp, LdChevronRight, LdCircleAlert, LdCircleCheck, LdClock3,
-    LdGauge, LdGlobe, LdInfo, LdLanguages, LdMoon, LdNetwork, LdPlus, LdPower, LdRadioTower,
-    LdRefreshCw, LdRoute, LdScrollText, LdSearch, LdServer, LdSettings, LdShieldCheck, LdSun,
-    LdTrash2, LdWifi, LdX, LdZap,
+    LdActivity, LdArrowDown, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight,
+    LdCircleAlert, LdCircleCheck, LdClock3, LdGauge, LdGlobe, LdInfo, LdLanguages, LdListFilter,
+    LdMoon, LdNetwork, LdPencil, LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRoute, LdSave,
+    LdScrollText, LdSearch, LdServer, LdSettings, LdShieldCheck, LdSun, LdTrash2, LdWifi, LdX,
+    LdZap,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
-    AppProfile, ConnectionRequest, ParseReport, ProxyNode, ProxyProtocol, Subscription, TunnelMode,
+    validate_custom_rules, AppProfile, ConnectionRequest, CustomRule, CustomRuleAction,
+    CustomRuleMatch, ParseReport, ProxyNode, ProxyProtocol, Subscription, TunnelMode,
+    MAX_CUSTOM_RULES,
 };
 use std::collections::HashMap;
 
@@ -23,6 +26,7 @@ enum AppView {
     Overview,
     Nodes,
     Subscriptions,
+    Rules,
     Logs,
     Settings,
 }
@@ -33,6 +37,7 @@ enum LogFilter {
     All,
     Direct,
     Proxy,
+    Block,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +63,21 @@ enum SystemProxyLoadState {
     Failed(String),
 }
 
+#[derive(Clone, PartialEq)]
+struct RuleSelectOption {
+    value: String,
+    label: String,
+}
+
+impl RuleSelectOption {
+    fn new(value: &str, label: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            label: label.to_string(),
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn wait_for_traffic_tick() {
     gloo_timers::future::TimeoutFuture::new(1_000).await;
@@ -74,6 +94,7 @@ impl AppView {
             Self::Overview => "概览",
             Self::Nodes => "节点",
             Self::Subscriptions => "订阅",
+            Self::Rules => "规则",
             Self::Logs => "日志",
             Self::Settings => "设置",
         }
@@ -93,6 +114,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut nodes = use_signal(Vec::<ProxyNode>::new);
     let mut selected_tag = use_signal(String::new);
     let mut subscriptions = use_signal(Vec::<Subscription>::new);
+    let mut custom_rules = use_signal(Vec::<CustomRule>::new);
     let mut tunnel_mode = use_signal(|| TunnelMode::Rule);
     let mut tun_enabled = use_signal(|| false);
     let mut import_open = use_signal(|| false);
@@ -168,6 +190,7 @@ pub fn ProxyApp(platform: String) -> Element {
                     let restored_nodes = collect_nodes(&profile.subscriptions);
                     let restored_tag = select_available_tag(&restored_nodes, &profile.selected_tag);
                     subscriptions.set(profile.subscriptions);
+                    custom_rules.set(profile.custom_rules);
                     nodes.set(restored_nodes);
                     selected_tag.set(restored_tag);
                     tunnel_mode.set(profile.tunnel_mode);
@@ -190,6 +213,7 @@ pub fn ProxyApp(platform: String) -> Element {
             tunnel_mode: tunnel_mode(),
             tun_enabled: tun_enabled(),
             dark_mode: dark_mode(),
+            custom_rules: custom_rules(),
             ..AppProfile::default()
         };
         spawn(async move {
@@ -292,6 +316,7 @@ pub fn ProxyApp(platform: String) -> Element {
                     NavItem { view: AppView::Overview, active_view }
                     NavItem { view: AppView::Nodes, active_view }
                     NavItem { view: AppView::Subscriptions, active_view }
+                    NavItem { view: AppView::Rules, active_view }
                     NavItem { view: AppView::Logs, active_view }
                     NavItem { view: AppView::Settings, active_view }
                 }
@@ -323,14 +348,16 @@ pub fn ProxyApp(platform: String) -> Element {
                                 Icon { icon: LdMoon, width: 19, height: 19 }
                             }
                         }
-                        button {
-                            class: "primary-button compact",
-                            onclick: move |_| {
-                                import_error.set(None);
-                                import_open.set(true);
-                            },
-                            Icon { icon: LdPlus, width: 18, height: 18 }
-                            span { "添加订阅" }
+                        if matches!(current_view, AppView::Overview | AppView::Nodes | AppView::Subscriptions) {
+                            button {
+                                class: "primary-button compact",
+                                onclick: move |_| {
+                                    import_error.set(None);
+                                    import_open.set(true);
+                                },
+                                Icon { icon: LdPlus, width: 18, height: 18 }
+                                span { "添加订阅" }
+                            }
                         }
                     }
                 }
@@ -359,6 +386,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             core_note,
                             tunnel_mode,
                             tun_enabled,
+                            custom_rules,
                             connection_allowed,
                             latency_results,
                             traffic,
@@ -388,6 +416,14 @@ pub fn ProxyApp(platform: String) -> Element {
                             notice,
                         }
                     },
+                    AppView::Rules => rsx! {
+                        RulesView {
+                            rules: custom_rules,
+                            connected,
+                            tunnel_mode,
+                            notice,
+                        }
+                    },
                     AppView::Logs => rsx! {
                         LogsView { logs: core_logs, connected }
                     },
@@ -412,6 +448,7 @@ pub fn ProxyApp(platform: String) -> Element {
                 NavItem { view: AppView::Overview, active_view }
                 NavItem { view: AppView::Nodes, active_view }
                 NavItem { view: AppView::Subscriptions, active_view }
+                NavItem { view: AppView::Rules, active_view }
                 NavItem { view: AppView::Logs, active_view }
                 NavItem { view: AppView::Settings, active_view }
             }
@@ -567,6 +604,7 @@ fn NavItem(view: AppView, mut active_view: Signal<AppView>) -> Element {
                 AppView::Overview => rsx! { Icon { icon: LdGauge, width: 20, height: 20 } },
                 AppView::Nodes => rsx! { Icon { icon: LdServer, width: 20, height: 20 } },
                 AppView::Subscriptions => rsx! { Icon { icon: LdRadioTower, width: 20, height: 20 } },
+                AppView::Rules => rsx! { Icon { icon: LdListFilter, width: 20, height: 20 } },
                 AppView::Logs => rsx! { Icon { icon: LdScrollText, width: 20, height: 20 } },
                 AppView::Settings => rsx! { Icon { icon: LdSettings, width: 20, height: 20 } },
             }
@@ -585,6 +623,7 @@ fn OverviewView(
     mut core_note: Signal<Option<String>>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
+    custom_rules: Signal<Vec<CustomRule>>,
     connection_allowed: bool,
     latency_results: Signal<HashMap<String, NodeLatency>>,
     traffic: Signal<TrafficDisplay>,
@@ -667,6 +706,7 @@ fn OverviewView(
                             selected_tag: selected_tag(),
                             mode: tunnel_mode(),
                             tun: tun_enabled(),
+                            custom_rules: custom_rules(),
                         });
                         match api::set_core_enabled(target, request).await {
                             Ok(status) => {
@@ -1153,6 +1193,493 @@ fn SubscriptionRow(
 }
 
 #[component]
+fn RulesView(
+    mut rules: Signal<Vec<CustomRule>>,
+    connected: Signal<bool>,
+    tunnel_mode: Signal<TunnelMode>,
+    mut notice: Signal<Option<String>>,
+) -> Element {
+    let mut editor_open = use_signal(|| false);
+    let mut editing_id = use_signal(|| None::<u64>);
+    let mut draft_match = use_signal(|| CustomRuleMatch::DomainSuffix);
+    let mut draft_action = use_signal(|| CustomRuleAction::Direct);
+    let mut draft_value = use_signal(String::new);
+    let mut editor_error = use_signal(|| None::<String>);
+    let stored = rules();
+    let enabled_count = stored.iter().filter(|rule| rule.enabled).count();
+    let total = stored.len();
+    let rule_mode_active = tunnel_mode() == TunnelMode::Rule;
+
+    let mut open_new_editor = move || {
+        editing_id.set(None);
+        draft_match.set(CustomRuleMatch::DomainSuffix);
+        draft_action.set(CustomRuleAction::Direct);
+        draft_value.set(String::new());
+        editor_error.set(None);
+        editor_open.set(true);
+    };
+    let on_edit = move |rule: CustomRule| {
+        editing_id.set(Some(rule.id));
+        draft_match.set(rule.match_type);
+        draft_action.set(rule.action);
+        draft_value.set(rule.value);
+        editor_error.set(None);
+        editor_open.set(true);
+    };
+    let placeholder = custom_rule_placeholder(draft_match());
+
+    rsx! {
+        section { class: "workspace-section rules-workspace glass-surface",
+            div { class: "workspace-toolbar rules-toolbar",
+                div {
+                    div { class: "section-title-line",
+                        h2 { "自定义分流" }
+                        span {
+                            class: if rule_mode_active { "status-badge online" } else { "status-badge" },
+                            if rule_mode_active { "规则模式" } else { "未启用" }
+                        }
+                    }
+                    p { "{enabled_count} 条启用 · {total} 条规则" }
+                }
+                button {
+                    class: "primary-button compact",
+                    disabled: total >= MAX_CUSTOM_RULES,
+                    onclick: move |_| open_new_editor(),
+                    Icon { icon: LdPlus, width: 17, height: 17 }
+                    span { "添加规则" }
+                }
+            }
+
+            if editor_open() {
+                div { class: "rule-editor",
+                    div { class: "rule-editor-grid",
+                        div { class: "rule-field",
+                            span { "动作" }
+                            RuleSelect {
+                                label: "动作".to_string(),
+                                value: custom_rule_action_value(draft_action()).to_string(),
+                                options: vec![
+                                    RuleSelectOption::new("direct", "直连"),
+                                    RuleSelectOption::new("proxy", "代理"),
+                                    RuleSelectOption::new("block", "拦截"),
+                                ],
+                                on_select: move |value: String| {
+                                    draft_action.set(parse_custom_rule_action(&value));
+                                },
+                            }
+                        }
+                        div { class: "rule-field",
+                            span { "匹配类型" }
+                            RuleSelect {
+                                label: "匹配类型".to_string(),
+                                value: custom_rule_match_value(draft_match()).to_string(),
+                                options: vec![
+                                    RuleSelectOption::new("domain", "精确域名"),
+                                    RuleSelectOption::new("domain_suffix", "域名后缀"),
+                                    RuleSelectOption::new("domain_keyword", "域名关键字"),
+                                    RuleSelectOption::new("ip_cidr", "IP CIDR"),
+                                ],
+                                on_select: move |value: String| {
+                                    draft_match.set(parse_custom_rule_match(&value));
+                                    editor_error.set(None);
+                                },
+                            }
+                        }
+                        label { class: "rule-field rule-value-field",
+                            span { "匹配内容" }
+                            input {
+                                value: draft_value,
+                                placeholder,
+                                spellcheck: "false",
+                                oninput: move |event| {
+                                    draft_value.set(event.value());
+                                    editor_error.set(None);
+                                },
+                                onkeydown: move |event| {
+                                    if event.key() == Key::Enter {
+                                        match save_custom_rule(
+                                            &mut rules.write(),
+                                            editing_id(),
+                                            draft_match(),
+                                            draft_action(),
+                                            &draft_value(),
+                                        ) {
+                                            Ok(()) => {
+                                                editor_open.set(false);
+                                                notify_rule_change(connected(), &mut notice);
+                                            }
+                                            Err(error) => editor_error.set(Some(error)),
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    if let Some(error) = editor_error() {
+                        div { class: "field-error",
+                            Icon { icon: LdCircleAlert, width: 15, height: 15 }
+                            span { "{error}" }
+                        }
+                    }
+                    div { class: "rule-editor-actions",
+                        button {
+                            class: "secondary-button",
+                            onclick: move |_| {
+                                editor_open.set(false);
+                                editor_error.set(None);
+                            },
+                            "取消"
+                        }
+                        button {
+                            class: "primary-button",
+                            onclick: move |_| {
+                                match save_custom_rule(
+                                    &mut rules.write(),
+                                    editing_id(),
+                                    draft_match(),
+                                    draft_action(),
+                                    &draft_value(),
+                                ) {
+                                    Ok(()) => {
+                                        editor_open.set(false);
+                                        notify_rule_change(connected(), &mut notice);
+                                    }
+                                    Err(error) => editor_error.set(Some(error)),
+                                }
+                            },
+                            Icon { icon: LdSave, width: 16, height: 16 }
+                            if editing_id().is_some() { "保存" } else { "添加" }
+                        }
+                    }
+                }
+            }
+
+            if stored.is_empty() {
+                div { class: "large-empty rules-empty",
+                    span { class: "empty-icon", Icon { icon: LdListFilter, width: 28, height: 28 } }
+                    strong { "暂无自定义规则" }
+                }
+            } else {
+                div { class: "rule-list",
+                    for (index, rule) in stored.into_iter().enumerate() {
+                        RuleListItem {
+                            key: "{rule.id}",
+                            rule,
+                            index,
+                            total,
+                            rules,
+                            connected: connected(),
+                            notice,
+                            on_edit,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RuleSelect(
+    label: String,
+    value: String,
+    options: Vec<RuleSelectOption>,
+    on_select: EventHandler<String>,
+) -> Element {
+    let mut open = use_signal(|| false);
+    let selected_label = options
+        .iter()
+        .find(|option| option.value == value)
+        .map(|option| option.label.clone())
+        .unwrap_or_else(|| value.clone());
+    let trigger_label = label.clone();
+    let menu_label = label;
+
+    rsx! {
+        div { class: if open() { "rule-select-control open" } else { "rule-select-control" },
+            button {
+                r#type: "button",
+                class: "rule-select-trigger",
+                aria_label: trigger_label,
+                aria_haspopup: "listbox",
+                aria_expanded: if open() { "true" } else { "false" },
+                onclick: move |event| {
+                    event.stop_propagation();
+                    open.set(!open());
+                },
+                onkeydown: move |event| {
+                    match event.key() {
+                        Key::ArrowDown | Key::ArrowUp => {
+                            event.prevent_default();
+                            open.set(true);
+                        }
+                        Key::Escape => {
+                            event.prevent_default();
+                            open.set(false);
+                        }
+                        _ => {}
+                    }
+                },
+                span { "{selected_label}" }
+                Icon { icon: LdChevronDown, width: 16, height: 16 }
+            }
+            if open() {
+                div {
+                    class: "rule-select-backdrop",
+                    aria_hidden: "true",
+                    onclick: move |_| open.set(false),
+                }
+                div { class: "rule-select-menu", role: "listbox", aria_label: menu_label,
+                    for option in options {
+                        {
+                            let option_value = option.value.clone();
+                            let selected = option.value == value;
+                            rsx! {
+                                button {
+                                    key: "{option.value}",
+                                    r#type: "button",
+                                    role: "option",
+                                    aria_selected: if selected { "true" } else { "false" },
+                                    class: if selected { "rule-select-option selected" } else { "rule-select-option" },
+                                    onclick: move |event| {
+                                        event.stop_propagation();
+                                        on_select.call(option_value.clone());
+                                        open.set(false);
+                                    },
+                                    span { "{option.label}" }
+                                    if selected {
+                                        Icon { icon: LdCheck, width: 15, height: 15 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RuleListItem(
+    rule: CustomRule,
+    index: usize,
+    total: usize,
+    mut rules: Signal<Vec<CustomRule>>,
+    connected: bool,
+    mut notice: Signal<Option<String>>,
+    on_edit: EventHandler<CustomRule>,
+) -> Element {
+    let rule_id = rule.id;
+    let edit_rule = rule.clone();
+    let enabled = rule.enabled;
+    let action = rule.action;
+    let match_type = rule.match_type;
+    let priority = index + 1;
+
+    rsx! {
+        div { class: if enabled { "rule-row" } else { "rule-row disabled" },
+            span { class: "rule-priority", "{priority:02}" }
+            span { class: custom_rule_action_class(action),
+                match action {
+                    CustomRuleAction::Direct => rsx! { Icon { icon: LdRoute, width: 15, height: 15 } },
+                    CustomRuleAction::Proxy => rsx! { Icon { icon: LdShieldCheck, width: 15, height: 15 } },
+                    CustomRuleAction::Block => rsx! { Icon { icon: LdBan, width: 15, height: 15 } },
+                }
+                {custom_rule_action_label(action)}
+            }
+            div { class: "rule-main",
+                strong { title: rule.value.clone(), "{rule.value}" }
+                small { "{custom_rule_match_label(match_type)}" }
+            }
+            label { class: "rule-enabled-toggle", title: if enabled { "停用规则" } else { "启用规则" },
+                input {
+                    r#type: "checkbox",
+                    checked: enabled,
+                    onchange: move |event| {
+                        if let Some(stored) = rules.write().iter_mut().find(|item| item.id == rule_id) {
+                            stored.enabled = event.checked();
+                            notify_rule_change(connected, &mut notice);
+                        }
+                    },
+                }
+                span { class: "switch" }
+            }
+            div { class: "rule-row-actions",
+                button {
+                    class: "icon-button",
+                    title: "上移",
+                    disabled: index == 0,
+                    onclick: move |_| {
+                        move_custom_rule(&mut rules.write(), rule_id, -1);
+                        notify_rule_change(connected, &mut notice);
+                    },
+                    Icon { icon: LdArrowUp, width: 16, height: 16 }
+                }
+                button {
+                    class: "icon-button",
+                    title: "下移",
+                    disabled: index + 1 >= total,
+                    onclick: move |_| {
+                        move_custom_rule(&mut rules.write(), rule_id, 1);
+                        notify_rule_change(connected, &mut notice);
+                    },
+                    Icon { icon: LdArrowDown, width: 16, height: 16 }
+                }
+                button {
+                    class: "icon-button",
+                    title: "编辑规则",
+                    onclick: move |_| on_edit.call(edit_rule.clone()),
+                    Icon { icon: LdPencil, width: 16, height: 16 }
+                }
+                button {
+                    class: "icon-button danger",
+                    title: "删除规则",
+                    onclick: move |_| {
+                        rules.write().retain(|item| item.id != rule_id);
+                        notify_rule_change(connected, &mut notice);
+                    },
+                    Icon { icon: LdTrash2, width: 16, height: 16 }
+                }
+            }
+        }
+    }
+}
+
+fn save_custom_rule(
+    rules: &mut Vec<CustomRule>,
+    editing_id: Option<u64>,
+    match_type: CustomRuleMatch,
+    action: CustomRuleAction,
+    value: &str,
+) -> Result<(), String> {
+    if editing_id.is_none() && rules.len() >= MAX_CUSTOM_RULES {
+        return Err(format!("最多添加 {MAX_CUSTOM_RULES} 条规则"));
+    }
+    let id = editing_id
+        .or_else(|| next_custom_rule_id(rules))
+        .ok_or_else(|| "无法生成规则 ID".to_string())?;
+    let enabled = rules
+        .iter()
+        .find(|rule| rule.id == id)
+        .map(|rule| rule.enabled)
+        .unwrap_or(true);
+    let candidate = CustomRule {
+        id,
+        enabled,
+        match_type,
+        value: value.to_string(),
+        action,
+    }
+    .normalized()
+    .map_err(|error| error.to_string())?;
+
+    let mut updated = rules.clone();
+    if let Some(existing) = updated.iter_mut().find(|rule| rule.id == id) {
+        *existing = candidate;
+    } else if editing_id.is_some() {
+        return Err("要编辑的规则不存在".to_string());
+    } else {
+        updated.push(candidate);
+    }
+    validate_custom_rules(&updated).map_err(|error| error.to_string())?;
+    *rules = updated;
+    Ok(())
+}
+
+fn next_custom_rule_id(rules: &[CustomRule]) -> Option<u64> {
+    (1..=(rules.len() as u64 + 1)).find(|id| rules.iter().all(|rule| rule.id != *id))
+}
+
+fn move_custom_rule(rules: &mut [CustomRule], id: u64, offset: isize) {
+    let Some(index) = rules.iter().position(|rule| rule.id == id) else {
+        return;
+    };
+    let Some(target) = index.checked_add_signed(offset) else {
+        return;
+    };
+    if target < rules.len() {
+        rules.swap(index, target);
+    }
+}
+
+fn notify_rule_change(connected: bool, notice: &mut Signal<Option<String>>) {
+    notice.set(Some(if connected {
+        "规则已保存，重新连接后生效".to_string()
+    } else {
+        "规则已保存".to_string()
+    }));
+}
+
+fn custom_rule_action_value(action: CustomRuleAction) -> &'static str {
+    match action {
+        CustomRuleAction::Direct => "direct",
+        CustomRuleAction::Proxy => "proxy",
+        CustomRuleAction::Block => "block",
+    }
+}
+
+fn parse_custom_rule_action(value: &str) -> CustomRuleAction {
+    match value {
+        "proxy" => CustomRuleAction::Proxy,
+        "block" => CustomRuleAction::Block,
+        _ => CustomRuleAction::Direct,
+    }
+}
+
+fn custom_rule_match_value(match_type: CustomRuleMatch) -> &'static str {
+    match match_type {
+        CustomRuleMatch::Domain => "domain",
+        CustomRuleMatch::DomainSuffix => "domain_suffix",
+        CustomRuleMatch::DomainKeyword => "domain_keyword",
+        CustomRuleMatch::IpCidr => "ip_cidr",
+    }
+}
+
+fn parse_custom_rule_match(value: &str) -> CustomRuleMatch {
+    match value {
+        "domain" => CustomRuleMatch::Domain,
+        "domain_keyword" => CustomRuleMatch::DomainKeyword,
+        "ip_cidr" => CustomRuleMatch::IpCidr,
+        _ => CustomRuleMatch::DomainSuffix,
+    }
+}
+
+fn custom_rule_match_label(match_type: CustomRuleMatch) -> &'static str {
+    match match_type {
+        CustomRuleMatch::Domain => "精确域名",
+        CustomRuleMatch::DomainSuffix => "域名后缀",
+        CustomRuleMatch::DomainKeyword => "域名关键字",
+        CustomRuleMatch::IpCidr => "IP CIDR",
+    }
+}
+
+fn custom_rule_placeholder(match_type: CustomRuleMatch) -> &'static str {
+    match match_type {
+        CustomRuleMatch::Domain => "api.example.com",
+        CustomRuleMatch::DomainSuffix => "example.com",
+        CustomRuleMatch::DomainKeyword => "google",
+        CustomRuleMatch::IpCidr => "203.0.113.0/24",
+    }
+}
+
+fn custom_rule_action_label(action: CustomRuleAction) -> &'static str {
+    match action {
+        CustomRuleAction::Direct => "直连",
+        CustomRuleAction::Proxy => "代理",
+        CustomRuleAction::Block => "拦截",
+    }
+}
+
+fn custom_rule_action_class(action: CustomRuleAction) -> &'static str {
+    match action {
+        CustomRuleAction::Direct => "rule-action direct",
+        CustomRuleAction::Proxy => "rule-action proxy",
+        CustomRuleAction::Block => "rule-action block",
+    }
+}
+
+#[component]
 fn LogsView(mut logs: Signal<Vec<CoreLogEntry>>, connected: Signal<bool>) -> Element {
     let mut filter = use_signal(|| LogFilter::Routes);
     let mut search = use_signal(String::new);
@@ -1168,6 +1695,12 @@ fn LogsView(mut logs: Signal<Vec<CoreLogEntry>>, connected: Signal<bool>) -> Ele
         .iter()
         .filter(|entry| {
             entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Proxy)
+        })
+        .count();
+    let block_count = stored
+        .iter()
+        .filter(|entry| {
+            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Block)
         })
         .count();
     let query = search().trim().to_ascii_lowercase();
@@ -1224,6 +1757,11 @@ fn LogsView(mut logs: Signal<Vec<CoreLogEntry>>, connected: Signal<bool>) -> Ele
                         onclick: move |_| filter.set(LogFilter::Proxy),
                         "代理 {proxy_count}"
                     }
+                    button {
+                        class: if filter() == LogFilter::Block { "active" } else { "" },
+                        onclick: move |_| filter.set(LogFilter::Block),
+                        "拦截 {block_count}"
+                    }
                 }
                 label { class: "search-field log-search",
                     Icon { icon: LdSearch, width: 17, height: 17 }
@@ -1274,6 +1812,7 @@ fn LogRow(entry: CoreLogEntry) -> Element {
                     class: match route.decision {
                         RouteDecision::Direct => "route-decision direct",
                         RouteDecision::Proxy => "route-decision proxy",
+                        RouteDecision::Block => "route-decision block",
                     },
                     {route_decision_label(route.decision)}
                 }
@@ -1309,6 +1848,9 @@ fn log_matches_filter(entry: &CoreLogEntry, filter: LogFilter) -> bool {
         LogFilter::Proxy => {
             entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Proxy)
         }
+        LogFilter::Block => {
+            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Block)
+        }
     }
 }
 
@@ -1327,6 +1869,7 @@ fn route_decision_label(decision: RouteDecision) -> &'static str {
     match decision {
         RouteDecision::Direct => "直连",
         RouteDecision::Proxy => "代理",
+        RouteDecision::Block => "拦截",
     }
 }
 
@@ -1813,5 +2356,75 @@ mod tests {
         assert_eq!(format_data_rate(1_536), "1.5 KiB/s");
         assert_eq!(format_data_amount(2 * 1024 * 1024), "2.0 MiB");
         assert_eq!(traffic_chart_height(50, 100), "50%");
+    }
+
+    #[test]
+    fn saves_normalized_custom_rules_and_rejects_duplicates() {
+        let mut rules = Vec::new();
+        assert_eq!(
+            save_custom_rule(
+                &mut rules,
+                None,
+                CustomRuleMatch::DomainSuffix,
+                CustomRuleAction::Proxy,
+                "*.Example.COM.",
+            ),
+            Ok(())
+        );
+        assert_eq!(rules[0].id, 1);
+        assert_eq!(rules[0].value, "example.com");
+
+        assert_eq!(
+            save_custom_rule(
+                &mut rules,
+                None,
+                CustomRuleMatch::DomainSuffix,
+                CustomRuleAction::Direct,
+                "example.com",
+            ),
+            Err("已存在相同的匹配规则".to_string())
+        );
+    }
+
+    #[test]
+    fn editing_and_moving_custom_rules_preserves_state() {
+        let mut rules = vec![
+            CustomRule {
+                id: 1,
+                enabled: false,
+                match_type: CustomRuleMatch::Domain,
+                value: "one.example".to_string(),
+                action: CustomRuleAction::Direct,
+            },
+            CustomRule {
+                id: 2,
+                enabled: true,
+                match_type: CustomRuleMatch::IpCidr,
+                value: "203.0.113.0/24".to_string(),
+                action: CustomRuleAction::Block,
+            },
+        ];
+
+        assert!(save_custom_rule(
+            &mut rules,
+            Some(1),
+            CustomRuleMatch::DomainKeyword,
+            CustomRuleAction::Proxy,
+            "Media",
+        )
+        .is_ok());
+        assert!(!rules[0].enabled);
+        assert_eq!(rules[0].value, "media");
+
+        move_custom_rule(&mut rules, 2, -1);
+        assert_eq!(
+            rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        move_custom_rule(&mut rules, 2, -1);
+        assert_eq!(
+            rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
     }
 }

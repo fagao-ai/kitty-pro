@@ -1,4 +1,7 @@
-use crate::{ConnectionRequest, ProxyAuth, ProxyNode, ProxyProtocol, TunnelMode};
+use crate::{
+    normalize_custom_rule_value, ConnectionRequest, CustomRule, ProxyAuth, ProxyNode,
+    ProxyProtocol, TunnelMode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
@@ -72,18 +75,20 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         TunnelMode::Direct => "direct",
         TunnelMode::Rule | TunnelMode::Global => "proxy",
     };
-    let rules = match request.mode {
-        TunnelMode::Rule => vec![
-            json!({ "port": 53, "action": "hijack-dns" }),
-            json!({ "action": "sniff" }),
-            json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }),
-            json!({ "rule_set": "geosite-cn", "action": "route", "outbound": "direct" }),
-            json!({ "rule_set": "geoip-cn", "action": "route", "outbound": "direct" }),
-        ],
-        TunnelMode::Global | TunnelMode::Direct => {
-            vec![json!({ "port": 53, "action": "hijack-dns" })]
-        }
-    };
+    let mut rules = vec![json!({ "port": 53, "action": "hijack-dns" })];
+    if request.mode == TunnelMode::Rule {
+        rules.push(json!({ "action": "sniff" }));
+        rules.push(json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }));
+        rules.extend(
+            request
+                .custom_rules
+                .iter()
+                .filter(|rule| rule.enabled)
+                .filter_map(custom_rule_to_value),
+        );
+        rules.push(json!({ "rule_set": "geosite-cn", "action": "route", "outbound": "direct" }));
+        rules.push(json!({ "rule_set": "geoip-cn", "action": "route", "outbound": "direct" }));
+    }
     let rule_sets = match request.mode {
         TunnelMode::Rule => vec![
             json!({
@@ -122,7 +127,10 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
-            "auto_detect_interface": true,
+            // Mixed/system-proxy connections must follow host routes so
+            // tailnets and other VPN interfaces remain reachable. Desktop
+            // TUN mode still pins outbounds to avoid re-entering its own TUN.
+            "auto_detect_interface": request.tun,
             "rules": rules,
             "rule_set": rule_sets,
             "final": route_final,
@@ -137,6 +145,15 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         });
     }
     config
+}
+
+fn custom_rule_to_value(rule: &CustomRule) -> Option<Value> {
+    let value = normalize_custom_rule_value(rule.match_type, &rule.value).ok()?;
+    let mut object = Map::new();
+    object.insert(rule.match_type.singbox_field().to_string(), json!([value]));
+    object.insert("action".to_string(), json!("route"));
+    object.insert("outbound".to_string(), json!(rule.action.outbound()));
+    Some(Value::Object(object))
 }
 
 fn node_to_outbound(node: &ProxyNode) -> Value {
@@ -269,6 +286,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             nodes,
             mode: TunnelMode::Rule,
             tun: true,
+            custom_rules: Vec::new(),
         };
 
         let config = build_singbox_config(
@@ -284,6 +302,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert_eq!(config["outbounds"][2]["type"], "selector");
         assert_eq!(config["inbounds"][1]["type"], "tun");
         assert_eq!(config["route"]["final"], "proxy");
+        assert_eq!(config["route"]["auto_detect_interface"], true);
         assert_eq!(config["route"]["rules"][0]["port"], 53);
         assert_eq!(config["route"]["rules"][1]["action"], "sniff");
         assert_eq!(
@@ -322,14 +341,90 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
                 nodes: nodes.clone(),
                 mode,
                 tun: false,
+                custom_rules: Vec::new(),
             };
             let config = build_singbox_config(&request, &SingBoxOptions::default());
 
             assert_eq!(config["route"]["final"], expected_final);
+            assert_eq!(config["route"]["auto_detect_interface"], false);
             assert_eq!(config["route"]["rules"].as_array().map(Vec::len), Some(1));
             assert!(config["route"]["rule_set"]
                 .as_array()
                 .is_some_and(Vec::is_empty));
         }
+    }
+
+    #[test]
+    fn custom_rules_keep_priority_and_map_to_native_singbox_fields() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            mode: TunnelMode::Rule,
+            tun: false,
+            custom_rules: vec![
+                CustomRule {
+                    id: 1,
+                    enabled: true,
+                    match_type: crate::CustomRuleMatch::DomainSuffix,
+                    value: "*.Example.com".to_string(),
+                    action: crate::CustomRuleAction::Proxy,
+                },
+                CustomRule {
+                    id: 2,
+                    enabled: true,
+                    match_type: crate::CustomRuleMatch::IpCidr,
+                    value: "203.0.113.9/24".to_string(),
+                    action: crate::CustomRuleAction::Block,
+                },
+                CustomRule {
+                    id: 3,
+                    enabled: false,
+                    match_type: crate::CustomRuleMatch::DomainKeyword,
+                    value: "disabled".to_string(),
+                    action: crate::CustomRuleAction::Direct,
+                },
+            ],
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        let rules = config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array");
+
+        assert_eq!(rules[2]["ip_is_private"], true);
+        assert_eq!(rules[3]["domain_suffix"], json!(["example.com"]));
+        assert_eq!(rules[3]["outbound"], "proxy");
+        assert_eq!(rules[4]["ip_cidr"], json!(["203.0.113.0/24"]));
+        assert_eq!(rules[4]["outbound"], "block");
+        assert_eq!(rules[5]["rule_set"], "geosite-cn");
+        assert_eq!(rules.len(), 7);
+    }
+
+    #[test]
+    fn custom_rules_are_inactive_outside_rule_mode() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            mode: TunnelMode::Global,
+            tun: false,
+            custom_rules: vec![CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: crate::CustomRuleMatch::Domain,
+                value: "example.com".to_string(),
+                action: crate::CustomRuleAction::Block,
+            }],
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        assert_eq!(config["route"]["rules"].as_array().map(Vec::len), Some(1));
     }
 }
