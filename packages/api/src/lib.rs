@@ -127,7 +127,9 @@ pub async fn preview_subscription(source: String) -> Result<ParseReport, ServerF
         return Err(ServerFnError::new("请输入订阅地址或内容"));
     }
 
-    let content = if source.starts_with("http://") || source.starts_with("https://") {
+    let content = if (source.starts_with("http://") || source.starts_with("https://"))
+        && !proxy_core::is_http_proxy_share_link(&source)
+    {
         download_subscription(&source).await?
     } else {
         source
@@ -1617,6 +1619,23 @@ mod tests {
         assert_eq!(report.nodes[0].protocol, proxy_core::ProxyProtocol::Trojan);
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+    #[test]
+    fn native_http_proxy_preview_is_not_downloaded_as_a_subscription() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("native test runtime should start");
+        let report = runtime
+            .block_on(preview_subscription(
+                "http://100.64.0.2:11080#Company".to_string(),
+            ))
+            .expect("HTTP proxy URI should parse locally");
+
+        assert_eq!(report.nodes.len(), 1);
+        assert_eq!(report.nodes[0].protocol, proxy_core::ProxyProtocol::Http);
+        assert_eq!(report.nodes[0].server, "100.64.0.2");
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn native_blocking_operations_run_off_the_calling_thread() {
@@ -1657,6 +1676,12 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| result.latency_ms.is_some() || result.error.is_some()));
+        if std::env::var("KITTY_TEST_REQUIRE_SUCCESS").as_deref() == Ok("1") {
+            assert!(
+                results.iter().any(|result| result.latency_ms.is_some()),
+                "live probe returned no successful nodes: {results:?}"
+            );
+        }
     }
 
     #[test]

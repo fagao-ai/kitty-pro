@@ -9,7 +9,23 @@ discover, start, or require a `sing-box` executable at runtime.
 
 - Base64 and unpadded Base64 share-link subscriptions
 - Clash YAML `proxies` subscriptions
-- Hysteria2, VMess, VLESS, Trojan, and Shadowsocks nodes
+- Hysteria2, VMess, VLESS, Trojan, Shadowsocks, HTTP/HTTPS proxy, and SOCKS5 nodes
+
+HTTP and SOCKS upstream proxies can be imported as a single-node source. Add a
+fragment to give the node a useful display name:
+
+```text
+http://100.64.0.2:11080#Company
+https://user:password@proxy.example.com:8443#Secure
+socks5://user:password@proxy.example.com:1080#SOCKS5
+```
+
+Select the upstream node and use Rule mode to route matching traffic either to
+the selected proxy, directly, or to the block outbound. System proxy mode
+covers proxy-aware desktop applications. Android VpnService captures system
+traffic; desktop TUN additionally requires the platform's network privileges.
+Literal IP proxy endpoints are excluded from desktop TUN routes to prevent the
+upstream connection from looping back into the tunnel.
 
 `proxy-core` owns parsing and sing-box JSON generation, so every Dioxus shell
 uses the same Rust types and configuration logic.

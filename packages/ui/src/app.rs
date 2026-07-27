@@ -494,7 +494,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                 span { "订阅地址或内容" }
                                 textarea {
                                     value: import_source,
-                                    placeholder: "https://...",
+                                    placeholder: "订阅地址，或 http://host:port#节点名称",
                                     rows: 5,
                                     oninput: move |event| import_source.set(event.value()),
                                 }
@@ -2104,6 +2104,8 @@ fn protocol_abbreviation(protocol: ProxyProtocol) -> &'static str {
         ProxyProtocol::Vless => "VL",
         ProxyProtocol::Trojan => "TR",
         ProxyProtocol::Shadowsocks => "SS",
+        ProxyProtocol::Http => "HT",
+        ProxyProtocol::Socks5 => "SO",
     }
 }
 
@@ -2114,6 +2116,8 @@ fn protocol_class(protocol: ProxyProtocol) -> &'static str {
         ProxyProtocol::Vless => "protocol-mark vless",
         ProxyProtocol::Trojan => "protocol-mark trojan",
         ProxyProtocol::Shadowsocks => "protocol-mark shadowsocks",
+        ProxyProtocol::Http => "protocol-mark http",
+        ProxyProtocol::Socks5 => "protocol-mark socks5",
     }
 }
 

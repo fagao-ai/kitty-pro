@@ -75,8 +75,28 @@ pub fn parse_share_link(link: &str, index: usize) -> Result<ProxyNode, ParseErro
         "trojan" => parse_standard_url(link, index, ProxyProtocol::Trojan),
         "vmess" => parse_vmess(link, index),
         "ss" => parse_shadowsocks(link, index),
+        "http" => parse_proxy_url(link, index, ProxyProtocol::Http, false),
+        "https" => parse_proxy_url(link, index, ProxyProtocol::Http, true),
+        "socks" | "socks5" => parse_proxy_url(link, index, ProxyProtocol::Socks5, false),
         _ => Err(ParseError::UnsupportedProtocol(scheme)),
     }
+}
+
+pub fn is_http_proxy_share_link(value: &str) -> bool {
+    if value.lines().count() != 1 {
+        return false;
+    }
+    let Ok(url) = Url::parse(value.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") || !matches!(url.path(), "" | "/") {
+        return false;
+    }
+
+    url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || (url.port().is_some() && url.query().is_none())
 }
 
 fn parse_uri_lines(text: &str) -> ParseReport {
@@ -162,6 +182,55 @@ fn parse_standard_url(
         transport,
         tls,
         hysteria2,
+    })
+}
+
+fn parse_proxy_url(
+    link: &str,
+    index: usize,
+    protocol: ProxyProtocol,
+    tls_enabled: bool,
+) -> Result<ProxyNode, ParseError> {
+    let url = Url::parse(link).map_err(|error| ParseError::InvalidUrl(error.to_string()))?;
+    let server = url
+        .host_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(ParseError::MissingField("server"))?
+        .to_string();
+    let port = url.port().or_else(|| match protocol {
+        ProxyProtocol::Http if tls_enabled => Some(443),
+        ProxyProtocol::Http => Some(80),
+        ProxyProtocol::Socks5 => Some(1080),
+        _ => None,
+    });
+    let port = port.ok_or(ParseError::InvalidPort)?;
+    let username = decode_component(url.username());
+    let password = url.password().map(decode_component);
+    let auth = if username.is_empty() && password.is_none() {
+        ProxyAuth::None
+    } else {
+        ProxyAuth::UserPassword {
+            username,
+            password: password.unwrap_or_default(),
+        }
+    };
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let mut tls = TlsOptions::default();
+    if tls_enabled {
+        tls = tls_from_query(&query, true);
+    }
+    let name = fragment_name(&url).unwrap_or_else(|| format!("{} {}", protocol.label(), index + 1));
+
+    Ok(ProxyNode {
+        tag: make_tag(&name, index),
+        name,
+        protocol,
+        server,
+        port,
+        auth,
+        transport: TransportOptions::default(),
+        tls,
+        hysteria2: None,
     })
 }
 
@@ -319,6 +388,8 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
         "vless" => ProxyProtocol::Vless,
         "trojan" => ProxyProtocol::Trojan,
         "ss" | "shadowsocks" => ProxyProtocol::Shadowsocks,
+        "http" | "https" => ProxyProtocol::Http,
+        "socks" | "socks5" => ProxyProtocol::Socks5,
         _ => return Err(ParseError::UnsupportedProtocol(kind)),
     };
     let name =
@@ -341,6 +412,18 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
             password: yaml_string(mapping, "password")
                 .ok_or(ParseError::MissingField("password"))?,
         },
+        ProxyProtocol::Http | ProxyProtocol::Socks5 => {
+            let username = yaml_string(mapping, "username");
+            let password = yaml_string(mapping, "password");
+            if username.is_none() && password.is_none() {
+                ProxyAuth::None
+            } else {
+                ProxyAuth::UserPassword {
+                    username: username.unwrap_or_default(),
+                    password: password.unwrap_or_default(),
+                }
+            }
+        }
     };
 
     let network = yaml_string(mapping, "network").unwrap_or_else(|| "tcp".to_string());
@@ -363,6 +446,7 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
         .and_then(YamlValue::as_mapping)
         .and_then(|grpc| yaml_string(grpc, "grpc-service-name"));
     let tls_enabled = protocol == ProxyProtocol::Hysteria2
+        || (protocol == ProxyProtocol::Http && kind == "https")
         || yaml_bool(mapping, "tls").unwrap_or(false)
         || yaml_string(mapping, "security")
             .is_some_and(|value| value == "tls" || value == "reality");
@@ -539,6 +623,10 @@ fn contains_share_link(text: &str) -> bool {
         "hysteria2://",
         "hy2://",
         "ss://",
+        "http://",
+        "https://",
+        "socks://",
+        "socks5://",
     ]
     .iter()
     .any(|scheme| text.to_ascii_lowercase().contains(scheme))
@@ -719,5 +807,70 @@ proxies:
 
         assert_eq!(report.nodes.len(), 2);
         assert!(report.rejected.is_empty());
+    }
+
+    #[test]
+    fn parses_http_https_and_socks5_proxy_links() {
+        let report = parse_subscription(
+            "http://100.64.0.2:11080#Company\n\
+https://alice:s%40cret@proxy.example.com:8443?insecure=1#Secure\n\
+socks5://bob:pass@127.0.0.1:1080#Socks",
+        );
+
+        assert_eq!(report.nodes.len(), 3);
+        assert!(report.rejected.is_empty());
+        assert_eq!(report.nodes[0].protocol, ProxyProtocol::Http);
+        assert_eq!(report.nodes[0].auth, ProxyAuth::None);
+        assert_eq!(report.nodes[1].protocol, ProxyProtocol::Http);
+        assert!(report.nodes[1].tls.enabled);
+        assert!(report.nodes[1].tls.insecure);
+        assert_eq!(
+            report.nodes[1].auth,
+            ProxyAuth::UserPassword {
+                username: "alice".to_string(),
+                password: "s@cret".to_string(),
+            }
+        );
+        assert_eq!(report.nodes[2].protocol, ProxyProtocol::Socks5);
+    }
+
+    #[test]
+    fn distinguishes_http_proxy_links_from_subscription_urls() {
+        assert!(is_http_proxy_share_link("http://100.64.0.2:11080#Company"));
+        assert!(is_http_proxy_share_link(
+            "https://user:pass@proxy.example.com"
+        ));
+        assert!(!is_http_proxy_share_link(
+            "https://example.com/api/subscription?token=secret"
+        ));
+    }
+
+    #[test]
+    fn parses_clash_http_and_socks5_proxies() {
+        let report = parse_subscription(
+            r#"
+proxies:
+  - name: Company HTTP
+    type: http
+    server: 100.64.0.2
+    port: 11080
+  - name: Office SOCKS
+    type: socks5
+    server: socks.example.com
+    port: 1080
+    username: alice
+    password: secret
+"#,
+        );
+
+        assert_eq!(report.nodes.len(), 2);
+        assert!(report.rejected.is_empty());
+        assert_eq!(report.nodes[0].protocol, ProxyProtocol::Http);
+        assert_eq!(report.nodes[0].auth, ProxyAuth::None);
+        assert_eq!(report.nodes[1].protocol, ProxyProtocol::Socks5);
+        assert!(matches!(
+            report.nodes[1].auth,
+            ProxyAuth::UserPassword { .. }
+        ));
     }
 }

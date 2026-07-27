@@ -14,6 +14,8 @@ pub enum ProxyProtocol {
     Vless,
     Trojan,
     Shadowsocks,
+    Http,
+    Socks5,
 }
 
 impl ProxyProtocol {
@@ -24,6 +26,8 @@ impl ProxyProtocol {
             Self::Vless => "VLESS",
             Self::Trojan => "Trojan",
             Self::Shadowsocks => "Shadowsocks",
+            Self::Http => "HTTP",
+            Self::Socks5 => "SOCKS5",
         }
     }
 }
@@ -37,6 +41,11 @@ impl fmt::Display for ProxyProtocol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProxyAuth {
+    None,
+    UserPassword {
+        username: String,
+        password: String,
+    },
     Password {
         password: String,
     },

@@ -788,6 +788,16 @@ body {
   background: var(--amber-soft);
 }
 
+.protocol-mark.http {
+  color: #16745b;
+  background: rgba(22, 116, 91, 0.13);
+}
+
+.protocol-mark.socks5 {
+  color: #3d669c;
+  background: rgba(61, 102, 156, 0.13);
+}
+
 .node-main,
 .subscription-main {
   min-width: 0;

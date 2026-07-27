@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::net::IpAddr;
 
 const CHINA_GEOSITE_RULE_SET_URL: &str =
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs";
@@ -41,14 +42,19 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         "listen_port": options.mixed_port,
     })];
     if request.tun {
-        inbounds.push(json!({
+        let mut tun_inbound = json!({
             "type": "tun",
             "tag": "tun-in",
             "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
             "auto_route": true,
             "strict_route": true,
             "stack": "system",
-        }));
+        });
+        let route_exclusions = selected_proxy_endpoint_routes(request);
+        if !route_exclusions.is_empty() {
+            tun_inbound["route_exclude_address"] = json!(route_exclusions);
+        }
+        inbounds.push(tun_inbound);
     }
 
     let mut outbounds: Vec<Value> = request.nodes.iter().map(node_to_outbound).collect();
@@ -166,6 +172,8 @@ fn node_to_outbound(node: &ProxyNode) -> Value {
             ProxyProtocol::Vless => "vless",
             ProxyProtocol::Trojan => "trojan",
             ProxyProtocol::Shadowsocks => "shadowsocks",
+            ProxyProtocol::Http => "http",
+            ProxyProtocol::Socks5 => "socks",
         }),
     );
     object.insert("tag".to_string(), json!(node.tag));
@@ -173,6 +181,11 @@ fn node_to_outbound(node: &ProxyNode) -> Value {
     object.insert("server_port".to_string(), json!(node.port));
 
     match &node.auth {
+        ProxyAuth::None => {}
+        ProxyAuth::UserPassword { username, password } => {
+            object.insert("username".to_string(), json!(username));
+            object.insert("password".to_string(), json!(password));
+        }
         ProxyAuth::Password { password } => {
             object.insert("password".to_string(), json!(password));
         }
@@ -194,6 +207,10 @@ fn node_to_outbound(node: &ProxyNode) -> Value {
             object.insert("method".to_string(), json!(method));
             object.insert("password".to_string(), json!(password));
         }
+    }
+
+    if node.protocol == ProxyProtocol::Socks5 {
+        object.insert("version".to_string(), json!("5"));
     }
 
     if node.protocol == ProxyProtocol::Hysteria2 {
@@ -247,6 +264,21 @@ fn node_to_outbound(node: &ProxyNode) -> Value {
         object.insert("transport".to_string(), transport);
     }
     Value::Object(object)
+}
+
+fn selected_proxy_endpoint_routes(request: &ConnectionRequest) -> Vec<String> {
+    request
+        .nodes
+        .iter()
+        .find(|node| node.tag == request.selected_tag)
+        .or_else(|| request.nodes.first())
+        .and_then(|node| node.server.parse::<IpAddr>().ok())
+        .map(|address| match address {
+            IpAddr::V4(address) => format!("{address}/32"),
+            IpAddr::V6(address) => format!("{address}/128"),
+        })
+        .into_iter()
+        .collect()
 }
 
 fn transport_to_value(node: &ProxyNode) -> Value {
@@ -426,5 +458,53 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
 
         let config = build_singbox_config(&request, &SingBoxOptions::default());
         assert_eq!(config["route"]["rules"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn builds_http_and_socks_outbounds_and_excludes_ip_endpoints_from_tun() {
+        let nodes = parse_subscription(
+            "http://100.64.0.2:11080#Company\n\
+socks5://alice:secret@127.0.0.1:1080#Socks",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            mode: TunnelMode::Rule,
+            tun: true,
+            custom_rules: Vec::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+
+        assert_eq!(config["outbounds"][0]["type"], "http");
+        assert!(config["outbounds"][0].get("username").is_none());
+        assert_eq!(config["outbounds"][1]["type"], "socks");
+        assert_eq!(config["outbounds"][1]["version"], "5");
+        assert_eq!(config["outbounds"][1]["username"], "alice");
+        assert_eq!(
+            config["inbounds"][1]["route_exclude_address"],
+            json!(["100.64.0.2/32"])
+        );
+    }
+
+    #[test]
+    fn builds_https_proxy_as_http_outbound_with_tls() {
+        let nodes =
+            parse_subscription("https://alice:secret@proxy.example.com:8443?insecure=1#Secure")
+                .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            mode: TunnelMode::Global,
+            tun: false,
+            custom_rules: Vec::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+
+        assert_eq!(config["outbounds"][0]["type"], "http");
+        assert_eq!(config["outbounds"][0]["tls"]["enabled"], true);
+        assert_eq!(config["outbounds"][0]["tls"]["insecure"], true);
     }
 }
