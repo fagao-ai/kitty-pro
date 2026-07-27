@@ -935,8 +935,43 @@ body {
   overflow: hidden;
 }
 
-.log-toolbar-actions .status-badge {
+.log-collection-toggle {
+  display: inline-flex;
+  width: 88px;
+  height: 32px;
+  flex: 0 0 88px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-soft);
+  background: var(--surface-soft);
+  font-size: 9px;
+  font-weight: 700;
   white-space: nowrap;
+}
+
+.log-collection-toggle.collecting {
+  color: var(--accent);
+  border-color: rgba(19, 122, 97, 0.22);
+  background: var(--accent-soft);
+}
+
+.log-collection-toggle.paused {
+  color: var(--amber);
+  border-color: rgba(182, 106, 32, 0.22);
+  background: var(--amber-soft);
+}
+
+.log-collection-toggle:not(:disabled):hover {
+  border-color: currentColor;
+}
+
+.log-collection-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .log-controls {
@@ -2262,7 +2297,13 @@ body {
     gap: 6px;
   }
 
-  .log-toolbar-actions .status-badge {
+  .log-collection-toggle {
+    width: 34px;
+    flex-basis: 34px;
+    padding: 0;
+  }
+
+  .log-collection-label {
     display: none;
   }
 

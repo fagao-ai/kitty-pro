@@ -8,6 +8,7 @@ import (
 
 func TestBridgeLogBufferReturnsIncrementalInfoLogs(t *testing.T) {
 	var logs bridgeLogBuffer
+	logs.setEnabled(true)
 	logs.WriteMessage(boxlog.LevelDebug, "DEBUG ignored")
 	logs.WriteMessage(boxlog.LevelInfo, "\x1b[36mINFO\x1b[0m outbound/direct[direct]: outbound connection to example.cn:443")
 
@@ -25,6 +26,7 @@ func TestBridgeLogBufferReturnsIncrementalInfoLogs(t *testing.T) {
 
 func TestBridgeLogBufferResetsStaleCursor(t *testing.T) {
 	var logs bridgeLogBuffer
+	logs.setEnabled(true)
 	logs.WriteMessage(boxlog.LevelWarn, "WARN first session")
 	logs.reset()
 	logs.WriteMessage(boxlog.LevelError, "ERROR second session")
@@ -37,6 +39,7 @@ func TestBridgeLogBufferResetsStaleCursor(t *testing.T) {
 
 func TestBridgeLogBufferKeepsOnlyNewestEntries(t *testing.T) {
 	var logs bridgeLogBuffer
+	logs.setEnabled(true)
 	for index := 0; index < bridgeLogLimit+2; index++ {
 		logs.WriteMessage(boxlog.LevelInfo, "INFO route")
 	}
@@ -47,6 +50,26 @@ func TestBridgeLogBufferKeepsOnlyNewestEntries(t *testing.T) {
 	}
 	if batch.Entries[0].Sequence != 3 || batch.Entries[len(batch.Entries)-1].Sequence != bridgeLogLimit+2 {
 		t.Fatalf("log buffer did not retain the newest entries: %+v", batch)
+	}
+}
+
+func TestBridgeLogBufferDoesNotCollectWhileDisabled(t *testing.T) {
+	var logs bridgeLogBuffer
+	logs.WriteMessage(boxlog.LevelInfo, "INFO ignored while disabled")
+
+	batch := logs.snapshot(0)
+	if batch.NextCursor != 0 || len(batch.Entries) != 0 {
+		t.Fatalf("disabled log buffer retained entries: %+v", batch)
+	}
+
+	logs.setEnabled(true)
+	logs.WriteMessage(boxlog.LevelInfo, "INFO collected while enabled")
+	logs.setEnabled(false)
+	logs.WriteMessage(boxlog.LevelInfo, "INFO ignored after pausing")
+
+	batch = logs.snapshot(0)
+	if batch.NextCursor != 1 || len(batch.Entries) != 1 {
+		t.Fatalf("paused log buffer advanced its cursor: %+v", batch)
 	}
 }
 

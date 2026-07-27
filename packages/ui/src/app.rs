@@ -5,9 +5,9 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
     LdActivity, LdArrowDown, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight,
     LdCircleAlert, LdCircleCheck, LdClock3, LdGauge, LdGlobe, LdInfo, LdLanguages, LdListFilter,
-    LdMoon, LdNetwork, LdPencil, LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRoute, LdSave,
-    LdScrollText, LdSearch, LdServer, LdSettings, LdShieldCheck, LdSun, LdTrash2, LdWifi, LdX,
-    LdZap,
+    LdMoon, LdNetwork, LdPause, LdPencil, LdPlay, LdPlus, LdPower, LdRadioTower, LdRefreshCw,
+    LdRoute, LdSave, LdScrollText, LdSearch, LdServer, LdSettings, LdShieldCheck, LdSun, LdTrash2,
+    LdWifi, LdX, LdZap,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
@@ -129,6 +129,9 @@ pub fn ProxyApp(platform: String) -> Element {
     let latency_busy = use_signal(|| false);
     let mut traffic = use_signal(TrafficDisplay::default);
     let mut core_logs = use_signal(Vec::<CoreLogEntry>::new);
+    let mut core_log_cursor = use_signal(|| 0_u64);
+    let mut log_poll_generation = use_signal(|| 0_u64);
+    let log_collection_paused = use_signal(|| false);
     let mut profile_loaded = use_signal(|| false);
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
     let system_proxy_busy = use_signal(|| false);
@@ -264,15 +267,34 @@ pub fn ProxyApp(platform: String) -> Element {
     });
 
     use_effect(move || {
-        if core_state() != "running" {
+        let enabled =
+            core_state() == "running" && active_view() == AppView::Logs && !log_collection_paused();
+        spawn(async move {
+            let _ = api::set_core_log_collection(enabled).await;
+        });
+    });
+
+    use_effect(move || {
+        let enabled =
+            core_state() == "running" && active_view() == AppView::Logs && !log_collection_paused();
+        let generation = {
+            let mut current = log_poll_generation.write();
+            *current = current.wrapping_add(1);
+            *current
+        };
+        if !enabled {
             return;
         }
-        core_logs.write().clear();
         spawn(async move {
-            let mut cursor = 0;
-            while core_state() == "running" {
+            let mut cursor = *core_log_cursor.peek();
+            while *log_poll_generation.peek() == generation
+                && core_state.peek().as_str() == "running"
+                && *active_view.peek() == AppView::Logs
+                && !*log_collection_paused.peek()
+            {
                 if let Ok(batch) = api::core_logs(cursor).await {
                     cursor = batch.next_cursor;
+                    core_log_cursor.set(cursor);
                     if !batch.entries.is_empty() {
                         let mut stored = core_logs.write();
                         stored.extend(batch.entries);
@@ -480,7 +502,11 @@ pub fn ProxyApp(platform: String) -> Element {
                         }
                     },
                     AppView::Logs => rsx! {
-                        LogsView { logs: core_logs, connected }
+                        LogsView {
+                            logs: core_logs,
+                            connected,
+                            collection_paused: log_collection_paused,
+                        }
                     },
                     AppView::Settings => rsx! {
                         SettingsView {
@@ -1742,7 +1768,11 @@ fn custom_rule_action_class(action: CustomRuleAction) -> &'static str {
 }
 
 #[component]
-fn LogsView(mut logs: Signal<Vec<CoreLogEntry>>, connected: Signal<bool>) -> Element {
+fn LogsView(
+    mut logs: Signal<Vec<CoreLogEntry>>,
+    connected: Signal<bool>,
+    mut collection_paused: Signal<bool>,
+) -> Element {
     let mut filter = use_signal(|| LogFilter::Routes);
     let mut search = use_signal(String::new);
     let stored = logs();
@@ -1784,9 +1814,37 @@ fn LogsView(mut logs: Signal<Vec<CoreLogEntry>>, connected: Signal<bool>) -> Ele
                     span { "{route_count} 条路由 · {stored.len()} 条记录" }
                 }
                 div { class: "toolbar-controls log-toolbar-actions",
-                    span {
-                        class: if connected() { "status-badge online" } else { "status-badge" },
-                        if connected() { "实时采集" } else { "已停止" }
+                    button {
+                        class: if !connected() {
+                            "log-collection-toggle stopped"
+                        } else if collection_paused() {
+                            "log-collection-toggle paused"
+                        } else {
+                            "log-collection-toggle collecting"
+                        },
+                        title: if !connected() {
+                            "内核未运行"
+                        } else if collection_paused() {
+                            "继续采集日志"
+                        } else {
+                            "暂停采集日志"
+                        },
+                        aria_pressed: collection_paused(),
+                        disabled: !connected(),
+                        onclick: move |_| {
+                            let paused = collection_paused();
+                            collection_paused.set(!paused);
+                        },
+                        if connected() && !collection_paused() {
+                            Icon { icon: LdPause, width: 14, height: 14 }
+                            span { class: "log-collection-label", "实时采集" }
+                        } else if connected() {
+                            Icon { icon: LdPlay, width: 14, height: 14 }
+                            span { class: "log-collection-label", "已暂停" }
+                        } else {
+                            Icon { icon: LdPause, width: 14, height: 14 }
+                            span { class: "log-collection-label", "已停止" }
+                        }
                     }
                     button {
                         class: "icon-button glass-control danger",

@@ -212,6 +212,17 @@ pub async fn core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
         not(any(target_os = "android", target_os = "ios")),
         any(target_arch = "wasm32", feature = "server")
     ),
+    post("/api/core/logs/collection")
+)]
+pub async fn set_core_log_collection(enabled: bool) -> Result<(), ServerFnError> {
+    native_set_core_log_collection(enabled)
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
     post("/api/core/latency")
 )]
 pub async fn measure_node_latency(
@@ -687,6 +698,38 @@ fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
         next_cursor: cursor,
         entries: Vec::new(),
     })
+}
+
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn native_set_core_log_collection(enabled: bool) -> Result<(), ServerFnError> {
+    let guard = core_slot()
+        .lock()
+        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    let Some(core) = guard.as_ref() else {
+        return Ok(());
+    };
+    if !core
+        .is_running()
+        .map_err(|error| ServerFnError::new(error.to_string()))?
+    {
+        return Ok(());
+    }
+    core.set_log_enabled(enabled)
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+fn native_set_core_log_collection(enabled: bool) -> Result<(), ServerFnError> {
+    singbox::android::set_log_enabled(enabled)
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+fn native_set_core_log_collection(_enabled: bool) -> Result<(), ServerFnError> {
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

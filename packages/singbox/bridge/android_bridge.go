@@ -209,6 +209,11 @@ func kitty_singbox_android_logs(cursor C.uint64_t) *C.char {
 	return C.CString(string(result))
 }
 
+//export kitty_singbox_android_set_log_enabled
+func kitty_singbox_android_set_log_enabled(enabled C.int) {
+	androidLogs.setEnabled(enabled != 0)
+}
+
 type androidCommandHandler struct{}
 
 func (*androidCommandHandler) ServiceStop() error   { return nil }

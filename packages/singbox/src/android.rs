@@ -94,6 +94,11 @@ pub fn logs(cursor: u64) -> Result<LogBatch, CoreError> {
     serde_json::from_str(&payload).map_err(|error| CoreError::LogsUnavailable(error.to_string()))
 }
 
+pub fn set_log_enabled(enabled: bool) -> Result<(), CoreError> {
+    ffi::android_set_log_enabled(enabled);
+    Ok(())
+}
+
 pub fn probe(
     config: &str,
     node_tags: &[String],

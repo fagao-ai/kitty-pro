@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -51,6 +52,7 @@ type bridgeLogBatch struct {
 
 type bridgeLogBuffer struct {
 	sync.Mutex
+	enabled      atomic.Bool
 	nextSequence uint64
 	entries      []bridgeLogEntry
 }
@@ -61,10 +63,16 @@ func (b *bridgeLogBuffer) WriteMessage(level boxlog.Level, message string) {
 	if level > boxlog.LevelInfo {
 		return
 	}
+	if !b.isEnabled() {
+		return
+	}
 	b.append(boxlog.FormatLevel(level), message)
 }
 
 func (b *bridgeLogBuffer) writeFormattedMessage(message string) {
+	if !b.isEnabled() {
+		return
+	}
 	level := inferFormattedLogLevel(message)
 	if level == "debug" || level == "trace" {
 		return
@@ -75,6 +83,9 @@ func (b *bridgeLogBuffer) writeFormattedMessage(message string) {
 func (b *bridgeLogBuffer) append(level string, message string) {
 	b.Lock()
 	defer b.Unlock()
+	if !b.enabled.Load() {
+		return
+	}
 	b.nextSequence++
 	entry := bridgeLogEntry{
 		Sequence:  b.nextSequence,
@@ -88,6 +99,14 @@ func (b *bridgeLogBuffer) append(level string, message string) {
 	} else {
 		b.entries = append(b.entries, entry)
 	}
+}
+
+func (b *bridgeLogBuffer) isEnabled() bool {
+	return b.enabled.Load()
+}
+
+func (b *bridgeLogBuffer) setEnabled(enabled bool) {
+	b.enabled.Store(enabled)
 }
 
 func (b *bridgeLogBuffer) reset() {
@@ -454,6 +473,26 @@ func kitty_singbox_logs(handle C.uint64_t, cursor C.uint64_t) (result *C.char) {
 	}
 	setLastError(nil)
 	return C.CString(string(payload))
+}
+
+//export kitty_singbox_set_log_enabled
+func kitty_singbox_set_log_enabled(handle C.uint64_t, enabled C.int) (result C.int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setLastError(recoveredError("set sing-box log collection", recovered))
+			result = 0
+		}
+	}()
+	state.Lock()
+	service, found := state.instances[uint64(handle)]
+	state.Unlock()
+	if !found {
+		setLastError(&bridgeError{message: "sing-box instance is not running"})
+		return 0
+	}
+	service.logs.setEnabled(enabled != 0)
+	setLastError(nil)
+	return 1
 }
 
 //export kitty_singbox_probe

@@ -224,6 +224,17 @@ impl SingBox {
         #[cfg(not(feature = "embedded-core"))]
         Err(CoreError::EmbeddedCoreUnavailable)
     }
+
+    pub fn set_log_enabled(&self, enabled: bool) -> Result<(), CoreError> {
+        #[cfg(feature = "embedded-core")]
+        {
+            let handle = self.handle.ok_or(CoreError::NotRunning)?;
+            return ffi::set_log_enabled(handle, enabled);
+        }
+
+        #[cfg(not(feature = "embedded-core"))]
+        Err(CoreError::EmbeddedCoreUnavailable)
+    }
 }
 
 impl Drop for SingBox {
@@ -288,6 +299,7 @@ mod ffi {
         fn kitty_singbox_last_error() -> *mut c_char;
         fn kitty_singbox_traffic(handle: u64) -> *mut c_char;
         fn kitty_singbox_logs(handle: u64, cursor: u64) -> *mut c_char;
+        fn kitty_singbox_set_log_enabled(handle: u64, enabled: i32) -> i32;
         #[cfg(not(target_os = "android"))]
         fn kitty_singbox_probe(
             config_content: *const c_char,
@@ -308,6 +320,8 @@ mod ffi {
         fn kitty_singbox_android_traffic() -> *mut c_char;
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_logs(cursor: u64) -> *mut c_char;
+        #[cfg(target_os = "android")]
+        fn kitty_singbox_android_set_log_enabled(enabled: i32);
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_probe(
             config_content: *const c_char,
@@ -353,6 +367,13 @@ mod ffi {
             return Err(CoreError::LogsUnavailable(last_error()));
         }
         Ok(payload)
+    }
+
+    pub fn set_log_enabled(handle: u64, enabled: bool) -> Result<(), CoreError> {
+        if unsafe { kitty_singbox_set_log_enabled(handle, i32::from(enabled)) } == 0 {
+            return Err(CoreError::LogsUnavailable(last_error()));
+        }
+        Ok(())
     }
 
     #[cfg(not(target_os = "android"))]
@@ -416,6 +437,11 @@ mod ffi {
             return Err(CoreError::LogsUnavailable(last_error()));
         }
         Ok(payload)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_set_log_enabled(enabled: bool) {
+        unsafe { kitty_singbox_android_set_log_enabled(i32::from(enabled)) }
     }
 
     #[cfg(target_os = "android")]
@@ -559,6 +585,8 @@ mod tests {
 
         core.start(&request, &options)
             .expect("embedded core should start");
+        core.set_log_enabled(true)
+            .expect("embedded core log collection should start");
         assert!(core.is_running().expect("core state should be readable"));
         let mut client = TcpStream::connect(("127.0.0.1", mixed_port))
             .expect("mixed inbound should accept HTTP proxy requests");
