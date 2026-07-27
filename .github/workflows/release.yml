@@ -166,6 +166,35 @@ jobs:
             else
               build_status=${PIPESTATUS[0]}
             fi
+          elif [[ "${{ matrix.id }}" == "macos" ]]; then
+            # hdiutil occasionally reports "Resource busy" on hosted macOS
+            # runners even though the .app bundle was created successfully.
+            # Retry only that transient failure; preserve all other failures.
+            build_status=1
+            for attempt in 1 2 3; do
+              attempt_log="$RUNNER_TEMP/kitty-pro-macos-build-attempt-$attempt.log"
+              echo "macOS bundle attempt $attempt/3" | tee -a "$log"
+              if dx bundle \
+                  --package desktop \
+                  ${{ matrix.platform_flag }} \
+                  ${{ matrix.target_args }} \
+                  --release \
+                  --verbose \
+                  --locked \
+                  --out-dir "dist/${{ matrix.id }}" \
+                  ${{ matrix.bundle_args }} 2>&1 | tee -a "$log" "$attempt_log"; then
+                build_status=0
+                break
+              else
+                build_status=${PIPESTATUS[0]}
+              fi
+              if [[ "$attempt" -ge 3 ]] || \
+                  ! grep -Eqi 'hdiutil:.*Resource busy' "$attempt_log"; then
+                break
+              fi
+              rm -f target/dx/kitty-pro/bundle/macos/macos/*.dmg || true
+              sleep $((attempt * 5))
+            done
           elif dx bundle \
               --package desktop \
               ${{ matrix.platform_flag }} \
