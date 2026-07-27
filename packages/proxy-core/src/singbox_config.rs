@@ -1,9 +1,10 @@
 use crate::{
-    normalize_custom_rule_value, ConnectionRequest, CustomRule, ProxyAuth, ProxyNode,
-    ProxyProtocol, TunnelMode,
+    normalize_custom_rule_value, ConnectionRequest, CustomRule, ProxyAuth, ProxyGroup,
+    ProxyGroupKind, ProxyNode, ProxyProtocol, TunnelMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 pub const CHINA_GEOSITE_RULE_SET_URL: &str =
@@ -148,9 +149,8 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         },
         "dns": {
             "servers": [{
-                "type": "tls",
+                "type": "local",
                 "tag": "dns-direct",
-                "server": "1.1.1.1",
             }],
             "final": "dns-direct",
         },
@@ -186,11 +186,79 @@ fn custom_rule_to_value(rule: &CustomRule) -> Option<Value> {
     Some(Value::Object(object))
 }
 
+pub fn apply_proxy_group_selections(config: &mut Value, selections: &HashMap<String, String>) {
+    let Some(outbounds) = config.get_mut("outbounds").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for outbound in outbounds {
+        if outbound.get("type").and_then(Value::as_str) != Some("selector") {
+            continue;
+        }
+        let Some(tag) = outbound.get("tag").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(selected) = selections.get(tag) else {
+            continue;
+        };
+        let valid = outbound
+            .get("outbounds")
+            .and_then(Value::as_array)
+            .is_some_and(|outbounds| {
+                outbounds
+                    .iter()
+                    .any(|value| value.as_str() == Some(selected))
+            });
+        if valid {
+            outbound["default"] = Value::String(selected.clone());
+        }
+    }
+}
+
+pub fn extract_proxy_groups(config: &Value) -> Vec<ProxyGroup> {
+    config
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|outbound| {
+            let kind = match outbound.get("type").and_then(Value::as_str)? {
+                "selector" => ProxyGroupKind::Selector,
+                "urltest" => ProxyGroupKind::UrlTest,
+                _ => return None,
+            };
+            let tag = outbound.get("tag").and_then(Value::as_str)?.to_string();
+            let outbounds = outbound
+                .get("outbounds")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if outbounds.is_empty() {
+                return None;
+            }
+            let selected = outbound
+                .get("default")
+                .and_then(Value::as_str)
+                .filter(|selected| outbounds.iter().any(|item| item == selected))
+                .unwrap_or(&outbounds[0])
+                .to_string();
+            Some(ProxyGroup {
+                tag,
+                kind,
+                outbounds,
+                selected,
+            })
+        })
+        .collect()
+}
+
 fn node_to_outbound(node: &ProxyNode) -> Value {
     let mut object = Map::new();
     object.insert(
         "type".to_string(),
         json!(match node.protocol {
+            ProxyProtocol::AnyTls => "anytls",
             ProxyProtocol::Hysteria2 => "hysteria2",
             ProxyProtocol::Vmess => "vmess",
             ProxyProtocol::Vless => "vless",
@@ -331,6 +399,32 @@ mod tests {
     use crate::parse_subscription;
 
     #[test]
+    fn builds_anytls_outbound() {
+        let nodes = parse_subscription(
+            "anytls://secret@edge.example.com:443?type=tcp&insecure=0&fp=chrome&sni=origin.example.com#AnyTLS",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            mode: TunnelMode::Global,
+            tun: false,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        let outbound = &config["outbounds"][0];
+        assert_eq!(outbound["type"], "anytls");
+        assert_eq!(outbound["password"], "secret");
+        assert_eq!(outbound["tls"]["enabled"], true);
+        assert_eq!(outbound["tls"]["server_name"], "origin.example.com");
+        assert_eq!(outbound["tls"]["utls"]["fingerprint"], "chrome");
+        assert!(outbound.get("transport").is_none());
+    }
+
+    #[test]
     fn builds_selector_protocol_outbounds_and_china_split_rules() {
         let nodes = parse_subscription(
             "hysteria2://secret@hy.example.com:443?sni=hy.example.com#Fast\n\
@@ -343,6 +437,8 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             mode: TunnelMode::Rule,
             tun: true,
             custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
         };
 
         let config = build_singbox_config(
@@ -375,6 +471,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             CHINA_GEOIP_RULE_SET_URL
         );
         assert_eq!(config["dns"]["final"], "dns-direct");
+        assert_eq!(config["dns"]["servers"][0]["type"], "local");
         assert_eq!(
             config["experimental"]["clash_api"]["external_controller"],
             "127.0.0.1:17891"
@@ -398,6 +495,8 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
                 mode,
                 tun: false,
                 custom_rules: Vec::new(),
+                config_script: None,
+                group_selections: HashMap::new(),
             };
             let config = build_singbox_config(&request, &SingBoxOptions::default());
 
@@ -422,6 +521,8 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             mode: TunnelMode::Rule,
             tun: false,
             custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
         };
         let config = build_singbox_config(
             &request,
@@ -481,6 +582,8 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
                     action: crate::CustomRuleAction::Direct,
                 },
             ],
+            config_script: None,
+            group_selections: HashMap::new(),
         };
 
         let config = build_singbox_config(&request, &SingBoxOptions::default());
@@ -515,6 +618,8 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
                 value: "example.com".to_string(),
                 action: crate::CustomRuleAction::Block,
             }],
+            config_script: None,
+            group_selections: HashMap::new(),
         };
 
         let config = build_singbox_config(&request, &SingBoxOptions::default());
@@ -534,6 +639,8 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
             mode: TunnelMode::Rule,
             tun: true,
             custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
         };
 
         let config = build_singbox_config(&request, &SingBoxOptions::default());
@@ -560,6 +667,8 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
             mode: TunnelMode::Global,
             tun: false,
             custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
         };
 
         let config = build_singbox_config(&request, &SingBoxOptions::default());
@@ -567,5 +676,36 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
         assert_eq!(config["outbounds"][0]["type"], "http");
         assert_eq!(config["outbounds"][0]["tls"]["enabled"], true);
         assert_eq!(config["outbounds"][0]["tls"]["insecure"], true);
+    }
+
+    #[test]
+    fn extracts_groups_and_applies_selector_defaults() {
+        let mut config = json!({
+            "outbounds": [
+                {"type": "vless", "tag": "node-a"},
+                {
+                    "type": "selector",
+                    "tag": "AI",
+                    "outbounds": ["node-a", "direct"],
+                    "default": "node-a"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "Auto",
+                    "outbounds": ["node-a"]
+                }
+            ]
+        });
+        apply_proxy_group_selections(
+            &mut config,
+            &HashMap::from([("AI".to_string(), "direct".to_string())]),
+        );
+
+        let groups = extract_proxy_groups(&config);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].tag, "AI");
+        assert_eq!(groups[0].selected, "direct");
+        assert_eq!(groups[1].kind, ProxyGroupKind::UrlTest);
+        assert_eq!(groups[1].selected, "node-a");
     }
 }

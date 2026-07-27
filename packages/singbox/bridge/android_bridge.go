@@ -16,7 +16,6 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/experimental/libbox"
@@ -144,7 +143,7 @@ func probeAndroidServer(server *libbox.CommandServer, nodeTags []string, probeUR
 	}
 
 	var waitGroup sync.WaitGroup
-	semaphore := make(chan struct{}, 8)
+	semaphore := make(chan struct{}, 100)
 	for index, tag := range nodeTags {
 		index := index
 		tag := tag
@@ -159,7 +158,7 @@ func probeAndroidServer(server *libbox.CommandServer, nodeTags []string, probeUR
 			defer waitGroup.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
-			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 			defer cancel()
 			delay, err := urltest.URLTest(ctx, probeURL, outbound)
 			if err != nil {
@@ -198,6 +197,30 @@ func androidTraffic() ([]byte, error) {
 		trafficURL:       service.trafficURL,
 		trafficAuthToken: service.trafficAuthToken,
 	}).traffic()
+}
+
+func androidSelectOutbound(group string, outbound string) error {
+	androidRuntime.Lock()
+	service := androidRuntime.service
+	androidRuntime.Unlock()
+	if service == nil {
+		return errors.New("Android VPN service is not running")
+	}
+	return (&instance{
+		trafficURL:       service.trafficURL,
+		trafficAuthToken: service.trafficAuthToken,
+	}).selectOutbound(group, outbound)
+}
+
+//export kitty_singbox_android_select_outbound
+func kitty_singbox_android_select_outbound(group *C.char, outbound *C.char) *C.char {
+	if group == nil || outbound == nil {
+		return C.CString("missing proxy group selection")
+	}
+	if err := androidSelectOutbound(C.GoString(group), C.GoString(outbound)); err != nil {
+		return C.CString(err.Error())
+	}
+	return nil
 }
 
 //export kitty_singbox_android_logs

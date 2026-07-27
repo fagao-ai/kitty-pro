@@ -12,8 +12,8 @@ use dioxus_free_icons::icons::ld_icons::{
 use dioxus_free_icons::Icon;
 use proxy_core::{
     validate_custom_rules, AppProfile, ConnectionRequest, CustomRule, CustomRuleAction,
-    CustomRuleMatch, ParseReport, ProxyNode, ProxyProtocol, Subscription, TunnelMode,
-    MAX_CUSTOM_RULES,
+    CustomRuleMatch, ParseReport, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol,
+    Subscription, TunnelMode, MAX_CUSTOM_RULES,
 };
 use std::collections::HashMap;
 
@@ -99,6 +99,16 @@ async fn wait_for_rule_set_update_check() {
     tokio::time::sleep(std::time::Duration::from_secs(RULE_SET_UPDATE_CHECK_SECS)).await;
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn wait_for_latency_poll() {
+    gloo_timers::future::TimeoutFuture::new(100).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn wait_for_latency_poll() {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
 impl AppView {
     fn title(self) -> &'static str {
         match self {
@@ -128,8 +138,12 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut subscriptions = use_signal(Vec::<Subscription>::new);
     let mut custom_rules = use_signal(Vec::<CustomRule>::new);
     let rule_sets_busy = use_signal(|| false);
+    let mut active_subscription_id = use_signal(|| None::<u64>);
     let mut tunnel_mode = use_signal(|| TunnelMode::Rule);
     let mut tun_enabled = use_signal(|| false);
+    let mut config_script_enabled = use_signal(|| false);
+    let mut config_script = use_signal(String::new);
+    let mut group_selections = use_signal(HashMap::<String, String>::new);
     let mut import_open = use_signal(|| false);
     let mut import_name = use_signal(String::new);
     let mut import_source = use_signal(String::new);
@@ -213,15 +227,25 @@ pub fn ProxyApp(platform: String) -> Element {
         spawn(async move {
             match api::load_profile().await {
                 Ok(profile) => {
-                    let restored_nodes = collect_nodes(&profile.subscriptions);
+                    let restored_active_id = resolve_active_subscription_id(
+                        &profile.subscriptions,
+                        profile.active_subscription_id,
+                        &profile.selected_tag,
+                    );
+                    let restored_nodes =
+                        collect_subscription_nodes(&profile.subscriptions, restored_active_id);
                     let restored_tag = select_available_tag(&restored_nodes, &profile.selected_tag);
                     subscriptions.set(profile.subscriptions);
                     custom_rules.set(profile.custom_rules);
+                    active_subscription_id.set(restored_active_id);
                     nodes.set(restored_nodes);
                     selected_tag.set(restored_tag);
                     tunnel_mode.set(profile.tunnel_mode);
                     tun_enabled.set(profile.tun_enabled);
                     dark_mode.set(profile.dark_mode);
+                    config_script_enabled.set(profile.config_script_enabled);
+                    config_script.set(profile.config_script);
+                    group_selections.set(profile.group_selections);
                     profile_loaded.set(true);
                 }
                 Err(error) => notice.set(Some(format!("无法恢复本地配置: {error}"))),
@@ -235,11 +259,15 @@ pub fn ProxyApp(platform: String) -> Element {
         }
         let profile = AppProfile {
             subscriptions: subscriptions(),
+            active_subscription_id: active_subscription_id(),
             selected_tag: selected_tag(),
             tunnel_mode: tunnel_mode(),
             tun_enabled: tun_enabled(),
             dark_mode: dark_mode(),
             custom_rules: custom_rules(),
+            config_script_enabled: config_script_enabled(),
+            config_script: config_script(),
+            group_selections: group_selections(),
             ..AppProfile::default()
         };
         spawn(async move {
@@ -349,18 +377,36 @@ pub fn ProxyApp(platform: String) -> Element {
         });
     });
 
+    let proxy_groups_resource = use_resource(move || {
+        let request = ConnectionRequest {
+            nodes: nodes(),
+            selected_tag: selected_tag(),
+            mode: tunnel_mode(),
+            tun: tun_enabled(),
+            custom_rules: custom_rules(),
+            config_script: if config_script_enabled() && !config_script().trim().is_empty() {
+                Some(config_script())
+            } else {
+                None
+            },
+            group_selections: group_selections(),
+        };
+        async move {
+            if request.nodes.is_empty() {
+                Ok(Vec::new())
+            } else {
+                api::preview_proxy_groups(request)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        }
+    });
+
     let current_view = active_view();
-    let filtered_nodes: Vec<ProxyNode> = {
-        let needle = search().to_ascii_lowercase();
-        nodes()
-            .into_iter()
-            .filter(|node| {
-                needle.is_empty()
-                    || node.name.to_ascii_lowercase().contains(&needle)
-                    || node.server.to_ascii_lowercase().contains(&needle)
-                    || node.protocol.label().to_ascii_lowercase().contains(&needle)
-            })
-            .collect()
+    let (proxy_groups, proxy_groups_error, proxy_groups_loading) = match proxy_groups_resource() {
+        Some(Ok(groups)) => (groups, None, false),
+        Some(Err(error)) => (Vec::new(), Some(error), false),
+        None => (Vec::new(), None, true),
     };
     let root_class = if dark_mode() {
         "proxy-app theme-dark"
@@ -404,6 +450,14 @@ pub fn ProxyApp(platform: String) -> Element {
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     custom_rules: custom_rules(),
+                                    config_script: if config_script_enabled()
+                                        && !config_script().trim().is_empty()
+                                    {
+                                        Some(config_script())
+                                    } else {
+                                        None
+                                    },
+                                    group_selections: group_selections(),
                                 };
                                 match api::restart_core(request).await {
                                     Ok(status) => {
@@ -507,15 +561,21 @@ pub fn ProxyApp(platform: String) -> Element {
                             connection_allowed,
                             latency_results,
                             traffic,
+                            config_script_enabled,
+                            config_script,
+                            group_selections,
                             notice,
                         }
                     },
                     AppView::Nodes => rsx! {
                         NodesView {
-                            nodes: filtered_nodes,
-                            probe_nodes: nodes(),
+                            groups: proxy_groups,
+                            groups_loading: proxy_groups_loading,
+                            groups_error: proxy_groups_error,
+                            nodes: nodes(),
                             all_count: nodes().len(),
-                            selected_tag,
+                            group_selections,
+                            connected,
                             search,
                             latency_results,
                             latency_busy,
@@ -526,6 +586,7 @@ pub fn ProxyApp(platform: String) -> Element {
                     AppView::Subscriptions => rsx! {
                         SubscriptionsView {
                             subscriptions,
+                            active_subscription_id,
                             import_open,
                             nodes,
                             selected_tag,
@@ -558,6 +619,12 @@ pub fn ProxyApp(platform: String) -> Element {
                             tunnel_mode,
                             tun_enabled,
                             dark_mode,
+                            nodes,
+                            selected_tag,
+                            custom_rules,
+                            config_script_enabled,
+                            config_script,
+                            group_selections,
                             system_proxy,
                             system_proxy_busy,
                             notice,
@@ -655,16 +722,20 @@ pub fn ProxyApp(platform: String) -> Element {
                                             };
                                             subscriptions.write().push(Subscription {
                                                 id,
-                                                name,
+                                                name: name.clone(),
                                                 source,
                                                 nodes: parsed_nodes,
                                                 rejected_count: rejected,
                                             });
-                                            let merged_nodes = collect_nodes(&subscriptions());
-                                            let next_tag = select_available_tag(&merged_nodes, &selected_tag());
-                                            nodes.set(merged_nodes);
+                                            active_subscription_id.set(Some(id));
+                                            let active_nodes = collect_subscription_nodes(
+                                                &subscriptions(),
+                                                Some(id),
+                                            );
+                                            let next_tag = select_available_tag(&active_nodes, "");
+                                            nodes.set(active_nodes);
                                             selected_tag.set(next_tag);
-                                            notice.set(Some(format!("已导入 {count} 个节点")));
+                                            notice.set(Some(format!("已导入并切换到 {name}，共 {count} 个节点")));
                                             import_source.set(String::new());
                                             import_name.set(String::new());
                                             import_open.set(false);
@@ -750,6 +821,9 @@ fn OverviewView(
     connection_allowed: bool,
     latency_results: Signal<HashMap<String, NodeLatency>>,
     traffic: Signal<TrafficDisplay>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
+    group_selections: Signal<HashMap<String, String>>,
     mut notice: Signal<Option<String>>,
 ) -> Element {
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
@@ -836,6 +910,14 @@ fn OverviewView(
                             mode: tunnel_mode(),
                             tun: tun_enabled(),
                             custom_rules: custom_rules(),
+                            config_script: if config_script_enabled()
+                                && !config_script().trim().is_empty()
+                            {
+                                Some(config_script())
+                            } else {
+                                None
+                            },
+                            group_selections: group_selections(),
                         });
                         match api::set_core_enabled(target, request).await {
                             Ok(status) => {
@@ -985,72 +1067,77 @@ fn MetricCard(label: String, value: String, icon: String) -> Element {
 
 #[component]
 fn NodesView(
+    groups: Vec<ProxyGroup>,
+    groups_loading: bool,
+    groups_error: Option<String>,
     nodes: Vec<ProxyNode>,
-    probe_nodes: Vec<ProxyNode>,
     all_count: usize,
-    selected_tag: Signal<String>,
+    mut group_selections: Signal<HashMap<String, String>>,
+    connected: Signal<bool>,
     mut search: Signal<String>,
     mut latency_results: Signal<HashMap<String, NodeLatency>>,
     mut latency_busy: Signal<bool>,
     mut import_open: Signal<bool>,
     mut notice: Signal<Option<String>>,
 ) -> Element {
+    let active_group = use_signal(String::new);
+    let requested_group = active_group();
+    let current_group = groups
+        .iter()
+        .find(|group| group.tag == requested_group)
+        .or_else(|| groups.first())
+        .cloned();
+    let current_group_tag = current_group
+        .as_ref()
+        .map(|group| group.tag.clone())
+        .unwrap_or_default();
+    let current_group_kind = current_group.as_ref().map(|group| group.kind);
+    let current_selected = current_group.as_ref().map(|group| {
+        group_selections()
+            .get(&group.tag)
+            .filter(|selected| group.outbounds.iter().any(|item| item == *selected))
+            .cloned()
+            .unwrap_or_else(|| group.selected.clone())
+    });
+    let needle = search().trim().to_ascii_lowercase();
+    let latency_snapshot = latency_results();
+    let mut members = current_group
+        .as_ref()
+        .map(|group| {
+            group
+                .outbounds
+                .iter()
+                .filter_map(|tag| {
+                    let node = nodes.iter().find(|node| node.tag == *tag).cloned();
+                    let nested_kind = groups
+                        .iter()
+                        .find(|candidate| candidate.tag == *tag)
+                        .map(|candidate| candidate.kind);
+                    let display_name = node.as_ref().map(|node| node.name.as_str()).unwrap_or(tag);
+                    (needle.is_empty()
+                        || display_name.to_ascii_lowercase().contains(&needle)
+                        || tag.to_ascii_lowercase().contains(&needle)
+                        || node.as_ref().is_some_and(|node| {
+                            node.server.to_ascii_lowercase().contains(&needle)
+                                || node.protocol.label().to_ascii_lowercase().contains(&needle)
+                        }))
+                    .then(|| ProxyGroupMember {
+                        tag: tag.clone(),
+                        node,
+                        nested_kind,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    sort_proxy_group_members(&mut members, &latency_snapshot);
+    let current_selected_label = current_selected
+        .as_deref()
+        .map(|tag| outbound_display_name(tag, &nodes))
+        .unwrap_or_else(|| "未选择".to_string());
+
     rsx! {
         section { class: "workspace-section glass-surface",
-            div { class: "workspace-toolbar",
-                div {
-                    p { class: "eyebrow", "PROXY NODES" }
-                    h2 { "全部节点" }
-                    span { "{all_count} 个节点" }
-                }
-                div { class: "toolbar-controls subscription-actions",
-                    label { class: "search-field",
-                        Icon { icon: LdSearch, width: 17, height: 17 }
-                        input {
-                            value: search,
-                            placeholder: "搜索节点",
-                            oninput: move |event| search.set(event.value()),
-                        }
-                    }
-                    button {
-                        class: "icon-button glass-control",
-                        title: if latency_busy() { "正在刷新延迟" } else { "刷新延迟" },
-                        disabled: latency_busy() || probe_nodes.is_empty(),
-                        onclick: move |_| {
-                            let probe_nodes = probe_nodes.clone();
-                            async move {
-                                latency_busy.set(true);
-                                match api::measure_node_latency(probe_nodes).await {
-                                    Ok(results) => {
-                                        let failures = results
-                                            .iter()
-                                            .filter(|result| result.latency_ms.is_none())
-                                            .count();
-                                        latency_results.set(
-                                            results
-                                                .into_iter()
-                                                .map(|result| (result.tag.clone(), result))
-                                                .collect(),
-                                        );
-                                        notice.set(Some(if failures == 0 {
-                                            "节点延迟已刷新".to_string()
-                                        } else {
-                                            format!("延迟刷新完成，{failures} 个节点不可用")
-                                        }));
-                                    }
-                                    Err(error) => notice.set(Some(format!("延迟探测失败: {error}"))),
-                                }
-                                latency_busy.set(false);
-                            }
-                        },
-                        if latency_busy() {
-                            span { class: "spinner" }
-                        } else {
-                            Icon { icon: LdRefreshCw, width: 18, height: 18 }
-                        }
-                    }
-                }
-            }
             if all_count == 0 {
                 div { class: "large-empty",
                     EmptyNodes {}
@@ -1061,20 +1148,303 @@ fn NodesView(
                         "添加订阅"
                     }
                 }
-            } else if nodes.is_empty() {
+            } else if groups_loading {
                 div { class: "large-empty",
-                    Icon { icon: LdSearch, width: 28, height: 28 }
-                    strong { "没有匹配的节点" }
+                    span { class: "spinner large" }
+                    strong { "正在生成代理组" }
+                }
+            } else if let Some(error) = groups_error {
+                div { class: "large-empty",
+                    Icon { icon: LdCircleAlert, width: 28, height: 28 }
+                    strong { "代理组生成失败" }
+                    p { "{error}" }
+                }
+            } else if groups.is_empty() {
+                div { class: "large-empty",
+                    Icon { icon: LdRoute, width: 28, height: 28 }
+                    strong { "配置中没有代理组" }
                 }
             } else {
-                div { class: "node-list",
-                    for node in nodes {
-                        NodeRow { node, selected_tag, latency_results }
+                div { class: "proxy-groups-layout",
+                    aside { class: "proxy-group-list", aria_label: "代理组",
+                        div { class: "proxy-group-list-heading",
+                            p { class: "eyebrow", "PROXY GROUPS" }
+                            strong { "{groups.len()} 个分组" }
+                        }
+                        for group in groups.clone() {
+                            ProxyGroupTab {
+                                group,
+                                nodes: nodes.clone(),
+                                active: current_group_tag.clone(),
+                                group_selections,
+                                active_group,
+                            }
+                        }
+                    }
+                    div { class: "proxy-group-members",
+                        div { class: "workspace-toolbar proxy-group-toolbar",
+                            div {
+                                p { class: "eyebrow", {current_group_kind.map(proxy_group_kind_label).unwrap_or("PROXY GROUP")} }
+                                h2 { "{current_group_tag}" }
+                                span {
+                                    if current_group_kind == Some(ProxyGroupKind::UrlTest) {
+                                        "自动测速 · {members.len()} 个候选"
+                                    } else {
+                                        "当前：{current_selected_label}"
+                                    }
+                                }
+                            }
+                            div { class: "toolbar-controls subscription-actions",
+                                label { class: "search-field",
+                                    Icon { icon: LdSearch, width: 17, height: 17 }
+                                    input {
+                                        value: search,
+                                        placeholder: "搜索当前分组",
+                                        oninput: move |event| search.set(event.value()),
+                                    }
+                                }
+                                button {
+                                    class: "icon-button glass-control",
+                                    title: if latency_busy() { "正在刷新延迟" } else { "刷新延迟" },
+                                    disabled: latency_busy() || nodes.is_empty(),
+                                    onclick: move |_| {
+                                        let probe_nodes = nodes.clone();
+                                        async move {
+                                            latency_busy.set(true);
+                                            let total = probe_nodes.len();
+                                            let mut failures = 0;
+                                            let session_id = match api::start_node_latency(probe_nodes).await {
+                                                Ok(session_id) => session_id,
+                                                Err(error) => {
+                                                    notice.set(Some(format!("启动测速失败: {error}")));
+                                                    latency_busy.set(false);
+                                                    return;
+                                                }
+                                            };
+                                            let completed = loop {
+                                                match api::poll_node_latency(session_id).await {
+                                                    Ok(snapshot) => {
+                                                        failures += snapshot
+                                                            .results
+                                                            .iter()
+                                                            .filter(|result| result.latency_ms.is_none())
+                                                            .count();
+                                                        if !snapshot.results.is_empty() {
+                                                            let mut current_results = latency_results.write();
+                                                            for result in snapshot.results {
+                                                                current_results.insert(result.tag.clone(), result);
+                                                            }
+                                                        }
+                                                        notice.set(Some(format!(
+                                                            "正在测速 {}/{total}",
+                                                            snapshot.completed
+                                                        )));
+                                                        if snapshot.done {
+                                                            break snapshot.completed;
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        notice.set(Some(format!("读取测速结果失败: {error}")));
+                                                        latency_busy.set(false);
+                                                        return;
+                                                    }
+                                                }
+                                                wait_for_latency_poll().await;
+                                            };
+                                            notice.set(Some(if failures == 0 {
+                                                format!("已完成 {completed} 个节点测速")
+                                            } else {
+                                                format!(
+                                                    "延迟刷新完成，{completed} 个节点中 {failures} 个不可用"
+                                                )
+                                            }));
+                                            latency_busy.set(false);
+                                        }
+                                    },
+                                    if latency_busy() {
+                                        span { class: "spinner" }
+                                    } else {
+                                        Icon { icon: LdRefreshCw, width: 18, height: 18 }
+                                    }
+                                }
+                            }
+                        }
+                        if members.is_empty() {
+                            div { class: "large-empty group-empty",
+                                Icon { icon: LdSearch, width: 28, height: 28 }
+                                strong { "当前分组没有匹配项" }
+                            }
+                        } else {
+                            div { class: "node-list proxy-member-list",
+                                for member in members {
+                                    ProxyGroupMemberRow {
+                                        group_tag: current_group_tag.clone(),
+                                        group_kind: current_group_kind.unwrap_or(ProxyGroupKind::Selector),
+                                        member,
+                                        selected: current_selected.clone().unwrap_or_default(),
+                                        connected,
+                                        group_selections,
+                                        latency_results,
+                                        notice,
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ProxyGroupMember {
+    tag: String,
+    node: Option<ProxyNode>,
+    nested_kind: Option<ProxyGroupKind>,
+}
+
+#[component]
+fn ProxyGroupTab(
+    group: ProxyGroup,
+    nodes: Vec<ProxyNode>,
+    active: String,
+    group_selections: Signal<HashMap<String, String>>,
+    mut active_group: Signal<String>,
+) -> Element {
+    let tag = group.tag.clone();
+    let selected = group_selections()
+        .get(&group.tag)
+        .filter(|selected| group.outbounds.iter().any(|item| item == *selected))
+        .cloned()
+        .unwrap_or_else(|| group.selected.clone());
+    let detail = if group.kind == ProxyGroupKind::UrlTest {
+        format!("自动测速 · {} 项", group.outbounds.len())
+    } else {
+        format!("当前：{}", outbound_display_name(&selected, &nodes))
+    };
+    rsx! {
+        button {
+            class: if active == group.tag { "proxy-group-tab active" } else { "proxy-group-tab" },
+            onclick: move |_| active_group.set(tag.clone()),
+            span { class: if group.kind == ProxyGroupKind::UrlTest { "group-kind-mark auto" } else { "group-kind-mark" },
+                if group.kind == ProxyGroupKind::UrlTest {
+                    Icon { icon: LdGauge, width: 17, height: 17 }
+                } else {
+                    Icon { icon: LdRoute, width: 17, height: 17 }
+                }
+            }
+            span { class: "proxy-group-tab-copy",
+                strong { "{group.tag}" }
+                small { "{detail}" }
+            }
+            Icon { icon: LdChevronRight, width: 16, height: 16 }
+        }
+    }
+}
+
+#[component]
+fn ProxyGroupMemberRow(
+    group_tag: String,
+    group_kind: ProxyGroupKind,
+    member: ProxyGroupMember,
+    selected: String,
+    connected: Signal<bool>,
+    mut group_selections: Signal<HashMap<String, String>>,
+    latency_results: Signal<HashMap<String, NodeLatency>>,
+    mut notice: Signal<Option<String>>,
+) -> Element {
+    let is_selected = group_kind == ProxyGroupKind::Selector && selected == member.tag;
+    let selectable = group_kind == ProxyGroupKind::Selector;
+    let member_tag = member.tag.clone();
+    let target_group = group_tag.clone();
+    let (latency_label, latency_class, latency_title) = member
+        .node
+        .as_ref()
+        .map(|node| format_latency(latency_results().get(&node.tag)))
+        .unwrap_or_else(|| ("".to_string(), "latency pending", String::new()));
+    let member_kind_label = member
+        .nested_kind
+        .map(proxy_group_kind_label)
+        .unwrap_or_else(|| match member.tag.as_str() {
+            "direct" => "直连",
+            "block" => "拦截",
+            _ => "代理节点",
+        });
+
+    rsx! {
+        button {
+            class: if is_selected { "node-row group-member-row selected" } else { "node-row group-member-row" },
+            disabled: !selectable,
+            onclick: move |_| {
+                let group = target_group.clone();
+                let outbound = member_tag.clone();
+                async move {
+                    if connected() {
+                        if let Err(error) = api::select_proxy_group(group.clone(), outbound.clone()).await {
+                            notice.set(Some(format!("切换 {group} 失败: {error}")));
+                            return;
+                        }
+                    }
+                    group_selections.write().insert(group.clone(), outbound.clone());
+                    notice.set(Some(format!("{group} 已切换到 {outbound}")));
+                }
+            },
+            if let Some(node) = member.node {
+                span { class: protocol_class(node.protocol), "{protocol_abbreviation(node.protocol)}" }
+                span { class: "node-main",
+                    strong { "{node.name}" }
+                    small { "{node.endpoint()}" }
+                }
+                span { class: "protocol-label", "{node.protocol.label()}" }
+                span { class: latency_class, title: latency_title, "{latency_label}" }
+            } else {
+                span { class: if member.nested_kind == Some(ProxyGroupKind::UrlTest) { "group-kind-mark auto" } else { "group-kind-mark" },
+                    if member.tag == "direct" {
+                        Icon { icon: LdWifi, width: 17, height: 17 }
+                    } else if member.tag == "block" {
+                        Icon { icon: LdShieldCheck, width: 17, height: 17 }
+                    } else if member.nested_kind == Some(ProxyGroupKind::UrlTest) {
+                        Icon { icon: LdGauge, width: 17, height: 17 }
+                    } else {
+                        Icon { icon: LdRoute, width: 17, height: 17 }
+                    }
+                }
+                span { class: "node-main",
+                    strong { "{member.tag}" }
+                    small { "{member_kind_label}" }
+                }
+                span { class: "protocol-label", "{member_kind_label}" }
+                span { class: "latency pending", "" }
+            }
+            if is_selected {
+                span { class: "selected-check", Icon { icon: LdCircleCheck, width: 19, height: 19 } }
+            } else if selectable {
+                span { class: "row-chevron", Icon { icon: LdChevronRight, width: 18, height: 18 } }
+            } else {
+                span { class: "auto-indicator", Icon { icon: LdGauge, width: 17, height: 17 } }
+            }
+        }
+    }
+}
+
+fn proxy_group_kind_label(kind: ProxyGroupKind) -> &'static str {
+    match kind {
+        ProxyGroupKind::Selector => "手动选择",
+        ProxyGroupKind::UrlTest => "自动测速",
+    }
+}
+
+fn outbound_display_name(tag: &str, nodes: &[ProxyNode]) -> String {
+    nodes
+        .iter()
+        .find(|node| node.tag == tag)
+        .map(|node| node.name.clone())
+        .unwrap_or_else(|| match tag {
+            "direct" => "直连".to_string(),
+            "block" => "拦截".to_string(),
+            _ => tag.to_string(),
+        })
 }
 
 #[component]
@@ -1144,6 +1514,7 @@ fn EmptyNodes() -> Element {
 #[component]
 fn SubscriptionsView(
     subscriptions: Signal<Vec<Subscription>>,
+    active_subscription_id: Signal<Option<u64>>,
     mut import_open: Signal<bool>,
     nodes: Signal<Vec<ProxyNode>>,
     selected_tag: Signal<String>,
@@ -1187,9 +1558,13 @@ fn SubscriptionsView(
                                         Err(_) => failed += 1,
                                     }
                                 }
-                                let merged_nodes = collect_nodes(&subscriptions());
-                                let next_tag = select_available_tag(&merged_nodes, &selected_tag());
-                                nodes.set(merged_nodes);
+                                let active_nodes = collect_subscription_nodes(
+                                    &subscriptions(),
+                                    active_subscription_id(),
+                                );
+                                let next_tag =
+                                    select_available_tag(&active_nodes, &selected_tag());
+                                nodes.set(active_nodes);
                                 selected_tag.set(next_tag);
                                 notice.set(Some(if failed == 0 {
                                     format!("已刷新 {refreshed} 个订阅")
@@ -1224,6 +1599,7 @@ fn SubscriptionsView(
                         SubscriptionRow {
                             subscription,
                             subscriptions,
+                            active_subscription_id,
                             nodes,
                             selected_tag,
                             refresh_busy,
@@ -1240,6 +1616,7 @@ fn SubscriptionsView(
 fn SubscriptionRow(
     subscription: Subscription,
     mut subscriptions: Signal<Vec<Subscription>>,
+    mut active_subscription_id: Signal<Option<u64>>,
     mut nodes: Signal<Vec<ProxyNode>>,
     mut selected_tag: Signal<String>,
     mut refresh_busy: Signal<Option<RefreshTarget>>,
@@ -1249,9 +1626,10 @@ fn SubscriptionRow(
     let subscription_source = subscription.source.clone();
     let display_source = source_label(&subscription.source);
     let refreshing = refresh_busy() == Some(RefreshTarget::One(subscription_id));
+    let active = active_subscription_id() == Some(subscription_id);
 
     rsx! {
-        div { class: "subscription-row",
+        div { class: if active { "subscription-row active" } else { "subscription-row" },
             span { class: "subscription-icon", Icon { icon: LdRadioTower, width: 20, height: 20 } }
             div { class: "subscription-main",
                 strong { "{subscription.name}" }
@@ -1265,7 +1643,26 @@ fn SubscriptionRow(
                 span { class: "warning-badge", "忽略 {subscription.rejected_count}" }
             }
             button {
-                class: "icon-button",
+                class: if active { "subscription-use-button active" } else { "subscription-use-button" },
+                disabled: active || refresh_busy().is_some(),
+                onclick: move |_| {
+                    active_subscription_id.set(Some(subscription_id));
+                    let active_nodes =
+                        collect_subscription_nodes(&subscriptions(), Some(subscription_id));
+                    let next_tag = select_available_tag(&active_nodes, "");
+                    nodes.set(active_nodes);
+                    selected_tag.set(next_tag);
+                    notice.set(Some("已切换订阅".to_string()));
+                },
+                if active {
+                    Icon { icon: LdCircleCheck, width: 15, height: 15 }
+                    "当前使用"
+                } else {
+                    "使用"
+                }
+            }
+            button {
+                class: "icon-button subscription-refresh-button",
                 title: "刷新订阅",
                 disabled: refresh_busy().is_some(),
                 onclick: move |_| {
@@ -1280,11 +1677,18 @@ fn SubscriptionRow(
                             };
                             match result {
                                 Ok(count) => {
-                                    let merged_nodes = collect_nodes(&subscriptions());
-                                    let next_tag =
-                                        select_available_tag(&merged_nodes, &selected_tag());
-                                    nodes.set(merged_nodes);
-                                    selected_tag.set(next_tag);
+                                    if active_subscription_id() == Some(subscription_id) {
+                                        let active_nodes = collect_subscription_nodes(
+                                            &subscriptions(),
+                                            Some(subscription_id),
+                                        );
+                                        let next_tag = select_available_tag(
+                                            &active_nodes,
+                                            &selected_tag(),
+                                        );
+                                        nodes.set(active_nodes);
+                                        selected_tag.set(next_tag);
+                                    }
                                     notice.set(Some(format!("已刷新 {count} 个节点")));
                                 }
                                 Err(reason) => {
@@ -1304,14 +1708,27 @@ fn SubscriptionRow(
                 }
             }
             button {
-                class: "icon-button danger",
+                class: "icon-button danger subscription-delete-button",
                 title: "删除订阅",
                 disabled: refresh_busy().is_some(),
                 onclick: move |_| {
+                    let deleting_active = active_subscription_id() == Some(subscription_id);
                     subscriptions.write().retain(|item| item.id != subscription_id);
-                    let merged_nodes = collect_nodes(&subscriptions());
-                    let next_tag = select_available_tag(&merged_nodes, &selected_tag());
-                    nodes.set(merged_nodes);
+                    let next_active_id = if deleting_active {
+                        subscriptions().first().map(|item| item.id)
+                    } else {
+                        active_subscription_id()
+                    };
+                    active_subscription_id.set(next_active_id);
+                    let active_nodes =
+                        collect_subscription_nodes(&subscriptions(), next_active_id);
+                    let requested_tag = if deleting_active {
+                        String::new()
+                    } else {
+                        selected_tag()
+                    };
+                    let next_tag = select_available_tag(&active_nodes, &requested_tag);
+                    nodes.set(active_nodes);
                     selected_tag.set(next_tag);
                     notice.set(Some("订阅已删除".to_string()));
                 },
@@ -2073,10 +2490,17 @@ fn SettingsView(
     mut tunnel_mode: Signal<TunnelMode>,
     mut tun_enabled: Signal<bool>,
     mut dark_mode: Signal<bool>,
+    nodes: Signal<Vec<ProxyNode>>,
+    selected_tag: Signal<String>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    mut config_script_enabled: Signal<bool>,
+    mut config_script: Signal<String>,
+    group_selections: Signal<HashMap<String, String>>,
     mut system_proxy: Signal<SystemProxyLoadState>,
     mut system_proxy_busy: Signal<bool>,
     mut notice: Signal<Option<String>>,
 ) -> Element {
+    let mut script_check_busy = use_signal(|| false);
     let (proxy_status, proxy_loading, proxy_error) = match system_proxy() {
         SystemProxyLoadState::Loading => (None, true, None),
         SystemProxyLoadState::Ready(status) => (Some(status), false, None),
@@ -2128,6 +2552,76 @@ fn SettingsView(
                     div { class: "inline-note",
                         Icon { icon: LdInfo, width: 16, height: 16 }
                         span { "{note}" }
+                    }
+                }
+            }
+
+            section { class: "settings-section script-settings glass-surface",
+                div { class: "section-heading",
+                    div {
+                        p { class: "eyebrow", "CONFIG SCRIPT" }
+                        h2 { "JavaScript 配置覆写" }
+                    }
+                    span {
+                        class: if config_script_enabled() { "status-badge ready" } else { "status-badge" },
+                        if config_script_enabled() { "已启用" } else { "未启用" }
+                    }
+                }
+                label { class: "setting-row toggle-row",
+                    span { class: "setting-icon", Icon { icon: LdScrollText, width: 19, height: 19 } }
+                    div {
+                        strong { "main(config)" }
+                        small { "sing-box JSON · QuickJS" }
+                    }
+                    input {
+                        r#type: "checkbox",
+                        checked: config_script_enabled,
+                        disabled: config_script().trim().is_empty(),
+                        onchange: move |event| config_script_enabled.set(event.checked()),
+                    }
+                    span { class: "switch" }
+                }
+                textarea {
+                    class: "script-editor",
+                    aria_label: "JavaScript 配置覆写脚本",
+                    spellcheck: "false",
+                    placeholder: "function main(config) {{\n  return config;\n}}",
+                    value: config_script,
+                    oninput: move |event| {
+                        let value = event.value();
+                        if value.trim().is_empty() {
+                            config_script_enabled.set(false);
+                        }
+                        config_script.set(value);
+                    },
+                }
+                div { class: "script-actions",
+                    button {
+                        class: "secondary-button",
+                        disabled: script_check_busy() || config_script().trim().is_empty(),
+                        onclick: move |_| async move {
+                            script_check_busy.set(true);
+                            let request = ConnectionRequest {
+                                nodes: nodes(),
+                                selected_tag: selected_tag(),
+                                mode: tunnel_mode(),
+                                tun: tun_enabled(),
+                                custom_rules: custom_rules(),
+                                config_script: Some(config_script()),
+                                group_selections: group_selections(),
+                            };
+                            match api::validate_config_script(request).await {
+                                Ok(()) => notice.set(Some("配置脚本校验通过".to_string())),
+                                Err(error) => notice.set(Some(format!("配置脚本校验失败: {error}"))),
+                            }
+                            script_check_busy.set(false);
+                        },
+                        if script_check_busy() {
+                            span { class: "spinner" }
+                        } else {
+                            Icon { icon: LdCircleCheck, width: 17, height: 17 }
+                        }
+                        span { "校验" }
                     }
                 }
             }
@@ -2283,6 +2777,7 @@ fn SettingsView(
 
 fn protocol_abbreviation(protocol: ProxyProtocol) -> &'static str {
     match protocol {
+        ProxyProtocol::AnyTls => "AT",
         ProxyProtocol::Hysteria2 => "HY",
         ProxyProtocol::Vmess => "VM",
         ProxyProtocol::Vless => "VL",
@@ -2295,6 +2790,7 @@ fn protocol_abbreviation(protocol: ProxyProtocol) -> &'static str {
 
 fn protocol_class(protocol: ProxyProtocol) -> &'static str {
     match protocol {
+        ProxyProtocol::AnyTls => "protocol-mark anytls",
         ProxyProtocol::Hysteria2 => "protocol-mark hy2",
         ProxyProtocol::Vmess => "protocol-mark vmess",
         ProxyProtocol::Vless => "protocol-mark vless",
@@ -2377,11 +2873,68 @@ fn apply_subscription_report(
     Ok(count)
 }
 
+#[cfg(test)]
 fn collect_nodes(subscriptions: &[Subscription]) -> Vec<ProxyNode> {
     subscriptions
         .iter()
         .flat_map(|subscription| subscription.nodes.iter().cloned())
         .collect()
+}
+
+fn resolve_active_subscription_id(
+    subscriptions: &[Subscription],
+    requested_id: Option<u64>,
+    selected_tag: &str,
+) -> Option<u64> {
+    requested_id
+        .filter(|id| {
+            subscriptions
+                .iter()
+                .any(|subscription| subscription.id == *id)
+        })
+        .or_else(|| {
+            subscriptions
+                .iter()
+                .find(|subscription| {
+                    subscription
+                        .nodes
+                        .iter()
+                        .any(|node| node.tag == selected_tag)
+                })
+                .map(|subscription| subscription.id)
+        })
+        .or_else(|| subscriptions.first().map(|subscription| subscription.id))
+}
+
+fn collect_subscription_nodes(
+    subscriptions: &[Subscription],
+    subscription_id: Option<u64>,
+) -> Vec<ProxyNode> {
+    subscription_id
+        .and_then(|id| {
+            subscriptions
+                .iter()
+                .find(|subscription| subscription.id == id)
+        })
+        .map(|subscription| subscription.nodes.clone())
+        .unwrap_or_default()
+}
+
+fn sort_proxy_group_members(
+    members: &mut [ProxyGroupMember],
+    results: &HashMap<String, NodeLatency>,
+) {
+    members.sort_by_key(|member| {
+        member
+            .node
+            .as_ref()
+            .and_then(|node| results.get(&node.tag))
+            .map(|result| match result.latency_ms {
+                Some(latency) => (0, latency),
+                None => (2, u64::MAX),
+            })
+            .unwrap_or((1, u64::MAX))
+    });
 }
 
 fn select_available_tag(nodes: &[ProxyNode], requested_tag: &str) -> String {
@@ -2441,6 +2994,46 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_ne!(nodes[0].tag, nodes[1].tag);
         assert_eq!(select_available_tag(&nodes, "missing"), nodes[0].tag);
+    }
+
+    #[test]
+    fn active_subscription_follows_selection_and_limits_nodes() {
+        let node = proxy_core::parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443#Edge",
+        )
+        .nodes
+        .pop()
+        .expect("fixture should parse");
+        let subscriptions = vec![
+            Subscription {
+                id: 1,
+                name: "One".to_string(),
+                source: "one".to_string(),
+                nodes: namespace_nodes(1, vec![node.clone()]),
+                rejected_count: 0,
+            },
+            Subscription {
+                id: 2,
+                name: "Two".to_string(),
+                source: "two".to_string(),
+                nodes: namespace_nodes(2, vec![node]),
+                rejected_count: 0,
+            },
+        ];
+        let second_tag = subscriptions[1].nodes[0].tag.clone();
+
+        assert_eq!(
+            resolve_active_subscription_id(&subscriptions, None, &second_tag),
+            Some(2)
+        );
+        let active_nodes = collect_subscription_nodes(&subscriptions, Some(2));
+        assert_eq!(active_nodes.len(), 1);
+        assert_eq!(active_nodes[0].tag, second_tag);
+
+        let remaining = vec![subscriptions[0].clone()];
+        let fallback_id = resolve_active_subscription_id(&remaining, Some(2), &second_tag);
+        assert_eq!(fallback_id, Some(1));
+        assert_eq!(collect_subscription_nodes(&remaining, fallback_id).len(), 1);
     }
 
     #[test]
@@ -2536,6 +3129,58 @@ mod tests {
         assert_eq!(format_latency(Some(&success)).1, "latency success");
         assert_eq!(format_latency(Some(&failure)).0, "失败");
         assert_eq!(format_latency(Some(&failure)).1, "latency error");
+    }
+
+    #[test]
+    fn latency_results_sort_success_before_pending_and_failure() {
+        let mut nodes = proxy_core::parse_subscription(
+            "trojan://password@slow.example.com:443#Slow\n\
+             trojan://password@pending.example.com:443#Pending\n\
+             trojan://password@fast.example.com:443#Fast\n\
+             trojan://password@failed.example.com:443#Failed",
+        )
+        .nodes;
+        let mut members = nodes
+            .drain(..)
+            .map(|node| ProxyGroupMember {
+                tag: node.tag.clone(),
+                node: Some(node),
+                nested_kind: None,
+            })
+            .collect::<Vec<_>>();
+        let mut results = HashMap::new();
+        results.insert(
+            members[0].tag.clone(),
+            NodeLatency {
+                tag: members[0].tag.clone(),
+                latency_ms: Some(300),
+                error: None,
+            },
+        );
+        results.insert(
+            members[2].tag.clone(),
+            NodeLatency {
+                tag: members[2].tag.clone(),
+                latency_ms: Some(80),
+                error: None,
+            },
+        );
+        results.insert(
+            members[3].tag.clone(),
+            NodeLatency {
+                tag: members[3].tag.clone(),
+                latency_ms: None,
+                error: Some("timeout".to_string()),
+            },
+        );
+
+        sort_proxy_group_members(&mut members, &results);
+
+        let names = members
+            .iter()
+            .filter_map(|member| member.node.as_ref().map(|node| node.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Fast", "Slow", "Pending", "Failed"]);
     }
 
     #[test]

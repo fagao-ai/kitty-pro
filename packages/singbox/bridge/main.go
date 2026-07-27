@@ -13,6 +13,7 @@ import (
 	stdjson "encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ type instance struct {
 }
 
 const bridgeLogLimit = 500
+const probeTimeout = 5 * time.Second
 
 type bridgeLogEntry struct {
 	Sequence  uint64 `json:"sequence"`
@@ -51,6 +53,12 @@ type bridgeLogEntry struct {
 type bridgeLogBatch struct {
 	NextCursor uint64           `json:"next_cursor"`
 	Entries    []bridgeLogEntry `json:"entries"`
+}
+
+type probeResult struct {
+	Tag       string  `json:"tag"`
+	LatencyMS *uint64 `json:"latency_ms,omitempty"`
+	Error     string  `json:"error,omitempty"`
 }
 
 type bridgeLogBuffer struct {
@@ -254,60 +262,6 @@ func start(configContent string) (*instance, error) {
 	}, nil
 }
 
-type probeResult struct {
-	Tag       string `json:"tag"`
-	LatencyMS uint64 `json:"latency_ms,omitempty"`
-	Error     string `json:"error,omitempty"`
-}
-
-func probe(configContent string, nodeTags []string, probeURL string) (results []probeResult, err error) {
-	service, err := start(configContent)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		service.cancel()
-		if closeErr := service.box.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close sing-box probe: %w", closeErr)
-		}
-	}()
-
-	results = make([]probeResult, len(nodeTags))
-	var waitGroup sync.WaitGroup
-	semaphore := make(chan struct{}, 8)
-	for index, tag := range nodeTags {
-		index := index
-		tag := tag
-		results[index].Tag = tag
-		outbound, loaded := service.box.Outbound().Outbound(tag)
-		if !loaded {
-			results[index].Error = fmt.Sprintf("probe outbound not found: %s", tag)
-			continue
-		}
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					results[index].Error = fmt.Sprintf("sing-box probe panic: %v", recovered)
-				}
-			}()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-			defer cancel()
-			delay, probeErr := urltest.URLTest(ctx, probeURL, outbound)
-			if probeErr != nil {
-				results[index].Error = probeErr.Error()
-				return
-			}
-			results[index].LatencyMS = uint64(delay)
-		}()
-	}
-	waitGroup.Wait()
-	return results, nil
-}
-
 func recoveredError(operation string, recovered any) error {
 	return fmt.Errorf("%s panic: %v", operation, recovered)
 }
@@ -331,6 +285,112 @@ func trafficEndpointFromOptions(options option.Options) (string, string) {
 		return "", ""
 	}
 	return "http://" + clashAPI.ExternalController + "/connections", clashAPI.Secret
+}
+
+func probe(configContent string, nodeTags []string, probeURL string) (results []probeResult, err error) {
+	service, err := start(configContent)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		service.cancel()
+		if closeErr := service.box.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("close sing-box probe: %w", closeErr)
+		}
+	}()
+
+	results = make([]probeResult, len(nodeTags))
+	var waitGroup sync.WaitGroup
+	semaphore := make(chan struct{}, 100)
+	for index, tag := range nodeTags {
+		index := index
+		tag := tag
+		results[index].Tag = tag
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					results[index] = probeResult{
+						Tag:   tag,
+						Error: fmt.Sprintf("sing-box probe panic: %v", recovered),
+					}
+				}
+			}()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			results[index] = service.probeOutbound(tag, probeURL)
+		}()
+	}
+	waitGroup.Wait()
+	return results, nil
+}
+
+func (service *instance) probeOutbound(tag string, probeURL string) probeResult {
+	result := probeResult{Tag: tag}
+	outbound, loaded := service.box.Outbound().Outbound(tag)
+	if !loaded {
+		result.Error = fmt.Sprintf("probe outbound not found: %s", tag)
+		return result
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	delay, err := urltest.URLTest(ctx, probeURL, outbound)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	latency := uint64(delay)
+	result.LatencyMS = &latency
+	return result
+}
+
+//export kitty_singbox_probe
+func kitty_singbox_probe(configContent *C.char, nodeTagsJSON *C.char, probeURL *C.char) *C.char {
+	if configContent == nil || nodeTagsJSON == nil || probeURL == nil {
+		setLastError(&bridgeError{message: "missing sing-box probe parameters"})
+		return nil
+	}
+	var nodeTags []string
+	if err := stdjson.Unmarshal([]byte(C.GoString(nodeTagsJSON)), &nodeTags); err != nil {
+		setLastError(err)
+		return nil
+	}
+	results, err := probe(C.GoString(configContent), nodeTags, C.GoString(probeURL))
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	payload, err := stdjson.Marshal(results)
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	setLastError(nil)
+	return C.CString(string(payload))
+}
+
+//export kitty_singbox_probe_outbound
+func kitty_singbox_probe_outbound(handle C.uint64_t, tag *C.char, probeURL *C.char) *C.char {
+	if tag == nil || probeURL == nil {
+		setLastError(&bridgeError{message: "missing sing-box outbound probe parameters"})
+		return nil
+	}
+	state.Lock()
+	service, found := state.instances[uint64(handle)]
+	state.Unlock()
+	if !found {
+		setLastError(&bridgeError{message: "sing-box instance is not running"})
+		return nil
+	}
+	result := service.probeOutbound(C.GoString(tag), C.GoString(probeURL))
+	payload, err := stdjson.Marshal(result)
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	setLastError(nil)
+	return C.CString(string(payload))
 }
 
 //export kitty_singbox_start
@@ -439,6 +499,38 @@ func (service *instance) traffic() ([]byte, error) {
 	})
 }
 
+func (service *instance) selectOutbound(group string, outbound string) error {
+	if service.trafficURL == "" {
+		return &bridgeError{message: "proxy selection is not enabled"}
+	}
+	payload, err := stdjson.Marshal(map[string]string{"name": outbound})
+	if err != nil {
+		return err
+	}
+	endpoint := strings.TrimSuffix(service.trafficURL, "/connections") + "/proxies/" + url.PathEscape(group)
+	request, err := http.NewRequest(http.MethodPut, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if service.trafficAuthToken != "" {
+		request.Header.Set("Authorization", "Bearer "+service.trafficAuthToken)
+	}
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("proxy selection endpoint returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
 //export kitty_singbox_traffic
 func kitty_singbox_traffic(handle C.uint64_t) (result *C.char) {
 	defer func() {
@@ -461,6 +553,27 @@ func kitty_singbox_traffic(handle C.uint64_t) (result *C.char) {
 	}
 	setLastError(nil)
 	return C.CString(string(payload))
+}
+
+//export kitty_singbox_select_outbound
+func kitty_singbox_select_outbound(handle C.uint64_t, group *C.char, outbound *C.char) C.int {
+	if group == nil || outbound == nil {
+		setLastError(&bridgeError{message: "missing proxy group selection"})
+		return 0
+	}
+	state.Lock()
+	service, found := state.instances[uint64(handle)]
+	state.Unlock()
+	if !found {
+		setLastError(&bridgeError{message: "sing-box instance is not running"})
+		return 0
+	}
+	if err := service.selectOutbound(C.GoString(group), C.GoString(outbound)); err != nil {
+		setLastError(err)
+		return 0
+	}
+	setLastError(nil)
+	return 1
 }
 
 //export kitty_singbox_logs
@@ -520,33 +633,6 @@ func kitty_singbox_validate_rule_set_file(path *C.char) (result *C.char) {
 	if err := validateRuleSetFile(C.GoString(path)); err != nil {
 		return C.CString(err.Error())
 	}
-	return nil
-}
-
-//export kitty_singbox_probe
-func kitty_singbox_probe(configContent *C.char, nodeTagsJSON *C.char, probeURL *C.char, resultOut **C.char) (errorOut *C.char) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			errorOut = C.CString(recoveredError("probe sing-box outbounds", recovered).Error())
-		}
-	}()
-	if configContent == nil || nodeTagsJSON == nil || probeURL == nil || resultOut == nil {
-		return C.CString("missing sing-box probe parameters")
-	}
-	*resultOut = nil
-	var nodeTags []string
-	if err := stdjson.Unmarshal([]byte(C.GoString(nodeTagsJSON)), &nodeTags); err != nil {
-		return C.CString(fmt.Sprintf("decode sing-box probe tags: %v", err))
-	}
-	results, err := probe(C.GoString(configContent), nodeTags, C.GoString(probeURL))
-	if err != nil {
-		return C.CString(err.Error())
-	}
-	payload, err := stdjson.Marshal(results)
-	if err != nil {
-		return C.CString(fmt.Sprintf("encode sing-box probe results: %v", err))
-	}
-	*resultOut = C.CString(string(payload))
 	return nil
 }
 

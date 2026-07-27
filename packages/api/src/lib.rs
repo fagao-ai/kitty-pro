@@ -1,7 +1,9 @@
 //! Shared fullstack APIs used by web, desktop, and mobile shells.
 
 use dioxus::prelude::*;
-use proxy_core::{AppProfile, ConnectionRequest, ParseReport, ProxyNode, RuleSetCachePaths};
+use proxy_core::{
+    AppProfile, ConnectionRequest, ParseReport, ProxyGroup, ProxyNode, RuleSetCachePaths,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use proxy_core::{
     SingBoxOptions, TunnelMode, CHINA_GEOIP_RULE_SET_URL, CHINA_GEOSITE_RULE_SET_URL,
@@ -12,9 +14,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_SUBSCRIPTION_BYTES: usize = 10 * 1024 * 1024;
 
-#[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
-const MAX_LATENCY_NODES: usize = 32;
+/// Kitty Pro's per-session safety limit; sing-box itself does not impose this limit.
+pub const MAX_LATENCY_NODES: usize = 100;
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -28,6 +29,10 @@ const MAX_RULE_SET_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const RULE_SET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+#[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+const LATENCY_PROBE_STAGGER_MS: u64 = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiCoreStatus {
     pub state: String,
@@ -40,6 +45,14 @@ pub struct NodeLatency {
     pub tag: String,
     pub latency_ms: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatencyProbeSnapshot {
+    pub results: Vec<NodeLatency>,
+    pub completed: usize,
+    pub total: usize,
+    pub done: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +235,41 @@ pub async fn update_rule_sets(force: bool) -> Result<RuleSetUpdateResult, Server
         not(any(target_os = "android", target_os = "ios")),
         any(target_arch = "wasm32", feature = "server")
     ),
+    post("/api/config-script/validate")
+)]
+pub async fn validate_config_script(request: ConnectionRequest) -> Result<(), ServerFnError> {
+    validate_native_config_script(request)
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/proxy-groups/preview")
+)]
+pub async fn preview_proxy_groups(
+    request: ConnectionRequest,
+) -> Result<Vec<ProxyGroup>, ServerFnError> {
+    preview_native_proxy_groups(request)
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/proxy-groups/select")
+)]
+pub async fn select_proxy_group(group: String, outbound: String) -> Result<(), ServerFnError> {
+    select_native_proxy_group(group, outbound)
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
     get("/api/core/traffic")
 )]
 pub async fn core_traffic() -> Result<CoreTraffic, ServerFnError> {
@@ -261,6 +309,28 @@ pub async fn measure_node_latency(
     nodes: Vec<ProxyNode>,
 ) -> Result<Vec<NodeLatency>, ServerFnError> {
     measure_native_latency(nodes).await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/latency/start")
+)]
+pub async fn start_node_latency(nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
+    start_native_latency_session(nodes).await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/latency/poll")
+)]
+pub async fn poll_node_latency(session_id: u64) -> Result<LatencyProbeSnapshot, ServerFnError> {
+    poll_native_latency_session(session_id)
 }
 
 #[cfg_attr(
@@ -315,7 +385,7 @@ where
 }
 
 #[allow(dead_code)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
     if nodes.is_empty() {
         return Err(ServerFnError::new("没有可探测的节点"));
@@ -336,9 +406,64 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
         mode: TunnelMode::Global,
         tun: false,
         custom_rules: Vec::new(),
+        config_script: None,
+        group_selections: Default::default(),
     };
-    let mut config = proxy_core::build_singbox_config(&request, &SingBoxOptions::default());
-    config["log"]["level"] = serde_json::Value::String("error".to_string());
+    let probe_options = SingBoxOptions {
+        log_level: "error".to_string(),
+        ..SingBoxOptions::default()
+    };
+    let mut config = proxy_core::build_singbox_config(&request, &probe_options);
+    config["inbounds"] = serde_json::json!([]);
+    config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
+    tokio::task::spawn_blocking(move || {
+        singbox::SingBox::probe_config(&config, &node_tags, LATENCY_CHECK_URL)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|result| NodeLatency {
+                        tag: result.tag,
+                        latency_ms: result.latency_ms,
+                        error: result.error,
+                    })
+                    .collect()
+            })
+            .map_err(|error| ServerFnError::new(error.to_string()))
+    })
+    .await
+    .map_err(|error| ServerFnError::new(format!("节点探测任务失败: {error}")))?
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
+    if nodes.is_empty() {
+        return Err(ServerFnError::new("没有可探测的节点"));
+    }
+    if nodes.len() > MAX_LATENCY_NODES {
+        return Err(ServerFnError::new(format!(
+            "单次最多探测 {MAX_LATENCY_NODES} 个节点"
+        )));
+    }
+
+    let node_tags = nodes
+        .iter()
+        .map(|node| node.tag.clone())
+        .collect::<Vec<_>>();
+    let request = ConnectionRequest {
+        nodes,
+        selected_tag: node_tags.first().cloned().unwrap_or_default(),
+        mode: TunnelMode::Global,
+        tun: false,
+        custom_rules: Vec::new(),
+        config_script: None,
+        group_selections: Default::default(),
+    };
+    let probe_options = SingBoxOptions {
+        log_level: "error".to_string(),
+        ..SingBoxOptions::default()
+    };
+    let mut config = proxy_core::build_singbox_config(&request, &probe_options);
     config["inbounds"] = serde_json::json!([]);
     config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
     let config = serde_json::to_string(&config)
@@ -367,6 +492,218 @@ async fn measure_native_latency(_nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatenc
     Err(ServerFnError::new("浏览器目标不能直接运行节点延迟探测"))
 }
 
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
+    validate_latency_nodes(&nodes)?;
+    let node_tags = nodes
+        .iter()
+        .map(|node| node.tag.clone())
+        .collect::<Vec<_>>();
+    let request = ConnectionRequest {
+        nodes,
+        selected_tag: node_tags.first().cloned().unwrap_or_default(),
+        mode: TunnelMode::Global,
+        tun: false,
+        custom_rules: Vec::new(),
+        config_script: None,
+        group_selections: Default::default(),
+    };
+    let probe_options = SingBoxOptions {
+        log_level: "error".to_string(),
+        ..SingBoxOptions::default()
+    };
+    let mut config = proxy_core::build_singbox_config(&request, &probe_options);
+    config["inbounds"] = serde_json::json!([]);
+    config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
+    let core = tokio::task::spawn_blocking(move || {
+        let mut core = singbox::SingBox::new().map_err(|error| error.to_string())?;
+        core.start_config(&config)
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>(core)
+    })
+    .await
+    .map_err(|error| ServerFnError::new(format!("启动节点探测任务失败: {error}")))?
+    .map_err(ServerFnError::new)?;
+
+    let (session_id, session) = register_latency_session(node_tags.len())?;
+    let core = std::sync::Arc::new(core);
+    tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, tag) in node_tags.into_iter().enumerate() {
+            let core = std::sync::Arc::clone(&core);
+            tasks.spawn(async move {
+                if index > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        index as u64 * LATENCY_PROBE_STAGGER_MS,
+                    ))
+                    .await;
+                }
+                let fallback_tag = tag.clone();
+                match tokio::task::spawn_blocking(move || {
+                    core.probe_outbound(&tag, LATENCY_CHECK_URL)
+                })
+                .await
+                {
+                    Ok(Ok(result)) => NodeLatency {
+                        tag: result.tag,
+                        latency_ms: result.latency_ms,
+                        error: result.error,
+                    },
+                    Ok(Err(error)) => NodeLatency {
+                        tag: fallback_tag,
+                        latency_ms: None,
+                        error: Some(error.to_string()),
+                    },
+                    Err(error) => NodeLatency {
+                        tag: fallback_tag,
+                        latency_ms: None,
+                        error: Some(format!("节点探测任务失败: {error}")),
+                    },
+                }
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(result) = result {
+                session.push(result);
+            }
+        }
+        session.finish();
+    });
+    Ok(session_id)
+}
+
+#[cfg(target_os = "android")]
+async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
+    validate_latency_nodes(&nodes)?;
+    let total = nodes.len();
+    let fallback_tags = nodes
+        .iter()
+        .map(|node| node.tag.clone())
+        .collect::<Vec<_>>();
+    let (session_id, session) = register_latency_session(total)?;
+    tokio::spawn(async move {
+        let results = measure_native_latency(nodes).await.unwrap_or_else(|error| {
+            fallback_tags
+                .into_iter()
+                .map(|tag| NodeLatency {
+                    tag,
+                    latency_ms: None,
+                    error: Some(error.to_string()),
+                })
+                .collect()
+        });
+        for result in results {
+            session.push(result);
+        }
+        session.finish();
+    });
+    Ok(session_id)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn start_native_latency_session(_nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
+    Err(ServerFnError::new("浏览器目标不能直接启动节点探测"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_latency_nodes(nodes: &[ProxyNode]) -> Result<(), ServerFnError> {
+    if nodes.is_empty() {
+        return Err(ServerFnError::new("没有可探测的节点"));
+    }
+    if nodes.len() > MAX_LATENCY_NODES {
+        return Err(ServerFnError::new(format!(
+            "单次最多探测 {MAX_LATENCY_NODES} 个节点"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LatencySession {
+    results: std::sync::Mutex<Vec<NodeLatency>>,
+    completed: std::sync::atomic::AtomicUsize,
+    total: usize,
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LatencySession {
+    fn push(&self, result: NodeLatency) {
+        if let Ok(mut results) = self.results.lock() {
+            results.push(result);
+        }
+        self.completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn finish(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn register_latency_session(
+    total: usize,
+) -> Result<(u64, std::sync::Arc<LatencySession>), ServerFnError> {
+    static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let session_id = NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let session = std::sync::Arc::new(LatencySession {
+        results: std::sync::Mutex::new(Vec::new()),
+        completed: std::sync::atomic::AtomicUsize::new(0),
+        total,
+        done: std::sync::atomic::AtomicBool::new(false),
+    });
+    latency_sessions()
+        .lock()
+        .map_err(|_| ServerFnError::new("节点探测会话锁已损坏"))?
+        .insert(session_id, std::sync::Arc::clone(&session));
+    Ok((session_id, session))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_native_latency_session(session_id: u64) -> Result<LatencyProbeSnapshot, ServerFnError> {
+    let session = latency_sessions()
+        .lock()
+        .map_err(|_| ServerFnError::new("节点探测会话锁已损坏"))?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| ServerFnError::new("节点探测会话不存在或已结束"))?;
+    let results = {
+        let mut results = session
+            .results
+            .lock()
+            .map_err(|_| ServerFnError::new("节点探测结果锁已损坏"))?;
+        std::mem::take(&mut *results)
+    };
+    let done = session.done.load(std::sync::atomic::Ordering::Acquire);
+    let snapshot = LatencyProbeSnapshot {
+        results,
+        completed: session.completed.load(std::sync::atomic::Ordering::Relaxed),
+        total: session.total,
+        done,
+    };
+    if done {
+        latency_sessions()
+            .lock()
+            .map_err(|_| ServerFnError::new("节点探测会话锁已损坏"))?
+            .remove(&session_id);
+    }
+    Ok(snapshot)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_native_latency_session(_session_id: u64) -> Result<LatencyProbeSnapshot, ServerFnError> {
+    Err(ServerFnError::new("浏览器目标不能直接读取节点探测"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn latency_sessions(
+) -> &'static std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<LatencySession>>> {
+    static SESSIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<LatencySession>>>,
+    > = std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
 async fn download_subscription(url: &str) -> Result<String, ServerFnError> {
@@ -1000,6 +1337,98 @@ fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File>
 }
 
 #[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_native_config_script(request: ConnectionRequest) -> Result<(), ServerFnError> {
+    if request.config_script.is_none() {
+        return Err(ServerFnError::new("脚本内容为空"));
+    }
+    build_native_config(&request, &SingBoxOptions::default()).map(|_| ())
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+fn validate_native_config_script(_request: ConnectionRequest) -> Result<(), ServerFnError> {
+    Err(ServerFnError::new("浏览器端不能直接执行配置脚本"))
+}
+
+#[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+fn preview_native_proxy_groups(
+    request: ConnectionRequest,
+) -> Result<Vec<ProxyGroup>, ServerFnError> {
+    let config = build_native_config(&request, &SingBoxOptions::default())?;
+    Ok(proxy_core::extract_proxy_groups(&config))
+}
+
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn select_native_proxy_group(group: String, outbound: String) -> Result<(), ServerFnError> {
+    if group.trim().is_empty() || outbound.trim().is_empty() {
+        return Err(ServerFnError::new("代理组和节点不能为空"));
+    }
+    let guard = core_slot()
+        .lock()
+        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    let core = guard
+        .as_ref()
+        .ok_or_else(|| ServerFnError::new("sing-box 尚未启动"))?;
+    core.select_outbound(&group, &outbound)
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+fn select_native_proxy_group(group: String, outbound: String) -> Result<(), ServerFnError> {
+    if group.trim().is_empty() || outbound.trim().is_empty() {
+        return Err(ServerFnError::new("代理组和节点不能为空"));
+    }
+    singbox::android::select_outbound(&group, &outbound)
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+fn select_native_proxy_group(_group: String, _outbound: String) -> Result<(), ServerFnError> {
+    Err(ServerFnError::new("浏览器端不能直接切换代理组"))
+}
+
+#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+fn preview_native_proxy_groups(
+    _request: ConnectionRequest,
+) -> Result<Vec<ProxyGroup>, ServerFnError> {
+    Err(ServerFnError::new("浏览器端不能直接生成代理组"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_native_config(
+    request: &ConnectionRequest,
+    options: &SingBoxOptions,
+) -> Result<serde_json::Value, ServerFnError> {
+    let mut config = proxy_core::build_singbox_config(request, options);
+    if let Some(script) = request.config_script.as_deref() {
+        let node_names = request
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.tag.clone(),
+                    serde_json::Value::String(node.name.clone()),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        config["__kitty_context"] = serde_json::json!({ "node_names": node_names });
+        config = proxy_core::apply_config_script(script, config)
+            .map_err(|error| ServerFnError::new(error.to_string()))?;
+        if let Some(config) = config.as_object_mut() {
+            config.remove("__kitty_context");
+        }
+    }
+    proxy_core::apply_proxy_group_selections(&mut config, &request.group_selections);
+    Ok(config)
+}
+
+#[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
 fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
     Ok(ApiCoreStatus {
@@ -1059,7 +1488,8 @@ fn toggle_native_core(
         rule_set_cache,
         ..SingBoxOptions::default()
     };
-    core.start(&request, &options)
+    let config = build_native_config(&request, &options)?;
+    core.start_config(&config)
         .map_err(|error| ServerFnError::new(error.to_string()))?;
     *guard = Some(core);
     drop(guard);
@@ -1093,7 +1523,7 @@ fn toggle_native_core(
         rule_set_cache,
         ..SingBoxOptions::default()
     };
-    let mut config = proxy_core::build_singbox_config(&request, &options);
+    let mut config = build_native_config(&request, &options)?;
     config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
     let config = serde_json::to_string(&config)
         .map_err(|error| ServerFnError::new(format!("序列化 Android VPN 配置失败: {error}")))?;
@@ -2182,6 +2612,37 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn native_config_applies_javascript_transform() {
+        let nodes = proxy_core::parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#香港节点",
+        )
+        .nodes;
+        let selected_tag = nodes[0].tag.clone();
+        let request = ConnectionRequest {
+            nodes,
+            selected_tag,
+            mode: TunnelMode::Rule,
+            tun: false,
+            custom_rules: Vec::new(),
+            config_script: Some(
+                "function main(config) {\
+                    config.log.level = Object.values(config.__kitty_context.node_names)[0];\
+                    return config;\
+                }"
+                .to_string(),
+            ),
+            group_selections: Default::default(),
+        };
+
+        let config = build_native_config(&request, &SingBoxOptions::default())
+            .expect("script should be applied before startup");
+
+        assert_eq!(config["log"]["level"], "香港节点");
+        assert!(config.get("__kitty_context").is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn unfinished_rule_set_transaction_restores_both_old_files() {
         let directory = TestDirectory::new("rule-set-rollback");
         let geosite = directory.0.join("geosite-cn.srs");
@@ -2245,6 +2706,39 @@ mod tests {
         assert!(!rule_set_backup_path(&geoip).exists());
         assert!(!rule_set_transaction_path(&directory.0).exists());
         assert!(!rule_set_commit_path(&directory.0).exists());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn latency_session_returns_only_incremental_results() {
+        let (session_id, session) = register_latency_session(2).expect("session should register");
+        session.push(NodeLatency {
+            tag: "fast".to_string(),
+            latency_ms: Some(42),
+            error: None,
+        });
+
+        let first = poll_native_latency_session(session_id).expect("first poll should succeed");
+        assert_eq!(first.completed, 1);
+        assert_eq!(first.results.len(), 1);
+        assert!(!first.done);
+
+        let second = poll_native_latency_session(session_id).expect("second poll should succeed");
+        assert!(second.results.is_empty());
+        assert_eq!(second.completed, 1);
+
+        session.push(NodeLatency {
+            tag: "slow".to_string(),
+            latency_ms: None,
+            error: Some("timeout".to_string()),
+        });
+        session.finish();
+        let final_snapshot =
+            poll_native_latency_session(session_id).expect("final poll should succeed");
+        assert_eq!(final_snapshot.completed, 2);
+        assert_eq!(final_snapshot.results.len(), 1);
+        assert!(final_snapshot.done);
+        assert!(poll_native_latency_session(session_id).is_err());
     }
 
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]

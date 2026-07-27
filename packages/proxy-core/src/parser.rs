@@ -70,6 +70,7 @@ pub fn parse_share_link(link: &str, index: usize) -> Result<ProxyNode, ParseErro
         .ok_or_else(|| ParseError::InvalidUrl("缺少协议头".to_string()))?;
 
     match scheme.as_str() {
+        "anytls" => parse_standard_url(link, index, ProxyProtocol::AnyTls),
         "hysteria2" | "hy2" => parse_standard_url(link, index, ProxyProtocol::Hysteria2),
         "vless" => parse_standard_url(link, index, ProxyProtocol::Vless),
         "trojan" => parse_standard_url(link, index, ProxyProtocol::Trojan),
@@ -152,14 +153,19 @@ fn parse_standard_url(
             alter_id: None,
             flow: non_empty(query.get("flow").cloned()),
         },
-        ProxyProtocol::Trojan | ProxyProtocol::Hysteria2 => ProxyAuth::Password {
-            password: required(password.unwrap_or(username), "password")?,
-        },
+        ProxyProtocol::AnyTls | ProxyProtocol::Trojan | ProxyProtocol::Hysteria2 => {
+            ProxyAuth::Password {
+                password: required(password.unwrap_or(username), "password")?,
+            }
+        }
         _ => return Err(ParseError::UnsupportedProtocol(protocol.to_string())),
     };
 
     let transport = transport_from_query(&query);
-    let tls = tls_from_query(&query, protocol == ProxyProtocol::Hysteria2);
+    let tls = tls_from_query(
+        &query,
+        matches!(protocol, ProxyProtocol::AnyTls | ProxyProtocol::Hysteria2),
+    );
     let hysteria2 = (protocol == ProxyProtocol::Hysteria2).then(|| Hysteria2Options {
         obfs: non_empty(query.get("obfs").cloned()),
         obfs_password: non_empty(
@@ -197,7 +203,7 @@ fn parse_proxy_url(
         .filter(|value| !value.is_empty())
         .ok_or(ParseError::MissingField("server"))?
         .to_string();
-    let port = url.port().or_else(|| match protocol {
+    let port = url.port().or(match protocol {
         ProxyProtocol::Http if tls_enabled => Some(443),
         ProxyProtocol::Http => Some(80),
         ProxyProtocol::Socks5 => Some(1080),
@@ -383,6 +389,7 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
         .ok_or(ParseError::MissingField("type"))?
         .to_ascii_lowercase();
     let protocol = match kind.as_str() {
+        "anytls" => ProxyProtocol::AnyTls,
         "hysteria2" | "hy2" => ProxyProtocol::Hysteria2,
         "vmess" => ProxyProtocol::Vmess,
         "vless" => ProxyProtocol::Vless,
@@ -402,11 +409,13 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
             alter_id: yaml_u32(mapping, "alterId").or_else(|| yaml_u32(mapping, "alter-id")),
             flow: non_empty(yaml_string(mapping, "flow")),
         },
-        ProxyProtocol::Trojan | ProxyProtocol::Hysteria2 => ProxyAuth::Password {
-            password: yaml_string(mapping, "password")
-                .or_else(|| yaml_string(mapping, "auth"))
-                .ok_or(ParseError::MissingField("password"))?,
-        },
+        ProxyProtocol::AnyTls | ProxyProtocol::Trojan | ProxyProtocol::Hysteria2 => {
+            ProxyAuth::Password {
+                password: yaml_string(mapping, "password")
+                    .or_else(|| yaml_string(mapping, "auth"))
+                    .ok_or(ParseError::MissingField("password"))?,
+            }
+        }
         ProxyProtocol::Shadowsocks => ProxyAuth::Shadowsocks {
             method: yaml_string(mapping, "cipher").ok_or(ParseError::MissingField("cipher"))?,
             password: yaml_string(mapping, "password")
@@ -445,7 +454,7 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
         .get(YamlValue::String("grpc-opts".to_string()))
         .and_then(YamlValue::as_mapping)
         .and_then(|grpc| yaml_string(grpc, "grpc-service-name"));
-    let tls_enabled = protocol == ProxyProtocol::Hysteria2
+    let tls_enabled = matches!(protocol, ProxyProtocol::AnyTls | ProxyProtocol::Hysteria2)
         || (protocol == ProxyProtocol::Http && kind == "https")
         || yaml_bool(mapping, "tls").unwrap_or(false)
         || yaml_string(mapping, "security")
@@ -617,6 +626,7 @@ fn decode_base64_text(value: &str) -> Option<String> {
 
 fn contains_share_link(text: &str) -> bool {
     [
+        "anytls://",
         "vmess://",
         "vless://",
         "trojan://",
@@ -760,6 +770,29 @@ trojan://password@tr.example.com:443?type=ws&path=%2Fedge&host=cdn.example.com&s
             Some(100)
         );
         assert_eq!(report.nodes[1].transport.path.as_deref(), Some("/edge"));
+    }
+
+    #[test]
+    fn parses_anytls_link() {
+        let report = parse_subscription(
+            "anytls://c2VjcmV0JTNEJTNE@edge.example.com:443?type=tcp&insecure=0&fp=chrome&sni=origin.example.com#Hong%20Kong",
+        );
+
+        assert_eq!(report.nodes.len(), 1);
+        assert!(report.rejected.is_empty());
+        let node = &report.nodes[0];
+        assert_eq!(node.protocol, ProxyProtocol::AnyTls);
+        assert_eq!(node.name, "Hong Kong");
+        assert!(node.tls.enabled);
+        assert!(!node.tls.insecure);
+        assert_eq!(node.tls.server_name.as_deref(), Some("origin.example.com"));
+        assert_eq!(node.tls.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(
+            node.auth,
+            ProxyAuth::Password {
+                password: "c2VjcmV0JTNEJTNE".to_string(),
+            }
+        );
     }
 
     #[test]

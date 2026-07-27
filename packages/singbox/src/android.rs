@@ -99,6 +99,10 @@ pub fn set_log_enabled(enabled: bool) -> Result<(), CoreError> {
     Ok(())
 }
 
+pub fn select_outbound(group: &str, outbound: &str) -> Result<(), CoreError> {
+    ffi::android_select_outbound(group, outbound)
+}
+
 pub fn probe(
     config: &str,
     node_tags: &[String],

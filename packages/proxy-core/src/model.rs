@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use thiserror::Error;
 
@@ -9,6 +9,7 @@ const MAX_CUSTOM_RULE_VALUE_BYTES: usize = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyProtocol {
+    AnyTls,
     Hysteria2,
     Vmess,
     Vless,
@@ -21,6 +22,7 @@ pub enum ProxyProtocol {
 impl ProxyProtocol {
     pub fn label(self) -> &'static str {
         match self {
+            Self::AnyTls => "AnyTLS",
             Self::Hysteria2 => "Hysteria2",
             Self::Vmess => "VMess",
             Self::Vless => "VLESS",
@@ -303,6 +305,25 @@ pub struct ConnectionRequest {
     pub tun: bool,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_script: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub group_selections: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyGroupKind {
+    Selector,
+    UrlTest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyGroup {
+    pub tag: String,
+    pub kind: ProxyGroupKind,
+    pub outbounds: Vec<String>,
+    pub selected: String,
 }
 
 /// A subscription together with its last successful parse result.
@@ -340,6 +361,8 @@ pub struct AppProfile {
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
     #[serde(default)]
+    pub active_subscription_id: Option<u64>,
+    #[serde(default)]
     pub selected_tag: String,
     #[serde(default)]
     pub tunnel_mode: TunnelMode,
@@ -349,6 +372,12 @@ pub struct AppProfile {
     pub dark_mode: bool,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
+    #[serde(default)]
+    pub config_script_enabled: bool,
+    #[serde(default)]
+    pub config_script: String,
+    #[serde(default)]
+    pub group_selections: HashMap<String, String>,
 }
 
 impl Default for AppProfile {
@@ -356,11 +385,15 @@ impl Default for AppProfile {
         Self {
             version: default_profile_version(),
             subscriptions: Vec::new(),
+            active_subscription_id: None,
             selected_tag: String::new(),
             tunnel_mode: TunnelMode::Rule,
             tun_enabled: false,
             dark_mode: false,
             custom_rules: Vec::new(),
+            config_script_enabled: false,
+            config_script: String::new(),
+            group_selections: HashMap::new(),
         }
     }
 }
@@ -436,7 +469,7 @@ mod tests {
             value: "example.com".to_string(),
             action: CustomRuleAction::Proxy,
         };
-        assert!(validate_custom_rules(&[rule.clone()]).is_ok());
+        assert!(validate_custom_rules(std::slice::from_ref(&rule)).is_ok());
         assert_eq!(
             validate_custom_rules(&[rule.clone(), rule]),
             Err(CustomRuleValidationError::InvalidId)

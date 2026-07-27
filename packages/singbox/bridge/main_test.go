@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
@@ -120,5 +122,61 @@ func TestProbeReturnsMissingOutboundAsNodeError(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].Tag != "missing" || results[0].Error == "" {
 		t.Fatalf("unexpected missing outbound result: %+v", results)
+	}
+}
+
+func TestProbeReturnsOneResultPerRequestedTag(t *testing.T) {
+	config := `{
+		"log": {"level": "error"},
+		"inbounds": [],
+		"outbounds": [{"type": "direct", "tag": "direct"}],
+		"route": {"auto_detect_interface": false, "final": "direct"}
+	}`
+	tags := []string{"missing-a", "missing-b", "missing-c"}
+
+	results, err := probe(config, tags, "https://www.gstatic.com/generate_204")
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if len(results) != len(tags) {
+		t.Fatalf("got %d results, want %d", len(results), len(tags))
+	}
+	for index, result := range results {
+		if result.Tag != tags[index] {
+			t.Fatalf("result %d tag = %q, want %q", index, result.Tag, tags[index])
+		}
+		if result.Error == "" {
+			t.Fatalf("result %d should report the missing outbound", index)
+		}
+	}
+}
+
+func TestProbeUsesAnExistingCoreForSuccessfulOutboundTests(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	config := `{
+		"log": {"level": "error"},
+		"inbounds": [],
+		"outbounds": [{"type": "direct", "tag": "direct"}],
+		"route": {"auto_detect_interface": false, "final": "direct"}
+	}`
+
+	service, err := start(config)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer func() {
+		service.cancel()
+		_ = service.box.Close()
+	}()
+	result := service.probeOutbound("direct", server.URL)
+
+	if result.Error != "" {
+		t.Fatalf("probe failed: %s", result.Error)
+	}
+	if result.LatencyMS == nil {
+		t.Fatal("probe should return a latency")
 	}
 }

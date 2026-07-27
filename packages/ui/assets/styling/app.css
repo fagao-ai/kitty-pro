@@ -799,6 +799,11 @@ body {
   font-weight: 800;
 }
 
+.protocol-mark.anytls {
+  color: #347b83;
+  background: rgba(52, 123, 131, 0.12);
+}
+
 .protocol-mark.hy2 {
   color: var(--accent);
   background: var(--accent-soft);
@@ -933,6 +938,142 @@ body {
 .workspace-section {
   min-height: calc(100vh - 126px);
   padding: 22px;
+}
+
+.proxy-groups-layout {
+  display: grid;
+  min-height: calc(100vh - 170px);
+  grid-template-columns: minmax(205px, 242px) minmax(0, 1fr);
+}
+
+.proxy-group-list {
+  min-width: 0;
+  padding-right: 18px;
+  border-right: 1px solid var(--border);
+}
+
+.proxy-group-list-heading {
+  min-height: 58px;
+  padding: 3px 10px 12px;
+}
+
+.proxy-group-list-heading strong {
+  display: block;
+  margin-top: 5px;
+  font-size: 12px;
+}
+
+.proxy-group-tab {
+  display: grid;
+  width: 100%;
+  min-height: 60px;
+  grid-template-columns: 34px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 9px;
+  color: inherit;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 150ms ease, box-shadow 150ms ease;
+}
+
+.proxy-group-tab:hover,
+.proxy-group-tab.active {
+  background: var(--surface-soft);
+}
+
+.proxy-group-tab.active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.proxy-group-tab > svg {
+  color: var(--text-faint);
+}
+
+.proxy-group-tab-copy {
+  min-width: 0;
+}
+
+.proxy-group-tab-copy strong,
+.proxy-group-tab-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-group-tab-copy strong {
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.proxy-group-tab-copy small {
+  margin-top: 4px;
+  color: var(--text-faint);
+  font-size: 9px;
+}
+
+.group-kind-mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  color: var(--blue);
+  border-radius: 7px;
+  background: var(--blue-soft);
+}
+
+.group-kind-mark.auto {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.proxy-group-members {
+  min-width: 0;
+  padding-left: 20px;
+}
+
+.proxy-group-toolbar {
+  min-height: 58px;
+  padding: 0 4px 10px;
+}
+
+.proxy-group-toolbar > div:first-child {
+  min-width: 0;
+}
+
+.proxy-group-toolbar h2,
+.proxy-group-toolbar > div:first-child > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-member-list {
+  margin-top: 0;
+}
+
+.group-member-row:disabled {
+  color: inherit;
+  opacity: 1;
+  cursor: default;
+}
+
+.group-member-row:disabled:hover {
+  background: transparent;
+}
+
+.auto-indicator {
+  display: grid;
+  place-items: center;
+  color: var(--amber);
+}
+
+.group-empty {
+  min-height: 220px;
 }
 
 .log-workspace {
@@ -1632,7 +1773,65 @@ body {
 }
 
 .subscription-row {
-  grid-template-columns: 38px minmax(160px, 1fr) 64px auto 38px 38px;
+  grid-template-columns: 38px minmax(160px, 1fr) 64px auto minmax(88px, auto) 38px 38px;
+}
+
+.subscription-row.active {
+  background: var(--surface-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.subscription-row .subscription-icon {
+  grid-column: 1;
+}
+
+.subscription-row .subscription-main {
+  grid-column: 2;
+}
+
+.subscription-row .subscription-stats {
+  grid-column: 3;
+}
+
+.subscription-row .warning-badge {
+  grid-column: 4;
+}
+
+.subscription-use-button {
+  display: inline-flex;
+  min-height: 32px;
+  grid-column: 5;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  color: var(--text-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.subscription-use-button:hover:not(:disabled) {
+  color: var(--accent-strong);
+  border-color: var(--border-strong);
+}
+
+.subscription-use-button.active {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  cursor: default;
+}
+
+.subscription-refresh-button {
+  grid-column: 6;
+}
+
+.subscription-delete-button {
+  grid-column: 7;
 }
 
 .subscription-icon {
@@ -1678,6 +1877,38 @@ body {
 
 .settings-section:first-child {
   grid-column: 1 / -1;
+}
+
+.script-settings {
+  grid-column: 1 / -1;
+}
+
+.script-editor {
+  width: 100%;
+  min-height: 280px;
+  margin-top: 12px;
+  padding: 13px 14px;
+  resize: vertical;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: 0;
+  background: var(--surface-soft);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.script-editor:focus {
+  border-color: rgba(19, 122, 97, 0.5);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.script-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
 }
 
 .status-badge.online,
@@ -1991,6 +2222,10 @@ body {
   .settings-section:first-child {
     grid-column: auto;
   }
+
+  .script-settings {
+    grid-column: auto;
+  }
 }
 
 @media (max-width: 760px) {
@@ -2132,6 +2367,53 @@ body {
     min-height: calc(100vh - 122px);
   }
 
+  .proxy-groups-layout {
+    min-height: auto;
+    grid-template-columns: 1fr;
+  }
+
+  .proxy-group-list {
+    display: flex;
+    max-width: 100%;
+    gap: 7px;
+    padding: 0 0 11px;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    scrollbar-width: none;
+  }
+
+  .proxy-group-list::-webkit-scrollbar {
+    display: none;
+  }
+
+  .proxy-group-list-heading {
+    display: none;
+  }
+
+  .proxy-group-tab {
+    min-width: 178px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+  }
+
+  .proxy-group-tab.active {
+    border-color: var(--border-strong);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+
+  .proxy-group-tab > svg {
+    display: none;
+  }
+
+  .proxy-group-members {
+    padding: 14px 0 0;
+  }
+
+  .proxy-group-toolbar {
+    align-items: flex-end;
+  }
+
   .node-row {
     grid-template-columns: 36px minmax(100px, 1fr) 52px 20px;
     gap: 9px;
@@ -2142,13 +2424,25 @@ body {
   }
 
   .subscription-row {
-    grid-template-columns: 36px minmax(100px, 1fr) 44px 34px;
+    grid-template-columns: 36px minmax(100px, 1fr) 78px 34px;
     gap: 8px;
   }
 
   .subscription-row .warning-badge,
-  .subscription-row .icon-button:first-of-type {
+  .subscription-row .subscription-stats,
+  .subscription-row .subscription-refresh-button {
     display: none;
+  }
+
+  .subscription-use-button {
+    min-height: 34px;
+    grid-column: 3;
+    padding: 0 8px;
+    font-size: 9px;
+  }
+
+  .subscription-delete-button {
+    grid-column: 4;
   }
 
   .subscription-row .icon-button {
@@ -2162,6 +2456,10 @@ body {
   }
 
   .settings-section:first-child {
+    grid-column: auto;
+  }
+
+  .script-settings {
     grid-column: auto;
   }
 

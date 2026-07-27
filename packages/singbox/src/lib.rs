@@ -7,6 +7,7 @@
 
 use proxy_core::{build_singbox_config, validate_custom_rules, ConnectionRequest, SingBoxOptions};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 #[cfg(target_os = "android")]
@@ -55,6 +56,8 @@ pub struct ProbeResult {
     pub error: Option<String>,
 }
 
+pub type LatencyProbeResult = ProbeResult;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformCapabilities {
     pub embedded_core: bool,
@@ -88,6 +91,8 @@ pub enum CoreError {
     LogsUnavailable(String),
     #[error("sing-box 规则集无效: {0}")]
     RuleSetInvalid(String),
+    #[error("切换 sing-box 代理组失败: {0}")]
+    SelectionUnavailable(String),
     #[error("sing-box 节点探测失败: {0}")]
     ProbeUnavailable(String),
     #[error("配置序列化失败: {0}")]
@@ -108,10 +113,10 @@ impl SingBox {
     pub fn new() -> Result<Self, CoreError> {
         #[cfg(feature = "embedded-core")]
         {
-            return Ok(Self {
+            Ok(Self {
                 handle: None,
                 version: ffi::version(),
-            });
+            })
         }
 
         #[cfg(not(feature = "embedded-core"))]
@@ -127,7 +132,7 @@ impl SingBox {
     pub fn version(&self) -> Result<String, CoreError> {
         #[cfg(feature = "embedded-core")]
         {
-            return Ok(self.version.clone());
+            Ok(self.version.clone())
         }
 
         #[cfg(not(feature = "embedded-core"))]
@@ -147,15 +152,31 @@ impl SingBox {
             validate_custom_rules(&request.custom_rules)
                 .map_err(|error| CoreError::InvalidConfig(error.to_string()))?;
             let config = build_singbox_config(request, options);
-            let content = serde_json::to_string(&config)?;
-            let handle = ffi::start(&content)?;
-            self.handle = Some(handle);
-            return Ok(());
+            self.start_config(&config)
         }
 
         #[cfg(not(feature = "embedded-core"))]
         {
             let _ = (request, options);
+            Err(CoreError::EmbeddedCoreUnavailable)
+        }
+    }
+
+    pub fn start_config(&mut self, config: &Value) -> Result<(), CoreError> {
+        #[cfg(feature = "embedded-core")]
+        {
+            if self.handle.is_some() {
+                return Err(CoreError::AlreadyRunning);
+            }
+            let content = serde_json::to_string(config)?;
+            let handle = ffi::start(&content)?;
+            self.handle = Some(handle);
+            Ok(())
+        }
+
+        #[cfg(not(feature = "embedded-core"))]
+        {
+            let _ = config;
             Err(CoreError::EmbeddedCoreUnavailable)
         }
     }
@@ -166,7 +187,7 @@ impl SingBox {
             let handle = self.handle.ok_or(CoreError::NotRunning)?;
             ffi::stop(handle)?;
             self.handle = None;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(feature = "embedded-core"))]
@@ -176,7 +197,7 @@ impl SingBox {
     pub fn is_running(&self) -> Result<bool, CoreError> {
         #[cfg(feature = "embedded-core")]
         {
-            return Ok(self.handle.is_some());
+            Ok(self.handle.is_some())
         }
 
         #[cfg(not(feature = "embedded-core"))]
@@ -186,7 +207,7 @@ impl SingBox {
     pub fn status(&self) -> CoreStatus {
         #[cfg(feature = "embedded-core")]
         {
-            return CoreStatus {
+            CoreStatus {
                 state: if self.handle.is_some() {
                     CoreState::Running
                 } else {
@@ -194,7 +215,7 @@ impl SingBox {
                 },
                 version: Some(self.version.clone()),
                 platform_note: None,
-            };
+            }
         }
 
         #[cfg(not(feature = "embedded-core"))]
@@ -206,8 +227,8 @@ impl SingBox {
         {
             let handle = self.handle.ok_or(CoreError::NotRunning)?;
             let payload = ffi::traffic(handle)?;
-            return serde_json::from_str(&payload)
-                .map_err(|error| CoreError::TrafficUnavailable(error.to_string()));
+            serde_json::from_str(&payload)
+                .map_err(|error| CoreError::TrafficUnavailable(error.to_string()))
         }
 
         #[cfg(not(feature = "embedded-core"))]
@@ -219,8 +240,8 @@ impl SingBox {
         {
             let handle = self.handle.ok_or(CoreError::NotRunning)?;
             let payload = ffi::logs(handle, cursor)?;
-            return serde_json::from_str(&payload)
-                .map_err(|error| CoreError::LogsUnavailable(error.to_string()));
+            serde_json::from_str(&payload)
+                .map_err(|error| CoreError::LogsUnavailable(error.to_string()))
         }
 
         #[cfg(not(feature = "embedded-core"))]
@@ -231,11 +252,64 @@ impl SingBox {
         #[cfg(feature = "embedded-core")]
         {
             let handle = self.handle.ok_or(CoreError::NotRunning)?;
-            return ffi::set_log_enabled(handle, enabled);
+            ffi::set_log_enabled(handle, enabled)
         }
 
         #[cfg(not(feature = "embedded-core"))]
         Err(CoreError::EmbeddedCoreUnavailable)
+    }
+
+    pub fn select_outbound(&self, group: &str, outbound: &str) -> Result<(), CoreError> {
+        #[cfg(feature = "embedded-core")]
+        {
+            let handle = self.handle.ok_or(CoreError::NotRunning)?;
+            ffi::select_outbound(handle, group, outbound)
+        }
+
+        #[cfg(not(feature = "embedded-core"))]
+        {
+            let _ = (group, outbound);
+            Err(CoreError::EmbeddedCoreUnavailable)
+        }
+    }
+
+    pub fn probe_config(
+        config: &Value,
+        node_tags: &[String],
+        probe_url: &str,
+    ) -> Result<Vec<LatencyProbeResult>, CoreError> {
+        #[cfg(feature = "embedded-core")]
+        {
+            let config = serde_json::to_string(config)?;
+            let node_tags = serde_json::to_string(node_tags)?;
+            let payload = ffi::probe(&config, &node_tags, probe_url)?;
+            serde_json::from_str(&payload)
+                .map_err(|error| CoreError::ProbeUnavailable(error.to_string()))
+        }
+
+        #[cfg(not(feature = "embedded-core"))]
+        {
+            let _ = (config, node_tags, probe_url);
+            Err(CoreError::EmbeddedCoreUnavailable)
+        }
+    }
+
+    pub fn probe_outbound(
+        &self,
+        tag: &str,
+        probe_url: &str,
+    ) -> Result<LatencyProbeResult, CoreError> {
+        #[cfg(feature = "embedded-core")]
+        {
+            let handle = self.handle.ok_or(CoreError::NotRunning)?;
+            ffi::probe_outbound(handle, tag, probe_url)
+        }
+
+        #[cfg(not(feature = "embedded-core"))]
+        {
+            let _ = (tag, probe_url);
+            Err(CoreError::EmbeddedCoreUnavailable)
+        }
     }
 }
 
@@ -261,8 +335,8 @@ pub fn probe_outbounds(
     {
         let node_tags = serde_json::to_string(node_tags)?;
         let payload = ffi::probe(config, &node_tags, probe_url)?;
-        return serde_json::from_str(&payload)
-            .map_err(|error| CoreError::ProbeUnavailable(error.to_string()));
+        serde_json::from_str(&payload)
+            .map_err(|error| CoreError::ProbeUnavailable(error.to_string()))
     }
 
     #[cfg(not(feature = "embedded-core"))]
@@ -275,7 +349,7 @@ pub fn probe_outbounds(
 pub fn validate_rule_set_file(path: &std::path::Path) -> Result<(), CoreError> {
     #[cfg(feature = "embedded-core")]
     {
-        return ffi::validate_rule_set_file(path);
+        ffi::validate_rule_set_file(path)
     }
 
     #[cfg(not(feature = "embedded-core"))]
@@ -308,6 +382,16 @@ mod ffi {
     use std::os::raw::c_char;
 
     unsafe extern "C" {
+        fn kitty_singbox_probe(
+            config_content: *const c_char,
+            node_tags_json: *const c_char,
+            probe_url: *const c_char,
+        ) -> *mut c_char;
+        fn kitty_singbox_probe_outbound(
+            handle: u64,
+            tag: *const c_char,
+            probe_url: *const c_char,
+        ) -> *mut c_char;
         fn kitty_singbox_start(config_content: *const c_char) -> u64;
         fn kitty_singbox_stop(handle: u64) -> i32;
         fn kitty_singbox_version() -> *mut c_char;
@@ -316,13 +400,11 @@ mod ffi {
         fn kitty_singbox_logs(handle: u64, cursor: u64) -> *mut c_char;
         fn kitty_singbox_set_log_enabled(handle: u64, enabled: i32) -> i32;
         fn kitty_singbox_validate_rule_set_file(path: *const c_char) -> *mut c_char;
-        #[cfg(not(target_os = "android"))]
-        fn kitty_singbox_probe(
-            config_content: *const c_char,
-            node_tags_json: *const c_char,
-            probe_url: *const c_char,
-            result: *mut *mut c_char,
-        ) -> *mut c_char;
+        fn kitty_singbox_select_outbound(
+            handle: u64,
+            group: *const c_char,
+            outbound: *const c_char,
+        ) -> i32;
         fn kitty_singbox_free_string(value: *mut c_char);
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_start(
@@ -338,6 +420,11 @@ mod ffi {
         fn kitty_singbox_android_logs(cursor: u64) -> *mut c_char;
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_set_log_enabled(enabled: i32);
+        #[cfg(target_os = "android")]
+        fn kitty_singbox_android_select_outbound(
+            group: *const c_char,
+            outbound: *const c_char,
+        ) -> *mut c_char;
         #[cfg(target_os = "android")]
         fn kitty_singbox_android_probe(
             config_content: *const c_char,
@@ -356,6 +443,41 @@ mod ffi {
             return Err(CoreError::InvalidConfig(last_error()));
         }
         Ok(handle)
+    }
+
+    pub fn probe(config: &str, node_tags_json: &str, probe_url: &str) -> Result<String, CoreError> {
+        let config = CString::new(config)
+            .map_err(|_| CoreError::ProbeUnavailable("配置中包含 NUL 字符".to_string()))?;
+        let node_tags_json = CString::new(node_tags_json)
+            .map_err(|_| CoreError::ProbeUnavailable("节点标识中包含 NUL 字符".to_string()))?;
+        let probe_url = CString::new(probe_url)
+            .map_err(|_| CoreError::ProbeUnavailable("探测地址中包含 NUL 字符".to_string()))?;
+        let payload = take_string(unsafe {
+            kitty_singbox_probe(config.as_ptr(), node_tags_json.as_ptr(), probe_url.as_ptr())
+        });
+        if payload.is_empty() {
+            return Err(CoreError::ProbeUnavailable(last_error()));
+        }
+        Ok(payload)
+    }
+
+    pub fn probe_outbound(
+        handle: u64,
+        tag: &str,
+        probe_url: &str,
+    ) -> Result<super::LatencyProbeResult, CoreError> {
+        let tag = CString::new(tag)
+            .map_err(|_| CoreError::ProbeUnavailable("节点标识中包含 NUL 字符".to_string()))?;
+        let probe_url = CString::new(probe_url)
+            .map_err(|_| CoreError::ProbeUnavailable("探测地址中包含 NUL 字符".to_string()))?;
+        let payload = take_string(unsafe {
+            kitty_singbox_probe_outbound(handle, tag.as_ptr(), probe_url.as_ptr())
+        });
+        if payload.is_empty() {
+            return Err(CoreError::ProbeUnavailable(last_error()));
+        }
+        serde_json::from_str(&payload)
+            .map_err(|error| CoreError::ProbeUnavailable(error.to_string()))
     }
 
     pub fn stop(handle: u64) -> Result<(), CoreError> {
@@ -392,6 +514,18 @@ mod ffi {
         Ok(())
     }
 
+    pub fn select_outbound(handle: u64, group: &str, outbound: &str) -> Result<(), CoreError> {
+        let group = CString::new(group)
+            .map_err(|_| CoreError::SelectionUnavailable("分组名称包含 NUL 字符".to_string()))?;
+        let outbound = CString::new(outbound)
+            .map_err(|_| CoreError::SelectionUnavailable("节点名称包含 NUL 字符".to_string()))?;
+        if unsafe { kitty_singbox_select_outbound(handle, group.as_ptr(), outbound.as_ptr()) } == 0
+        {
+            return Err(CoreError::SelectionUnavailable(last_error()));
+        }
+        Ok(())
+    }
+
     pub fn validate_rule_set_file(path: &std::path::Path) -> Result<(), CoreError> {
         let path = path
             .to_str()
@@ -405,36 +539,6 @@ mod ffi {
             Err(CoreError::RuleSetInvalid(take_string(error)))
         }
     }
-
-    #[cfg(not(target_os = "android"))]
-    pub fn probe(config: &str, node_tags_json: &str, probe_url: &str) -> Result<String, CoreError> {
-        let config = CString::new(config)
-            .map_err(|_| CoreError::InvalidConfig("配置中包含 NUL 字符".to_string()))?;
-        let node_tags_json = CString::new(node_tags_json)
-            .map_err(|_| CoreError::ProbeUnavailable("节点标识包含 NUL 字符".to_string()))?;
-        let probe_url = CString::new(probe_url)
-            .map_err(|_| CoreError::ProbeUnavailable("探测地址包含 NUL 字符".to_string()))?;
-        let mut result = std::ptr::null_mut();
-        let error = unsafe {
-            kitty_singbox_probe(
-                config.as_ptr(),
-                node_tags_json.as_ptr(),
-                probe_url.as_ptr(),
-                &mut result,
-            )
-        };
-        if !error.is_null() {
-            return Err(CoreError::ProbeUnavailable(take_string(error)));
-        }
-        let payload = take_string(result);
-        if payload.is_empty() {
-            return Err(CoreError::ProbeUnavailable(
-                "sing-box 探测没有返回结果".to_string(),
-            ));
-        }
-        Ok(payload)
-    }
-
     #[cfg(target_os = "android")]
     pub fn android_start(config: &str, tun_fd: i32, data_path: &str) -> Result<(), CoreError> {
         let config = CString::new(config)
@@ -472,6 +576,17 @@ mod ffi {
     #[cfg(target_os = "android")]
     pub fn android_set_log_enabled(enabled: bool) {
         unsafe { kitty_singbox_android_set_log_enabled(i32::from(enabled)) }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn android_select_outbound(group: &str, outbound: &str) -> Result<(), CoreError> {
+        let group = CString::new(group)
+            .map_err(|_| CoreError::SelectionUnavailable("分组名称包含 NUL 字符".to_string()))?;
+        let outbound = CString::new(outbound)
+            .map_err(|_| CoreError::SelectionUnavailable("节点名称包含 NUL 字符".to_string()))?;
+        take_optional_error(unsafe {
+            kitty_singbox_android_select_outbound(group.as_ptr(), outbound.as_ptr())
+        })
     }
 
     #[cfg(target_os = "android")]
@@ -575,15 +690,22 @@ mod tests {
         use std::time::Duration;
 
         let nodes = proxy_core::parse_subscription(
-            "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443#Edge",
+            "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443#Edge\n\
+             anytls://secret@127.0.0.1:443?insecure=1&sni=edge.example.com#AnyTLS",
         )
         .nodes;
+        assert!(nodes
+            .iter()
+            .any(|node| node.protocol == proxy_core::ProxyProtocol::AnyTls));
+        let selected_tag = nodes[0].tag.clone();
         let request = ConnectionRequest {
-            selected_tag: nodes[0].tag.clone(),
+            selected_tag: selected_tag.clone(),
             nodes,
             mode: proxy_core::TunnelMode::Direct,
             tun: false,
             custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: Default::default(),
         };
         let target_listener =
             TcpListener::bind(("127.0.0.1", 0)).expect("local HTTP listener should bind");
@@ -619,6 +741,8 @@ mod tests {
         core.set_log_enabled(true)
             .expect("embedded core log collection should start");
         assert!(core.is_running().expect("core state should be readable"));
+        core.select_outbound("proxy", &selected_tag)
+            .expect("selector should switch through the embedded Clash API");
         let mut client = TcpStream::connect(("127.0.0.1", mixed_port))
             .expect("mixed inbound should accept HTTP proxy requests");
         client
@@ -650,6 +774,15 @@ mod tests {
                 && entry.message.contains(&format!("127.0.0.1:{target_port}"))
         }));
         core.stop().expect("embedded core should stop");
+
+        let probe_options = SingBoxOptions {
+            mixed_port: available_loopback_ports().0,
+            log_level: "error".to_string(),
+            ..SingBoxOptions::default()
+        };
+        core.start(&request, &probe_options)
+            .expect("embedded core should restart without the Clash API");
+        core.stop().expect("restarted embedded core should stop");
     }
 
     fn available_loopback_ports() -> (u16, u16) {
