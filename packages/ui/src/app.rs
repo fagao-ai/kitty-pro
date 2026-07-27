@@ -15,7 +15,7 @@ use proxy_core::{
 use std::collections::HashMap;
 
 const APP_CSS: &str = include_str!("../assets/styling/app.css");
-const BRAND_ICON: Asset = asset!("/assets/kitty-pro.svg");
+const BRAND_ICON_SVG: &str = include_str!("../assets/kitty-pro.svg");
 const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,7 +542,11 @@ pub fn ProxyApp(platform: String) -> Element {
 fn Brand() -> Element {
     rsx! {
         div { class: "brand",
-            img { class: "brand-mark", src: BRAND_ICON, alt: "", aria_hidden: "true" }
+            div {
+                class: "brand-mark",
+                aria_hidden: "true",
+                dangerous_inner_html: BRAND_ICON_SVG,
+            }
             div {
                 strong { "Kitty Pro" }
                 small { "SING-BOX CLIENT" }

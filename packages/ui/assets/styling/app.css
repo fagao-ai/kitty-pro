@@ -128,6 +128,12 @@ body {
   box-shadow: 0 8px 20px rgba(234, 88, 12, 0.14);
 }
 
+.brand-mark svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .brand strong,
 .brand small {
   display: block;
