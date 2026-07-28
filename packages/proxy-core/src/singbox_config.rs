@@ -1,6 +1,6 @@
 use crate::{
-    normalize_custom_rule_value, ConnectionRequest, CustomRule, ProxyAuth, ProxyGroup,
-    ProxyGroupKind, ProxyNode, ProxyProtocol, TunnelMode,
+    normalize_custom_rule_value, ConnectionRequest, CustomRule, CustomRuleAction, CustomRuleMatch,
+    ProxyAuth, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol, TunnelMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -11,6 +11,8 @@ pub const CHINA_GEOSITE_RULE_SET_URL: &str =
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs";
 pub const CHINA_GEOIP_RULE_SET_URL: &str =
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs";
+const SECURE_DNS_SERVER: &str = "1.1.1.1";
+const SECURE_DNS_SERVER_NAME: &str = "cloudflare-dns.com";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleSetCachePaths {
@@ -141,19 +143,14 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         ],
         (TunnelMode::Global | TunnelMode::Direct, _) => Vec::new(),
     };
+    let dns = build_dns_config(request);
 
     let mut config = json!({
         "log": {
             "level": options.log_level,
             "timestamp": true,
         },
-        "dns": {
-            "servers": [{
-                "type": "local",
-                "tag": "dns-direct",
-            }],
-            "final": "dns-direct",
-        },
+        "dns": dns,
         "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {
@@ -161,6 +158,9 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
             // tailnets and other VPN interfaces remain reachable. Desktop
             // TUN mode still pins outbounds to avoid re-entering its own TUN.
             "auto_detect_interface": request.tun,
+            // Proxy endpoints and rule-set downloads must resolve without
+            // depending on the proxy that is still being established.
+            "default_domain_resolver": "dns-direct",
             "rules": rules,
             "rule_set": rule_sets,
             "final": route_final,
@@ -175,6 +175,77 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         });
     }
     config
+}
+
+fn build_dns_config(request: &ConnectionRequest) -> Value {
+    let mut servers = vec![json!({
+        "type": "local",
+        "tag": "dns-direct",
+    })];
+    if request.mode == TunnelMode::Direct {
+        return json!({
+            "servers": servers,
+            "final": "dns-direct",
+        });
+    }
+
+    servers.push(json!({
+        "type": "https",
+        "tag": "dns-proxy",
+        "server": SECURE_DNS_SERVER,
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+            "enabled": true,
+            "server_name": SECURE_DNS_SERVER_NAME,
+        },
+        "detour": "proxy",
+    }));
+
+    let mut rules = vec![
+        json!({
+            "query_type": ["PTR"],
+            "action": "route",
+            "server": "dns-direct",
+        }),
+        json!({
+            "domain_suffix": ["lan", "local", "home.arpa"],
+            "action": "route",
+            "server": "dns-direct",
+        }),
+    ];
+    if request.mode == TunnelMode::Rule {
+        rules.extend(
+            request
+                .custom_rules
+                .iter()
+                .filter(|rule| rule.enabled && rule.action == CustomRuleAction::Direct)
+                .filter_map(custom_direct_dns_rule_to_value),
+        );
+        rules.push(json!({
+            "rule_set": "geosite-cn",
+            "action": "route",
+            "server": "dns-direct",
+        }));
+    }
+
+    json!({
+        "servers": servers,
+        "rules": rules,
+        "final": "dns-proxy",
+    })
+}
+
+fn custom_direct_dns_rule_to_value(rule: &CustomRule) -> Option<Value> {
+    if rule.match_type == CustomRuleMatch::IpCidr {
+        return None;
+    }
+    let value = normalize_custom_rule_value(rule.match_type, &rule.value).ok()?;
+    Some(json!({
+        rule.match_type.singbox_field(): [value],
+        "action": "route",
+        "server": "dns-direct",
+    }))
 }
 
 fn custom_rule_to_value(rule: &CustomRule) -> Option<Value> {
@@ -470,8 +541,13 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             config["route"]["rule_set"][1]["url"],
             CHINA_GEOIP_RULE_SET_URL
         );
-        assert_eq!(config["dns"]["final"], "dns-direct");
+        assert_eq!(config["dns"]["final"], "dns-proxy");
         assert_eq!(config["dns"]["servers"][0]["type"], "local");
+        assert_eq!(config["dns"]["servers"][1]["type"], "https");
+        assert_eq!(config["dns"]["servers"][1]["server"], "1.1.1.1");
+        assert_eq!(config["dns"]["servers"][1]["detour"], "proxy");
+        assert_eq!(config["dns"]["rules"][2]["rule_set"], "geosite-cn");
+        assert_eq!(config["route"]["default_domain_resolver"], "dns-direct");
         assert_eq!(
             config["experimental"]["clash_api"]["external_controller"],
             "127.0.0.1:17891"
@@ -506,7 +582,56 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             assert!(config["route"]["rule_set"]
                 .as_array()
                 .is_some_and(Vec::is_empty));
+            if mode == TunnelMode::Direct {
+                assert_eq!(config["dns"]["final"], "dns-direct");
+                assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(1));
+            } else {
+                assert_eq!(config["dns"]["final"], "dns-proxy");
+                assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(2));
+            }
         }
+    }
+
+    #[test]
+    fn direct_domain_rules_use_local_dns_before_secure_dns_fallback() {
+        let nodes = parse_subscription(
+            "hysteria2://secret@155.248.218.187:10086?sni=bing.com&insecure=1#HY2",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            mode: TunnelMode::Rule,
+            tun: true,
+            custom_rules: vec![
+                CustomRule {
+                    id: 1,
+                    enabled: true,
+                    match_type: CustomRuleMatch::DomainSuffix,
+                    value: "*.corp.example".to_string(),
+                    action: CustomRuleAction::Direct,
+                },
+                CustomRule {
+                    id: 2,
+                    enabled: true,
+                    match_type: CustomRuleMatch::IpCidr,
+                    value: "100.64.0.0/16".to_string(),
+                    action: CustomRuleAction::Direct,
+                },
+            ],
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        let dns_rules = config["dns"]["rules"]
+            .as_array()
+            .expect("DNS rules should be an array");
+
+        assert_eq!(dns_rules[2]["domain_suffix"], json!(["corp.example"]));
+        assert_eq!(dns_rules[2]["server"], "dns-direct");
+        assert_eq!(dns_rules[3]["rule_set"], "geosite-cn");
+        assert_eq!(dns_rules.len(), 4);
     }
 
     #[test]

@@ -421,7 +421,7 @@ jobs:
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
-      - name: Configure optional Android release signing
+      - name: Configure Android release signing
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -429,17 +429,22 @@ jobs:
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          if [[ -z "$KEYSTORE_BASE64" ]]; then
-            echo "No Android signing secrets found; the APK will use a generated debug certificate."
-            exit 0
+          if [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" || -z "$KEY_ALIAS" ]]; then
+            echo "Android release signing secrets are required so every APK remains upgrade-compatible." >&2
+            echo "Configure ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, and ANDROID_KEY_ALIAS." >&2
+            exit 1
           fi
 
           keystore="$RUNNER_TEMP/kitty-pro-release.jks"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          if [[ ! -s "$keystore" ]]; then
+            echo "ANDROID_KEYSTORE_BASE64 decoded to an empty keystore." >&2
+            exit 1
+          fi
           echo "ANDROID_KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
           echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
           echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
 
       - name: Build Android APK
         shell: bash

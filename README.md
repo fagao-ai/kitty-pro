@@ -80,9 +80,17 @@ and Android NDK. The build script uses the Homebrew defaults, but honors
 The result is an arm64-v8a APK for Android 7.0 and later at
 `dist/android/Kitty-Pro-arm64-v8a.apk`. It contains both the Dioxus JNI
 library and the embedded sing-box Go library. The release build is aligned and
-signed with the local Android debug certificate by default. Set
+signed with `~/.android/kitty-pro-release.jks` when that permanent key exists.
+On macOS, its password can be read from the `com.kitty.pro.android.release`
+Keychain item. Otherwise local builds reuse `~/.android/debug.keystore`. Set
 `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and
-optionally `ANDROID_KEY_PASSWORD` to use a release certificate.
+optionally `ANDROID_KEY_PASSWORD` to use a permanent release certificate.
+`ANDROID_VERSION_CODE` can override the automatically increasing version code.
+
+Android upgrades require the same application ID, the same signing key, and a
+non-decreasing version code. Keep the release keystore private and backed up:
+losing it makes it impossible to update existing installations. Uninstalling
+the app clears its subscriptions and settings.
 
 ## GitHub Actions packages
 
@@ -99,9 +107,9 @@ Run it manually from the repository's **Actions** page, or push a tag such as
 `v0.1.0`. Manual runs retain downloadable workflow artifacts for 14 days. A
 `v*` tag also creates a GitHub Release and attaches the distributable files.
 
-Android builds fall back to a generated debug certificate, which is suitable
-for direct installation but not Play Store publication. Add these GitHub
-Actions secrets to sign with an existing release key:
+Android release builds require a permanent signing key. The workflow fails
+when signing secrets are absent instead of generating a new certificate that
+would conflict with earlier installations. Add these GitHub Actions secrets:
 
 - `ANDROID_KEYSTORE_BASE64`: Base64-encoded JKS or PKCS12 keystore
 - `ANDROID_KEYSTORE_PASSWORD`: Keystore password

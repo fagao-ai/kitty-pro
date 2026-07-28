@@ -11,6 +11,20 @@ output_dir="$repo_root/dist/android"
 stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/kitty-pro-apk.XXXXXX")"
 build_variant="${ANDROID_BUILD_VARIANT:-release}"
 android_rust_target="${ANDROID_RUST_TARGET:-aarch64-linux-android}"
+android_version_code="${ANDROID_VERSION_CODE:-}"
+
+# Android only accepts an in-place update when the new package has a version
+# code at least as high as the installed package. Epoch minutes are monotonic
+# across local and CI builds while remaining well below Android's integer
+# limit. Release automation can still provide an explicit reproducible value.
+if [[ -z "$android_version_code" ]]; then
+    android_version_code="$(($(date -u +%s) / 60))"
+fi
+if [[ ! "$android_version_code" =~ ^[1-9][0-9]*$ ]] ||
+    ((android_version_code > 2100000000)); then
+    echo "ANDROID_VERSION_CODE must be an integer from 1 to 2100000000" >&2
+    exit 1
+fi
 
 case "$android_rust_target" in
     aarch64-linux-android)
@@ -49,10 +63,27 @@ if [[ ! -d "$build_tools" && -d "$sdk_root/build-tools" ]]; then
     build_tools="$(find "$sdk_root/build-tools" -mindepth 1 -maxdepth 1 -type d -print | sort | tail -n 1)"
 fi
 
+dedicated_keystore="$HOME/.android/kitty-pro-release.jks"
 if [[ -n "${ANDROID_KEYSTORE_PATH:-}" ]]; then
     keystore="$ANDROID_KEYSTORE_PATH"
     keystore_alias="${ANDROID_KEY_ALIAS:?ANDROID_KEY_ALIAS is required with ANDROID_KEYSTORE_PATH}"
     keystore_password="${ANDROID_KEYSTORE_PASSWORD:?ANDROID_KEYSTORE_PASSWORD is required with ANDROID_KEYSTORE_PATH}"
+    key_password="${ANDROID_KEY_PASSWORD:-$keystore_password}"
+    generate_debug_keystore=false
+elif [[ -f "$dedicated_keystore" ]]; then
+    keystore="$dedicated_keystore"
+    keystore_alias="${ANDROID_KEY_ALIAS:-kitty-pro}"
+    keystore_password="${ANDROID_KEYSTORE_PASSWORD:-}"
+    if [[ -z "$keystore_password" ]] && command -v security >/dev/null 2>&1; then
+        keystore_password="$(
+            security find-generic-password \
+                -w -a kitty-pro -s com.kitty.pro.android.release 2>/dev/null || true
+        )"
+    fi
+    if [[ -z "$keystore_password" ]]; then
+        echo "Set ANDROID_KEYSTORE_PASSWORD for $dedicated_keystore" >&2
+        exit 1
+    fi
     key_password="${ANDROID_KEY_PASSWORD:-$keystore_password}"
     generate_debug_keystore=false
 else
@@ -157,6 +188,13 @@ gradle_build_file="$android_project/app/build.gradle.kts"
 perl -0pi -e 's/namespace\s*=\s*"[^"]+"/namespace = "dev.dioxus.main"/' "$gradle_build_file"
 if ! grep -q 'namespace = "dev\.dioxus\.main"' "$gradle_build_file"; then
     echo "Unable to configure the Dioxus Android namespace" >&2
+    exit 1
+fi
+
+perl -0pi -e "s/versionCode\s*=\s*[0-9]+/versionCode = $android_version_code/" \
+    "$gradle_build_file"
+if ! grep -q "versionCode = $android_version_code" "$gradle_build_file"; then
+    echo "Unable to configure Android versionCode" >&2
     exit 1
 fi
 
@@ -289,6 +327,14 @@ apksigner sign \
     "$unsigned_apk"
 apksigner verify --verbose --print-certs "$signed_apk"
 
+package_badging="$(aapt dump badging "$signed_apk")"
+package_badging="${package_badging%%$'\n'*}"
+if [[ "$package_badging" != *"name='com.kitty.pro'"* ]] ||
+    [[ "$package_badging" != *"versionCode='$android_version_code'"* ]]; then
+    echo "Signed APK has unexpected package metadata: $package_badging" >&2
+    exit 1
+fi
+
 apk_entries="$(unzip -Z1 "$signed_apk")"
 if ! grep -Eq '^classes([0-9]+)?\.dex$' <<<"$apk_entries"; then
     echo "Signed APK does not contain classes.dex" >&2
@@ -310,4 +356,5 @@ if [[ -n "$unexpected_main_libraries" ]]; then
     exit 1
 fi
 
+echo "APK versionCode: $android_version_code"
 echo "APK: $signed_apk"
