@@ -1267,13 +1267,32 @@ body {
   background: var(--surface-soft);
 }
 
-.log-time {
+.log-origin {
+  min-width: 0;
   align-self: start;
   padding-top: 5px;
+}
+
+.log-time,
+.log-source {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-time {
   color: var(--text-faint);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 9px;
   font-variant-numeric: tabular-nums;
+}
+
+.log-source {
+  margin-top: 6px;
+  color: var(--text-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 8px;
 }
 
 .route-decision,

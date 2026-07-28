@@ -88,6 +88,8 @@ pub struct RouteLogDetail {
     pub outbound_tag: String,
     #[serde(default)]
     pub outbound_chain: Vec<String>,
+    #[serde(default)]
+    pub source_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +433,7 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
         selected_tag: node_tags.first().cloned().unwrap_or_default(),
         mode: TunnelMode::Global,
         tun: false,
+        allow_lan: false,
         custom_rules: Vec::new(),
         config_script: None,
         group_selections: Default::default(),
@@ -481,6 +484,7 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
         selected_tag: node_tags.first().cloned().unwrap_or_default(),
         mode: TunnelMode::Global,
         tun: false,
+        allow_lan: false,
         custom_rules: Vec::new(),
         config_script: None,
         group_selections: Default::default(),
@@ -530,6 +534,7 @@ async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, Serv
         selected_tag: node_tags.first().cloned().unwrap_or_default(),
         mode: TunnelMode::Global,
         tun: false,
+        allow_lan: false,
         custom_rules: Vec::new(),
         config_script: None,
         group_selections: Default::default(),
@@ -1466,6 +1471,16 @@ fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn desktop_mixed_listen_address(allow_lan: bool) -> &'static str {
+    if allow_lan {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn toggle_native_core(
     enabled: bool,
     request: Option<ConnectionRequest>,
@@ -1509,6 +1524,7 @@ fn toggle_native_core(
     }
 
     let options = SingBoxOptions {
+        listen: desktop_mixed_listen_address(request.allow_lan).to_string(),
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
@@ -1686,14 +1702,18 @@ fn normalize_log_batch(batch: singbox::LogBatch) -> CoreLogBatch {
                 sequence: entry.sequence,
                 timestamp: entry.timestamp,
                 level: entry.level,
-                route: parse_route_log(&entry.message, entry.outbound_chain),
+                route: parse_route_log(&entry.message, entry.outbound_chain, entry.source_ip),
                 message: entry.message,
             })
             .collect(),
     }
 }
 
-fn parse_route_log(message: &str, outbound_chain: Vec<String>) -> Option<RouteLogDetail> {
+fn parse_route_log(
+    message: &str,
+    outbound_chain: Vec<String>,
+    source_ip: Option<String>,
+) -> Option<RouteLogDetail> {
     let component = message.split_once("outbound/")?.1;
     let type_end = component.find('[')?;
     let outbound_type = component[..type_end].trim();
@@ -1728,6 +1748,7 @@ fn parse_route_log(message: &str, outbound_chain: Vec<String>) -> Option<RouteLo
         outbound_type: outbound_type.to_string(),
         outbound_tag: outbound_tag.to_string(),
         outbound_chain,
+        source_ip,
     })
 }
 
@@ -2637,6 +2658,13 @@ mod tests {
         }
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn desktop_listener_follows_allow_lan_setting() {
+        assert_eq!(desktop_mixed_listen_address(false), "127.0.0.1");
+        assert_eq!(desktop_mixed_listen_address(true), "0.0.0.0");
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn native_config_applies_javascript_transform() {
@@ -2650,6 +2678,7 @@ mod tests {
             selected_tag,
             mode: TunnelMode::Rule,
             tun: false,
+            allow_lan: false,
             custom_rules: Vec::new(),
             config_script: Some(
                 "function main(config) {\
@@ -2854,6 +2883,7 @@ mod tests {
         let route = parse_route_log(
             "INFO[0001] [12 0ms] outbound/direct[direct]: outbound connection to www.baidu.com:443",
             Vec::new(),
+            Some("127.0.0.1".to_string()),
         )
         .expect("direct route should be parsed");
 
@@ -2862,6 +2892,7 @@ mod tests {
         assert_eq!(route.port, Some(443));
         assert_eq!(route.target_kind, RouteTargetKind::Domain);
         assert_eq!(route.outbound_tag, "direct");
+        assert_eq!(route.source_ip.as_deref(), Some("127.0.0.1"));
     }
 
     #[test]
@@ -2873,6 +2904,7 @@ mod tests {
                 "美国节点".to_string(),
                 "subscription-1-edge".to_string(),
             ],
+            Some("192.168.1.23".to_string()),
         )
         .expect("proxy route should be parsed");
         assert_eq!(proxy.decision, RouteDecision::Proxy);
@@ -2881,10 +2913,12 @@ mod tests {
         assert_eq!(proxy.target_kind, RouteTargetKind::Ip);
         assert_eq!(proxy.outbound_type, "vless");
         assert_eq!(proxy.outbound_chain[0], "AI节点");
+        assert_eq!(proxy.source_ip.as_deref(), Some("192.168.1.23"));
 
         let ipv6 = parse_route_log(
             "INFO[0003] outbound/direct[direct]: outbound connection to [2001:db8::1]:443",
             Vec::new(),
+            None,
         )
         .expect("IPv6 route should be parsed");
         assert_eq!(ipv6.host, "2001:db8::1");
@@ -2897,6 +2931,7 @@ mod tests {
         let route = parse_route_log(
             "INFO[0004] outbound/block[block]: outbound connection to ads.example.com:443",
             Vec::new(),
+            None,
         )
         .expect("block route should be parsed");
 
@@ -2909,6 +2944,7 @@ mod tests {
         assert!(parse_route_log(
             "INFO[0001] inbound/mixed[mixed-in]: inbound connection to example.com:443",
             Vec::new(),
+            None,
         )
         .is_none());
     }

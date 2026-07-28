@@ -143,6 +143,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut active_subscription_id = use_signal(|| None::<u64>);
     let mut tunnel_mode = use_signal(|| TunnelMode::Rule);
     let mut tun_enabled = use_signal(|| false);
+    let mut allow_lan = use_signal(|| false);
     let mut config_script_enabled = use_signal(|| false);
     let mut config_script = use_signal(String::new);
     let mut group_selections = use_signal(HashMap::<String, String>::new);
@@ -245,6 +246,7 @@ pub fn ProxyApp(platform: String) -> Element {
                     selected_tag.set(restored_tag);
                     tunnel_mode.set(profile.tunnel_mode);
                     tun_enabled.set(profile.tun_enabled);
+                    allow_lan.set(profile.allow_lan);
                     dark_mode.set(profile.dark_mode);
                     config_script_enabled.set(profile.config_script_enabled);
                     config_script.set(profile.config_script);
@@ -266,6 +268,7 @@ pub fn ProxyApp(platform: String) -> Element {
             selected_tag: selected_tag(),
             tunnel_mode: tunnel_mode(),
             tun_enabled: tun_enabled(),
+            allow_lan: allow_lan(),
             dark_mode: dark_mode(),
             custom_rules: custom_rules(),
             config_script_enabled: config_script_enabled(),
@@ -386,6 +389,7 @@ pub fn ProxyApp(platform: String) -> Element {
             selected_tag: selected_tag(),
             mode: tunnel_mode(),
             tun: tun_enabled(),
+            allow_lan: allow_lan(),
             custom_rules: custom_rules(),
             config_script: if config_script_enabled() && !config_script().trim().is_empty() {
                 Some(config_script())
@@ -452,6 +456,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                     selected_tag: selected_tag(),
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
+                                    allow_lan: allow_lan(),
                                     custom_rules: custom_rules(),
                                     config_script: if config_script_enabled()
                                         && !config_script().trim().is_empty()
@@ -524,6 +529,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                     selected_tag: selected_tag(),
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
+                                    allow_lan: allow_lan(),
                                     custom_rules: custom_rules(),
                                     config_script: if config_script_enabled()
                                         && !config_script().trim().is_empty()
@@ -621,6 +627,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             core_note,
                             tunnel_mode,
                             tun_enabled,
+                            allow_lan,
                             custom_rules,
                             connection_allowed,
                             latency_results,
@@ -682,8 +689,11 @@ pub fn ProxyApp(platform: String) -> Element {
                             core_state,
                             core_version,
                             core_note,
+                            connected,
+                            core_restarting,
                             tunnel_mode,
                             tun_enabled,
+                            allow_lan,
                             dark_mode,
                             nodes,
                             selected_tag,
@@ -881,6 +891,7 @@ fn OverviewView(
     mut core_note: Signal<Option<String>>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
+    allow_lan: Signal<bool>,
     custom_rules: Signal<Vec<CustomRule>>,
     connection_allowed: bool,
     latency_results: Signal<HashMap<String, NodeLatency>>,
@@ -958,7 +969,7 @@ fn OverviewView(
                         }
                         span {
                             Icon { icon: LdWifi, width: 15, height: 15 }
-                            "本地代理 7890"
+                            if allow_lan() { "局域网代理 7890" } else { "本地代理 7890" }
                         }
                     }
                 }
@@ -977,6 +988,7 @@ fn OverviewView(
                                 selected_tag: selected_tag(),
                                 mode: tunnel_mode(),
                                 tun: tun_enabled(),
+                                allow_lan: allow_lan(),
                                 custom_rules: custom_rules(),
                                 config_script: if config_script_enabled()
                                     && !config_script().trim().is_empty()
@@ -2559,7 +2571,7 @@ fn LogsView(
             } else {
                 div { class: "log-list", aria_label: "内核日志",
                     div { class: "log-table-header",
-                        span { "时间" }
+                        span { "时间 / 来源" }
                         span { "路由" }
                         span { "目标" }
                         span { "出口" }
@@ -2579,11 +2591,17 @@ fn LogRow(entry: CoreLogEntry) -> Element {
     let level_class = format!("log-level {}", entry.level);
     let level_label = entry.level.to_ascii_uppercase();
     let route = entry.route.clone();
+    let source_ip = route.as_ref().and_then(|route| route.source_ip.clone());
     let has_route = route.is_some();
 
     rsx! {
         div { class: if has_route { "log-row route-entry" } else { "log-row raw-entry" },
-            time { class: "log-time", "{entry.timestamp}" }
+            div { class: "log-origin",
+                time { class: "log-time", "{entry.timestamp}" }
+                if let Some(source_ip) = source_ip {
+                    small { class: "log-source", title: source_ip.clone(), "{source_ip}" }
+                }
+            }
             if let Some(route) = route {
                 div { class: "route-decision-cell",
                     span {
@@ -2653,6 +2671,10 @@ fn log_matches_search(entry: &CoreLogEntry, query: &str) -> bool {
             || route.outbound_tag.to_ascii_lowercase().contains(query)
             || route.outbound_type.to_ascii_lowercase().contains(query)
             || route
+                .source_ip
+                .as_ref()
+                .is_some_and(|source_ip| source_ip.to_ascii_lowercase().contains(query))
+            || route
                 .outbound_chain
                 .iter()
                 .any(|tag| tag.to_ascii_lowercase().contains(query))
@@ -2697,11 +2719,14 @@ fn route_target_kind_label(kind: RouteTargetKind) -> &'static str {
 #[component]
 fn SettingsView(
     platform: String,
-    core_state: Signal<String>,
-    core_version: Signal<Option<String>>,
-    core_note: Signal<Option<String>>,
+    mut core_state: Signal<String>,
+    mut core_version: Signal<Option<String>>,
+    mut core_note: Signal<Option<String>>,
+    mut connected: Signal<bool>,
+    mut core_restarting: Signal<bool>,
     mut tunnel_mode: Signal<TunnelMode>,
     mut tun_enabled: Signal<bool>,
+    mut allow_lan: Signal<bool>,
     mut dark_mode: Signal<bool>,
     nodes: Signal<Vec<ProxyNode>>,
     selected_tag: Signal<String>,
@@ -2789,6 +2814,7 @@ fn SettingsView(
                                 selected_tag: selected_tag(),
                                 mode: tunnel_mode(),
                                 tun: tun_enabled(),
+                                allow_lan: allow_lan(),
                                 custom_rules: custom_rules(),
                                 config_script: Some(config_script()),
                                 group_selections: group_selections(),
@@ -2833,6 +2859,77 @@ fn SettingsView(
                         onchange: move |event| tun_enabled.set(event.checked()),
                     }
                     span { class: "switch" }
+                }
+                if platform != "Mobile" {
+                    label {
+                        class: "setting-row toggle-row",
+                        title: "允许同一局域网设备直接使用此代理",
+                        span { class: "setting-icon", Icon { icon: LdWifi, width: 19, height: 19 } }
+                        div {
+                            strong { "允许局域网连接" }
+                            small {
+                                if allow_lan() { "0.0.0.0:7890 · 无认证" }
+                                else { "127.0.0.1:7890" }
+                            }
+                        }
+                        input {
+                            r#type: "checkbox",
+                            aria_label: "允许局域网连接",
+                            checked: allow_lan,
+                            disabled: core_restarting(),
+                            onchange: move |event| async move {
+                                let enabled = event.checked();
+                                allow_lan.set(enabled);
+                                if !connected() {
+                                    notice.set(Some(if enabled {
+                                        "局域网连接将在下次启动内核时生效".to_string()
+                                    } else {
+                                        "仅本机访问将在下次启动内核时生效".to_string()
+                                    }));
+                                    return;
+                                }
+
+                                core_restarting.set(true);
+                                let request = ConnectionRequest {
+                                    nodes: nodes(),
+                                    selected_tag: selected_tag(),
+                                    mode: tunnel_mode(),
+                                    tun: tun_enabled(),
+                                    allow_lan: enabled,
+                                    custom_rules: custom_rules(),
+                                    config_script: if config_script_enabled()
+                                        && !config_script().trim().is_empty()
+                                    {
+                                        Some(config_script())
+                                    } else {
+                                        None
+                                    },
+                                    group_selections: group_selections(),
+                                };
+                                match api::restart_core(request).await {
+                                    Ok(status) => {
+                                        let is_running = status.state == "running";
+                                        connected.set(is_running);
+                                        core_state.set(status.state);
+                                        core_version.set(status.version);
+                                        core_note.set(status.note);
+                                        notice.set(Some(if enabled {
+                                            "已允许局域网连接，sing-box 内核已重启".to_string()
+                                        } else {
+                                            "已恢复仅本机访问，sing-box 内核已重启".to_string()
+                                        }));
+                                    }
+                                    Err(error) => {
+                                        connected.set(false);
+                                        core_state.set("stopped".to_string());
+                                        notice.set(Some(format!("应用局域网监听设置失败: {error}")));
+                                    }
+                                }
+                                core_restarting.set(false);
+                            },
+                        }
+                        span { class: "switch" }
+                    }
                 }
             }
 

@@ -43,6 +43,8 @@ pub struct LogEntry {
     pub message: String,
     #[serde(default)]
     pub outbound_chain: Vec<String>,
+    #[serde(default)]
+    pub source_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,6 +707,7 @@ mod tests {
             nodes,
             mode: proxy_core::TunnelMode::Direct,
             tun: false,
+            allow_lan: false,
             custom_rules: Vec::new(),
             config_script: None,
             group_selections: Default::default(),

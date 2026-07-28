@@ -304,6 +304,8 @@ pub struct ConnectionRequest {
     #[serde(default)]
     pub tun: bool,
     #[serde(default)]
+    pub allow_lan: bool,
+    #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_script: Option<String>,
@@ -369,6 +371,8 @@ pub struct AppProfile {
     #[serde(default)]
     pub tun_enabled: bool,
     #[serde(default)]
+    pub allow_lan: bool,
+    #[serde(default)]
     pub dark_mode: bool,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
@@ -389,6 +393,7 @@ impl Default for AppProfile {
             selected_tag: String::new(),
             tunnel_mode: TunnelMode::Rule,
             tun_enabled: false,
+            allow_lan: false,
             dark_mode: false,
             custom_rules: Vec::new(),
             config_script_enabled: false,
@@ -423,6 +428,7 @@ mod tests {
                 rejected_count: 1,
             }],
             selected_tag: node.tag,
+            allow_lan: true,
             dark_mode: true,
             custom_rules: vec![CustomRule {
                 id: 1,
@@ -440,8 +446,16 @@ mod tests {
         .expect("profile should deserialize");
 
         assert_eq!(restored, profile);
+        assert!(restored.allow_lan);
         assert_eq!(restored.subscriptions[0].node_count(), 1);
         assert_eq!(restored.custom_rules.len(), 1);
+    }
+
+    #[test]
+    fn older_profiles_keep_lan_access_disabled() {
+        let restored: AppProfile = serde_json::from_str("{}").expect("profile should deserialize");
+
+        assert!(!restored.allow_lan);
     }
 
     #[test]

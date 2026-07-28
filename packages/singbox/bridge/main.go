@@ -56,6 +56,7 @@ type bridgeLogEntry struct {
 	Level         string    `json:"level"`
 	Message       string    `json:"message"`
 	OutboundChain []string  `json:"outbound_chain,omitempty"`
+	SourceIP      string    `json:"source_ip,omitempty"`
 	recordedAt    time.Time `json:"-"`
 }
 
@@ -82,6 +83,7 @@ type bridgeRouteRecord struct {
 	target        string
 	outbound      string
 	outboundChain []string
+	sourceIP      string
 	recordedAt    time.Time
 }
 
@@ -148,7 +150,7 @@ func (b *bridgeLogBuffer) reset() {
 	b.Unlock()
 }
 
-func (b *bridgeLogBuffer) recordConnectionRoute(target string, outbound string, outboundChain []string) {
+func (b *bridgeLogBuffer) recordConnectionRoute(target string, outbound string, outboundChain []string, sourceIP string) {
 	if !b.isEnabled() || target == "" || outbound == "" || len(outboundChain) == 0 {
 		return
 	}
@@ -170,6 +172,7 @@ func (b *bridgeLogBuffer) recordConnectionRoute(target string, outbound string, 
 		entryOutbound, entryTarget, found := parseBridgeRouteKey(entry.Message)
 		if found && entryOutbound == outbound && entryTarget == target {
 			entry.OutboundChain = append([]string(nil), normalizedChain...)
+			entry.SourceIP = sourceIP
 			return
 		}
 	}
@@ -177,6 +180,7 @@ func (b *bridgeLogBuffer) recordConnectionRoute(target string, outbound string, 
 		target:        target,
 		outbound:      outbound,
 		outboundChain: normalizedChain,
+		sourceIP:      sourceIP,
 		recordedAt:    now,
 	})
 	b.prunePendingRoutes(now)
@@ -194,6 +198,7 @@ func (b *bridgeLogBuffer) attachPendingRoute(entry *bridgeLogEntry) {
 		}
 		if route.outbound == outbound && route.target == target {
 			entry.OutboundChain = append([]string(nil), route.outboundChain...)
+			entry.SourceIP = route.sourceIP
 			b.pendingRoutes = append(b.pendingRoutes[:index], b.pendingRoutes[index+1:]...)
 			return
 		}
@@ -246,6 +251,10 @@ func bridgeConnectionTarget(metadata *trafficontrol.TrackerMetadata) string {
 		return ""
 	}
 	return net.JoinHostPort(host, strconv.Itoa(int(destination.Port)))
+}
+
+func bridgeConnectionSourceIP(metadata *trafficontrol.TrackerMetadata) string {
+	return metadata.Metadata.Source.Unwrap().AddrString()
 }
 
 func (b *bridgeLogBuffer) snapshot(cursor uint64) bridgeLogBatch {
@@ -389,6 +398,7 @@ func start(configContent string) (*instance, error) {
 								bridgeConnectionTarget(event.Metadata),
 								event.Metadata.Outbound,
 								event.Metadata.Chain,
+								bridgeConnectionSourceIP(event.Metadata),
 							)
 						}
 					case <-connectionDone:
