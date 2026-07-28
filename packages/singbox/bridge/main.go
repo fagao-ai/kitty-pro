@@ -12,9 +12,11 @@ import (
 	"context"
 	stdjson "encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,14 +24,18 @@ import (
 	"unsafe"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/srs"
 	"github.com/sagernet/sing-box/common/urltest"
 	CBox "github.com/sagernet/sing-box/constant"
-	_ "github.com/sagernet/sing-box/experimental/clashapi"
+	"github.com/sagernet/sing-box/experimental/clashapi"
+	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
 	"github.com/sagernet/sing-box/include"
 	boxlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/common/observable"
+	singservice "github.com/sagernet/sing/service"
 )
 
 type instance struct {
@@ -42,12 +48,15 @@ type instance struct {
 
 const bridgeLogLimit = 500
 const probeTimeout = 5 * time.Second
+const bridgeRouteEnrichmentGrace = 100 * time.Millisecond
 
 type bridgeLogEntry struct {
-	Sequence  uint64 `json:"sequence"`
-	Timestamp string `json:"timestamp"`
-	Level     string `json:"level"`
-	Message   string `json:"message"`
+	Sequence      uint64    `json:"sequence"`
+	Timestamp     string    `json:"timestamp"`
+	Level         string    `json:"level"`
+	Message       string    `json:"message"`
+	OutboundChain []string  `json:"outbound_chain,omitempty"`
+	recordedAt    time.Time `json:"-"`
 }
 
 type bridgeLogBatch struct {
@@ -63,9 +72,17 @@ type probeResult struct {
 
 type bridgeLogBuffer struct {
 	sync.Mutex
-	enabled      atomic.Bool
-	nextSequence uint64
-	entries      []bridgeLogEntry
+	enabled       atomic.Bool
+	nextSequence  uint64
+	entries       []bridgeLogEntry
+	pendingRoutes []bridgeRouteRecord
+}
+
+type bridgeRouteRecord struct {
+	target        string
+	outbound      string
+	outboundChain []string
+	recordedAt    time.Time
 }
 
 func (b *bridgeLogBuffer) WriteMessage(level boxlog.Level, message string) {
@@ -97,13 +114,16 @@ func (b *bridgeLogBuffer) append(level string, message string) {
 	if !b.enabled.Load() {
 		return
 	}
+	recordedAt := time.Now()
 	b.nextSequence++
 	entry := bridgeLogEntry{
-		Sequence:  b.nextSequence,
-		Timestamp: time.Now().Format("15:04:05.000"),
-		Level:     level,
-		Message:   stripANSI(strings.TrimSpace(message)),
+		Sequence:   b.nextSequence,
+		Timestamp:  recordedAt.Format("15:04:05.000"),
+		Level:      level,
+		Message:    stripANSI(strings.TrimSpace(message)),
+		recordedAt: recordedAt,
 	}
+	b.attachPendingRoute(&entry)
 	if len(b.entries) == bridgeLogLimit {
 		copy(b.entries, b.entries[1:])
 		b.entries[len(b.entries)-1] = entry
@@ -124,7 +144,108 @@ func (b *bridgeLogBuffer) reset() {
 	b.Lock()
 	b.nextSequence = 0
 	b.entries = nil
+	b.pendingRoutes = nil
 	b.Unlock()
+}
+
+func (b *bridgeLogBuffer) recordConnectionRoute(target string, outbound string, outboundChain []string) {
+	if !b.isEnabled() || target == "" || outbound == "" || len(outboundChain) == 0 {
+		return
+	}
+	normalizedChain := make([]string, len(outboundChain))
+	for index, tag := range outboundChain {
+		normalizedChain[len(outboundChain)-1-index] = tag
+	}
+	b.Lock()
+	defer b.Unlock()
+	now := time.Now()
+	for index := len(b.entries) - 1; index >= 0; index-- {
+		entry := &b.entries[index]
+		if now.Sub(entry.recordedAt) > 10*time.Second {
+			break
+		}
+		if len(entry.OutboundChain) > 0 {
+			continue
+		}
+		entryOutbound, entryTarget, found := parseBridgeRouteKey(entry.Message)
+		if found && entryOutbound == outbound && entryTarget == target {
+			entry.OutboundChain = append([]string(nil), normalizedChain...)
+			return
+		}
+	}
+	b.pendingRoutes = append(b.pendingRoutes, bridgeRouteRecord{
+		target:        target,
+		outbound:      outbound,
+		outboundChain: normalizedChain,
+		recordedAt:    now,
+	})
+	b.prunePendingRoutes(now)
+}
+
+func (b *bridgeLogBuffer) attachPendingRoute(entry *bridgeLogEntry) {
+	outbound, target, found := parseBridgeRouteKey(entry.Message)
+	if !found {
+		return
+	}
+	for index := len(b.pendingRoutes) - 1; index >= 0; index-- {
+		route := b.pendingRoutes[index]
+		if entry.recordedAt.Sub(route.recordedAt) > 10*time.Second {
+			break
+		}
+		if route.outbound == outbound && route.target == target {
+			entry.OutboundChain = append([]string(nil), route.outboundChain...)
+			b.pendingRoutes = append(b.pendingRoutes[:index], b.pendingRoutes[index+1:]...)
+			return
+		}
+	}
+	b.prunePendingRoutes(entry.recordedAt)
+}
+
+func (b *bridgeLogBuffer) prunePendingRoutes(now time.Time) {
+	firstRecent := 0
+	for firstRecent < len(b.pendingRoutes) && now.Sub(b.pendingRoutes[firstRecent].recordedAt) > 10*time.Second {
+		firstRecent++
+	}
+	if firstRecent > 0 {
+		b.pendingRoutes = append([]bridgeRouteRecord(nil), b.pendingRoutes[firstRecent:]...)
+	}
+}
+
+func parseBridgeRouteKey(message string) (outbound string, target string, found bool) {
+	componentStart := strings.Index(message, "outbound/")
+	if componentStart == -1 {
+		return "", "", false
+	}
+	component := message[componentStart+len("outbound/"):]
+	tagStart := strings.IndexByte(component, '[')
+	if tagStart == -1 {
+		return "", "", false
+	}
+	tagEnd := strings.IndexByte(component[tagStart+1:], ']')
+	if tagEnd == -1 {
+		return "", "", false
+	}
+	tagEnd += tagStart + 1
+	outbound = strings.TrimSpace(component[tagStart+1 : tagEnd])
+	detail := component[tagEnd+1:]
+	targetStart := strings.Index(detail, "connection to ")
+	if outbound == "" || targetStart == -1 {
+		return "", "", false
+	}
+	target = strings.TrimSpace(detail[targetStart+len("connection to "):])
+	return outbound, target, target != ""
+}
+
+func bridgeConnectionTarget(metadata *trafficontrol.TrackerMetadata) string {
+	destination := metadata.Metadata.Destination
+	host := metadata.Metadata.Domain
+	if host == "" {
+		host = destination.AddrString()
+	}
+	if host == "" || destination.Port == 0 {
+		return ""
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(destination.Port)))
 }
 
 func (b *bridgeLogBuffer) snapshot(cursor uint64) bridgeLogBatch {
@@ -134,13 +255,21 @@ func (b *bridgeLogBuffer) snapshot(cursor uint64) bridgeLogBatch {
 		cursor = 0
 	}
 	entries := make([]bridgeLogEntry, 0)
+	nextCursor := cursor
+	now := time.Now()
 	for _, entry := range b.entries {
-		if entry.Sequence > cursor {
-			entries = append(entries, entry)
+		if entry.Sequence <= cursor {
+			continue
 		}
+		_, _, isRoute := parseBridgeRouteKey(entry.Message)
+		if isRoute && len(entry.OutboundChain) == 0 && now.Sub(entry.recordedAt) < bridgeRouteEnrichmentGrace {
+			break
+		}
+		entries = append(entries, entry)
+		nextCursor = entry.Sequence
 	}
 	return bridgeLogBatch{
-		NextCursor: b.nextSequence,
+		NextCursor: nextCursor,
 		Entries:    entries,
 	}
 }
@@ -223,8 +352,8 @@ func start(configContent string) (*instance, error) {
 		return nil, err
 	}
 	if options.Experimental != nil && options.Experimental.ClashAPI != nil {
-		logFactory, observable := service.LogFactory().(boxlog.ObservableFactory)
-		if !observable {
+		logFactory, observableLogs := service.LogFactory().(boxlog.ObservableFactory)
+		if !observableLogs {
 			cancel()
 			_ = service.Close()
 			return nil, &bridgeError{message: "sing-box observable logs are not available"}
@@ -246,6 +375,30 @@ func start(configContent string) (*instance, error) {
 				}
 			}
 		}()
+		if clashServer, ok := singservice.FromContext[adapter.ClashServer](ctx).(*clashapi.Server); ok {
+			connectionSubscriber := observable.NewSubscriber[trafficontrol.ConnectionEvent](256)
+			clashServer.TrafficManager().SetEventHook(connectionSubscriber)
+			connectionEvents, connectionDone := connectionSubscriber.Subscription()
+			go func() {
+				defer connectionSubscriber.Close()
+				for {
+					select {
+					case event := <-connectionEvents:
+						if event.Type == trafficontrol.ConnectionEventNew && event.Metadata != nil {
+							logs.recordConnectionRoute(
+								bridgeConnectionTarget(event.Metadata),
+								event.Metadata.Outbound,
+								event.Metadata.Chain,
+							)
+						}
+					case <-connectionDone:
+						return
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+		}
 	}
 	if err = service.Start(); err != nil {
 		cancel()

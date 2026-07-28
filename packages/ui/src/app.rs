@@ -1,5 +1,6 @@
 use api::{
-    CoreLogEntry, CoreTraffic, NodeLatency, RouteDecision, RouteTargetKind, SystemProxyStatus,
+    CoreLogEntry, CoreTraffic, NodeLatency, RouteDecision, RouteLogDetail, RouteTargetKind,
+    SystemProxyStatus,
 };
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
@@ -2584,13 +2585,26 @@ fn LogRow(entry: CoreLogEntry) -> Element {
         div { class: if has_route { "log-row route-entry" } else { "log-row raw-entry" },
             time { class: "log-time", "{entry.timestamp}" }
             if let Some(route) = route {
-                span {
-                    class: match route.decision {
-                        RouteDecision::Direct => "route-decision direct",
-                        RouteDecision::Proxy => "route-decision proxy",
-                        RouteDecision::Block => "route-decision block",
-                    },
-                    {route_decision_label(route.decision)}
+                div { class: "route-decision-cell",
+                    span {
+                        class: match route.decision {
+                            RouteDecision::Direct => "route-decision direct",
+                            RouteDecision::Proxy => "route-decision proxy",
+                            RouteDecision::Block => "route-decision block",
+                        },
+                        {route_decision_label(route.decision)}
+                    }
+                    if let Some(group) = route_primary_group(&route) {
+                        small {
+                            class: match route.decision {
+                                RouteDecision::Direct => "route-decision-group direct",
+                                RouteDecision::Proxy => "route-decision-group proxy",
+                                RouteDecision::Block => "route-decision-group block",
+                            },
+                            title: route_group_chain(&route),
+                            "{group}"
+                        }
+                    }
                 }
                 div { class: "log-target", title: route.target.clone(),
                     strong { "{route.host}" }
@@ -2638,7 +2652,31 @@ fn log_matches_search(entry: &CoreLogEntry, query: &str) -> bool {
         route.host.to_ascii_lowercase().contains(query)
             || route.outbound_tag.to_ascii_lowercase().contains(query)
             || route.outbound_type.to_ascii_lowercase().contains(query)
+            || route
+                .outbound_chain
+                .iter()
+                .any(|tag| tag.to_ascii_lowercase().contains(query))
     })
+}
+
+fn route_primary_group(route: &RouteLogDetail) -> Option<&str> {
+    route
+        .outbound_chain
+        .iter()
+        .find(|tag| {
+            tag.as_str() != route.outbound_tag && !matches!(tag.as_str(), "direct" | "block")
+        })
+        .map(String::as_str)
+}
+
+fn route_group_chain(route: &RouteLogDetail) -> String {
+    route
+        .outbound_chain
+        .iter()
+        .filter(|tag| tag.as_str() != route.outbound_tag)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" → ")
 }
 
 fn route_decision_label(decision: RouteDecision) -> &'static str {

@@ -86,6 +86,8 @@ pub struct RouteLogDetail {
     pub target_kind: RouteTargetKind,
     pub outbound_type: String,
     pub outbound_tag: String,
+    #[serde(default)]
+    pub outbound_chain: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1684,14 +1686,14 @@ fn normalize_log_batch(batch: singbox::LogBatch) -> CoreLogBatch {
                 sequence: entry.sequence,
                 timestamp: entry.timestamp,
                 level: entry.level,
-                route: parse_route_log(&entry.message),
+                route: parse_route_log(&entry.message, entry.outbound_chain),
                 message: entry.message,
             })
             .collect(),
     }
 }
 
-fn parse_route_log(message: &str) -> Option<RouteLogDetail> {
+fn parse_route_log(message: &str, outbound_chain: Vec<String>) -> Option<RouteLogDetail> {
     let component = message.split_once("outbound/")?.1;
     let type_end = component.find('[')?;
     let outbound_type = component[..type_end].trim();
@@ -1725,6 +1727,7 @@ fn parse_route_log(message: &str) -> Option<RouteLogDetail> {
         target_kind,
         outbound_type: outbound_type.to_string(),
         outbound_tag: outbound_tag.to_string(),
+        outbound_chain,
     })
 }
 
@@ -2850,6 +2853,7 @@ mod tests {
     fn parses_direct_domain_route_log() {
         let route = parse_route_log(
             "INFO[0001] [12 0ms] outbound/direct[direct]: outbound connection to www.baidu.com:443",
+            Vec::new(),
         )
         .expect("direct route should be parsed");
 
@@ -2864,6 +2868,11 @@ mod tests {
     fn parses_proxy_ip_and_ipv6_route_logs() {
         let proxy = parse_route_log(
             "INFO[0002] outbound/vless[subscription-1-edge]: outbound packet connection to 8.8.8.8:53",
+            vec![
+                "AI节点".to_string(),
+                "美国节点".to_string(),
+                "subscription-1-edge".to_string(),
+            ],
         )
         .expect("proxy route should be parsed");
         assert_eq!(proxy.decision, RouteDecision::Proxy);
@@ -2871,9 +2880,11 @@ mod tests {
         assert_eq!(proxy.port, Some(53));
         assert_eq!(proxy.target_kind, RouteTargetKind::Ip);
         assert_eq!(proxy.outbound_type, "vless");
+        assert_eq!(proxy.outbound_chain[0], "AI节点");
 
         let ipv6 = parse_route_log(
             "INFO[0003] outbound/direct[direct]: outbound connection to [2001:db8::1]:443",
+            Vec::new(),
         )
         .expect("IPv6 route should be parsed");
         assert_eq!(ipv6.host, "2001:db8::1");
@@ -2885,6 +2896,7 @@ mod tests {
     fn parses_block_route_log() {
         let route = parse_route_log(
             "INFO[0004] outbound/block[block]: outbound connection to ads.example.com:443",
+            Vec::new(),
         )
         .expect("block route should be parsed");
 
@@ -2895,7 +2907,8 @@ mod tests {
     #[test]
     fn ignores_non_outbound_log_lines() {
         assert!(parse_route_log(
-            "INFO[0001] inbound/mixed[mixed-in]: inbound connection to example.com:443"
+            "INFO[0001] inbound/mixed[mixed-in]: inbound connection to example.com:443",
+            Vec::new(),
         )
         .is_none());
     }

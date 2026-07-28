@@ -30,6 +30,7 @@ func TestBridgeLogBufferReturnsIncrementalInfoLogs(t *testing.T) {
 	logs.setEnabled(true)
 	logs.WriteMessage(boxlog.LevelDebug, "DEBUG ignored")
 	logs.WriteMessage(boxlog.LevelInfo, "\x1b[36mINFO\x1b[0m outbound/direct[direct]: outbound connection to example.cn:443")
+	logs.recordConnectionRoute("example.cn:443", "direct", []string{"direct"})
 
 	first := logs.snapshot(0)
 	if first.NextCursor != 1 || len(first.Entries) != 1 {
@@ -40,6 +41,51 @@ func TestBridgeLogBufferReturnsIncrementalInfoLogs(t *testing.T) {
 	}
 	if next := logs.snapshot(first.NextCursor); len(next.Entries) != 0 {
 		t.Fatalf("incremental cursor returned duplicate entries: %+v", next)
+	}
+}
+
+func TestBridgeLogBufferWaitsForConnectionChainBeforeAdvancingCursor(t *testing.T) {
+	var logs bridgeLogBuffer
+	logs.setEnabled(true)
+	logs.WriteMessage(boxlog.LevelInfo, "outbound/anytls[node-tw]: outbound connection to chatgpt.com:443")
+
+	pending := logs.snapshot(0)
+	if pending.NextCursor != 0 || len(pending.Entries) != 0 {
+		t.Fatalf("route log escaped before enrichment: %+v", pending)
+	}
+
+	logs.recordConnectionRoute("chatgpt.com:443", "node-tw", []string{"node-tw", "台湾节点", "AI节点"})
+	batch := logs.snapshot(pending.NextCursor)
+	if batch.NextCursor != 1 || len(batch.Entries) != 1 || batch.Entries[0].OutboundChain[0] != "AI节点" {
+		t.Fatalf("enriched route log was not released: %+v", batch)
+	}
+}
+
+func TestBridgeLogBufferAttachesConnectionChainAfterRouteLog(t *testing.T) {
+	var logs bridgeLogBuffer
+	logs.setEnabled(true)
+	logs.WriteMessage(boxlog.LevelInfo, "outbound/anytls[node-tw]: outbound connection to chatgpt.com:443")
+	logs.recordConnectionRoute("chatgpt.com:443", "node-tw", []string{"node-tw", "台湾节点", "AI节点"})
+
+	batch := logs.snapshot(0)
+	if len(batch.Entries) != 1 {
+		t.Fatalf("unexpected log batch: %+v", batch)
+	}
+	want := []string{"AI节点", "台湾节点", "node-tw"}
+	if got := batch.Entries[0].OutboundChain; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("unexpected outbound chain: %v", got)
+	}
+}
+
+func TestBridgeLogBufferAttachesConnectionChainBeforeRouteLog(t *testing.T) {
+	var logs bridgeLogBuffer
+	logs.setEnabled(true)
+	logs.recordConnectionRoute("[2001:db8::1]:443", "node-us", []string{"node-us", "美国节点", "漏网之鱼"})
+	logs.WriteMessage(boxlog.LevelInfo, "outbound/vless[node-us]: outbound packet connection to [2001:db8::1]:443")
+
+	batch := logs.snapshot(0)
+	if len(batch.Entries) != 1 || batch.Entries[0].OutboundChain[0] != "漏网之鱼" {
+		t.Fatalf("pending outbound chain was not attached: %+v", batch)
 	}
 }
 

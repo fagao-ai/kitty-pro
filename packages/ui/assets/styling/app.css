@@ -1291,6 +1291,48 @@ body {
   font-weight: 780;
 }
 
+.route-decision-cell {
+  display: grid;
+  min-width: 0;
+  align-self: start;
+  justify-items: start;
+}
+
+.route-decision-group {
+  display: inline-flex;
+  width: 52px;
+  min-height: 22px;
+  align-items: center;
+  justify-content: center;
+  margin-top: 5px;
+  padding: 0 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 8px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.route-decision-group.direct {
+  color: var(--accent);
+  border-color: rgba(19, 122, 97, 0.2);
+  background: var(--accent-soft);
+}
+
+.route-decision-group.proxy {
+  color: var(--blue);
+  border-color: rgba(49, 111, 163, 0.2);
+  background: var(--blue-soft);
+}
+
+.route-decision-group.block {
+  color: var(--coral);
+  border-color: rgba(185, 78, 78, 0.2);
+  background: var(--coral-soft);
+}
+
 .route-decision.direct {
   color: var(--accent);
   border-color: rgba(19, 122, 97, 0.2);

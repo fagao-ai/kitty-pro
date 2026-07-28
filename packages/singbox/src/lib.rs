@@ -41,6 +41,8 @@ pub struct LogEntry {
     pub timestamp: String,
     pub level: String,
     pub message: String,
+    #[serde(default)]
+    pub outbound_chain: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
