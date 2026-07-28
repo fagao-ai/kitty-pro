@@ -13,6 +13,8 @@ pub const CHINA_GEOIP_RULE_SET_URL: &str =
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs";
 const SECURE_DNS_SERVER: &str = "1.1.1.1";
 const SECURE_DNS_SERVER_NAME: &str = "cloudflare-dns.com";
+const PROXY_ENDPOINT_DNS_SERVER: &str = "1.12.12.12";
+const PROXY_ENDPOINT_DNS_SERVER_NAME: &str = "doh.pub";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleSetCachePaths {
@@ -144,6 +146,11 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         (TunnelMode::Global | TunnelMode::Direct, _) => Vec::new(),
     };
     let dns = build_dns_config(request);
+    let default_domain_resolver = if request.mode == TunnelMode::Direct {
+        "dns-direct"
+    } else {
+        "dns-bootstrap"
+    };
 
     let mut config = json!({
         "log": {
@@ -158,9 +165,9 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
             // tailnets and other VPN interfaces remain reachable. Desktop
             // TUN mode still pins outbounds to avoid re-entering its own TUN.
             "auto_detect_interface": request.tun,
-            // Proxy endpoints and rule-set downloads must resolve without
-            // depending on the proxy that is still being established.
-            "default_domain_resolver": "dns-direct",
+            // Proxy endpoints and rule-set downloads must resolve through a
+            // direct encrypted resolver without trusting the system DNS.
+            "default_domain_resolver": default_domain_resolver,
             "rules": rules,
             "rule_set": rule_sets,
             "final": route_final,
@@ -189,6 +196,17 @@ fn build_dns_config(request: &ConnectionRequest) -> Value {
         });
     }
 
+    servers.push(json!({
+        "type": "https",
+        "tag": "dns-bootstrap",
+        "server": PROXY_ENDPOINT_DNS_SERVER,
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+            "enabled": true,
+            "server_name": PROXY_ENDPOINT_DNS_SERVER_NAME,
+        },
+    }));
     servers.push(json!({
         "type": "https",
         "tag": "dns-proxy",
@@ -544,10 +562,14 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert_eq!(config["dns"]["final"], "dns-proxy");
         assert_eq!(config["dns"]["servers"][0]["type"], "local");
         assert_eq!(config["dns"]["servers"][1]["type"], "https");
-        assert_eq!(config["dns"]["servers"][1]["server"], "1.1.1.1");
-        assert_eq!(config["dns"]["servers"][1]["detour"], "proxy");
+        assert_eq!(config["dns"]["servers"][1]["tag"], "dns-bootstrap");
+        assert_eq!(config["dns"]["servers"][1]["server"], "1.12.12.12");
+        assert_eq!(config["dns"]["servers"][1]["tls"]["server_name"], "doh.pub");
+        assert!(config["dns"]["servers"][1].get("detour").is_none());
+        assert_eq!(config["dns"]["servers"][2]["server"], "1.1.1.1");
+        assert_eq!(config["dns"]["servers"][2]["detour"], "proxy");
         assert_eq!(config["dns"]["rules"][2]["rule_set"], "geosite-cn");
-        assert_eq!(config["route"]["default_domain_resolver"], "dns-direct");
+        assert_eq!(config["route"]["default_domain_resolver"], "dns-bootstrap");
         assert_eq!(
             config["experimental"]["clash_api"]["external_controller"],
             "127.0.0.1:17891"
@@ -585,9 +607,11 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             if mode == TunnelMode::Direct {
                 assert_eq!(config["dns"]["final"], "dns-direct");
                 assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(1));
+                assert_eq!(config["route"]["default_domain_resolver"], "dns-direct");
             } else {
                 assert_eq!(config["dns"]["final"], "dns-proxy");
-                assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(2));
+                assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(3));
+                assert_eq!(config["route"]["default_domain_resolver"], "dns-bootstrap");
             }
         }
     }
