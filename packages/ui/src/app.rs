@@ -511,6 +511,67 @@ pub fn ProxyApp(platform: String) -> Element {
                     }
                     div { class: "topbar-actions",
                         button {
+                            class: "icon-button glass-control mobile-core-restart-button",
+                            title: if core_restarting() { "正在重启内核" } else { "重启内核" },
+                            aria_label: "重启内核",
+                            aria_busy: core_restarting(),
+                            disabled: !connected() || core_busy() || core_restarting(),
+                            onclick: move |_| async move {
+                                core_restarting.set(true);
+                                let request = ConnectionRequest {
+                                    nodes: nodes(),
+                                    selected_tag: selected_tag(),
+                                    mode: tunnel_mode(),
+                                    tun: tun_enabled(),
+                                    custom_rules: custom_rules(),
+                                    config_script: if config_script_enabled()
+                                        && !config_script().trim().is_empty()
+                                    {
+                                        Some(config_script())
+                                    } else {
+                                        None
+                                    },
+                                    group_selections: group_selections(),
+                                };
+                                match api::restart_core(request).await {
+                                    Ok(status) => {
+                                        let is_running = status.state == "running";
+                                        connected.set(is_running);
+                                        core_state.set(status.state);
+                                        core_version.set(status.version);
+                                        core_note.set(status.note);
+                                        notice.set(Some(if is_running {
+                                            "sing-box 内核已重启".to_string()
+                                        } else {
+                                            ANDROID_VPN_WAITING_NOTICE.to_string()
+                                        }));
+                                    }
+                                    Err(error) => {
+                                        notice.set(Some(format!("内核重启失败: {error}")));
+                                        match api::core_status().await {
+                                            Ok(status) => {
+                                                connected.set(status.state == "running");
+                                                core_state.set(status.state);
+                                                core_version.set(status.version);
+                                                core_note.set(status.note);
+                                            }
+                                            Err(status_error) => {
+                                                connected.set(false);
+                                                core_state.set("unavailable".to_string());
+                                                core_note.set(Some(status_error.to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                                core_restarting.set(false);
+                            },
+                            if core_restarting() {
+                                span { class: "spinner" }
+                            } else {
+                                Icon { icon: LdRefreshCw, width: 18, height: 18 }
+                            }
+                        }
+                        button {
                             class: "icon-button glass-control",
                             title: if dark_mode() { "切换浅色主题" } else { "切换深色主题" },
                             onclick: move |_| dark_mode.toggle(),
@@ -566,6 +627,8 @@ pub fn ProxyApp(platform: String) -> Element {
                             config_script_enabled,
                             config_script,
                             group_selections,
+                            system_proxy,
+                            system_proxy_busy,
                             notice,
                         }
                     },
@@ -627,8 +690,6 @@ pub fn ProxyApp(platform: String) -> Element {
                             config_script_enabled,
                             config_script,
                             group_selections,
-                            system_proxy,
-                            system_proxy_busy,
                             notice,
                         }
                     },
@@ -826,6 +887,8 @@ fn OverviewView(
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
     group_selections: Signal<HashMap<String, String>>,
+    system_proxy: Signal<SystemProxyLoadState>,
+    system_proxy_busy: Signal<bool>,
     mut notice: Signal<Option<String>>,
 ) -> Element {
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
@@ -898,51 +961,60 @@ fn OverviewView(
                         }
                     }
                 }
-                button {
-                    class: if is_core_action_busy && is_connected { "power-button active loading" } else if is_core_action_busy { "power-button loading" } else if is_connected { "power-button active" } else { "power-button" },
-                    title: if is_core_restarting { "正在重启内核" } else if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
-                    aria_busy: is_core_action_busy,
-                    disabled: is_core_action_busy || (!is_connected && !connection_allowed),
-                    onclick: move |_| async move {
-                        let target = !connected();
-                        core_busy.set(true);
-                        let request = target.then(|| ConnectionRequest {
-                            nodes: nodes(),
-                            selected_tag: selected_tag(),
-                            mode: tunnel_mode(),
-                            tun: tun_enabled(),
-                            custom_rules: custom_rules(),
-                            config_script: if config_script_enabled()
-                                && !config_script().trim().is_empty()
-                            {
-                                Some(config_script())
-                            } else {
-                                None
-                            },
-                            group_selections: group_selections(),
-                        });
-                        match api::set_core_enabled(target, request).await {
-                            Ok(status) => {
-                                let is_running = status.state == "running";
-                                connected.set(is_running);
-                                core_state.set(status.state);
-                                core_note.set(status.note);
-                                notice.set(Some(if !target {
-                                    "连接已断开".to_string()
-                                } else if is_running {
-                                    "sing-box 已启动".to_string()
+                div { class: "connection-controls",
+                    button {
+                        class: if is_core_action_busy && is_connected { "power-button active loading" } else if is_core_action_busy { "power-button loading" } else if is_connected { "power-button active" } else { "power-button" },
+                        title: if is_core_restarting { "正在重启内核" } else if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
+                        aria_label: if is_connected { "停止内核" } else { "启动内核" },
+                        aria_busy: is_core_action_busy,
+                        disabled: is_core_action_busy || (!is_connected && !connection_allowed),
+                        onclick: move |_| async move {
+                            let target = !connected();
+                            core_busy.set(true);
+                            let request = target.then(|| ConnectionRequest {
+                                nodes: nodes(),
+                                selected_tag: selected_tag(),
+                                mode: tunnel_mode(),
+                                tun: tun_enabled(),
+                                custom_rules: custom_rules(),
+                                config_script: if config_script_enabled()
+                                    && !config_script().trim().is_empty()
+                                {
+                                    Some(config_script())
                                 } else {
-                                    ANDROID_VPN_WAITING_NOTICE.to_string()
-                                }));
+                                    None
+                                },
+                                group_selections: group_selections(),
+                            });
+                            match api::set_core_enabled(target, request).await {
+                                Ok(status) => {
+                                    let is_running = status.state == "running";
+                                    connected.set(is_running);
+                                    core_state.set(status.state);
+                                    core_note.set(status.note);
+                                    notice.set(Some(if !target {
+                                        "连接已断开".to_string()
+                                    } else if is_running {
+                                        "sing-box 已启动".to_string()
+                                    } else {
+                                        ANDROID_VPN_WAITING_NOTICE.to_string()
+                                    }));
+                                }
+                                Err(error) => notice.set(Some(error.to_string())),
                             }
-                            Err(error) => notice.set(Some(error.to_string())),
+                            core_busy.set(false);
+                        },
+                        if is_core_action_busy {
+                            span { class: "spinner large" }
+                        } else {
+                            Icon { icon: LdPower, width: 32, height: 32 }
                         }
-                        core_busy.set(false);
-                    },
-                    if is_core_action_busy {
-                        span { class: "spinner large" }
-                    } else {
-                        Icon { icon: LdPower, width: 32, height: 32 }
+                    }
+                    SystemProxyToggle {
+                        core_running: is_connected,
+                        system_proxy,
+                        system_proxy_busy,
+                        notice,
                     }
                 }
             }
@@ -1016,6 +1088,107 @@ fn OverviewView(
                         NodeRow { node, selected_tag, latency_results }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn SystemProxyToggle(
+    core_running: bool,
+    mut system_proxy: Signal<SystemProxyLoadState>,
+    mut system_proxy_busy: Signal<bool>,
+    mut notice: Signal<Option<String>>,
+) -> Element {
+    let (proxy_status, proxy_loading, proxy_error) = match system_proxy() {
+        SystemProxyLoadState::Loading => (None, true, None),
+        SystemProxyLoadState::Ready(status) => (Some(status), false, None),
+        SystemProxyLoadState::Failed(error) => (None, false, Some(error)),
+    };
+    let proxy_ready = proxy_status.is_some();
+    let proxy_supported = proxy_status.as_ref().is_some_and(|status| status.supported);
+    let proxy_enabled = proxy_status.as_ref().is_some_and(|status| status.enabled);
+    let proxy_busy = system_proxy_busy();
+    let proxy_label = if proxy_busy {
+        "设置中"
+    } else if proxy_loading {
+        "读取中"
+    } else if proxy_enabled {
+        "已启用"
+    } else if proxy_error.is_some() {
+        "读取失败"
+    } else if !proxy_supported {
+        "不可用"
+    } else {
+        "未启用"
+    };
+    let proxy_detail = if proxy_busy {
+        if proxy_enabled {
+            "正在恢复启用前的系统代理设置".to_string()
+        } else {
+            "正在应用到系统网络服务".to_string()
+        }
+    } else {
+        proxy_status
+            .as_ref()
+            .map(|status| status.detail.clone())
+            .or(proxy_error)
+            .unwrap_or_else(|| "正在读取系统代理状态".to_string())
+    };
+
+    rsx! {
+        label {
+            class: "overview-proxy-toggle",
+            title: "{proxy_detail}",
+            div {
+                strong { "系统代理" }
+                small { "{proxy_label}" }
+            }
+            if proxy_loading || proxy_busy {
+                span {
+                    class: if proxy_enabled { "switch switch-loading active" } else { "switch switch-loading" },
+                    aria_busy: "true",
+                    aria_label: if proxy_busy { "正在设置系统代理" } else { "正在读取系统代理状态" },
+                    span { class: "spinner" }
+                }
+            } else {
+                input {
+                    r#type: "checkbox",
+                    aria_label: "系统代理",
+                    checked: proxy_enabled,
+                    disabled: !proxy_ready || !proxy_supported || (!proxy_enabled && !core_running),
+                    onchange: move |event| {
+                        let enabled = event.checked();
+                        async move {
+                            system_proxy_busy.set(true);
+                            match api::set_system_proxy(enabled).await {
+                                Ok(status) => {
+                                    system_proxy.set(SystemProxyLoadState::Ready(status));
+                                    notice.set(Some(if enabled {
+                                        "系统代理已启用".to_string()
+                                    } else {
+                                        "系统代理已恢复为启用前的设置".to_string()
+                                    }));
+                                }
+                                Err(error) => {
+                                    notice.set(Some(format!("系统代理设置失败: {error}")));
+                                    match api::system_proxy_status().await {
+                                        Ok(status) => {
+                                            system_proxy.set(SystemProxyLoadState::Ready(status));
+                                        }
+                                        Err(refresh_error) => {
+                                            system_proxy.set(SystemProxyLoadState::Failed(
+                                                refresh_error.to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            system_proxy_busy.set(false);
+                        }
+                    },
+                }
+                span { class: "switch" }
             }
         }
     }
@@ -2498,39 +2671,9 @@ fn SettingsView(
     mut config_script_enabled: Signal<bool>,
     mut config_script: Signal<String>,
     group_selections: Signal<HashMap<String, String>>,
-    mut system_proxy: Signal<SystemProxyLoadState>,
-    mut system_proxy_busy: Signal<bool>,
     mut notice: Signal<Option<String>>,
 ) -> Element {
     let mut script_check_busy = use_signal(|| false);
-    let (proxy_status, proxy_loading, proxy_error) = match system_proxy() {
-        SystemProxyLoadState::Loading => (None, true, None),
-        SystemProxyLoadState::Ready(status) => (Some(status), false, None),
-        SystemProxyLoadState::Failed(error) => (None, false, Some(error)),
-    };
-    let proxy_ready = proxy_status.is_some();
-    let proxy_supported = proxy_status.as_ref().is_some_and(|status| status.supported);
-    let proxy_enabled = proxy_status.as_ref().is_some_and(|status| status.enabled);
-    let proxy_busy = system_proxy_busy();
-    let proxy_detail = if proxy_busy {
-        if proxy_enabled {
-            "正在恢复启用前的系统代理设置".to_string()
-        } else {
-            "正在应用到系统网络服务".to_string()
-        }
-    } else {
-        proxy_status
-            .as_ref()
-            .map(|status| status.detail.clone())
-            .unwrap_or_else(|| {
-                if proxy_loading {
-                    "正在读取系统代理状态".to_string()
-                } else {
-                    "无法读取系统代理状态".to_string()
-                }
-            })
-    };
-    let enable_allowed = core_state() == "running";
 
     rsx! {
         div { class: "settings-grid",
@@ -2624,92 +2767,6 @@ fn SettingsView(
                             Icon { icon: LdCircleCheck, width: 17, height: 17 }
                         }
                         span { "校验" }
-                    }
-                }
-            }
-
-            section { class: "settings-section glass-surface",
-                div { class: "section-heading",
-                    div {
-                        p { class: "eyebrow", "SYSTEM PROXY" }
-                        h2 { "系统代理" }
-                    }
-                    span {
-                        class: if proxy_busy { "status-badge pending" } else if proxy_enabled { "status-badge online" } else { "status-badge" },
-                        role: "status",
-                        aria_live: "polite",
-                        if proxy_busy { "设置中" }
-                        else if proxy_loading { "读取中" }
-                        else if proxy_enabled { "已启用" }
-                        else if proxy_error.is_some() { "读取失败" }
-                        else { "未启用" }
-                    }
-                }
-                label { class: "setting-row toggle-row",
-                    span { class: "setting-icon", Icon { icon: LdRoute, width: 19, height: 19 } }
-                    div {
-                        strong { "使用本地 mixed 代理" }
-                        small { "127.0.0.1:7890；{proxy_detail}" }
-                    }
-                    if proxy_loading || proxy_busy {
-                        span { class: if proxy_enabled { "switch switch-loading active" } else { "switch switch-loading" },
-                            aria_busy: "true",
-                            aria_label: if proxy_busy { "正在设置系统代理" } else { "正在读取系统代理状态" },
-                            span { class: "spinner" }
-                        }
-                    } else {
-                        input {
-                            r#type: "checkbox",
-                            checked: proxy_enabled,
-                            disabled: !proxy_ready || !proxy_supported || (!proxy_enabled && !enable_allowed),
-                            onchange: move |event| {
-                                let enabled = event.checked();
-                                async move {
-                                    system_proxy_busy.set(true);
-                                    match api::set_system_proxy(enabled).await {
-                                        Ok(status) => {
-                                            system_proxy.set(SystemProxyLoadState::Ready(status));
-                                            notice.set(Some(if enabled {
-                                                "系统代理已启用".to_string()
-                                            } else {
-                                                "系统代理已恢复为启用前的设置".to_string()
-                                            }));
-                                        }
-                                        Err(error) => {
-                                            notice.set(Some(format!("系统代理设置失败: {error}")));
-                                            match api::system_proxy_status().await {
-                                                Ok(status) => {
-                                                    system_proxy.set(SystemProxyLoadState::Ready(status));
-                                                }
-                                                Err(refresh_error) => {
-                                                    system_proxy.set(SystemProxyLoadState::Failed(
-                                                        refresh_error.to_string(),
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    system_proxy_busy.set(false);
-                                }
-                            },
-                        }
-                        span { class: "switch" }
-                    }
-                }
-                if let Some(error) = proxy_error {
-                    div { class: "inline-note",
-                        Icon { icon: LdInfo, width: 16, height: 16 }
-                        span { "无法读取系统代理状态：{error}" }
-                    }
-                } else if proxy_ready && !proxy_supported {
-                    div { class: "inline-note",
-                        Icon { icon: LdInfo, width: 16, height: 16 }
-                        span { "当前平台尚未提供系统代理适配。" }
-                    }
-                } else if proxy_ready && !proxy_enabled && !enable_allowed {
-                    div { class: "inline-note",
-                        Icon { icon: LdInfo, width: 16, height: 16 }
-                        span { "请先在概览页建立连接，再启用系统代理。" }
                     }
                 }
             }
