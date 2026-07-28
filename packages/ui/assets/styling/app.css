@@ -1279,8 +1279,9 @@ body {
 .route-decision,
 .log-level {
   display: inline-flex;
+  box-sizing: border-box;
   width: 52px;
-  min-height: 25px;
+  height: 25px;
   align-items: center;
   justify-content: center;
   align-self: start;
@@ -1300,8 +1301,9 @@ body {
 
 .route-decision-group {
   display: inline-flex;
+  box-sizing: border-box;
   width: 52px;
-  min-height: 22px;
+  height: 25px;
   align-items: center;
   justify-content: center;
   margin-top: 5px;
