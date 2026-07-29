@@ -2860,76 +2860,74 @@ fn SettingsView(
                     }
                     span { class: "switch" }
                 }
-                if platform != "Mobile" {
-                    label {
-                        class: "setting-row toggle-row",
-                        title: "允许同一局域网设备直接使用此代理",
-                        span { class: "setting-icon", Icon { icon: LdWifi, width: 19, height: 19 } }
-                        div {
-                            strong { "允许局域网连接" }
-                            small {
-                                if allow_lan() { "0.0.0.0:7890 · 无认证" }
-                                else { "127.0.0.1:7890" }
-                            }
+                label {
+                    class: "setting-row toggle-row",
+                    title: "允许同一局域网设备直接使用此代理",
+                    span { class: "setting-icon", Icon { icon: LdWifi, width: 19, height: 19 } }
+                    div {
+                        strong { "允许局域网连接" }
+                        small {
+                            if allow_lan() { "0.0.0.0:7890 · 无认证" }
+                            else { "127.0.0.1:7890" }
                         }
-                        input {
-                            r#type: "checkbox",
-                            aria_label: "允许局域网连接",
-                            checked: allow_lan,
-                            disabled: core_restarting(),
-                            onchange: move |event| async move {
-                                let enabled = event.checked();
-                                allow_lan.set(enabled);
-                                if !connected() {
-                                    notice.set(Some(if enabled {
-                                        "局域网连接将在下次启动内核时生效".to_string()
-                                    } else {
-                                        "仅本机访问将在下次启动内核时生效".to_string()
-                                    }));
-                                    return;
-                                }
-
-                                core_restarting.set(true);
-                                let request = ConnectionRequest {
-                                    nodes: nodes(),
-                                    selected_tag: selected_tag(),
-                                    mode: tunnel_mode(),
-                                    tun: tun_enabled(),
-                                    allow_lan: enabled,
-                                    custom_rules: custom_rules(),
-                                    config_script: if config_script_enabled()
-                                        && !config_script().trim().is_empty()
-                                    {
-                                        Some(config_script())
-                                    } else {
-                                        None
-                                    },
-                                    group_selections: group_selections(),
-                                };
-                                match api::restart_core(request).await {
-                                    Ok(status) => {
-                                        let is_running = status.state == "running";
-                                        connected.set(is_running);
-                                        core_state.set(status.state);
-                                        core_version.set(status.version);
-                                        core_note.set(status.note);
-                                        notice.set(Some(if enabled {
-                                            "已允许局域网连接，sing-box 内核已重启".to_string()
-                                        } else {
-                                            "已恢复仅本机访问，sing-box 内核已重启".to_string()
-                                        }));
-                                    }
-                                    Err(error) => {
-                                        connected.set(false);
-                                        core_state.set("stopped".to_string());
-                                        notice.set(Some(format!("应用局域网监听设置失败: {error}")));
-                                    }
-                                }
-                                core_restarting.set(false);
-                            },
-                        }
-                        span { class: "switch" }
                     }
+                    input {
+                        r#type: "checkbox",
+                        aria_label: "允许局域网连接",
+                        checked: allow_lan,
+                        disabled: core_restarting(),
+                        onchange: move |event| async move {
+                            let enabled = event.checked();
+                            allow_lan.set(enabled);
+                            if !connected() {
+                                notice.set(Some(if enabled {
+                                    "局域网连接将在下次启动内核时生效".to_string()
+                                } else {
+                                    "仅本机访问将在下次启动内核时生效".to_string()
+                                }));
+                                return;
+                            }
+
+                            core_restarting.set(true);
+                            let request = ConnectionRequest {
+                                nodes: nodes(),
+                                selected_tag: selected_tag(),
+                                mode: tunnel_mode(),
+                                tun: tun_enabled(),
+                                allow_lan: enabled,
+                                custom_rules: custom_rules(),
+                                config_script: if config_script_enabled()
+                                    && !config_script().trim().is_empty()
+                                {
+                                    Some(config_script())
+                                } else {
+                                    None
+                                },
+                                group_selections: group_selections(),
+                            };
+                            match api::restart_core(request).await {
+                                Ok(status) => {
+                                    let is_running = status.state == "running";
+                                    connected.set(is_running);
+                                    core_state.set(status.state);
+                                    core_version.set(status.version);
+                                    core_note.set(status.note);
+                                    notice.set(Some(if enabled {
+                                        "已允许局域网连接，sing-box 内核已重启".to_string()
+                                    } else {
+                                        "已恢复仅本机访问，sing-box 内核已重启".to_string()
+                                    }));
+                                }
+                                Err(error) => {
+                                    connected.set(false);
+                                    core_state.set("stopped".to_string());
+                                    notice.set(Some(format!("应用局域网监听设置失败: {error}")));
+                                }
+                            }
+                            core_restarting.set(false);
+                        },
+                    }
+                    span { class: "switch" }
                 }
             }
 

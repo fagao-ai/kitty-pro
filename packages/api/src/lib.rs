@@ -1470,8 +1470,8 @@ fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
 }
 
 #[allow(dead_code)]
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-fn desktop_mixed_listen_address(allow_lan: bool) -> &'static str {
+#[cfg(not(target_arch = "wasm32"))]
+fn mixed_listen_address(allow_lan: bool) -> &'static str {
     if allow_lan {
         "0.0.0.0"
     } else {
@@ -1524,7 +1524,7 @@ fn toggle_native_core(
     }
 
     let options = SingBoxOptions {
-        listen: desktop_mixed_listen_address(request.allow_lan).to_string(),
+        listen: mixed_listen_address(request.allow_lan).to_string(),
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
@@ -1560,6 +1560,7 @@ fn toggle_native_core(
     proxy_core::validate_custom_rules(&request.custom_rules)
         .map_err(|error| ServerFnError::new(format!("自定义规则无效: {error}")))?;
     let options = SingBoxOptions {
+        listen: mixed_listen_address(request.allow_lan).to_string(),
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
@@ -2658,11 +2659,11 @@ mod tests {
         }
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn desktop_listener_follows_allow_lan_setting() {
-        assert_eq!(desktop_mixed_listen_address(false), "127.0.0.1");
-        assert_eq!(desktop_mixed_listen_address(true), "0.0.0.0");
+    fn native_listener_follows_allow_lan_setting() {
+        assert_eq!(mixed_listen_address(false), "127.0.0.1");
+        assert_eq!(mixed_listen_address(true), "0.0.0.0");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
