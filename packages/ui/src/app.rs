@@ -23,6 +23,119 @@ use crate::APP_CSS;
 const BRAND_ICON_SVG: &str = include_str!("../assets/kitty-pro.svg");
 const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
 const RULE_SET_UPDATE_CHECK_SECS: u64 = 6 * 60 * 60;
+const TOAST_DISMISS_MILLIS: u64 = 4_500;
+const LATENCY_CACHE_KEY: &str = "kitty-pro.node-latency.v1";
+
+type LatencyCacheEntry = (String, String, u64);
+
+fn load_latency_cache_script() -> String {
+    r#"
+const key = __CACHE_KEY__;
+try {
+    const raw = localStorage.getItem(key);
+    const cached = raw ? JSON.parse(raw) : null;
+    if (cached && Array.isArray(cached.results)) {
+        dioxus.send(cached.results);
+    } else {
+        localStorage.removeItem(key);
+        dioxus.send([]);
+    }
+} catch (_) {
+    localStorage.removeItem(key);
+    dioxus.send([]);
+}
+"#
+    .replace("__CACHE_KEY__", &format!("{LATENCY_CACHE_KEY:?}"))
+}
+
+fn save_latency_cache_script() -> String {
+    r#"
+const key = __CACHE_KEY__;
+const results = await dioxus.recv();
+try {
+    if (Array.isArray(results) && results.length > 0) {
+        localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), results }));
+    } else {
+        localStorage.removeItem(key);
+    }
+} catch (_) {}
+"#
+    .replace("__CACHE_KEY__", &format!("{LATENCY_CACHE_KEY:?}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToastMessage {
+    id: u64,
+    kind: ToastKind,
+    message: String,
+}
+
+#[derive(Clone, Copy)]
+struct ToastManager {
+    messages: Signal<Vec<ToastMessage>>,
+    next_id: Signal<u64>,
+}
+
+impl ToastManager {
+    fn info(self, message: impl Into<String>) {
+        self.push(ToastKind::Info, message.into());
+    }
+
+    fn success(self, message: impl Into<String>) {
+        self.push(ToastKind::Success, message.into());
+    }
+
+    fn error(self, message: impl Into<String>) {
+        self.push(ToastKind::Error, message.into());
+    }
+
+    fn push(self, kind: ToastKind, message: String) {
+        let id = {
+            let mut next_id = self.next_id;
+            let mut value = next_id.write();
+            *value = value.wrapping_add(1);
+            *value
+        };
+        let mut messages = self.messages;
+        {
+            let mut stored = messages.write();
+            if stored.len() >= 4 {
+                stored.remove(0);
+            }
+            stored.push(ToastMessage { id, kind, message });
+        }
+        spawn(async move {
+            wait_for_toast_dismiss().await;
+            messages.write().retain(|toast| toast.id != id);
+        });
+    }
+
+    fn dismiss(self, id: u64) {
+        let mut messages = self.messages;
+        messages.write().retain(|toast| toast.id != id);
+    }
+
+    #[cfg(target_os = "android")]
+    fn contains(self, message: &str) -> bool {
+        self.messages
+            .peek()
+            .iter()
+            .any(|toast| toast.message == message)
+    }
+
+    #[cfg(target_os = "android")]
+    fn dismiss_message(self, message: &str) {
+        let mut messages = self.messages;
+        messages.write().retain(|toast| toast.message != message);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppView {
@@ -111,6 +224,16 @@ async fn wait_for_latency_poll() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn wait_for_toast_dismiss() {
+    gloo_timers::future::TimeoutFuture::new(TOAST_DISMISS_MILLIS as u32).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn wait_for_toast_dismiss() {
+    tokio::time::sleep(std::time::Duration::from_millis(TOAST_DISMISS_MILLIS)).await;
+}
+
 impl AppView {
     fn title(self) -> &'static str {
         match self {
@@ -134,7 +257,11 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut core_state = use_signal(|| "checking".to_string());
     let mut core_version = use_signal(|| None::<String>);
     let mut core_note = use_signal(|| None::<String>);
-    let mut notice = use_signal(|| None::<String>);
+    let toast = ToastManager {
+        messages: use_signal(Vec::<ToastMessage>::new),
+        next_id: use_signal(|| 0),
+    };
+    use_context_provider(|| toast);
     let mut nodes = use_signal(Vec::<ProxyNode>::new);
     let mut selected_tag = use_signal(String::new);
     let mut subscriptions = use_signal(Vec::<Subscription>::new);
@@ -154,7 +281,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut import_error = use_signal(|| None::<String>);
     let search = use_signal(String::new);
     let refresh_busy = use_signal(|| None::<RefreshTarget>);
-    let latency_results = use_signal(HashMap::<String, NodeLatency>::new);
+    let mut latency_results = use_signal(HashMap::<String, NodeLatency>::new);
     let latency_busy = use_signal(|| false);
     let mut traffic = use_signal(TrafficDisplay::default);
     let mut traffic_poll_generation = use_signal(|| 0_u64);
@@ -192,8 +319,9 @@ pub fn ProxyApp(platform: String) -> Element {
                     Ok(status) => {
                         let is_running = status.state == "running";
                         connected.set(is_running);
-                        if is_running && notice().as_deref() == Some(ANDROID_VPN_WAITING_NOTICE) {
-                            notice.set(Some("Android VPN 已连接".to_string()));
+                        if is_running && toast.contains(ANDROID_VPN_WAITING_NOTICE) {
+                            toast.dismiss_message(ANDROID_VPN_WAITING_NOTICE);
+                            toast.success("Android VPN 已连接");
                         }
                         core_state.set(status.state);
                         core_version.set(status.version);
@@ -253,8 +381,26 @@ pub fn ProxyApp(platform: String) -> Element {
                     group_selections.set(profile.group_selections);
                     profile_loaded.set(true);
                 }
-                Err(error) => notice.set(Some(format!("无法恢复本地配置: {error}"))),
+                Err(error) => toast.error(format!("无法恢复本地配置: {error}")),
             }
+        });
+    });
+
+    use_effect(move || {
+        if !profile_loaded() {
+            return;
+        }
+        let current_nodes = nodes();
+        if current_nodes.is_empty() {
+            latency_results.set(HashMap::new());
+            return;
+        }
+        spawn(async move {
+            let mut eval = document::eval(&load_latency_cache_script());
+            let Ok(entries) = eval.recv::<Vec<LatencyCacheEntry>>().await else {
+                return;
+            };
+            latency_results.set(restore_cached_latencies(&current_nodes, entries));
         });
     });
 
@@ -278,7 +424,7 @@ pub fn ProxyApp(platform: String) -> Element {
         };
         spawn(async move {
             if let Err(error) = api::save_profile(profile).await {
-                notice.set(Some(format!("本地配置保存失败: {error}")));
+                toast.error(format!("本地配置保存失败: {error}"));
             }
         });
     });
@@ -390,7 +536,11 @@ pub fn ProxyApp(platform: String) -> Element {
             mode: tunnel_mode(),
             tun: tun_enabled(),
             allow_lan: allow_lan(),
-            custom_rules: custom_rules(),
+            custom_rules: connection_custom_rules(
+                config_script_enabled(),
+                &config_script(),
+                custom_rules(),
+            ),
             config_script: if config_script_enabled() && !config_script().trim().is_empty() {
                 Some(config_script())
             } else {
@@ -457,7 +607,11 @@ pub fn ProxyApp(platform: String) -> Element {
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
-                                    custom_rules: custom_rules(),
+                                    custom_rules: connection_custom_rules(
+                                        config_script_enabled(),
+                                        &config_script(),
+                                        custom_rules(),
+                                    ),
                                     config_script: if config_script_enabled()
                                         && !config_script().trim().is_empty()
                                     {
@@ -474,14 +628,14 @@ pub fn ProxyApp(platform: String) -> Element {
                                         core_state.set(status.state);
                                         core_version.set(status.version);
                                         core_note.set(status.note);
-                                        notice.set(Some(if is_running {
-                                            "sing-box 内核已重启".to_string()
+                                        if is_running {
+                                            toast.success("sing-box 内核已重启");
                                         } else {
-                                            ANDROID_VPN_WAITING_NOTICE.to_string()
-                                        }));
+                                            toast.info(ANDROID_VPN_WAITING_NOTICE);
+                                        }
                                     }
                                     Err(error) => {
-                                        notice.set(Some(format!("内核重启失败: {error}")));
+                                        toast.error(format!("内核重启失败: {error}"));
                                         match api::core_status().await {
                                             Ok(status) => {
                                                 connected.set(status.state == "running");
@@ -530,7 +684,11 @@ pub fn ProxyApp(platform: String) -> Element {
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
-                                    custom_rules: custom_rules(),
+                                    custom_rules: connection_custom_rules(
+                                        config_script_enabled(),
+                                        &config_script(),
+                                        custom_rules(),
+                                    ),
                                     config_script: if config_script_enabled()
                                         && !config_script().trim().is_empty()
                                     {
@@ -547,14 +705,14 @@ pub fn ProxyApp(platform: String) -> Element {
                                         core_state.set(status.state);
                                         core_version.set(status.version);
                                         core_note.set(status.note);
-                                        notice.set(Some(if is_running {
-                                            "sing-box 内核已重启".to_string()
+                                        if is_running {
+                                            toast.success("sing-box 内核已重启");
                                         } else {
-                                            ANDROID_VPN_WAITING_NOTICE.to_string()
-                                        }));
+                                            toast.info(ANDROID_VPN_WAITING_NOTICE);
+                                        }
                                     }
                                     Err(error) => {
-                                        notice.set(Some(format!("内核重启失败: {error}")));
+                                        toast.error(format!("内核重启失败: {error}"));
                                         match api::core_status().await {
                                             Ok(status) => {
                                                 connected.set(status.state == "running");
@@ -602,19 +760,6 @@ pub fn ProxyApp(platform: String) -> Element {
                     }
                 }
 
-                if let Some(message) = notice() {
-                    div { class: "notice-bar glass-surface",
-                        Icon { icon: LdInfo, width: 17, height: 17 }
-                        span { "{message}" }
-                        button {
-                            class: "bare-icon",
-                            title: "关闭",
-                            onclick: move |_| notice.set(None),
-                            Icon { icon: LdX, width: 16, height: 16 }
-                        }
-                    }
-                }
-
                 match current_view {
                     AppView::Overview => rsx! {
                         OverviewView {
@@ -637,7 +782,6 @@ pub fn ProxyApp(platform: String) -> Element {
                             group_selections,
                             system_proxy,
                             system_proxy_busy,
-                            notice,
                         }
                     },
                     AppView::Nodes => rsx! {
@@ -653,7 +797,6 @@ pub fn ProxyApp(platform: String) -> Element {
                             latency_results,
                             latency_busy,
                             import_open,
-                            notice,
                         }
                     },
                     AppView::Subscriptions => rsx! {
@@ -664,7 +807,6 @@ pub fn ProxyApp(platform: String) -> Element {
                             nodes,
                             selected_tag,
                             refresh_busy,
-                            notice,
                         }
                     },
                     AppView::Rules => rsx! {
@@ -673,7 +815,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             connected,
                             tunnel_mode,
                             rule_sets_busy,
-                            notice,
+                            config_script_enabled,
                         }
                     },
                     AppView::Logs => rsx! {
@@ -701,7 +843,6 @@ pub fn ProxyApp(platform: String) -> Element {
                             config_script_enabled,
                             config_script,
                             group_selections,
-                            notice,
                         }
                     },
                 }
@@ -809,7 +950,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                             let next_tag = select_available_tag(&active_nodes, "");
                                             nodes.set(active_nodes);
                                             selected_tag.set(next_tag);
-                                            notice.set(Some(format!("已导入并切换到 {name}，共 {count} 个节点")));
+                                            toast.success(format!("已导入并切换到 {name}，共 {count} 个节点"));
                                             import_source.set(String::new());
                                             import_name.set(String::new());
                                             import_open.set(false);
@@ -835,6 +976,46 @@ pub fn ProxyApp(platform: String) -> Element {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            ToastViewport {}
+        }
+    }
+}
+
+#[component]
+fn ToastViewport() -> Element {
+    let toast = use_context::<ToastManager>();
+
+    rsx! {
+        div {
+            class: "toast-viewport",
+            aria_live: "polite",
+            aria_relevant: "additions",
+            for item in (toast.messages)() {
+                div {
+                    class: match item.kind {
+                        ToastKind::Info => "toast toast-info",
+                        ToastKind::Success => "toast toast-success",
+                        ToastKind::Error => "toast toast-error",
+                    },
+                    role: if item.kind == ToastKind::Error { "alert" } else { "status" },
+                    span { class: "toast-icon",
+                        match item.kind {
+                            ToastKind::Info => rsx! { Icon { icon: LdInfo, width: 18, height: 18 } },
+                            ToastKind::Success => rsx! { Icon { icon: LdCircleCheck, width: 18, height: 18 } },
+                            ToastKind::Error => rsx! { Icon { icon: LdCircleAlert, width: 18, height: 18 } },
+                        }
+                    }
+                    span { class: "toast-message", "{item.message}" }
+                    button {
+                        class: "toast-close",
+                        title: "关闭提示",
+                        aria_label: "关闭提示",
+                        onclick: move |_| toast.dismiss(item.id),
+                        Icon { icon: LdX, width: 16, height: 16 }
                     }
                 }
             }
@@ -901,8 +1082,8 @@ fn OverviewView(
     group_selections: Signal<HashMap<String, String>>,
     system_proxy: Signal<SystemProxyLoadState>,
     system_proxy_busy: Signal<bool>,
-    mut notice: Signal<Option<String>>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
     let is_connected = connected();
     let is_core_busy = core_busy();
@@ -989,7 +1170,11 @@ fn OverviewView(
                                 mode: tunnel_mode(),
                                 tun: tun_enabled(),
                                 allow_lan: allow_lan(),
-                                custom_rules: custom_rules(),
+                                custom_rules: connection_custom_rules(
+                                    config_script_enabled(),
+                                    &config_script(),
+                                    custom_rules(),
+                                ),
                                 config_script: if config_script_enabled()
                                     && !config_script().trim().is_empty()
                                 {
@@ -1005,15 +1190,15 @@ fn OverviewView(
                                     connected.set(is_running);
                                     core_state.set(status.state);
                                     core_note.set(status.note);
-                                    notice.set(Some(if !target {
-                                        "连接已断开".to_string()
+                                    if !target {
+                                        toast.success("连接已断开");
                                     } else if is_running {
-                                        "sing-box 已启动".to_string()
+                                        toast.success("sing-box 已启动");
                                     } else {
-                                        ANDROID_VPN_WAITING_NOTICE.to_string()
-                                    }));
+                                        toast.info(ANDROID_VPN_WAITING_NOTICE);
+                                    }
                                 }
-                                Err(error) => notice.set(Some(error.to_string())),
+                                Err(error) => toast.error(error.to_string()),
                             }
                             core_busy.set(false);
                         },
@@ -1027,7 +1212,6 @@ fn OverviewView(
                         core_running: is_connected,
                         system_proxy,
                         system_proxy_busy,
-                        notice,
                     }
                 }
             }
@@ -1111,8 +1295,8 @@ fn SystemProxyToggle(
     core_running: bool,
     mut system_proxy: Signal<SystemProxyLoadState>,
     mut system_proxy_busy: Signal<bool>,
-    mut notice: Signal<Option<String>>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     let (proxy_status, proxy_loading, proxy_error) = match system_proxy() {
         SystemProxyLoadState::Loading => (None, true, None),
         SystemProxyLoadState::Ready(status) => (Some(status), false, None),
@@ -1177,14 +1361,14 @@ fn SystemProxyToggle(
                             match api::set_system_proxy(enabled).await {
                                 Ok(status) => {
                                     system_proxy.set(SystemProxyLoadState::Ready(status));
-                                    notice.set(Some(if enabled {
-                                        "系统代理已启用".to_string()
+                                    if enabled {
+                                        toast.success("系统代理已启用");
                                     } else {
-                                        "系统代理已恢复为启用前的设置".to_string()
-                                    }));
+                                        toast.success("系统代理已恢复为启用前的设置");
+                                    }
                                 }
                                 Err(error) => {
-                                    notice.set(Some(format!("系统代理设置失败: {error}")));
+                                    toast.error(format!("系统代理设置失败: {error}"));
                                     match api::system_proxy_status().await {
                                         Ok(status) => {
                                             system_proxy.set(SystemProxyLoadState::Ready(status));
@@ -1266,8 +1450,8 @@ fn NodesView(
     mut latency_results: Signal<HashMap<String, NodeLatency>>,
     mut latency_busy: Signal<bool>,
     mut import_open: Signal<bool>,
-    mut notice: Signal<Option<String>>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     let active_group = use_signal(String::new);
     let requested_group = active_group();
     let current_group = groups
@@ -1397,14 +1581,14 @@ fn NodesView(
                                     disabled: latency_busy() || nodes.is_empty(),
                                     onclick: move |_| {
                                         let probe_nodes = nodes.clone();
+                                        let cache_nodes = nodes.clone();
                                         async move {
                                             latency_busy.set(true);
-                                            let total = probe_nodes.len();
                                             let mut failures = 0;
                                             let session_id = match api::start_node_latency(probe_nodes).await {
                                                 Ok(session_id) => session_id,
                                                 Err(error) => {
-                                                    notice.set(Some(format!("启动测速失败: {error}")));
+                                                    toast.error(format!("启动测速失败: {error}"));
                                                     latency_busy.set(false);
                                                     return;
                                                 }
@@ -1423,29 +1607,30 @@ fn NodesView(
                                                                 current_results.insert(result.tag.clone(), result);
                                                             }
                                                         }
-                                                        notice.set(Some(format!(
-                                                            "正在测速 {}/{total}",
-                                                            snapshot.completed
-                                                        )));
                                                         if snapshot.done {
                                                             break snapshot.completed;
                                                         }
                                                     }
                                                     Err(error) => {
-                                                        notice.set(Some(format!("读取测速结果失败: {error}")));
+                                                        toast.error(format!("读取测速结果失败: {error}"));
                                                         latency_busy.set(false);
                                                         return;
                                                     }
                                                 }
                                                 wait_for_latency_poll().await;
                                             };
-                                            notice.set(Some(if failures == 0 {
-                                                format!("已完成 {completed} 个节点测速")
+                                            if failures == 0 {
+                                                toast.success(format!("已完成 {completed} 个节点测速"));
                                             } else {
-                                                format!(
+                                                toast.info(format!(
                                                     "延迟刷新完成，{completed} 个节点中 {failures} 个不可用"
-                                                )
-                                            }));
+                                                ));
+                                            }
+                                            persist_latency_cache(
+                                                &cache_nodes,
+                                                &latency_results.peek(),
+                                            )
+                                            .await;
                                             latency_busy.set(false);
                                         }
                                     },
@@ -1473,7 +1658,6 @@ fn NodesView(
                                         connected,
                                         group_selections,
                                         latency_results,
-                                        notice,
                                     }
                                 }
                             }
@@ -1540,8 +1724,8 @@ fn ProxyGroupMemberRow(
     connected: Signal<bool>,
     mut group_selections: Signal<HashMap<String, String>>,
     latency_results: Signal<HashMap<String, NodeLatency>>,
-    mut notice: Signal<Option<String>>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     let is_selected = group_kind == ProxyGroupKind::Selector && selected == member.tag;
     let selectable = group_kind == ProxyGroupKind::Selector;
     let member_tag = member.tag.clone();
@@ -1570,12 +1754,12 @@ fn ProxyGroupMemberRow(
                 async move {
                     if connected() {
                         if let Err(error) = api::select_proxy_group(group.clone(), outbound.clone()).await {
-                            notice.set(Some(format!("切换 {group} 失败: {error}")));
+                            toast.error(format!("切换 {group} 失败: {error}"));
                             return;
                         }
                     }
                     group_selections.write().insert(group.clone(), outbound.clone());
-                    notice.set(Some(format!("{group} 已切换到 {outbound}")));
+                    toast.success(format!("{group} 已切换到 {outbound}"));
                 }
             },
             if let Some(node) = member.node {
@@ -1665,6 +1849,62 @@ fn NodeRow(
     }
 }
 
+fn restore_cached_latencies(
+    nodes: &[ProxyNode],
+    entries: Vec<LatencyCacheEntry>,
+) -> HashMap<String, NodeLatency> {
+    let cached_by_tag = entries
+        .iter()
+        .map(|(tag, endpoint, latency_ms)| ((tag.as_str(), endpoint.as_str()), *latency_ms))
+        .collect::<HashMap<_, _>>();
+    let cached_by_endpoint = entries
+        .iter()
+        .map(|(_, endpoint, latency_ms)| (endpoint.as_str(), *latency_ms))
+        .collect::<HashMap<_, _>>();
+
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let endpoint = node.endpoint();
+            cached_by_tag
+                .get(&(node.tag.as_str(), endpoint.as_str()))
+                .or_else(|| cached_by_endpoint.get(endpoint.as_str()))
+                .map(|latency_ms| {
+                    (
+                        node.tag.clone(),
+                        NodeLatency {
+                            tag: node.tag.clone(),
+                            latency_ms: Some(*latency_ms),
+                            error: None,
+                        },
+                    )
+                })
+        })
+        .collect()
+}
+
+fn latency_cache_entries(
+    nodes: &[ProxyNode],
+    results: &HashMap<String, NodeLatency>,
+) -> Vec<LatencyCacheEntry> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            results
+                .get(&node.tag)
+                .and_then(|result| result.latency_ms)
+                .map(|latency_ms| (node.tag.clone(), node.endpoint(), latency_ms))
+        })
+        .collect()
+}
+
+async fn persist_latency_cache(nodes: &[ProxyNode], results: &HashMap<String, NodeLatency>) {
+    let eval = document::eval(&save_latency_cache_script());
+    if eval.send(latency_cache_entries(nodes, results)).is_ok() {
+        let _ = eval.await;
+    }
+}
+
 fn format_latency(result: Option<&NodeLatency>) -> (String, &'static str, String) {
     match result {
         Some(NodeLatency {
@@ -1707,8 +1947,8 @@ fn SubscriptionsView(
     nodes: Signal<Vec<ProxyNode>>,
     selected_tag: Signal<String>,
     refresh_busy: Signal<Option<RefreshTarget>>,
-    notice: Signal<Option<String>>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     rsx! {
         section { class: "workspace-section glass-surface",
             div { class: "workspace-toolbar",
@@ -1754,11 +1994,11 @@ fn SubscriptionsView(
                                     select_available_tag(&active_nodes, &selected_tag());
                                 nodes.set(active_nodes);
                                 selected_tag.set(next_tag);
-                                notice.set(Some(if failed == 0 {
-                                    format!("已刷新 {refreshed} 个订阅")
+                                if failed == 0 {
+                                    toast.success(format!("已刷新 {refreshed} 个订阅"));
                                 } else {
-                                    format!("已刷新 {refreshed} 个订阅，{failed} 个失败")
-                                }));
+                                    toast.info(format!("已刷新 {refreshed} 个订阅，{failed} 个失败"));
+                                }
                                 refresh_busy.set(None);
                             }
                         },
@@ -1791,7 +2031,6 @@ fn SubscriptionsView(
                             nodes,
                             selected_tag,
                             refresh_busy,
-                            notice,
                         }
                     }
                 }
@@ -1808,8 +2047,8 @@ fn SubscriptionRow(
     mut nodes: Signal<Vec<ProxyNode>>,
     mut selected_tag: Signal<String>,
     mut refresh_busy: Signal<Option<RefreshTarget>>,
-    mut notice: Signal<Option<String>>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     let subscription_id = subscription.id;
     let subscription_source = subscription.source.clone();
     let display_source = source_label(&subscription.source);
@@ -1840,7 +2079,7 @@ fn SubscriptionRow(
                     let next_tag = select_available_tag(&active_nodes, "");
                     nodes.set(active_nodes);
                     selected_tag.set(next_tag);
-                    notice.set(Some("已切换订阅".to_string()));
+                    toast.success("已切换订阅");
                 },
                 if active {
                     Icon { icon: LdCircleCheck, width: 15, height: 15 }
@@ -1877,14 +2116,14 @@ fn SubscriptionRow(
                                         nodes.set(active_nodes);
                                         selected_tag.set(next_tag);
                                     }
-                                    notice.set(Some(format!("已刷新 {count} 个节点")));
+                                    toast.success(format!("已刷新 {count} 个节点"));
                                 }
                                 Err(reason) => {
-                                    notice.set(Some(format!("刷新失败: {reason}")));
+                                    toast.error(format!("刷新失败: {reason}"));
                                 }
                             }
                         }
-                        Err(error) => notice.set(Some(format!("刷新失败: {error}"))),
+                        Err(error) => toast.error(format!("刷新失败: {error}")),
                     }
                     refresh_busy.set(None);
                     }
@@ -1918,7 +2157,7 @@ fn SubscriptionRow(
                     let next_tag = select_available_tag(&active_nodes, &requested_tag);
                     nodes.set(active_nodes);
                     selected_tag.set(next_tag);
-                    notice.set(Some("订阅已删除".to_string()));
+                    toast.success("订阅已删除");
                 },
                 Icon { icon: LdTrash2, width: 17, height: 17 }
             }
@@ -1932,8 +2171,9 @@ fn RulesView(
     connected: Signal<bool>,
     tunnel_mode: Signal<TunnelMode>,
     mut rule_sets_busy: Signal<bool>,
-    mut notice: Signal<Option<String>>,
+    config_script_enabled: Signal<bool>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     let mut editor_open = use_signal(|| false);
     let mut editing_id = use_signal(|| None::<u64>);
     let mut draft_match = use_signal(|| CustomRuleMatch::DomainSuffix);
@@ -1944,6 +2184,7 @@ fn RulesView(
     let enabled_count = stored.iter().filter(|rule| rule.enabled).count();
     let total = stored.len();
     let rule_mode_active = tunnel_mode() == TunnelMode::Rule;
+    let override_active = config_script_enabled();
 
     let mut open_new_editor = move || {
         editing_id.set(None);
@@ -1964,14 +2205,31 @@ fn RulesView(
     let placeholder = custom_rule_placeholder(draft_match());
 
     rsx! {
-        section { class: "workspace-section rules-workspace glass-surface",
+        section {
+            class: if override_active {
+                "workspace-section rules-workspace rules-override-active glass-surface"
+            } else {
+                "workspace-section rules-workspace glass-surface"
+            },
             div { class: "workspace-toolbar rules-toolbar",
                 div {
                     div { class: "section-title-line",
                         h2 { "自定义分流" }
                         span {
-                            class: if rule_mode_active { "status-badge online" } else { "status-badge" },
-                            if rule_mode_active { "规则模式" } else { "未启用" }
+                            class: if override_active {
+                                "status-badge pending"
+                            } else if rule_mode_active {
+                                "status-badge online"
+                            } else {
+                                "status-badge"
+                            },
+                            if override_active {
+                                "脚本覆写"
+                            } else if rule_mode_active {
+                                "规则模式"
+                            } else {
+                                "未启用"
+                            }
                         }
                     }
                     p { "{enabled_count} 条启用 · {total} 条规则" }
@@ -1981,12 +2239,12 @@ fn RulesView(
                         class: "secondary-button compact",
                         title: "立即更新分流规则",
                         aria_busy: rule_sets_busy(),
-                        disabled: rule_sets_busy(),
+                        disabled: rule_sets_busy() || override_active,
                         onclick: move |_| async move {
                             rule_sets_busy.set(true);
                             match api::update_rule_sets(true).await {
-                                Ok(_) => notice.set(Some("分流规则已更新".to_string())),
-                                Err(error) => notice.set(Some(format!("分流规则更新失败: {error}"))),
+                                Ok(_) => toast.success("分流规则已更新"),
+                                Err(error) => toast.error(format!("分流规则更新失败: {error}")),
                             }
                             rule_sets_busy.set(false);
                         },
@@ -1999,7 +2257,7 @@ fn RulesView(
                     }
                     button {
                         class: "primary-button compact",
-                        disabled: total >= MAX_CUSTOM_RULES,
+                        disabled: override_active || total >= MAX_CUSTOM_RULES,
                         onclick: move |_| open_new_editor(),
                         Icon { icon: LdPlus, width: 17, height: 17 }
                         span { "添加规则" }
@@ -2007,7 +2265,17 @@ fn RulesView(
                 }
             }
 
-            if editor_open() {
+            if override_active {
+                div { class: "rule-override-notice", role: "status",
+                    Icon { icon: LdScrollText, width: 17, height: 17 }
+                    div {
+                        strong { "JavaScript 配置覆写已启用" }
+                        span { "自定义分流规则暂不可用" }
+                    }
+                }
+            }
+
+            if editor_open() && !override_active {
                 div { class: "rule-editor",
                     div { class: "rule-editor-grid",
                         div { class: "rule-field",
@@ -2063,7 +2331,7 @@ fn RulesView(
                                         ) {
                                             Ok(()) => {
                                                 editor_open.set(false);
-                                                notify_rule_change(connected(), &mut notice);
+                                                notify_rule_change(connected(), toast);
                                             }
                                             Err(error) => editor_error.set(Some(error)),
                                         }
@@ -2099,7 +2367,7 @@ fn RulesView(
                                 ) {
                                     Ok(()) => {
                                         editor_open.set(false);
-                                        notify_rule_change(connected(), &mut notice);
+                                        notify_rule_change(connected(), toast);
                                     }
                                     Err(error) => editor_error.set(Some(error)),
                                 }
@@ -2126,7 +2394,7 @@ fn RulesView(
                             total,
                             rules,
                             connected: connected(),
-                            notice,
+                            locked: override_active,
                             on_edit,
                         }
                     }
@@ -2224,9 +2492,10 @@ fn RuleListItem(
     total: usize,
     mut rules: Signal<Vec<CustomRule>>,
     connected: bool,
-    mut notice: Signal<Option<String>>,
+    locked: bool,
     on_edit: EventHandler<CustomRule>,
 ) -> Element {
+    let toast = use_context::<ToastManager>();
     let rule_id = rule.id;
     let edit_rule = rule.clone();
     let enabled = rule.enabled;
@@ -2235,7 +2504,14 @@ fn RuleListItem(
     let priority = index + 1;
 
     rsx! {
-        div { class: if enabled { "rule-row" } else { "rule-row disabled" },
+        div {
+            class: if locked {
+                "rule-row locked"
+            } else if enabled {
+                "rule-row"
+            } else {
+                "rule-row disabled"
+            },
             span { class: "rule-priority", "{priority:02}" }
             span { class: custom_rule_action_class(action),
                 match action {
@@ -2253,10 +2529,11 @@ fn RuleListItem(
                 input {
                     r#type: "checkbox",
                     checked: enabled,
+                    disabled: locked,
                     onchange: move |event| {
                         if let Some(stored) = rules.write().iter_mut().find(|item| item.id == rule_id) {
                             stored.enabled = event.checked();
-                            notify_rule_change(connected, &mut notice);
+                            notify_rule_change(connected, toast);
                         }
                     },
                 }
@@ -2266,35 +2543,37 @@ fn RuleListItem(
                 button {
                     class: "icon-button",
                     title: "上移",
-                    disabled: index == 0,
+                    disabled: locked || index == 0,
                     onclick: move |_| {
                         move_custom_rule(&mut rules.write(), rule_id, -1);
-                        notify_rule_change(connected, &mut notice);
+                        notify_rule_change(connected, toast);
                     },
                     Icon { icon: LdArrowUp, width: 16, height: 16 }
                 }
                 button {
                     class: "icon-button",
                     title: "下移",
-                    disabled: index + 1 >= total,
+                    disabled: locked || index + 1 >= total,
                     onclick: move |_| {
                         move_custom_rule(&mut rules.write(), rule_id, 1);
-                        notify_rule_change(connected, &mut notice);
+                        notify_rule_change(connected, toast);
                     },
                     Icon { icon: LdArrowDown, width: 16, height: 16 }
                 }
                 button {
                     class: "icon-button",
                     title: "编辑规则",
+                    disabled: locked,
                     onclick: move |_| on_edit.call(edit_rule.clone()),
                     Icon { icon: LdPencil, width: 16, height: 16 }
                 }
                 button {
                     class: "icon-button danger",
                     title: "删除规则",
+                    disabled: locked,
                     onclick: move |_| {
                         rules.write().retain(|item| item.id != rule_id);
-                        notify_rule_change(connected, &mut notice);
+                        notify_rule_change(connected, toast);
                     },
                     Icon { icon: LdTrash2, width: 16, height: 16 }
                 }
@@ -2344,6 +2623,18 @@ fn save_custom_rule(
     Ok(())
 }
 
+fn connection_custom_rules(
+    config_script_enabled: bool,
+    config_script: &str,
+    custom_rules: Vec<CustomRule>,
+) -> Vec<CustomRule> {
+    if config_script_enabled && !config_script.trim().is_empty() {
+        Vec::new()
+    } else {
+        custom_rules
+    }
+}
+
 fn next_custom_rule_id(rules: &[CustomRule]) -> Option<u64> {
     (1..=(rules.len() as u64 + 1)).find(|id| rules.iter().all(|rule| rule.id != *id))
 }
@@ -2360,12 +2651,12 @@ fn move_custom_rule(rules: &mut [CustomRule], id: u64, offset: isize) {
     }
 }
 
-fn notify_rule_change(connected: bool, notice: &mut Signal<Option<String>>) {
-    notice.set(Some(if connected {
-        "规则已保存，重新连接后生效".to_string()
+fn notify_rule_change(connected: bool, toast: ToastManager) {
+    toast.success(if connected {
+        "规则已保存，重新连接后生效"
     } else {
-        "规则已保存".to_string()
-    }));
+        "规则已保存"
+    });
 }
 
 fn custom_rule_action_value(action: CustomRuleAction) -> &'static str {
@@ -2734,9 +3025,11 @@ fn SettingsView(
     mut config_script_enabled: Signal<bool>,
     mut config_script: Signal<String>,
     group_selections: Signal<HashMap<String, String>>,
-    mut notice: Signal<Option<String>>,
 ) -> Element {
     let mut script_check_busy = use_signal(|| false);
+    let mut script_editor_open = use_signal(|| false);
+    let mut script_draft = use_signal(String::new);
+    let toast = use_context::<ToastManager>();
 
     rsx! {
         div { class: "settings-grid",
@@ -2775,62 +3068,37 @@ fn SettingsView(
                         if config_script_enabled() { "已启用" } else { "未启用" }
                     }
                 }
-                label { class: "setting-row toggle-row",
+                div { class: "setting-row script-setting-row",
                     span { class: "setting-icon", Icon { icon: LdScrollText, width: 19, height: 19 } }
                     div {
                         strong { "main(config)" }
-                        small { "sing-box JSON · QuickJS" }
-                    }
-                    input {
-                        r#type: "checkbox",
-                        checked: config_script_enabled,
-                        disabled: config_script().trim().is_empty(),
-                        onchange: move |event| config_script_enabled.set(event.checked()),
-                    }
-                    span { class: "switch" }
-                }
-                textarea {
-                    class: "script-editor",
-                    aria_label: "JavaScript 配置覆写脚本",
-                    spellcheck: "false",
-                    placeholder: "function main(config) {{\n  return config;\n}}",
-                    value: config_script,
-                    oninput: move |event| {
-                        let value = event.value();
-                        if value.trim().is_empty() {
-                            config_script_enabled.set(false);
-                        }
-                        config_script.set(value);
-                    },
-                }
-                div { class: "script-actions",
-                    button {
-                        class: "secondary-button",
-                        disabled: script_check_busy() || config_script().trim().is_empty(),
-                        onclick: move |_| async move {
-                            script_check_busy.set(true);
-                            let request = ConnectionRequest {
-                                nodes: nodes(),
-                                selected_tag: selected_tag(),
-                                mode: tunnel_mode(),
-                                tun: tun_enabled(),
-                                allow_lan: allow_lan(),
-                                custom_rules: custom_rules(),
-                                config_script: Some(config_script()),
-                                group_selections: group_selections(),
-                            };
-                            match api::validate_config_script(request).await {
-                                Ok(()) => notice.set(Some("配置脚本校验通过".to_string())),
-                                Err(error) => notice.set(Some(format!("配置脚本校验失败: {error}"))),
+                        small {
+                            if config_script().trim().is_empty() {
+                                "尚未配置"
+                            } else {
+                                "QuickJS · 已配置 {config_script().chars().count()} 个字符"
                             }
-                            script_check_busy.set(false);
-                        },
-                        if script_check_busy() {
-                            span { class: "spinner" }
-                        } else {
-                            Icon { icon: LdCircleCheck, width: 17, height: 17 }
                         }
-                        span { "校验" }
+                    }
+                    button {
+                        class: "icon-button",
+                        title: "编辑 JavaScript 配置覆写",
+                        aria_label: "编辑 JavaScript 配置覆写",
+                        onclick: move |_| {
+                            script_draft.set(config_script());
+                            script_editor_open.set(true);
+                        },
+                        Icon { icon: LdPencil, width: 17, height: 17 }
+                    }
+                    label { class: "compact-toggle", title: "启用 JavaScript 配置覆写",
+                        input {
+                            r#type: "checkbox",
+                            aria_label: "启用 JavaScript 配置覆写",
+                            checked: config_script_enabled,
+                            disabled: config_script().trim().is_empty(),
+                            onchange: move |event| config_script_enabled.set(event.checked()),
+                        }
+                        span { class: "switch" }
                     }
                 }
             }
@@ -2880,11 +3148,11 @@ fn SettingsView(
                             let enabled = event.checked();
                             allow_lan.set(enabled);
                             if !connected() {
-                                notice.set(Some(if enabled {
-                                    "局域网连接将在下次启动内核时生效".to_string()
+                                toast.info(if enabled {
+                                    "局域网连接将在下次启动内核时生效"
                                 } else {
-                                    "仅本机访问将在下次启动内核时生效".to_string()
-                                }));
+                                    "仅本机访问将在下次启动内核时生效"
+                                });
                                 return;
                             }
 
@@ -2895,7 +3163,11 @@ fn SettingsView(
                                 mode: tunnel_mode(),
                                 tun: tun_enabled(),
                                 allow_lan: enabled,
-                                custom_rules: custom_rules(),
+                                custom_rules: connection_custom_rules(
+                                    config_script_enabled(),
+                                    &config_script(),
+                                    custom_rules(),
+                                ),
                                 config_script: if config_script_enabled()
                                     && !config_script().trim().is_empty()
                                 {
@@ -2912,16 +3184,16 @@ fn SettingsView(
                                     core_state.set(status.state);
                                     core_version.set(status.version);
                                     core_note.set(status.note);
-                                    notice.set(Some(if enabled {
-                                        "已允许局域网连接，sing-box 内核已重启".to_string()
+                                    toast.success(if enabled {
+                                        "已允许局域网连接，sing-box 内核已重启"
                                     } else {
-                                        "已恢复仅本机访问，sing-box 内核已重启".to_string()
-                                    }));
+                                        "已恢复仅本机访问，sing-box 内核已重启"
+                                    });
                                 }
                                 Err(error) => {
                                     connected.set(false);
                                     core_state.set("stopped".to_string());
-                                    notice.set(Some(format!("应用局域网监听设置失败: {error}")));
+                                    toast.error(format!("应用局域网监听设置失败: {error}"));
                                 }
                             }
                             core_restarting.set(false);
@@ -2961,6 +3233,100 @@ fn SettingsView(
                         small { "界面语言" }
                     }
                     span { class: "setting-value", "简体中文" }
+                }
+            }
+        }
+
+        if script_editor_open() {
+            div {
+                class: "modal-backdrop",
+                role: "presentation",
+                onclick: move |_| {
+                    if !script_check_busy() {
+                        script_editor_open.set(false);
+                    }
+                },
+                div {
+                    class: "modal script-modal glass-modal",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "编辑 JavaScript 配置覆写",
+                    onclick: move |event| event.stop_propagation(),
+                    div { class: "modal-header",
+                        div {
+                            p { class: "eyebrow", "CONFIG SCRIPT" }
+                            h2 { "JavaScript 配置覆写" }
+                        }
+                        button {
+                            class: "icon-button",
+                            title: "关闭",
+                            aria_label: "关闭脚本编辑器",
+                            disabled: script_check_busy(),
+                            onclick: move |_| script_editor_open.set(false),
+                            Icon { icon: LdX, width: 19, height: 19 }
+                        }
+                    }
+                    textarea {
+                        class: "script-editor",
+                        aria_label: "JavaScript 配置覆写脚本",
+                        spellcheck: "false",
+                        placeholder: "function main(config) {{\n  return config;\n}}",
+                        value: script_draft,
+                        oninput: move |event| script_draft.set(event.value()),
+                    }
+                    div { class: "modal-actions",
+                        button {
+                            class: "secondary-button",
+                            disabled: script_check_busy(),
+                            onclick: move |_| script_editor_open.set(false),
+                            "取消"
+                        }
+                        button {
+                            class: "secondary-button",
+                            disabled: script_check_busy() || script_draft().trim().is_empty(),
+                            onclick: move |_| async move {
+                                script_check_busy.set(true);
+                                let request = ConnectionRequest {
+                                    nodes: nodes(),
+                                    selected_tag: selected_tag(),
+                                    mode: tunnel_mode(),
+                                    tun: tun_enabled(),
+                                    allow_lan: allow_lan(),
+                                    custom_rules: Vec::new(),
+                                    config_script: Some(script_draft()),
+                                    group_selections: group_selections(),
+                                };
+                                match api::validate_config_script(request).await {
+                                    Ok(()) => toast.success("配置脚本校验通过"),
+                                    Err(error) => {
+                                        toast.error(format!("配置脚本校验失败: {error}"));
+                                    }
+                                }
+                                script_check_busy.set(false);
+                            },
+                            if script_check_busy() {
+                                span { class: "spinner" }
+                            } else {
+                                Icon { icon: LdCircleCheck, width: 17, height: 17 }
+                            }
+                            "校验"
+                        }
+                        button {
+                            class: "primary-button",
+                            disabled: script_check_busy(),
+                            onclick: move |_| {
+                                let value = script_draft();
+                                if value.trim().is_empty() {
+                                    config_script_enabled.set(false);
+                                }
+                                config_script.set(value);
+                                script_editor_open.set(false);
+                                toast.success("配置脚本已保存");
+                            },
+                            Icon { icon: LdSave, width: 16, height: 16 }
+                            "保存"
+                        }
+                    }
                 }
             }
         }
@@ -3324,6 +3690,58 @@ mod tests {
     }
 
     #[test]
+    fn latency_cache_keeps_successes_for_unchanged_endpoints() {
+        let node = proxy_core::parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443#Edge",
+        )
+        .nodes
+        .pop()
+        .expect("fixture should parse");
+        let results = HashMap::from([
+            (
+                node.tag.clone(),
+                NodeLatency {
+                    tag: node.tag.clone(),
+                    latency_ms: Some(128),
+                    error: None,
+                },
+            ),
+            (
+                "offline".to_string(),
+                NodeLatency {
+                    tag: "offline".to_string(),
+                    latency_ms: None,
+                    error: Some("timeout".to_string()),
+                },
+            ),
+        ]);
+
+        let entries = latency_cache_entries(std::slice::from_ref(&node), &results);
+        assert_eq!(entries, vec![(node.tag.clone(), node.endpoint(), 128)]);
+
+        let restored = restore_cached_latencies(std::slice::from_ref(&node), entries.clone());
+        assert_eq!(
+            restored.get(&node.tag).and_then(|item| item.latency_ms),
+            Some(128)
+        );
+
+        let mut renamed_node = node.clone();
+        renamed_node.tag = "renamed-edge".to_string();
+        let restored_renamed =
+            restore_cached_latencies(std::slice::from_ref(&renamed_node), entries.clone());
+        assert_eq!(
+            restored_renamed
+                .get(&renamed_node.tag)
+                .and_then(|item| item.latency_ms),
+            Some(128)
+        );
+
+        let mut changed_node = node;
+        changed_node.server = "new-edge.example.com".to_string();
+        assert!(restore_cached_latencies(&[changed_node], entries).is_empty());
+    }
+
+    #[test]
     fn latency_results_sort_success_before_pending_and_failure() {
         let mut nodes = proxy_core::parse_subscription(
             "trojan://password@slow.example.com:443#Slow\n\
@@ -3409,6 +3827,25 @@ mod tests {
             ),
             Err("已存在相同的匹配规则".to_string())
         );
+    }
+
+    #[test]
+    fn script_override_excludes_custom_rules_from_connection_config() {
+        let rules = vec![CustomRule {
+            id: 1,
+            enabled: true,
+            match_type: CustomRuleMatch::Domain,
+            value: "example.com".to_string(),
+            action: CustomRuleAction::Proxy,
+        }];
+
+        assert!(connection_custom_rules(
+            true,
+            "function main(config) { return config; }",
+            rules.clone()
+        )
+        .is_empty());
+        assert_eq!(connection_custom_rules(false, "", rules.clone()), rules);
     }
 
     #[test]
