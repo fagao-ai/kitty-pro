@@ -4,7 +4,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	boxlog "github.com/sagernet/sing-box/log"
 )
@@ -204,7 +206,11 @@ func TestProbeReturnsOneResultPerRequestedTag(t *testing.T) {
 }
 
 func TestProbeUsesAnExistingCoreForSuccessfulOutboundTests(t *testing.T) {
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			time.Sleep(100 * time.Millisecond)
+		}
 		response.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -230,5 +236,11 @@ func TestProbeUsesAnExistingCoreForSuccessfulOutboundTests(t *testing.T) {
 	}
 	if result.LatencyMS == nil {
 		t.Fatal("probe should return a latency")
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("unified delay should make two requests, got %d", requests.Load())
+	}
+	if *result.LatencyMS >= 80 {
+		t.Fatalf("unified delay included warm-up request: %dms", *result.LatencyMS)
 	}
 }

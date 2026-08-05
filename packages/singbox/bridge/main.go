@@ -26,7 +26,6 @@ import (
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/srs"
-	"github.com/sagernet/sing-box/common/urltest"
 	CBox "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/clashapi"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
@@ -498,7 +497,7 @@ func (service *instance) probeOutbound(tag string, probeURL string) probeResult 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	delay, err := urltest.URLTest(ctx, probeURL, outbound)
+	delay, err := unifiedURLTest(ctx, probeURL, outbound)
 	if err != nil {
 		result.Error = err.Error()
 		return result

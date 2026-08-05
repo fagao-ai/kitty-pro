@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/experimental/libbox"
 )
 
@@ -160,7 +159,7 @@ func probeAndroidServer(server *libbox.CommandServer, nodeTags []string, probeUR
 			defer func() { <-semaphore }()
 			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 			defer cancel()
-			delay, err := urltest.URLTest(ctx, probeURL, outbound)
+			delay, err := unifiedURLTest(ctx, probeURL, outbound)
 			if err != nil {
 				results[index].Error = err.Error()
 				return
