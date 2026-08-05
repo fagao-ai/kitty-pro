@@ -533,6 +533,10 @@ pub fn ProxyApp(platform: String) -> Element {
         let request = ConnectionRequest {
             nodes: nodes(),
             selected_tag: selected_tag(),
+            proxy_server_nameservers: active_subscription_proxy_server_nameservers(
+                &subscriptions(),
+                active_subscription_id(),
+            ),
             mode: tunnel_mode(),
             tun: tun_enabled(),
             allow_lan: allow_lan(),
@@ -604,6 +608,11 @@ pub fn ProxyApp(platform: String) -> Element {
                                 let request = ConnectionRequest {
                                     nodes: nodes(),
                                     selected_tag: selected_tag(),
+                                    proxy_server_nameservers:
+                                        active_subscription_proxy_server_nameservers(
+                                            &subscriptions(),
+                                            active_subscription_id(),
+                                        ),
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
@@ -681,6 +690,11 @@ pub fn ProxyApp(platform: String) -> Element {
                                 let request = ConnectionRequest {
                                     nodes: nodes(),
                                     selected_tag: selected_tag(),
+                                    proxy_server_nameservers:
+                                        active_subscription_proxy_server_nameservers(
+                                            &subscriptions(),
+                                            active_subscription_id(),
+                                        ),
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
@@ -765,6 +779,10 @@ pub fn ProxyApp(platform: String) -> Element {
                         OverviewView {
                             nodes,
                             selected_tag,
+                            proxy_server_nameservers: active_subscription_proxy_server_nameservers(
+                                &subscriptions(),
+                                active_subscription_id(),
+                            ),
                             connected,
                             core_busy,
                             core_restarting,
@@ -790,6 +808,10 @@ pub fn ProxyApp(platform: String) -> Element {
                             groups_loading: proxy_groups_loading,
                             groups_error: proxy_groups_error,
                             nodes: nodes(),
+                            proxy_server_nameservers: active_subscription_proxy_server_nameservers(
+                                &subscriptions(),
+                                active_subscription_id(),
+                            ),
                             all_count: nodes().len(),
                             group_selections,
                             connected,
@@ -839,6 +861,10 @@ pub fn ProxyApp(platform: String) -> Element {
                             dark_mode,
                             nodes,
                             selected_tag,
+                            proxy_server_nameservers: active_subscription_proxy_server_nameservers(
+                                &subscriptions(),
+                                active_subscription_id(),
+                            ),
                             custom_rules,
                             config_script_enabled,
                             config_script,
@@ -926,10 +952,15 @@ pub fn ProxyApp(platform: String) -> Element {
                                     let source = import_source();
                                     match api::preview_subscription(source.clone()).await {
                                         Ok(report) if !report.nodes.is_empty() => {
-                                            let count = report.nodes.len();
-                                            let rejected = report.rejected.len();
+                                            let ParseReport {
+                                                nodes: report_nodes,
+                                                rejected,
+                                                proxy_server_nameservers,
+                                            } = report;
+                                            let count = report_nodes.len();
+                                            let rejected = rejected.len();
                                             let id = next_subscription_id(&subscriptions());
-                                            let parsed_nodes = namespace_nodes(id, report.nodes);
+                                            let parsed_nodes = namespace_nodes(id, report_nodes);
                                             let name = if import_name().trim().is_empty() {
                                                 source_label(&source)
                                             } else {
@@ -940,6 +971,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                                 name: name.clone(),
                                                 source,
                                                 nodes: parsed_nodes,
+                                                proxy_server_nameservers,
                                                 rejected_count: rejected,
                                             });
                                             active_subscription_id.set(Some(id));
@@ -1065,6 +1097,7 @@ fn NavItem(view: AppView, mut active_view: Signal<AppView>) -> Element {
 fn OverviewView(
     nodes: Signal<Vec<ProxyNode>>,
     selected_tag: Signal<String>,
+    proxy_server_nameservers: Vec<String>,
     mut connected: Signal<bool>,
     mut core_busy: Signal<bool>,
     core_restarting: Signal<bool>,
@@ -1161,12 +1194,15 @@ fn OverviewView(
                         aria_label: if is_connected { "停止内核" } else { "启动内核" },
                         aria_busy: is_core_action_busy,
                         disabled: is_core_action_busy || (!is_connected && !connection_allowed),
-                        onclick: move |_| async move {
+                        onclick: move |_| {
+                            let proxy_server_nameservers = proxy_server_nameservers.clone();
+                            async move {
                             let target = !connected();
                             core_busy.set(true);
                             let request = target.then(|| ConnectionRequest {
                                 nodes: nodes(),
                                 selected_tag: selected_tag(),
+                                proxy_server_nameservers: proxy_server_nameservers.clone(),
                                 mode: tunnel_mode(),
                                 tun: tun_enabled(),
                                 allow_lan: allow_lan(),
@@ -1201,6 +1237,7 @@ fn OverviewView(
                                 Err(error) => toast.error(error.to_string()),
                             }
                             core_busy.set(false);
+                            }
                         },
                         if is_core_action_busy {
                             span { class: "spinner large" }
@@ -1443,6 +1480,7 @@ fn NodesView(
     groups_loading: bool,
     groups_error: Option<String>,
     nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
     all_count: usize,
     mut group_selections: Signal<HashMap<String, String>>,
     connected: Signal<bool>,
@@ -1582,10 +1620,15 @@ fn NodesView(
                                     onclick: move |_| {
                                         let probe_nodes = nodes.clone();
                                         let cache_nodes = nodes.clone();
+                                        let proxy_server_nameservers =
+                                            proxy_server_nameservers.clone();
                                         async move {
                                             latency_busy.set(true);
                                             let mut failures = 0;
-                                            let session_id = match api::start_node_latency(probe_nodes).await {
+                                            let session_id = match api::start_node_latency(
+                                                probe_nodes,
+                                                proxy_server_nameservers.clone(),
+                                            ).await {
                                                 Ok(session_id) => session_id,
                                                 Err(error) => {
                                                     toast.error(format!("启动测速失败: {error}"));
@@ -3021,6 +3064,7 @@ fn SettingsView(
     mut dark_mode: Signal<bool>,
     nodes: Signal<Vec<ProxyNode>>,
     selected_tag: Signal<String>,
+    proxy_server_nameservers: Vec<String>,
     custom_rules: Signal<Vec<CustomRule>>,
     mut config_script_enabled: Signal<bool>,
     mut config_script: Signal<String>,
@@ -3030,6 +3074,8 @@ fn SettingsView(
     let mut script_editor_open = use_signal(|| false);
     let mut script_draft = use_signal(String::new);
     let toast = use_context::<ToastManager>();
+    let allow_lan_proxy_server_nameservers = proxy_server_nameservers.clone();
+    let script_proxy_server_nameservers = proxy_server_nameservers;
 
     rsx! {
         div { class: "settings-grid",
@@ -3144,7 +3190,10 @@ fn SettingsView(
                         aria_label: "允许局域网连接",
                         checked: allow_lan,
                         disabled: core_restarting(),
-                        onchange: move |event| async move {
+                        onchange: move |event| {
+                            let proxy_server_nameservers =
+                                allow_lan_proxy_server_nameservers.clone();
+                            async move {
                             let enabled = event.checked();
                             allow_lan.set(enabled);
                             if !connected() {
@@ -3160,6 +3209,7 @@ fn SettingsView(
                             let request = ConnectionRequest {
                                 nodes: nodes(),
                                 selected_tag: selected_tag(),
+                                proxy_server_nameservers: proxy_server_nameservers.clone(),
                                 mode: tunnel_mode(),
                                 tun: tun_enabled(),
                                 allow_lan: enabled,
@@ -3197,6 +3247,7 @@ fn SettingsView(
                                 }
                             }
                             core_restarting.set(false);
+                            }
                         },
                     }
                     span { class: "switch" }
@@ -3284,11 +3335,15 @@ fn SettingsView(
                         button {
                             class: "secondary-button",
                             disabled: script_check_busy() || script_draft().trim().is_empty(),
-                            onclick: move |_| async move {
+                            onclick: move |_| {
+                                let proxy_server_nameservers =
+                                    script_proxy_server_nameservers.clone();
+                                async move {
                                 script_check_busy.set(true);
                                 let request = ConnectionRequest {
                                     nodes: nodes(),
                                     selected_tag: selected_tag(),
+                                    proxy_server_nameservers: proxy_server_nameservers.clone(),
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
@@ -3303,6 +3358,7 @@ fn SettingsView(
                                     }
                                 }
                                 script_check_busy.set(false);
+                                }
                             },
                             if script_check_busy() {
                                 span { class: "spinner" }
@@ -3420,13 +3476,19 @@ fn apply_subscription_report(
             .map(|issue| issue.reason.clone())
             .unwrap_or_else(|| "没有找到可用节点".to_string()));
     }
-    let count = report.nodes.len();
-    let rejected_count = report.rejected.len();
+    let ParseReport {
+        nodes,
+        rejected,
+        proxy_server_nameservers,
+    } = report;
+    let count = nodes.len();
+    let rejected_count = rejected.len();
     let subscription = subscriptions
         .iter_mut()
         .find(|subscription| subscription.id == subscription_id)
         .ok_or_else(|| "订阅已不存在".to_string())?;
-    subscription.nodes = namespace_nodes(subscription_id, report.nodes);
+    subscription.nodes = namespace_nodes(subscription_id, nodes);
+    subscription.proxy_server_nameservers = proxy_server_nameservers;
     subscription.rejected_count = rejected_count;
     Ok(count)
 }
@@ -3475,6 +3537,20 @@ fn collect_subscription_nodes(
                 .find(|subscription| subscription.id == id)
         })
         .map(|subscription| subscription.nodes.clone())
+        .unwrap_or_default()
+}
+
+fn active_subscription_proxy_server_nameservers(
+    subscriptions: &[Subscription],
+    subscription_id: Option<u64>,
+) -> Vec<String> {
+    subscription_id
+        .and_then(|id| {
+            subscriptions
+                .iter()
+                .find(|subscription| subscription.id == id)
+        })
+        .map(|subscription| subscription.proxy_server_nameservers.clone())
         .unwrap_or_default()
 }
 
@@ -3538,6 +3614,7 @@ mod tests {
                 name: "One".to_string(),
                 source: "one".to_string(),
                 nodes: first,
+                proxy_server_nameservers: Vec::new(),
                 rejected_count: 0,
             },
             Subscription {
@@ -3545,6 +3622,7 @@ mod tests {
                 name: "Two".to_string(),
                 source: "two".to_string(),
                 nodes: second,
+                proxy_server_nameservers: Vec::new(),
                 rejected_count: 0,
             },
         ]);
@@ -3568,6 +3646,7 @@ mod tests {
                 name: "One".to_string(),
                 source: "one".to_string(),
                 nodes: namespace_nodes(1, vec![node.clone()]),
+                proxy_server_nameservers: Vec::new(),
                 rejected_count: 0,
             },
             Subscription {
@@ -3575,6 +3654,7 @@ mod tests {
                 name: "Two".to_string(),
                 source: "two".to_string(),
                 nodes: namespace_nodes(2, vec![node]),
+                proxy_server_nameservers: Vec::new(),
                 rejected_count: 0,
             },
         ];
@@ -3615,6 +3695,7 @@ mod tests {
             name: "Primary".to_string(),
             source: "https://example.com/subscription".to_string(),
             nodes: vec![original.clone()],
+            proxy_server_nameservers: Vec::new(),
             rejected_count: 0,
         }];
 
@@ -3627,6 +3708,7 @@ mod tests {
                     line: 1,
                     reason: "无效内容".to_string(),
                 }],
+                proxy_server_nameservers: Vec::new(),
             },
         );
 
@@ -3652,6 +3734,7 @@ mod tests {
             name: "Primary".to_string(),
             source: "https://example.com/subscription".to_string(),
             nodes: vec![original],
+            proxy_server_nameservers: Vec::new(),
             rejected_count: 0,
         }];
 
@@ -3662,12 +3745,19 @@ mod tests {
                 ParseReport {
                     nodes: vec![replacement],
                     rejected: Vec::new(),
+                    proxy_server_nameservers: vec![
+                        "https://resolver.example.com/dns-query".to_string(),
+                    ],
                 },
             ),
             Ok(1)
         );
         assert_eq!(subscriptions[0].nodes.len(), 1);
         assert!(subscriptions[0].nodes[0].tag.starts_with("subscription-9-"));
+        assert_eq!(
+            subscriptions[0].proxy_server_nameservers,
+            vec!["https://resolver.example.com/dns-query"]
+        );
     }
 
     #[test]

@@ -705,6 +705,7 @@ mod tests {
         let request = ConnectionRequest {
             selected_tag: selected_tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: proxy_core::TunnelMode::Direct,
             tun: false,
             allow_lan: false,

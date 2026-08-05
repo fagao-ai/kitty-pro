@@ -361,12 +361,23 @@ fn parse_shadowsocks(link: &str, index: usize) -> Result<ProxyNode, ParseError> 
 fn parse_clash_yaml(text: &str) -> Result<ParseReport, ParseError> {
     let root: YamlValue =
         serde_yaml::from_str(text).map_err(|error| ParseError::InvalidYaml(error.to_string()))?;
-    let proxies = root
+    let root = root
         .as_mapping()
-        .and_then(|mapping| yaml_get(mapping, "proxies"))
+        .ok_or_else(|| ParseError::InvalidYaml("根节点不是对象".to_string()))?;
+    let proxies = yaml_get(root, "proxies")
         .and_then(YamlValue::as_sequence)
         .ok_or_else(|| ParseError::InvalidYaml("缺少 proxies 列表".to_string()))?;
-    let mut report = ParseReport::default();
+    let proxy_server_nameservers = yaml_get(root, "dns")
+        .and_then(YamlValue::as_mapping)
+        .map(|dns| yaml_strings(dns, "proxy-server-nameserver"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|server| !server.trim().is_empty())
+        .collect();
+    let mut report = ParseReport {
+        proxy_server_nameservers,
+        ..Default::default()
+    };
 
     for (index, value) in proxies.iter().enumerate() {
         match clash_proxy_to_node(value, index) {
@@ -798,6 +809,9 @@ trojan://password@tr.example.com:443?type=ws&path=%2Fedge&host=cdn.example.com&s
     #[test]
     fn parses_clash_yaml() {
         let source = r#"
+dns:
+  proxy-server-nameserver:
+    - https://cdn.ookkzz.com/message-chat/hello-cn
 proxies:
   - name: HK-HY2
     type: hysteria2
@@ -822,6 +836,10 @@ proxies:
 
         assert_eq!(report.nodes.len(), 2);
         assert!(report.rejected.is_empty());
+        assert_eq!(
+            report.proxy_server_nameservers,
+            vec!["https://cdn.ookkzz.com/message-chat/hello-cn"]
+        );
         assert_eq!(
             report.nodes[1].transport.host.as_deref(),
             Some("cdn.example.com")

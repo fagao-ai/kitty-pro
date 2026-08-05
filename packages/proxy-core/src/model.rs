@@ -142,6 +142,8 @@ pub struct ParseIssue {
 pub struct ParseReport {
     pub nodes: Vec<ProxyNode>,
     pub rejected: Vec<ParseIssue>,
+    #[serde(default)]
+    pub proxy_server_nameservers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -300,6 +302,8 @@ pub struct ConnectionRequest {
     pub nodes: Vec<ProxyNode>,
     pub selected_tag: String,
     #[serde(default)]
+    pub proxy_server_nameservers: Vec<String>,
+    #[serde(default)]
     pub mode: TunnelMode,
     #[serde(default)]
     pub tun: bool,
@@ -341,6 +345,8 @@ pub struct Subscription {
     pub source: String,
     #[serde(default)]
     pub nodes: Vec<ProxyNode>,
+    #[serde(default)]
+    pub proxy_server_nameservers: Vec<String>,
     #[serde(default)]
     pub rejected_count: usize,
 }
@@ -425,6 +431,7 @@ mod tests {
                 name: "Primary".to_string(),
                 source: "https://example.com/subscription?token=secret".to_string(),
                 nodes: vec![node.clone()],
+                proxy_server_nameservers: vec!["https://resolver.example.com/dns-query".to_string()],
                 rejected_count: 1,
             }],
             selected_tag: node.tag,
@@ -448,14 +455,31 @@ mod tests {
         assert_eq!(restored, profile);
         assert!(restored.allow_lan);
         assert_eq!(restored.subscriptions[0].node_count(), 1);
+        assert_eq!(
+            restored.subscriptions[0].proxy_server_nameservers,
+            vec!["https://resolver.example.com/dns-query"]
+        );
         assert_eq!(restored.custom_rules.len(), 1);
     }
 
     #[test]
     fn older_profiles_keep_lan_access_disabled() {
-        let restored: AppProfile = serde_json::from_str("{}").expect("profile should deserialize");
+        let restored: AppProfile = serde_json::from_str(
+            r#"{
+                "subscriptions": [{
+                    "id": 1,
+                    "name": "Legacy",
+                    "source": "legacy",
+                    "nodes": []
+                }]
+            }"#,
+        )
+        .expect("profile should deserialize");
 
         assert!(!restored.allow_lan);
+        assert!(restored.subscriptions[0]
+            .proxy_server_nameservers
+            .is_empty());
     }
 
     #[test]

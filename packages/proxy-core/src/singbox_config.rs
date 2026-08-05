@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use url::Url;
 
 pub const CHINA_GEOSITE_RULE_SET_URL: &str =
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs";
@@ -145,9 +146,11 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         ],
         (TunnelMode::Global | TunnelMode::Direct, _) => Vec::new(),
     };
-    let dns = build_dns_config(request);
+    let (dns, subscription_dns) = build_dns_config(request);
     let default_domain_resolver = if request.mode == TunnelMode::Direct {
         "dns-direct"
+    } else if subscription_dns {
+        "dns-subscription"
     } else {
         "dns-bootstrap"
     };
@@ -184,16 +187,19 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
     config
 }
 
-fn build_dns_config(request: &ConnectionRequest) -> Value {
+fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
     let mut servers = vec![json!({
         "type": "local",
         "tag": "dns-direct",
     })];
     if request.mode == TunnelMode::Direct {
-        return json!({
-            "servers": servers,
-            "final": "dns-direct",
-        });
+        return (
+            json!({
+                "servers": servers,
+                "final": "dns-direct",
+            }),
+            false,
+        );
     }
 
     servers.push(json!({
@@ -207,6 +213,14 @@ fn build_dns_config(request: &ConnectionRequest) -> Value {
             "server_name": PROXY_ENDPOINT_DNS_SERVER_NAME,
         },
     }));
+    let subscription_dns = request
+        .proxy_server_nameservers
+        .iter()
+        .find_map(|server| subscription_https_dns_server(server));
+    let has_subscription_dns = subscription_dns.is_some();
+    if let Some(server) = subscription_dns {
+        servers.push(server);
+    }
     servers.push(json!({
         "type": "https",
         "tag": "dns-proxy",
@@ -247,11 +261,46 @@ fn build_dns_config(request: &ConnectionRequest) -> Value {
         }));
     }
 
-    json!({
-        "servers": servers,
-        "rules": rules,
-        "final": "dns-proxy",
-    })
+    (
+        json!({
+            "servers": servers,
+            "rules": rules,
+            "final": "dns-proxy",
+        }),
+        has_subscription_dns,
+    )
+}
+
+fn subscription_https_dns_server(value: &str) -> Option<Value> {
+    let url = Url::parse(value.trim()).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let server = url.host_str()?.to_string();
+    let path = if url.path().is_empty() {
+        "/dns-query"
+    } else {
+        url.path()
+    };
+    let mut options = json!({
+        "type": "https",
+        "tag": "dns-subscription",
+        "server": server,
+        "server_port": url.port().unwrap_or(443),
+        "path": path,
+        "tls": {
+            "enabled": true,
+            "server_name": server,
+        },
+    });
+    if server.parse::<IpAddr>().is_err() {
+        options["domain_resolver"] = json!("dns-bootstrap");
+    }
+    Some(options)
 }
 
 fn custom_direct_dns_rule_to_value(rule: &CustomRule) -> Option<Value> {
@@ -496,6 +545,7 @@ mod tests {
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Global,
             tun: false,
             allow_lan: false,
@@ -524,6 +574,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Rule,
             tun: true,
             allow_lan: false,
@@ -592,6 +643,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             let request = ConnectionRequest {
                 selected_tag: nodes[0].tag.clone(),
                 nodes: nodes.clone(),
+                proxy_server_nameservers: Vec::new(),
                 mode,
                 tun: false,
                 allow_lan: false,
@@ -620,6 +672,64 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
     }
 
     #[test]
+    fn subscription_dns_resolves_proxy_endpoints_with_bootstrap_dns() {
+        let nodes = parse_subscription(
+            "anytls://secret@bilibili-image-cdn.juhazf.cn:50033?sni=example.com#AnyTLS",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: vec![
+                "https://cdn.ookkzz.com/message-chat/hello-cn".to_string()
+            ],
+            mode: TunnelMode::Global,
+            tun: false,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        let server = &config["dns"]["servers"][2];
+
+        assert_eq!(
+            config["route"]["default_domain_resolver"],
+            "dns-subscription"
+        );
+        assert_eq!(server["tag"], "dns-subscription");
+        assert_eq!(server["server"], "cdn.ookkzz.com");
+        assert_eq!(server["path"], "/message-chat/hello-cn");
+        assert_eq!(server["domain_resolver"], "dns-bootstrap");
+        assert_eq!(config["dns"]["servers"][3]["tag"], "dns-proxy");
+    }
+
+    #[test]
+    fn invalid_subscription_dns_falls_back_to_bootstrap_dns() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: vec!["http://resolver.example.com/dns-query".to_string()],
+            mode: TunnelMode::Global,
+            tun: false,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+
+        assert_eq!(config["route"]["default_domain_resolver"], "dns-bootstrap");
+        assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
     fn direct_domain_rules_use_local_dns_before_secure_dns_fallback() {
         let nodes = parse_subscription(
             "hysteria2://secret@155.248.218.187:10086?sni=bing.com&insecure=1#HY2",
@@ -628,6 +738,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Rule,
             tun: true,
             allow_lan: false,
@@ -671,6 +782,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Rule,
             tun: false,
             allow_lan: false,
@@ -711,6 +823,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Rule,
             tun: false,
             allow_lan: false,
@@ -764,6 +877,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Global,
             tun: false,
             allow_lan: false,
@@ -792,6 +906,7 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Rule,
             tun: true,
             allow_lan: false,
@@ -821,6 +936,7 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Global,
             tun: false,
             allow_lan: false,

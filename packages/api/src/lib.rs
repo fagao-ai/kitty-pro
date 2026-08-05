@@ -33,6 +33,10 @@ const RULE_SET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2
 #[cfg(not(target_arch = "wasm32"))]
 const LATENCY_PROBE_STAGGER_MS: u64 = 10;
 
+#[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_CONCURRENT_LATENCY_PROBES: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiCoreStatus {
     pub state: String,
@@ -332,8 +336,9 @@ pub async fn set_core_log_collection(enabled: bool) -> Result<(), ServerFnError>
 )]
 pub async fn measure_node_latency(
     nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
 ) -> Result<Vec<NodeLatency>, ServerFnError> {
-    measure_native_latency(nodes).await
+    measure_native_latency(nodes, proxy_server_nameservers).await
 }
 
 #[cfg_attr(
@@ -343,8 +348,11 @@ pub async fn measure_node_latency(
     ),
     post("/api/core/latency/start")
 )]
-pub async fn start_node_latency(nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
-    start_native_latency_session(nodes).await
+pub async fn start_node_latency(
+    nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
+) -> Result<u64, ServerFnError> {
+    start_native_latency_session(nodes, proxy_server_nameservers).await
 }
 
 #[cfg_attr(
@@ -414,7 +422,10 @@ where
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
+async fn measure_native_latency(
+    nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
+) -> Result<Vec<NodeLatency>, ServerFnError> {
     if nodes.is_empty() {
         return Err(ServerFnError::new("没有可探测的节点"));
     }
@@ -431,6 +442,7 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
     let request = ConnectionRequest {
         nodes,
         selected_tag: node_tags.first().cloned().unwrap_or_default(),
+        proxy_server_nameservers,
         mode: TunnelMode::Global,
         tun: false,
         allow_lan: false,
@@ -465,7 +477,10 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
-async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
+async fn measure_native_latency(
+    nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
+) -> Result<Vec<NodeLatency>, ServerFnError> {
     if nodes.is_empty() {
         return Err(ServerFnError::new("没有可探测的节点"));
     }
@@ -482,6 +497,7 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
     let request = ConnectionRequest {
         nodes,
         selected_tag: node_tags.first().cloned().unwrap_or_default(),
+        proxy_server_nameservers,
         mode: TunnelMode::Global,
         tun: false,
         allow_lan: false,
@@ -518,12 +534,18 @@ async fn measure_native_latency(nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-async fn measure_native_latency(_nodes: Vec<ProxyNode>) -> Result<Vec<NodeLatency>, ServerFnError> {
+async fn measure_native_latency(
+    _nodes: Vec<ProxyNode>,
+    _proxy_server_nameservers: Vec<String>,
+) -> Result<Vec<NodeLatency>, ServerFnError> {
     Err(ServerFnError::new("浏览器目标不能直接运行节点延迟探测"))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
+async fn start_native_latency_session(
+    nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
+) -> Result<u64, ServerFnError> {
     validate_latency_nodes(&nodes)?;
     let node_tags = nodes
         .iter()
@@ -532,6 +554,7 @@ async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, Serv
     let request = ConnectionRequest {
         nodes,
         selected_tag: node_tags.first().cloned().unwrap_or_default(),
+        proxy_server_nameservers,
         mode: TunnelMode::Global,
         tun: false,
         allow_lan: false,
@@ -560,8 +583,11 @@ async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, Serv
     let core = std::sync::Arc::new(core);
     tokio::spawn(async move {
         let mut tasks = tokio::task::JoinSet::new();
+        let concurrency =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LATENCY_PROBES));
         for (index, tag) in node_tags.into_iter().enumerate() {
             let core = std::sync::Arc::clone(&core);
+            let concurrency = std::sync::Arc::clone(&concurrency);
             tasks.spawn(async move {
                 if index > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(
@@ -569,6 +595,10 @@ async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, Serv
                     ))
                     .await;
                 }
+                let _permit = concurrency
+                    .acquire_owned()
+                    .await
+                    .expect("latency probe semaphore should remain open");
                 let fallback_tag = tag.clone();
                 match tokio::task::spawn_blocking(move || {
                     core.probe_outbound(&tag, LATENCY_CHECK_URL)
@@ -604,7 +634,10 @@ async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, Serv
 }
 
 #[cfg(target_os = "android")]
-async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
+async fn start_native_latency_session(
+    nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
+) -> Result<u64, ServerFnError> {
     validate_latency_nodes(&nodes)?;
     let total = nodes.len();
     let fallback_tags = nodes
@@ -613,18 +646,26 @@ async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, Serv
         .collect::<Vec<_>>();
     let (session_id, session) = register_latency_session(total)?;
     tokio::spawn(async move {
-        let results = measure_native_latency(nodes).await.unwrap_or_else(|error| {
-            fallback_tags
-                .into_iter()
-                .map(|tag| NodeLatency {
-                    tag,
-                    latency_ms: None,
-                    error: Some(error.to_string()),
-                })
-                .collect()
-        });
-        for result in results {
-            session.push(result);
+        for (node_batch, fallback_batch) in nodes
+            .chunks(MAX_CONCURRENT_LATENCY_PROBES)
+            .zip(fallback_tags.chunks(MAX_CONCURRENT_LATENCY_PROBES))
+        {
+            let results =
+                measure_native_latency(node_batch.to_vec(), proxy_server_nameservers.clone())
+                    .await
+                    .unwrap_or_else(|error| {
+                        fallback_batch
+                            .iter()
+                            .map(|tag| NodeLatency {
+                                tag: tag.clone(),
+                                latency_ms: None,
+                                error: Some(error.to_string()),
+                            })
+                            .collect()
+                    });
+            for result in results {
+                session.push(result);
+            }
         }
         session.finish();
     });
@@ -632,7 +673,10 @@ async fn start_native_latency_session(nodes: Vec<ProxyNode>) -> Result<u64, Serv
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn start_native_latency_session(_nodes: Vec<ProxyNode>) -> Result<u64, ServerFnError> {
+async fn start_native_latency_session(
+    _nodes: Vec<ProxyNode>,
+    _proxy_server_nameservers: Vec<String>,
+) -> Result<u64, ServerFnError> {
     Err(ServerFnError::new("浏览器目标不能直接启动节点探测"))
 }
 
@@ -750,7 +794,7 @@ async fn download_subscription(url: &str) -> Result<String, ServerFnError> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("OKZTWO-Mac-Client-1.5.6 kitty-pro/0.1")
+        .user_agent("clash.meta kitty-pro/0.1")
         .build()
         .map_err(|error| ServerFnError::new(error.to_string()))?;
     let response = client
@@ -2677,6 +2721,7 @@ mod tests {
         let request = ConnectionRequest {
             nodes,
             selected_tag,
+            proxy_server_nameservers: Vec::new(),
             mode: TunnelMode::Rule,
             tun: false,
             allow_lan: false,
@@ -2859,11 +2904,14 @@ mod tests {
             .expect("native test runtime should start");
         let results = runtime.block_on(async move {
             let mut report = preview_subscription(source).await?;
+            report
+                .nodes
+                .sort_by_key(|node| node.protocol != proxy_core::ProxyProtocol::AnyTls);
             report.nodes.truncate(8);
             if report.nodes.is_empty() {
                 return Err(ServerFnError::new("订阅没有可探测的节点"));
             }
-            measure_node_latency(report.nodes).await
+            measure_node_latency(report.nodes, report.proxy_server_nameservers).await
         });
         let results = results.expect("live node probe should return per-node results");
 
