@@ -16,6 +16,7 @@ pub enum ProxyProtocol {
     Trojan,
     Shadowsocks,
     Http,
+    #[serde(alias = "mixed")]
     Socks5,
 }
 
@@ -480,6 +481,23 @@ mod tests {
         assert!(restored.subscriptions[0]
             .proxy_server_nameservers
             .is_empty());
+    }
+
+    #[test]
+    fn transient_mixed_proxy_profiles_migrate_to_socks5() {
+        let restored: ProxyNode = serde_json::from_str(
+            r#"{
+                "tag": "company",
+                "name": "Company",
+                "protocol": "mixed",
+                "server": "100.64.0.2",
+                "port": 11080,
+                "auth": { "kind": "none" }
+            }"#,
+        )
+        .expect("transient mixed proxy node should remain readable");
+
+        assert_eq!(restored.protocol, ProxyProtocol::Socks5);
     }
 
     #[test]

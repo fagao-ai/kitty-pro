@@ -2867,13 +2867,34 @@ mod tests {
             .expect("native test runtime should start");
         let report = runtime
             .block_on(preview_subscription(
-                "http://100.64.0.2:11080#Company".to_string(),
+                "http://proxy.example.com:8080#HTTP".to_string(),
             ))
             .expect("HTTP proxy URI should parse locally");
 
         assert_eq!(report.nodes.len(), 1);
         assert_eq!(report.nodes[0].protocol, proxy_core::ProxyProtocol::Http);
-        assert_eq!(report.nodes[0].server, "100.64.0.2");
+        assert_eq!(report.nodes[0].server, "proxy.example.com");
+        assert_eq!(report.nodes[0].port, 8080);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+    #[test]
+    fn native_company_proxy_preview_creates_one_socks5_node() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("native test runtime should start");
+        let report = runtime
+            .block_on(preview_subscription(
+                "socks5://100.64.0.2:11080#Company".to_string(),
+            ))
+            .expect("SOCKS5 proxy URI should parse locally");
+
+        assert_eq!(report.nodes.len(), 1);
+        let node = &report.nodes[0];
+        assert_eq!(node.name, "Company");
+        assert_eq!(node.protocol, proxy_core::ProxyProtocol::Socks5);
+        assert_eq!(node.server, "100.64.0.2");
+        assert_eq!(node.port, 11080);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

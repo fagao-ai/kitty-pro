@@ -924,7 +924,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                 span { "订阅地址或内容" }
                                 textarea {
                                     value: import_source,
-                                    placeholder: "订阅地址，或 http://host:port#节点名称",
+                                    placeholder: "订阅地址，或代理 URL（HTTP/HTTPS/SOCKS5）",
                                     rows: 5,
                                     oninput: move |event| import_source.set(event.value()),
                                 }

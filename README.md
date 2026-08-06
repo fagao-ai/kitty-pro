@@ -11,13 +11,16 @@ discover, start, or require a `sing-box` executable at runtime.
 - Clash YAML `proxies` subscriptions
 - Hysteria2, VMess, VLESS, Trojan, Shadowsocks, HTTP/HTTPS proxy, and SOCKS5 nodes
 
-HTTP and SOCKS upstream proxies can be imported as a single-node source. Add a
-fragment to give the node a useful display name:
+HTTP and SOCKS upstream proxies can be imported as a single-node source. Use
+the actual upstream protocol in the URL. For a corporate endpoint that exposes
+SOCKS5, prefer `socks5://`; Kitty Pro's local mixed inbound still accepts HTTP,
+HTTPS, and SOCKS5 clients. Add a fragment to give the node a useful display
+name:
 
 ```text
-http://100.64.0.2:11080#Company
+socks5://100.64.0.2:11080#Company
+http://proxy.example.com:8080#HTTP
 https://user:password@proxy.example.com:8443#Secure
-socks5://user:password@proxy.example.com:1080#SOCKS5
 ```
 
 Select the upstream node and use Rule mode to route matching traffic either to
