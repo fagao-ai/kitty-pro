@@ -38,11 +38,17 @@ import (
 )
 
 type instance struct {
-	box              *box.Box
-	cancel           context.CancelFunc
-	trafficURL       string
-	trafficAuthToken string
-	logs             *bridgeLogBuffer
+	box      *box.Box
+	cancel   context.CancelFunc
+	clashAPI *clashAPIClient
+	logs     *bridgeLogBuffer
+}
+
+type clashAPIClient struct {
+	connectionsURL string
+	authToken      string
+	client         *http.Client
+	transport      *http.Transport
 }
 
 const bridgeLogLimit = 500
@@ -416,12 +422,39 @@ func start(configContent string) (*instance, error) {
 	}
 	trafficURL, trafficAuthToken := trafficEndpointFromOptions(options)
 	return &instance{
-		box:              service,
-		cancel:           cancel,
-		trafficURL:       trafficURL,
-		trafficAuthToken: trafficAuthToken,
-		logs:             logs,
+		box:      service,
+		cancel:   cancel,
+		clashAPI: newClashAPIClient(trafficURL, trafficAuthToken),
+		logs:     logs,
 	}, nil
+}
+
+func newClashAPIClient(connectionsURL string, authToken string) *clashAPIClient {
+	if connectionsURL == "" {
+		return nil
+	}
+	transport := &http.Transport{Proxy: nil}
+	return &clashAPIClient{
+		connectionsURL: connectionsURL,
+		authToken:      authToken,
+		client: &http.Client{
+			Timeout:   2 * time.Second,
+			Transport: transport,
+		},
+		transport: transport,
+	}
+}
+
+func (client *clashAPIClient) close() {
+	if client != nil {
+		client.transport.CloseIdleConnections()
+	}
+}
+
+func (service *instance) close() error {
+	service.cancel()
+	service.clashAPI.close()
+	return service.box.Close()
 }
 
 func recoveredError(operation string, recovered any) error {
@@ -455,8 +488,7 @@ func probe(configContent string, nodeTags []string, probeURL string) (results []
 		return nil, err
 	}
 	defer func() {
-		service.cancel()
-		if closeErr := service.box.Close(); closeErr != nil && err == nil {
+		if closeErr := service.close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("close sing-box probe: %w", closeErr)
 		}
 	}()
@@ -601,8 +633,7 @@ func kitty_singbox_stop(handle C.uint64_t) (result C.int) {
 		return 0
 	}
 
-	service.cancel()
-	if err := service.box.Close(); err != nil {
+	if err := service.close(); err != nil {
 		setLastError(err)
 		return 0
 	}
@@ -623,23 +654,17 @@ type trafficResult struct {
 }
 
 func (service *instance) traffic() ([]byte, error) {
-	if service.trafficURL == "" {
+	if service.clashAPI == nil {
 		return nil, &bridgeError{message: "traffic statistics are not enabled"}
 	}
-	request, err := http.NewRequest(http.MethodGet, service.trafficURL, nil)
+	request, err := http.NewRequest(http.MethodGet, service.clashAPI.connectionsURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	if service.trafficAuthToken != "" {
-		request.Header.Set("Authorization", "Bearer "+service.trafficAuthToken)
+	if service.clashAPI.authToken != "" {
+		request.Header.Set("Authorization", "Bearer "+service.clashAPI.authToken)
 	}
-	client := &http.Client{
-		Timeout: 2 * time.Second,
-		Transport: &http.Transport{
-			Proxy: nil,
-		},
-	}
-	response, err := client.Do(request)
+	response, err := service.clashAPI.client.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -662,27 +687,23 @@ func (service *instance) traffic() ([]byte, error) {
 }
 
 func (service *instance) selectOutbound(group string, outbound string) error {
-	if service.trafficURL == "" {
+	if service.clashAPI == nil {
 		return &bridgeError{message: "proxy selection is not enabled"}
 	}
 	payload, err := stdjson.Marshal(map[string]string{"name": outbound})
 	if err != nil {
 		return err
 	}
-	endpoint := strings.TrimSuffix(service.trafficURL, "/connections") + "/proxies/" + url.PathEscape(group)
+	endpoint := strings.TrimSuffix(service.clashAPI.connectionsURL, "/connections") + "/proxies/" + url.PathEscape(group)
 	request, err := http.NewRequest(http.MethodPut, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	if service.trafficAuthToken != "" {
-		request.Header.Set("Authorization", "Bearer "+service.trafficAuthToken)
+	if service.clashAPI.authToken != "" {
+		request.Header.Set("Authorization", "Bearer "+service.clashAPI.authToken)
 	}
-	client := &http.Client{
-		Timeout:   2 * time.Second,
-		Transport: &http.Transport{Proxy: nil},
-	}
-	response, err := client.Do(request)
+	response, err := service.clashAPI.client.Do(request)
 	if err != nil {
 		return err
 	}

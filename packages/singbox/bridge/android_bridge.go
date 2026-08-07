@@ -21,9 +21,8 @@ import (
 )
 
 type androidService struct {
-	server           *libbox.CommandServer
-	trafficURL       string
-	trafficAuthToken string
+	server   *libbox.CommandServer
+	clashAPI *clashAPIClient
 }
 
 var androidRuntime = struct {
@@ -67,13 +66,13 @@ func startAndroid(configContent string, tunFD int32, dataPath string) error {
 	androidRuntime.Lock()
 	previous := androidRuntime.service
 	androidRuntime.service = &androidService{
-		server:           server,
-		trafficURL:       trafficURL,
-		trafficAuthToken: trafficAuthToken,
+		server:   server,
+		clashAPI: newClashAPIClient(trafficURL, trafficAuthToken),
 	}
 	androidRuntime.err = nil
 	androidRuntime.Unlock()
 	if previous != nil {
+		previous.clashAPI.close()
 		_ = previous.server.CloseService()
 		previous.server.Close()
 	}
@@ -180,6 +179,7 @@ func stopAndroid() error {
 	if service == nil {
 		return nil
 	}
+	service.clashAPI.close()
 	err := service.server.CloseService()
 	service.server.Close()
 	return err
@@ -192,10 +192,7 @@ func androidTraffic() ([]byte, error) {
 	if service == nil {
 		return nil, errors.New("Android VPN service is not running")
 	}
-	return (&instance{
-		trafficURL:       service.trafficURL,
-		trafficAuthToken: service.trafficAuthToken,
-	}).traffic()
+	return (&instance{clashAPI: service.clashAPI}).traffic()
 }
 
 func androidSelectOutbound(group string, outbound string) error {
@@ -205,10 +202,7 @@ func androidSelectOutbound(group string, outbound string) error {
 	if service == nil {
 		return errors.New("Android VPN service is not running")
 	}
-	return (&instance{
-		trafficURL:       service.trafficURL,
-		trafficAuthToken: service.trafficAuthToken,
-	}).selectOutbound(group, outbound)
+	return (&instance{clashAPI: service.clashAPI}).selectOutbound(group, outbound)
 }
 
 //export kitty_singbox_android_select_outbound

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -157,9 +158,35 @@ func TestStartWithoutClashAPIDoesNotSubscribeLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start config without Clash API: %v", err)
 	}
-	service.cancel()
-	if err = service.box.Close(); err != nil {
+	if err = service.close(); err != nil {
 		t.Fatalf("close config without Clash API: %v", err)
+	}
+}
+
+func TestTrafficPollingReusesClashAPIConnection(t *testing.T) {
+	var connections atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"uploadTotal":1,"downloadTotal":2,"connections":[]}`))
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	clashAPI := newClashAPIClient(server.URL+"/connections", "")
+	defer clashAPI.close()
+	service := &instance{clashAPI: clashAPI}
+	for range 20 {
+		if _, err := service.traffic(); err != nil {
+			t.Fatalf("read traffic: %v", err)
+		}
+	}
+	if connections.Load() != 1 {
+		t.Fatalf("traffic polling opened %d connections, want 1", connections.Load())
 	}
 }
 
@@ -226,8 +253,7 @@ func TestProbeUsesAnExistingCoreForSuccessfulOutboundTests(t *testing.T) {
 		t.Fatalf("start failed: %v", err)
 	}
 	defer func() {
-		service.cancel()
-		_ = service.box.Close()
+		_ = service.close()
 	}()
 	result := service.probeOutbound("direct", server.URL)
 
