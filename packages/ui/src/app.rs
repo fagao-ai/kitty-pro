@@ -3097,6 +3097,7 @@ fn SettingsView(
     let mut script_check_busy = use_signal(|| false);
     let mut script_editor_open = use_signal(|| false);
     let mut script_draft = use_signal(String::new);
+    let mut tun_busy = use_signal(|| false);
     let toast = use_context::<ToastManager>();
     let tun_proxy_server_nameservers = proxy_server_nameservers.clone();
     let allow_lan_proxy_server_nameservers = proxy_server_nameservers.clone();
@@ -3193,15 +3194,26 @@ fn SettingsView(
                         strong { "TUN 模式" }
                         small { "系统级网络接管" }
                     }
-                    input {
-                        r#type: "checkbox",
-                        checked: tun_enabled,
-                        disabled: core_restarting(),
-                        onchange: move |event| {
+                    if tun_busy() {
+                        span {
+                            class: if tun_enabled() { "switch switch-loading active" } else { "switch switch-loading" },
+                            aria_busy: "true",
+                            aria_label: if tun_enabled() { "正在关闭 TUN 模式" } else { "正在准备 TUN 权限" },
+                            span { class: "spinner" }
+                        }
+                    } else {
+                        input {
+                            r#type: "checkbox",
+                            checked: tun_enabled,
+                            disabled: core_restarting(),
+                            onclick: move |event| {
+                            event.prevent_default();
+                            let enabled = !tun_enabled();
                             let proxy_server_nameservers =
                                 tun_proxy_server_nameservers.clone();
+                            tun_busy.set(true);
+                            core_restarting.set(true);
                             async move {
-                                let enabled = event.checked();
                                 let previous_enabled = tun_enabled();
                                 let request = ConnectionRequest {
                                     nodes: nodes(),
@@ -3225,7 +3237,6 @@ fn SettingsView(
                                     group_selections: group_selections(),
                                 };
                                 if !connected() {
-                                    core_restarting.set(true);
                                     let result = if enabled {
                                         api::prepare_tun_mode(request).await
                                     } else {
@@ -3249,11 +3260,11 @@ fn SettingsView(
                                             });
                                         }
                                     }
+                                    tun_busy.set(false);
                                     core_restarting.set(false);
                                     return;
                                 }
 
-                                core_restarting.set(true);
                                 match api::restart_core(request).await {
                                     Ok(status) => {
                                         let is_running = status.state == "running";
@@ -3284,11 +3295,13 @@ fn SettingsView(
                                         toast.error(format!("应用 TUN 设置失败: {error}"));
                                     }
                                 }
+                                tun_busy.set(false);
                                 core_restarting.set(false);
                             }
                         },
+                        }
+                        span { class: "switch" }
                     }
-                    span { class: "switch" }
                 }
                 }
                 label {

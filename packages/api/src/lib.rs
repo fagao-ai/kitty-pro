@@ -2521,16 +2521,14 @@ struct LinuxSystemProxyBackup {
 #[cfg(target_os = "macos")]
 fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
     let services = mac_network_services()?;
-    let mut configured = 0usize;
-
-    for service in &services {
-        let web = mac_proxy_settings(service, "-getwebproxy")?;
-        let secure_web = mac_proxy_settings(service, "-getsecurewebproxy")?;
-        let socks = mac_proxy_settings(service, "-getsocksfirewallproxy")?;
-        if [web, secure_web, socks].into_iter().all(is_kitty_proxy) {
-            configured += 1;
-        }
-    }
+    let configured = read_mac_proxy_backups(&services)?
+        .iter()
+        .filter(|service| {
+            [&service.web, &service.secure_web, &service.socks]
+                .into_iter()
+                .all(is_kitty_proxy)
+        })
+        .count();
 
     let enabled = !services.is_empty() && configured == services.len();
     let detail = if enabled {
@@ -2652,17 +2650,7 @@ fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnE
             return Err(ServerFnError::new("未找到已启用的 macOS 网络服务"));
         }
         let backup = MacSystemProxyBackup {
-            services: services
-                .iter()
-                .map(|service| {
-                    Ok(MacServiceProxyBackup {
-                        service: service.clone(),
-                        web: mac_proxy_settings(service, "-getwebproxy")?,
-                        secure_web: mac_proxy_settings(service, "-getsecurewebproxy")?,
-                        socks: mac_proxy_settings(service, "-getsocksfirewallproxy")?,
-                    })
-                })
-                .collect::<Result<Vec<_>, ServerFnError>>()?,
+            services: read_mac_proxy_backups(&services)?,
         };
         if backup.services.iter().any(|service| {
             [&service.web, &service.secure_web, &service.socks]
@@ -2680,14 +2668,25 @@ fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnE
             let _ = std::fs::remove_file(&backup_path);
             return Err(error);
         }
-        native_system_proxy_status()
+        Ok(SystemProxyStatus {
+            supported: true,
+            enabled: true,
+            detail: format!(
+                "已为 {} 个网络服务设置 127.0.0.1:7890",
+                backup.services.len()
+            ),
+        })
     } else {
         let backup_path = system_proxy_backup_path()?;
         let backup = read_system_proxy_backup(&backup_path)?;
         restore_mac_proxy_backup(&backup)?;
         std::fs::remove_file(&backup_path)
             .map_err(|error| ServerFnError::new(format!("清理代理备份失败: {error}")))?;
-        native_system_proxy_status()
+        Ok(SystemProxyStatus {
+            supported: true,
+            enabled: false,
+            detail: "未启用系统代理".to_string(),
+        })
     }
 }
 
@@ -3094,7 +3093,36 @@ fn mac_proxy_settings(service: &str, flag: &str) -> Result<MacProxySettings, Ser
 }
 
 #[cfg(target_os = "macos")]
-fn is_kitty_proxy(settings: MacProxySettings) -> bool {
+fn read_mac_proxy_backups(
+    services: &[String],
+) -> Result<Vec<MacServiceProxyBackup>, ServerFnError> {
+    std::thread::scope(|scope| {
+        let tasks = services
+            .iter()
+            .map(|service| {
+                scope.spawn(move || {
+                    Ok(MacServiceProxyBackup {
+                        service: service.clone(),
+                        web: mac_proxy_settings(service, "-getwebproxy")?,
+                        secure_web: mac_proxy_settings(service, "-getsecurewebproxy")?,
+                        socks: mac_proxy_settings(service, "-getsocksfirewallproxy")?,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tasks
+            .into_iter()
+            .map(|task| {
+                task.join()
+                    .map_err(|_| ServerFnError::new("读取 macOS 网络服务代理的任务异常退出"))?
+            })
+            .collect()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn is_kitty_proxy(settings: &MacProxySettings) -> bool {
     settings.enabled && settings.server == SYSTEM_PROXY_HOST && settings.port == SYSTEM_PROXY_PORT
 }
 
