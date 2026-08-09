@@ -29,6 +29,7 @@ import (
 	CBox "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/clashapi"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
+	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing-box/include"
 	boxlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -329,6 +330,10 @@ func validateRuleSetFile(path string) error {
 	return err
 }
 
+func checkConfig(configContent string) error {
+	return libbox.CheckConfig(configContent)
+}
+
 var state = struct {
 	sync.Mutex
 	nextHandle uint64
@@ -354,6 +359,10 @@ func start(configContent string) (*instance, error) {
 	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(configContent))
 	if err != nil {
 		return nil, err
+	}
+	if options.Experimental != nil && options.Experimental.CacheFile != nil &&
+		options.Experimental.CacheFile.Enabled && options.Experimental.CacheFile.Path != "" {
+		ctx = contextWithCacheFileOwner(ctx, options.Experimental.CacheFile.Path)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	logs := &bridgeLogBuffer{}
@@ -814,6 +823,22 @@ func kitty_singbox_validate_rule_set_file(path *C.char) (result *C.char) {
 		return C.CString("missing sing-box rule-set path")
 	}
 	if err := validateRuleSetFile(C.GoString(path)); err != nil {
+		return C.CString(err.Error())
+	}
+	return nil
+}
+
+//export kitty_singbox_check_config
+func kitty_singbox_check_config(configContent *C.char) (result *C.char) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = C.CString(recoveredError("check sing-box config", recovered).Error())
+		}
+	}()
+	if configContent == nil {
+		return C.CString("missing sing-box configuration")
+	}
+	if err := checkConfig(C.GoString(configContent)); err != nil {
 		return C.CString(err.Error())
 	}
 	return nil

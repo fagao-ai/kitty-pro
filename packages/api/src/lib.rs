@@ -4,6 +4,9 @@ use dioxus::prelude::*;
 use proxy_core::{
     AppProfile, ConnectionRequest, ParseReport, ProxyGroup, ProxyNode, RuleSetCachePaths,
 };
+
+#[cfg(target_os = "macos")]
+mod macos_route;
 #[cfg(not(target_arch = "wasm32"))]
 use proxy_core::{
     SingBoxOptions, TunnelMode, CHINA_GEOIP_RULE_SET_URL, CHINA_GEOSITE_RULE_SET_URL,
@@ -227,10 +230,43 @@ pub async fn restart_core(request: ConnectionRequest) -> Result<ApiCoreStatus, S
         .map_err(|error| ServerFnError::new(format!("自定义规则无效: {error}")))?;
     let rule_set_cache = prepare_rule_set_cache_for_request(Some(&request)).await?;
     run_native_blocking("sing-box 重启任务失败", move || {
-        toggle_native_core(false, None, None)?;
-        toggle_native_core(true, Some(request), rule_set_cache)
+        restart_native_core(request, rule_set_cache)
     })
     .await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/tun/prepare")
+)]
+pub async fn prepare_tun_mode(request: ConnectionRequest) -> Result<(), ServerFnError> {
+    if !request.tun {
+        return Err(ServerFnError::new("TUN 权限预检需要启用 TUN 的连接配置"));
+    }
+    if request.nodes.is_empty() {
+        return Err(ServerFnError::new("请先导入并选择一个节点"));
+    }
+    proxy_core::validate_custom_rules(&request.custom_rules)
+        .map_err(|error| ServerFnError::new(format!("自定义规则无效: {error}")))?;
+    let rule_set_cache = prepare_rule_set_cache_for_request(Some(&request)).await?;
+    run_native_blocking("TUN 权限预检任务失败", move || {
+        prepare_native_tun_mode(request, rule_set_cache)
+    })
+    .await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/core/tun/release")
+)]
+pub async fn release_tun_mode() -> Result<(), ServerFnError> {
+    run_native_blocking("释放 TUN 权限准备任务失败", release_native_tun_mode).await
 }
 
 #[cfg_attr(
@@ -969,6 +1005,72 @@ fn native_rule_set_cache_paths() -> Result<RuleSetCachePaths, ServerFnError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn prepare_native_fakeip_cache_file() -> Result<String, ServerFnError> {
+    let profile = profile_path()?;
+    let directory = profile
+        .parent()
+        .ok_or_else(|| ServerFnError::new("无法确定 FakeIP 缓存目录"))?
+        .join("cache");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| ServerFnError::new(format!("创建 FakeIP 缓存目录失败: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| ServerFnError::new(format!("限制 FakeIP 缓存目录权限失败: {error}")),
+        )?;
+    }
+
+    let path = directory.join("sing-box.db");
+    prepare_private_fakeip_cache_file(&path)?;
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| ServerFnError::new("FakeIP 缓存路径不是有效 UTF-8"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn prepare_private_fakeip_cache_file(path: &std::path::Path) -> Result<(), ServerFnError> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(ServerFnError::new("FakeIP 缓存文件不能是符号链接"));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(ServerFnError::new("FakeIP 缓存路径不是普通文件"));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| ServerFnError::new(format!("准备 FakeIP 缓存文件失败: {error}")))?;
+    if !file
+        .metadata()
+        .map_err(|error| ServerFnError::new(format!("检查 FakeIP 缓存文件失败: {error}")))?
+        .is_file()
+    {
+        return Err(ServerFnError::new("FakeIP 缓存路径不是普通文件"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                ServerFnError::new(format!("限制 FakeIP 缓存文件权限失败: {error}"))
+            })?;
+    }
+    drop(file);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn native_rule_set_cache_ready(paths: &RuleSetCachePaths) -> Result<bool, ServerFnError> {
     let geosite = std::path::Path::new(&paths.geosite);
     let geoip = std::path::Path::new(&paths.geoip);
@@ -1288,11 +1390,11 @@ fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
         .lock()
         .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
     let status = if let Some(core) = guard.as_mut() {
-        core.status()
+        core.engine.status()
     } else {
-        match SingBox::discover() {
+        match SingBox::discover().map(NativeCore::new) {
             Ok(core) => {
-                let status = core.status();
+                let status = core.engine.status();
                 *guard = Some(core);
                 status
             }
@@ -1349,33 +1451,82 @@ fn load_native_profile() -> Result<AppProfile, ServerFnError> {
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
 fn save_native_profile(profile: &AppProfile) -> Result<(), ServerFnError> {
+    let path = profile_path()?;
+    save_native_profile_to_path(profile, &path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_native_profile_to_path(
+    profile: &AppProfile,
+    path: &std::path::Path,
+) -> Result<(), ServerFnError> {
     use std::fs;
     use std::io::Write;
 
-    let path = profile_path()?;
+    let _guard = profile_write_lock()
+        .lock()
+        .map_err(|_| ServerFnError::new("本地配置写入锁已损坏"))?;
     let parent = path
         .parent()
         .ok_or_else(|| ServerFnError::new("本地配置目录无效"))?;
     fs::create_dir_all(parent)
         .map_err(|error| ServerFnError::new(format!("创建本地配置目录失败: {error}")))?;
 
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(profile)
         .map_err(|error| ServerFnError::new(format!("序列化本地配置失败: {error}")))?;
-    let mut file = create_private_file(&temporary)
+    let (temporary, mut file) = create_unique_profile_temporary_file(path)
         .map_err(|error| ServerFnError::new(format!("写入本地配置失败: {error}")))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| ServerFnError::new(format!("写入本地配置失败: {error}")))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(ServerFnError::new(format!("写入本地配置失败: {error}")));
+    }
     drop(file);
 
     #[cfg(windows)]
     if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|error| ServerFnError::new(format!("替换本地配置失败: {error}")))?;
+        if let Err(error) = fs::remove_file(path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(ServerFnError::new(format!("替换本地配置失败: {error}")));
+        }
     }
-    fs::rename(&temporary, &path)
-        .map_err(|error| ServerFnError::new(format!("保存本地配置失败: {error}")))
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(ServerFnError::new(format!("保存本地配置失败: {error}")));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn profile_write_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_unique_profile_temporary_file(
+    path: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), id));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1447,7 +1598,8 @@ fn select_native_proxy_group(group: String, outbound: String) -> Result<(), Serv
     let core = guard
         .as_ref()
         .ok_or_else(|| ServerFnError::new("sing-box 尚未启动"))?;
-    core.select_outbound(&group, &outbound)
+    core.engine
+        .select_outbound(&group, &outbound)
         .map_err(|error| ServerFnError::new(error.to_string()))
 }
 
@@ -1499,8 +1651,40 @@ fn build_native_config(
             config.remove("__kitty_context");
         }
     }
+    apply_owned_fakeip_cache_config(&mut config, request, options);
     proxy_core::apply_proxy_group_selections(&mut config, &request.group_selections);
+    #[cfg(target_os = "macos")]
+    macos_route::pin_non_default_outbound_sources(&mut config)
+        .map_err(|error| ServerFnError::new(format!("TUN 路由预检失败: {error}")))?;
     Ok(config)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_owned_fakeip_cache_config(
+    config: &mut serde_json::Value,
+    request: &ConnectionRequest,
+    options: &SingBoxOptions,
+) {
+    if !request.tun || request.mode == TunnelMode::Direct {
+        return;
+    }
+    let Some(path) = options.fakeip_cache_file.as_deref() else {
+        return;
+    };
+    let Some(config) = config.as_object_mut() else {
+        return;
+    };
+    let experimental = config
+        .entry("experimental")
+        .or_insert_with(|| serde_json::json!({}));
+    if !experimental.is_object() {
+        *experimental = serde_json::json!({});
+    }
+    experimental["cache_file"] = serde_json::json!({
+        "enabled": true,
+        "path": path,
+        "store_fakeip": true,
+    });
 }
 
 #[allow(dead_code)]
@@ -1533,18 +1717,36 @@ fn toggle_native_core(
     use proxy_core::SingBoxOptions;
     use singbox::SingBox;
 
-    let mut guard = core_slot()
-        .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
     if !enabled {
+        // Never leave the OS pointing at a loopback listener that is about to
+        // disappear. If restoration fails, keep the core alive.
+        restore_managed_system_proxy_after_core_outage().map_err(ServerFnError::new)?;
+        let mut guard = core_slot()
+            .lock()
+            .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
         if let Some(core) = guard.as_mut() {
             if core
+                .engine
                 .is_running()
                 .map_err(|error| ServerFnError::new(error.to_string()))?
             {
-                core.stop()
-                    .map_err(|error| ServerFnError::new(error.to_string()))?;
+                if let Err(stop_error) = core.engine.stop() {
+                    let state = match core.engine.is_running() {
+                        Ok(false) => "复查确认内核已停止".to_string(),
+                        Ok(true) => "复查发现内核仍在运行".to_string(),
+                        Err(status_error) => {
+                            format!("无法确认内核状态，复查失败: {status_error}")
+                        }
+                    };
+                    core.engine.force_shutdown();
+                    core.config = None;
+                    return Err(ServerFnError::new(format!(
+                        "停止 sing-box 内核返回错误，{state}；已强制清理内核: {stop_error}"
+                    )));
+                }
             }
+            core.engine.discard_prepared_config();
+            core.config = None;
         }
         drop(guard);
         return native_core_status();
@@ -1554,32 +1756,419 @@ fn toggle_native_core(
     if request.nodes.is_empty() {
         return Err(ServerFnError::new("请先导入并选择一个节点"));
     }
-    let mut core = match guard.take() {
-        Some(core) => core,
-        None => SingBox::discover().map_err(|error| ServerFnError::new(error.to_string()))?,
+    let options = SingBoxOptions {
+        listen: mixed_listen_address(request.allow_lan).to_string(),
+        traffic_api_port: Some(allocate_loopback_port()?),
+        traffic_api_secret: Some(generate_traffic_api_secret()?),
+        rule_set_cache,
+        fakeip_cache_file: if request.tun && request.mode != TunnelMode::Direct {
+            Some(prepare_native_fakeip_cache_file()?)
+        } else {
+            None
+        },
+        ..SingBoxOptions::default()
     };
+    let config = build_native_config(&request, &options)?;
+    singbox::check_config(&config).map_err(|error| ServerFnError::new(error.to_string()))?;
+
+    let mut guard = core_slot()
+        .lock()
+        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    if guard.is_none() {
+        *guard = Some(
+            SingBox::discover()
+                .map(NativeCore::new)
+                .map_err(|error| ServerFnError::new(error.to_string()))?,
+        );
+    }
+    let core = guard.as_mut().expect("sing-box core was just initialized");
     if core
+        .engine
         .is_running()
         .map_err(|error| ServerFnError::new(error.to_string()))?
     {
-        *guard = Some(core);
         drop(guard);
         return native_core_status();
     }
+    core.config = None;
+    if let Err(error) = core.engine.start_config(&config) {
+        return Err(ServerFnError::new(error.to_string()));
+    }
+    core.config = Some(config);
+    drop(guard);
+    native_core_status()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+trait RestartCoreEngine {
+    fn restart_is_running(&self) -> Result<bool, String>;
+    fn restart_stop(&mut self) -> Result<(), String>;
+    fn restart_start(&mut self, config: &serde_json::Value) -> Result<(), String>;
+    fn restart_force_shutdown(&mut self);
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+impl RestartCoreEngine for singbox::SingBox {
+    fn restart_is_running(&self) -> Result<bool, String> {
+        self.is_running().map_err(|error| error.to_string())
+    }
+
+    fn restart_stop(&mut self) -> Result<(), String> {
+        self.stop().map_err(|error| error.to_string())
+    }
+
+    fn restart_start(&mut self, config: &serde_json::Value) -> Result<(), String> {
+        self.start_config(config).map_err(|error| error.to_string())
+    }
+
+    fn restart_force_shutdown(&mut self) {
+        self.force_shutdown();
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+#[derive(Debug, PartialEq, Eq)]
+enum CoreRestartOutcome {
+    CandidateRunning,
+    PreviousPreserved { error: String },
+    PreviousRestored { error: String },
+    CoreOffline { error: String },
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+enum CoreStartObservation {
+    Running,
+    Stopped { error: String },
+    Unknown { error: String },
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn start_core_and_observe<E: RestartCoreEngine>(
+    engine: &mut E,
+    config: &serde_json::Value,
+) -> CoreStartObservation {
+    match engine.restart_start(config) {
+        Ok(()) => CoreStartObservation::Running,
+        Err(start_error) => match engine.restart_is_running() {
+            Ok(true) => CoreStartObservation::Running,
+            Ok(false) => CoreStartObservation::Stopped { error: start_error },
+            Err(status_error) => CoreStartObservation::Unknown {
+                error: format!("{start_error}；复查运行状态失败: {status_error}"),
+            },
+        },
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn restore_previous_core<E: RestartCoreEngine>(
+    engine: &mut E,
+    previous: Option<&serde_json::Value>,
+    cause: String,
+) -> CoreRestartOutcome {
+    let Some(previous) = previous else {
+        return CoreRestartOutcome::CoreOffline {
+            error: format!("{cause}；没有可回滚的旧配置"),
+        };
+    };
+    match start_core_and_observe(engine, previous) {
+        CoreStartObservation::Running => CoreRestartOutcome::PreviousRestored {
+            error: format!("{cause}；已恢复旧配置"),
+        },
+        CoreStartObservation::Stopped {
+            error: rollback_error,
+        } => CoreRestartOutcome::CoreOffline {
+            error: format!("{cause}；恢复旧配置失败: {rollback_error}"),
+        },
+        CoreStartObservation::Unknown {
+            error: rollback_error,
+        } => {
+            engine.restart_force_shutdown();
+            CoreRestartOutcome::CoreOffline {
+                error: format!(
+                    "{cause}；恢复旧配置后无法确认内核状态，已强制关闭内核: {rollback_error}"
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn restart_core_transaction<E, C>(
+    engine: &mut E,
+    candidate: &serde_json::Value,
+    previous: Option<&serde_json::Value>,
+    check_candidate: C,
+) -> CoreRestartOutcome
+where
+    E: RestartCoreEngine,
+    C: FnOnce(&serde_json::Value) -> Result<(), String>,
+{
+    if let Err(error) = check_candidate(candidate) {
+        return CoreRestartOutcome::PreviousPreserved {
+            error: format!("新配置静态校验失败，内核未重启: {error}"),
+        };
+    }
+
+    let was_running = match engine.restart_is_running() {
+        Ok(running) => running,
+        Err(error) => {
+            engine.restart_force_shutdown();
+            return CoreRestartOutcome::CoreOffline {
+                error: format!("读取 sing-box 运行状态失败，已强制关闭无法确认状态的内核: {error}"),
+            };
+        }
+    };
+    if was_running {
+        if let Err(stop_error) = engine.restart_stop() {
+            // Some backends report a shutdown error after they have already
+            // released their runtime handle. Re-check before claiming that
+            // the previous core was preserved.
+            match engine.restart_is_running() {
+                Ok(true) => {
+                    return CoreRestartOutcome::PreviousPreserved {
+                        error: format!(
+                            "停止旧 sing-box 内核失败，但旧内核仍在运行，配置未切换: {stop_error}"
+                        ),
+                    };
+                }
+                Ok(false) => {
+                    return restore_previous_core(
+                        engine,
+                        previous,
+                        format!("停止旧 sing-box 内核返回错误且内核已停止: {stop_error}"),
+                    );
+                }
+                Err(status_error) => {
+                    engine.restart_force_shutdown();
+                    return CoreRestartOutcome::CoreOffline {
+                        error: format!(
+                            "停止旧 sing-box 内核失败且无法确认状态，已强制关闭内核: {stop_error}；复查状态失败: {status_error}"
+                        ),
+                    };
+                }
+            }
+        }
+    }
+
+    match start_core_and_observe(engine, candidate) {
+        CoreStartObservation::Running => CoreRestartOutcome::CandidateRunning,
+        CoreStartObservation::Stopped {
+            error: candidate_error,
+        } => restore_previous_core(
+            engine,
+            previous,
+            format!("新配置启动失败: {candidate_error}"),
+        ),
+        CoreStartObservation::Unknown {
+            error: candidate_error,
+        } => {
+            engine.restart_force_shutdown();
+            CoreRestartOutcome::CoreOffline {
+                error: format!("新配置启动后无法确认内核状态，已强制关闭内核: {candidate_error}"),
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn core_config_after_restart(
+    outcome: &CoreRestartOutcome,
+    candidate: serde_json::Value,
+    previous: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match outcome {
+        CoreRestartOutcome::CandidateRunning => Some(candidate),
+        CoreRestartOutcome::PreviousPreserved { .. }
+        | CoreRestartOutcome::PreviousRestored { .. } => previous,
+        CoreRestartOutcome::CoreOffline { .. } => None,
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn finish_core_restart<F>(
+    outcome: CoreRestartOutcome,
+    restore_managed_system_proxy: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match outcome {
+        CoreRestartOutcome::CandidateRunning => Ok(()),
+        CoreRestartOutcome::PreviousPreserved { error }
+        | CoreRestartOutcome::PreviousRestored { error } => Err(error),
+        CoreRestartOutcome::CoreOffline { error } => match restore_managed_system_proxy() {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!(
+                "{error}；恢复 Kitty Pro 管理的系统代理失败: {restore_error}"
+            )),
+        },
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn restore_managed_system_proxy_after_core_outage() -> Result<(), String> {
+    let backup_path = system_proxy_backup_path().map_err(|error| error.to_string())?;
+    if !backup_path.exists() {
+        return Ok(());
+    }
+    set_native_system_proxy(false)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(target_os = "android"),
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+))]
+fn restore_managed_system_proxy_after_core_outage() -> Result<(), String> {
+    Ok(())
+}
+
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn restart_native_core(
+    request: ConnectionRequest,
+    rule_set_cache: Option<RuleSetCachePaths>,
+) -> Result<ApiCoreStatus, ServerFnError> {
+    use proxy_core::SingBoxOptions;
+    use singbox::SingBox;
 
     let options = SingBoxOptions {
         listen: mixed_listen_address(request.allow_lan).to_string(),
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
+        fakeip_cache_file: if request.tun && request.mode != TunnelMode::Direct {
+            Some(prepare_native_fakeip_cache_file()?)
+        } else {
+            None
+        },
         ..SingBoxOptions::default()
     };
-    let config = build_native_config(&request, &options)?;
-    core.start_config(&config)
-        .map_err(|error| ServerFnError::new(error.to_string()))?;
-    *guard = Some(core);
+    let candidate = build_native_config(&request, &options)?;
+
+    let mut guard = core_slot()
+        .lock()
+        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    if guard.is_none() {
+        *guard = Some(
+            SingBox::discover()
+                .map(NativeCore::new)
+                .map_err(|error| ServerFnError::new(error.to_string()))?,
+        );
+    }
+    let core = guard.as_mut().expect("sing-box core was just initialized");
+    let previous = core.config.clone();
+    core.engine
+        .prepare_config(&candidate)
+        .map_err(|error| ServerFnError::new(format!("新配置预检失败，内核未重启: {error}")))?;
+    let restart_result =
+        restart_core_transaction(&mut core.engine, &candidate, previous.as_ref(), |_| Ok(()));
+    core.engine.discard_prepared_config();
+    core.config = core_config_after_restart(&restart_result, candidate, previous);
     drop(guard);
+
+    finish_core_restart(
+        restart_result,
+        restore_managed_system_proxy_after_core_outage,
+    )
+    .map_err(ServerFnError::new)?;
     native_core_status()
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+fn restart_native_core(
+    request: ConnectionRequest,
+    rule_set_cache: Option<RuleSetCachePaths>,
+) -> Result<ApiCoreStatus, ServerFnError> {
+    // Starting the active VpnService again makes it stop the previous core,
+    // establish a fresh VPN interface, and apply the replacement config.
+    toggle_native_core(true, Some(request), rule_set_cache)
+}
+
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn prepare_native_tun_mode(
+    request: ConnectionRequest,
+    rule_set_cache: Option<RuleSetCachePaths>,
+) -> Result<(), ServerFnError> {
+    use proxy_core::SingBoxOptions;
+    use singbox::SingBox;
+
+    let options = SingBoxOptions {
+        listen: mixed_listen_address(request.allow_lan).to_string(),
+        traffic_api_port: Some(allocate_loopback_port()?),
+        traffic_api_secret: Some(generate_traffic_api_secret()?),
+        rule_set_cache,
+        fakeip_cache_file: if request.mode != TunnelMode::Direct {
+            Some(prepare_native_fakeip_cache_file()?)
+        } else {
+            None
+        },
+        ..SingBoxOptions::default()
+    };
+    let candidate = build_native_config(&request, &options)?;
+    let mut guard = core_slot()
+        .lock()
+        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    if guard.is_none() {
+        *guard = Some(
+            SingBox::discover()
+                .map(NativeCore::new)
+                .map_err(|error| ServerFnError::new(error.to_string()))?,
+        );
+    }
+    let core = guard.as_mut().expect("sing-box core was just initialized");
+    if core
+        .engine
+        .is_running()
+        .map_err(|error| ServerFnError::new(error.to_string()))?
+    {
+        return Err(ServerFnError::new(
+            "sing-box 已在运行，请通过核心重启应用 TUN 设置",
+        ));
+    }
+    core.engine
+        .prepare_config(&candidate)
+        .map_err(|error| ServerFnError::new(format!("TUN 配置或权限预检失败: {error}")))
+}
+
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn release_native_tun_mode() -> Result<(), ServerFnError> {
+    let mut guard = core_slot()
+        .lock()
+        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    if let Some(core) = guard.as_mut() {
+        if core
+            .engine
+            .is_running()
+            .map_err(|error| ServerFnError::new(error.to_string()))?
+        {
+            return Err(ServerFnError::new(
+                "sing-box 正在运行，不能单独释放当前 TUN helper",
+            ));
+        }
+        core.engine.discard_prepared_config();
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
+fn prepare_native_tun_mode(
+    _request: ConnectionRequest,
+    _rule_set_cache: Option<RuleSetCachePaths>,
+) -> Result<(), ServerFnError> {
+    Err(ServerFnError::new("当前平台不使用桌面 TUN 权限预检"))
+}
+
+#[allow(dead_code)]
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
+fn release_native_tun_mode() -> Result<(), ServerFnError> {
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1608,6 +2197,11 @@ fn toggle_native_core(
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
+        fakeip_cache_file: if request.tun && request.mode != TunnelMode::Direct {
+            Some(prepare_native_fakeip_cache_file()?)
+        } else {
+            None
+        },
         ..SingBoxOptions::default()
     };
     let mut config = build_native_config(&request, &options)?;
@@ -1628,12 +2222,14 @@ fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
         return Ok(CoreTraffic::default());
     };
     if !core
+        .engine
         .is_running()
         .map_err(|error| ServerFnError::new(error.to_string()))?
     {
         return Ok(CoreTraffic::default());
     }
     let traffic = core
+        .engine
         .traffic()
         .map_err(|error| ServerFnError::new(error.to_string()))?;
     Ok(CoreTraffic {
@@ -1674,6 +2270,7 @@ fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
         });
     };
     if !core
+        .engine
         .is_running()
         .map_err(|error| ServerFnError::new(error.to_string()))?
     {
@@ -1682,7 +2279,8 @@ fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
             entries: Vec::new(),
         });
     }
-    core.logs(cursor)
+    core.engine
+        .logs(cursor)
         .map(normalize_log_batch)
         .map_err(|error| ServerFnError::new(error.to_string()))
 }
@@ -1714,12 +2312,14 @@ fn native_set_core_log_collection(enabled: bool) -> Result<(), ServerFnError> {
         return Ok(());
     };
     if !core
+        .engine
         .is_running()
         .map_err(|error| ServerFnError::new(error.to_string()))?
     {
         return Ok(());
     }
-    core.set_log_enabled(enabled)
+    core.engine
+        .set_log_enabled(enabled)
         .map_err(|error| ServerFnError::new(error.to_string()))
 }
 
@@ -2196,7 +2796,7 @@ fn ensure_core_is_running() -> Result<(), ServerFnError> {
     let Some(core) = guard.as_ref() else {
         return Err(ServerFnError::new("请先建立连接，再启用系统代理"));
     };
-    let status = core.status();
+    let status = core.engine.status();
     if status.state != CoreState::Running {
         return Err(ServerFnError::new("请先建立连接，再启用系统代理"));
     }
@@ -2643,13 +3243,20 @@ pub fn shutdown_native_runtime() -> Result<(), String> {
     match core_slot().lock() {
         Ok(mut guard) => {
             if let Some(core) = guard.as_mut() {
-                match core.is_running() {
-                    Ok(true) => {
-                        if let Err(error) = core.stop() {
+                match core.engine.is_running() {
+                    Ok(true) => match core.engine.stop() {
+                        Ok(()) => {
+                            core.engine.discard_prepared_config();
+                            core.config = None;
+                        }
+                        Err(error) => {
                             errors.push(format!("停止 sing-box 内核失败: {error}"));
                         }
+                    },
+                    Ok(false) => {
+                        core.engine.discard_prepared_config();
+                        core.config = None;
                     }
-                    Ok(false) => {}
                     Err(error) => errors.push(format!("读取 sing-box 状态失败: {error}")),
                 }
             }
@@ -2666,11 +3273,28 @@ pub fn shutdown_native_runtime() -> Result<(), String> {
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-fn core_slot() -> &'static std::sync::Mutex<Option<singbox::SingBox>> {
+fn core_slot() -> &'static std::sync::Mutex<Option<NativeCore>> {
     use std::sync::{Mutex, OnceLock};
 
-    static CORE: OnceLock<Mutex<Option<singbox::SingBox>>> = OnceLock::new();
+    static CORE: OnceLock<Mutex<Option<NativeCore>>> = OnceLock::new();
     CORE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+#[derive(Debug)]
+struct NativeCore {
+    engine: singbox::SingBox,
+    config: Option<serde_json::Value>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+impl NativeCore {
+    fn new(engine: singbox::SingBox) -> Self {
+        Self {
+            engine,
+            config: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2701,6 +3325,499 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    struct FakeRestartCore {
+        running: bool,
+        fail_status: bool,
+        fail_status_on_call: Option<usize>,
+        status_calls: std::cell::Cell<usize>,
+        fail_stop: bool,
+        stop_error_after_shutdown: bool,
+        fail_start_tags: std::collections::HashSet<String>,
+        start_error_after_running_tags: std::collections::HashSet<String>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    impl FakeRestartCore {
+        fn running(events: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                running: true,
+                fail_status: false,
+                fail_status_on_call: None,
+                status_calls: std::cell::Cell::new(0),
+                fail_stop: false,
+                stop_error_after_shutdown: false,
+                fail_start_tags: std::collections::HashSet::new(),
+                start_error_after_running_tags: std::collections::HashSet::new(),
+                events,
+            }
+        }
+
+        fn push_event(&self, event: impl Into<String>) {
+            self.events.lock().unwrap().push(event.into());
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    impl RestartCoreEngine for FakeRestartCore {
+        fn restart_is_running(&self) -> Result<bool, String> {
+            self.push_event("status");
+            let call = self.status_calls.get() + 1;
+            self.status_calls.set(call);
+            if self.fail_status || self.fail_status_on_call == Some(call) {
+                Err("status failed".to_string())
+            } else {
+                Ok(self.running)
+            }
+        }
+
+        fn restart_stop(&mut self) -> Result<(), String> {
+            self.push_event("stop");
+            if self.fail_stop {
+                if self.stop_error_after_shutdown {
+                    self.running = false;
+                }
+                return Err("stop failed".to_string());
+            }
+            self.running = false;
+            Ok(())
+        }
+
+        fn restart_start(&mut self, config: &serde_json::Value) -> Result<(), String> {
+            let tag = config["tag"].as_str().unwrap_or("unknown");
+            self.push_event(format!("start:{tag}"));
+            if self.fail_start_tags.contains(tag) {
+                return Err(format!("{tag} failed"));
+            }
+            self.running = true;
+            if self.start_error_after_running_tags.contains(tag) {
+                return Err(format!("{tag} response failed"));
+            }
+            Ok(())
+        }
+
+        fn restart_force_shutdown(&mut self) {
+            self.push_event("force-shutdown");
+            self.running = false;
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    fn restart_fixture() -> (
+        serde_json::Value,
+        serde_json::Value,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        FakeRestartCore,
+    ) {
+        let candidate = serde_json::json!({ "tag": "candidate" });
+        let previous = serde_json::json!({ "tag": "previous" });
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let core = FakeRestartCore::running(events.clone());
+        (candidate, previous, events, core)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn restart_checks_candidate_before_stopping_previous_core() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        let check_events = events.clone();
+
+        let outcome =
+            restart_core_transaction(&mut core, &candidate, Some(&previous), move |config| {
+                check_events
+                    .lock()
+                    .unwrap()
+                    .push(format!("check:{}", config["tag"].as_str().unwrap()));
+                Ok(())
+            });
+
+        assert_eq!(outcome, CoreRestartOutcome::CandidateRunning);
+        assert!(core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["check:candidate", "status", "stop", "start:candidate"]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate.clone(), Some(previous)),
+            Some(candidate)
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn invalid_restart_candidate_leaves_previous_core_untouched() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| {
+            Err("invalid candidate".to_string())
+        });
+
+        assert!(matches!(
+            outcome,
+            CoreRestartOutcome::PreviousPreserved { .. }
+        ));
+        assert!(core.running);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous.clone())),
+            Some(previous)
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn failed_candidate_restores_previous_config_without_proxy_restore() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.fail_start_tags.insert("candidate".to_string());
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert!(matches!(
+            outcome,
+            CoreRestartOutcome::PreviousRestored { .. }
+        ));
+        assert!(core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "status",
+                "stop",
+                "start:candidate",
+                "status",
+                "start:previous"
+            ]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous.clone())),
+            Some(previous)
+        );
+
+        let restore_calls = std::cell::Cell::new(0);
+        assert!(finish_core_restart(outcome, || {
+            restore_calls.set(restore_calls.get() + 1);
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(restore_calls.get(), 0);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn failed_candidate_and_rollback_marks_core_offline_and_restores_proxy() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.fail_start_tags = ["candidate".to_string(), "previous".to_string()]
+            .into_iter()
+            .collect();
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert!(matches!(outcome, CoreRestartOutcome::CoreOffline { .. }));
+        assert!(!core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "status",
+                "stop",
+                "start:candidate",
+                "status",
+                "start:previous",
+                "status"
+            ]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous)),
+            None
+        );
+
+        let restore_calls = std::cell::Cell::new(0);
+        assert!(finish_core_restart(outcome, || {
+            restore_calls.set(restore_calls.get() + 1);
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(restore_calls.get(), 1);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn failed_stop_preserves_previous_config_without_proxy_restore() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.fail_stop = true;
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert!(matches!(
+            outcome,
+            CoreRestartOutcome::PreviousPreserved { .. }
+        ));
+        assert!(core.running);
+        assert_eq!(*events.lock().unwrap(), ["status", "stop", "status"]);
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous.clone())),
+            Some(previous)
+        );
+
+        let restore_calls = std::cell::Cell::new(0);
+        assert!(finish_core_restart(outcome, || {
+            restore_calls.set(restore_calls.get() + 1);
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(restore_calls.get(), 0);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn failed_stop_after_shutdown_restores_previous_config() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.fail_stop = true;
+        core.stop_error_after_shutdown = true;
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert!(matches!(
+            outcome,
+            CoreRestartOutcome::PreviousRestored { .. }
+        ));
+        assert!(core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["status", "stop", "status", "start:previous"]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous.clone())),
+            Some(previous)
+        );
+
+        let restore_calls = std::cell::Cell::new(0);
+        assert!(finish_core_restart(outcome, || {
+            restore_calls.set(restore_calls.get() + 1);
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(restore_calls.get(), 0);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn failed_stop_with_unknown_state_forces_shutdown_and_restores_proxy() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.fail_stop = true;
+        core.fail_status_on_call = Some(2);
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert!(matches!(outcome, CoreRestartOutcome::CoreOffline { .. }));
+        assert!(!core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["status", "stop", "status", "force-shutdown"]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous)),
+            None
+        );
+
+        let restore_calls = std::cell::Cell::new(0);
+        assert!(finish_core_restart(outcome, || {
+            restore_calls.set(restore_calls.get() + 1);
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(restore_calls.get(), 1);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn candidate_start_error_after_running_commits_candidate() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.start_error_after_running_tags
+            .insert("candidate".to_string());
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert_eq!(outcome, CoreRestartOutcome::CandidateRunning);
+        assert!(core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["status", "stop", "start:candidate", "status"]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate.clone(), Some(previous)),
+            Some(candidate)
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn candidate_start_with_unknown_state_is_forced_offline() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.fail_start_tags.insert("candidate".to_string());
+        core.fail_status_on_call = Some(2);
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert!(matches!(outcome, CoreRestartOutcome::CoreOffline { .. }));
+        assert!(!core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "status",
+                "stop",
+                "start:candidate",
+                "status",
+                "force-shutdown"
+            ]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous)),
+            None
+        );
+
+        let restore_calls = std::cell::Cell::new(0);
+        assert!(finish_core_restart(outcome, || {
+            restore_calls.set(restore_calls.get() + 1);
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(restore_calls.get(), 1);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[test]
+    fn rollback_start_error_after_running_is_still_restored() {
+        let (candidate, previous, events, mut core) = restart_fixture();
+        core.fail_start_tags.insert("candidate".to_string());
+        core.start_error_after_running_tags
+            .insert("previous".to_string());
+
+        let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
+
+        assert!(matches!(
+            outcome,
+            CoreRestartOutcome::PreviousRestored { .. }
+        ));
+        assert!(core.running);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "status",
+                "stop",
+                "start:candidate",
+                "status",
+                "start:previous",
+                "status"
+            ]
+        );
+        assert_eq!(
+            core_config_after_restart(&outcome, candidate, Some(previous.clone())),
+            Some(previous)
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn concurrent_profile_saves_are_atomic_and_last_write_wins() {
+        let directory = TestDirectory::new("profile-concurrency");
+        let path = directory.0.join("profile.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut writers = Vec::new();
+
+        for index in 0..8 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                let profile = AppProfile {
+                    selected_tag: format!("concurrent-{index}"),
+                    config_script: "x".repeat(32 * 1024 + index),
+                    ..AppProfile::default()
+                };
+                barrier.wait();
+                save_native_profile_to_path(&profile, &path)
+            }));
+        }
+        for writer in writers {
+            writer
+                .join()
+                .expect("profile writer should not panic")
+                .expect("concurrent profile save should succeed");
+        }
+
+        let concurrent: AppProfile = serde_json::from_slice(
+            &std::fs::read(&path).expect("concurrent profile should be readable"),
+        )
+        .expect("concurrent profile should contain one complete JSON document");
+        assert!(concurrent.selected_tag.starts_with("concurrent-"));
+
+        let last = AppProfile {
+            selected_tag: "last-write".to_string(),
+            ..AppProfile::default()
+        };
+        save_native_profile_to_path(&last, &path).expect("last profile save should succeed");
+        let saved: AppProfile =
+            serde_json::from_slice(&std::fs::read(&path).expect("last profile should be readable"))
+                .expect("last profile should be valid");
+        assert_eq!(saved, last);
+
+        let remaining = std::fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, [std::ffi::OsString::from("profile.json")]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fakeip_cache_file_is_private_and_reused() {
+        let directory = TestDirectory::new("fakeip-cache");
+        let path = directory.0.join("sing-box.db");
+
+        prepare_private_fakeip_cache_file(&path).expect("cache file should be created");
+        std::fs::write(&path, b"persistent fakeip mapping")
+            .expect("cache fixture should be written");
+        prepare_private_fakeip_cache_file(&path).expect("cache file should be reusable");
+
+        assert_eq!(
+            std::fs::read(&path).expect("cache fixture should be readable"),
+            b"persistent fakeip mapping"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("cache metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fakeip_cache_file_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("fakeip-cache-symlink");
+        let target = directory.0.join("target.db");
+        let path = directory.0.join("sing-box.db");
+        std::fs::write(&target, b"unrelated data").expect("target should be written");
+        symlink(&target, &path).expect("cache symlink should be created");
+
+        let error =
+            prepare_private_fakeip_cache_file(&path).expect_err("cache symlink should be rejected");
+
+        assert!(error.to_string().contains("符号链接"));
+        assert_eq!(
+            std::fs::read(&target).expect("symlink target should remain readable"),
+            b"unrelated data"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2741,6 +3858,50 @@ mod tests {
 
         assert_eq!(config["log"]["level"], "香港节点");
         assert!(config.get("__kitty_context").is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn app_owned_fakeip_cache_path_overrides_script_output() {
+        let nodes = proxy_core::parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Global,
+            tun: true,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: Default::default(),
+        };
+        let options = SingBoxOptions {
+            fakeip_cache_file: Some("/app-data/cache/sing-box.db".to_string()),
+            ..SingBoxOptions::default()
+        };
+        let mut config = serde_json::json!({
+            "experimental": {
+                "cache_file": {
+                    "enabled": true,
+                    "path": "/tmp/untrusted.db",
+                    "store_fakeip": false,
+                }
+            }
+        });
+
+        apply_owned_fakeip_cache_config(&mut config, &request, &options);
+
+        assert_eq!(
+            config["experimental"]["cache_file"],
+            serde_json::json!({
+                "enabled": true,
+                "path": "/app-data/cache/sing-box.db",
+                "store_fakeip": true,
+            })
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -70,6 +70,23 @@ dx serve --package desktop --desktop --open false --interactive false
 
 The desktop shell links and calls the same `singbox` Rust API locally.
 
+On desktop systems, enabling TUN performs configuration validation and asks
+for network privileges immediately. Starting the core then reuses that
+authorized helper instead of prompting a second time. The GUI itself remains
+unprivileged:
+
+- Windows starts a separate elevated core through the standard UAC prompt.
+- Linux starts a separate root core through `pkexec`; a working polkit agent
+  and `/dev/net/tun` are required.
+- macOS keeps using its separately authorized helper and session-scoped DNS.
+
+The helper accepts commands only through a random local session and holds a
+lifecycle lease from the GUI. Closing Kitty Pro releases the lease, stops the
+embedded core, and removes TUN routes even if the normal shutdown request
+cannot complete. AppImage/portable builds do not install a persistent root
+service; Linux desktops without polkit should install the distribution's
+polkit package and agent before using TUN.
+
 ## Build an Android APK
 
 On macOS, install Go 1.24, OpenJDK 17, the Android SDK command-line tools,

@@ -1113,7 +1113,7 @@ fn OverviewView(
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
     group_selections: Signal<HashMap<String, String>>,
-    system_proxy: Signal<SystemProxyLoadState>,
+    mut system_proxy: Signal<SystemProxyLoadState>,
     system_proxy_busy: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
@@ -1234,7 +1234,33 @@ fn OverviewView(
                                         toast.info(ANDROID_VPN_WAITING_NOTICE);
                                     }
                                 }
-                                Err(error) => toast.error(error.to_string()),
+                                Err(error) => {
+                                    toast.error(error.to_string());
+                                    match api::core_status().await {
+                                        Ok(status) => {
+                                            connected.set(status.state == "running");
+                                            core_state.set(status.state);
+                                            core_note.set(status.note);
+                                        }
+                                        Err(status_error) => {
+                                            connected.set(false);
+                                            core_state.set("unavailable".to_string());
+                                            core_note.set(Some(status_error.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                            if !target {
+                                match api::system_proxy_status().await {
+                                    Ok(status) => {
+                                        system_proxy.set(SystemProxyLoadState::Ready(status));
+                                    }
+                                    Err(error) => {
+                                        system_proxy.set(SystemProxyLoadState::Failed(
+                                            error.to_string(),
+                                        ));
+                                    }
+                                }
                             }
                             core_busy.set(false);
                             }
@@ -1669,11 +1695,9 @@ fn NodesView(
                                                     "延迟刷新完成，{completed} 个节点中 {failures} 个不可用"
                                                 ));
                                             }
-                                            persist_latency_cache(
-                                                &cache_nodes,
-                                                &latency_results.peek(),
-                                            )
-                                            .await;
+                                            let latency_snapshot = latency_results();
+                                            persist_latency_cache(&cache_nodes, &latency_snapshot)
+                                                .await;
                                             latency_busy.set(false);
                                         }
                                     },
@@ -3074,6 +3098,7 @@ fn SettingsView(
     let mut script_editor_open = use_signal(|| false);
     let mut script_draft = use_signal(String::new);
     let toast = use_context::<ToastManager>();
+    let tun_proxy_server_nameservers = proxy_server_nameservers.clone();
     let allow_lan_proxy_server_nameservers = proxy_server_nameservers.clone();
     let script_proxy_server_nameservers = proxy_server_nameservers;
 
@@ -3161,6 +3186,7 @@ fn SettingsView(
                     button { class: if tunnel_mode() == TunnelMode::Global { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Global), "全局" }
                     button { class: if tunnel_mode() == TunnelMode::Direct { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Direct), "直连" }
                 }
+                if !cfg!(target_os = "android") {
                 label { class: "setting-row toggle-row",
                     span { class: "setting-icon", Icon { icon: LdNetwork, width: 19, height: 19 } }
                     div {
@@ -3170,9 +3196,100 @@ fn SettingsView(
                     input {
                         r#type: "checkbox",
                         checked: tun_enabled,
-                        onchange: move |event| tun_enabled.set(event.checked()),
+                        disabled: core_restarting(),
+                        onchange: move |event| {
+                            let proxy_server_nameservers =
+                                tun_proxy_server_nameservers.clone();
+                            async move {
+                                let enabled = event.checked();
+                                let previous_enabled = tun_enabled();
+                                let request = ConnectionRequest {
+                                    nodes: nodes(),
+                                    selected_tag: selected_tag(),
+                                    proxy_server_nameservers,
+                                    mode: tunnel_mode(),
+                                    tun: enabled,
+                                    allow_lan: allow_lan(),
+                                    custom_rules: connection_custom_rules(
+                                        config_script_enabled(),
+                                        &config_script(),
+                                        custom_rules(),
+                                    ),
+                                    config_script: if config_script_enabled()
+                                        && !config_script().trim().is_empty()
+                                    {
+                                        Some(config_script())
+                                    } else {
+                                        None
+                                    },
+                                    group_selections: group_selections(),
+                                };
+                                if !connected() {
+                                    core_restarting.set(true);
+                                    let result = if enabled {
+                                        api::prepare_tun_mode(request).await
+                                    } else {
+                                        api::release_tun_mode().await
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            tun_enabled.set(enabled);
+                                            toast.success(if enabled {
+                                                "TUN 权限已准备，启动内核时直接生效"
+                                            } else {
+                                                "TUN 模式已关闭"
+                                            });
+                                        }
+                                        Err(error) => {
+                                            tun_enabled.set(previous_enabled);
+                                            toast.error(if enabled {
+                                                format!("TUN 权限准备失败: {error}")
+                                            } else {
+                                                format!("关闭 TUN 失败: {error}")
+                                            });
+                                        }
+                                    }
+                                    core_restarting.set(false);
+                                    return;
+                                }
+
+                                core_restarting.set(true);
+                                match api::restart_core(request).await {
+                                    Ok(status) => {
+                                        let is_running = status.state == "running";
+                                        tun_enabled.set(enabled);
+                                        connected.set(is_running);
+                                        core_state.set(status.state);
+                                        core_version.set(status.version);
+                                        core_note.set(status.note);
+                                        toast.success(if enabled {
+                                            "TUN 模式已启用"
+                                        } else {
+                                            "TUN 模式已关闭"
+                                        });
+                                    }
+                                    Err(error) => {
+                                        tun_enabled.set(previous_enabled);
+                                        match api::core_status().await {
+                                            Ok(status) => {
+                                                connected.set(status.state == "running");
+                                                core_state.set(status.state);
+                                                core_version.set(status.version);
+                                                core_note.set(status.note);
+                                            }
+                                            Err(status_error) => {
+                                                core_note.set(Some(status_error.to_string()));
+                                            }
+                                        }
+                                        toast.error(format!("应用 TUN 设置失败: {error}"));
+                                    }
+                                }
+                                core_restarting.set(false);
+                            }
+                        },
                     }
                     span { class: "switch" }
+                }
                 }
                 label {
                     class: "setting-row toggle-row",
@@ -3194,59 +3311,71 @@ fn SettingsView(
                             let proxy_server_nameservers =
                                 allow_lan_proxy_server_nameservers.clone();
                             async move {
-                            let enabled = event.checked();
-                            allow_lan.set(enabled);
-                            if !connected() {
-                                toast.info(if enabled {
-                                    "局域网连接将在下次启动内核时生效"
-                                } else {
-                                    "仅本机访问将在下次启动内核时生效"
-                                });
-                                return;
-                            }
-
-                            core_restarting.set(true);
-                            let request = ConnectionRequest {
-                                nodes: nodes(),
-                                selected_tag: selected_tag(),
-                                proxy_server_nameservers: proxy_server_nameservers.clone(),
-                                mode: tunnel_mode(),
-                                tun: tun_enabled(),
-                                allow_lan: enabled,
-                                custom_rules: connection_custom_rules(
-                                    config_script_enabled(),
-                                    &config_script(),
-                                    custom_rules(),
-                                ),
-                                config_script: if config_script_enabled()
-                                    && !config_script().trim().is_empty()
-                                {
-                                    Some(config_script())
-                                } else {
-                                    None
-                                },
-                                group_selections: group_selections(),
-                            };
-                            match api::restart_core(request).await {
-                                Ok(status) => {
-                                    let is_running = status.state == "running";
-                                    connected.set(is_running);
-                                    core_state.set(status.state);
-                                    core_version.set(status.version);
-                                    core_note.set(status.note);
-                                    toast.success(if enabled {
-                                        "已允许局域网连接，sing-box 内核已重启"
+                                let enabled = event.checked();
+                                if !connected() {
+                                    allow_lan.set(enabled);
+                                    toast.info(if enabled {
+                                        "局域网连接将在下次启动内核时生效"
                                     } else {
-                                        "已恢复仅本机访问，sing-box 内核已重启"
+                                        "仅本机访问将在下次启动内核时生效"
                                     });
+                                    return;
                                 }
-                                Err(error) => {
-                                    connected.set(false);
-                                    core_state.set("stopped".to_string());
-                                    toast.error(format!("应用局域网监听设置失败: {error}"));
+
+                                core_restarting.set(true);
+                                let request = ConnectionRequest {
+                                    nodes: nodes(),
+                                    selected_tag: selected_tag(),
+                                    proxy_server_nameservers,
+                                    mode: tunnel_mode(),
+                                    tun: tun_enabled(),
+                                    allow_lan: enabled,
+                                    custom_rules: connection_custom_rules(
+                                        config_script_enabled(),
+                                        &config_script(),
+                                        custom_rules(),
+                                    ),
+                                    config_script: if config_script_enabled()
+                                        && !config_script().trim().is_empty()
+                                    {
+                                        Some(config_script())
+                                    } else {
+                                        None
+                                    },
+                                    group_selections: group_selections(),
+                                };
+                                match api::restart_core(request).await {
+                                    Ok(status) => {
+                                        let is_running = status.state == "running";
+                                        allow_lan.set(enabled);
+                                        connected.set(is_running);
+                                        core_state.set(status.state);
+                                        core_version.set(status.version);
+                                        core_note.set(status.note);
+                                        toast.success(if enabled {
+                                            "已允许局域网连接，sing-box 内核已重启"
+                                        } else {
+                                            "已恢复仅本机访问，sing-box 内核已重启"
+                                        });
+                                    }
+                                    Err(error) => {
+                                        match api::core_status().await {
+                                            Ok(status) => {
+                                                connected.set(status.state == "running");
+                                                core_state.set(status.state);
+                                                core_version.set(status.version);
+                                                core_note.set(status.note);
+                                            }
+                                            Err(status_error) => {
+                                                core_note.set(Some(status_error.to_string()));
+                                            }
+                                        }
+                                        toast.error(format!(
+                                            "应用局域网监听设置失败: {error}"
+                                        ));
+                                    }
                                 }
-                            }
-                            core_restarting.set(false);
+                                core_restarting.set(false);
                             }
                         },
                     }

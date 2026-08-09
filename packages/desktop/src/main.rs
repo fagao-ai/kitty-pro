@@ -77,6 +77,19 @@ fn should_show_window_on_reopen<T: 'static>(event: &Event<'_, T>) -> bool {
 
 #[cfg(feature = "desktop")]
 fn main() {
+    #[cfg(target_os = "macos")]
+    if let Some(exit_code) = singbox::macos::run_helper_from_args() {
+        // Only the separately authorized helper process reaches this branch;
+        // the original GUI process continues with the user's privileges.
+        std::process::exit(exit_code);
+    }
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if let Some(exit_code) = singbox::desktop_helper::run_helper_from_args() {
+        // The elevated helper must exit before Dioxus initializes a second
+        // desktop runtime in the child process.
+        std::process::exit(exit_code);
+    }
+
     let window_icon = icon_from_memory(APP_ICON).expect("embedded application icon must be valid");
     let config = Config::new()
         .with_window(WindowBuilder::new().with_title("Kitty Pro"))

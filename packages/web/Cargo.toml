@@ -9,7 +9,12 @@ ui = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dioxus = { workspace = true, features = ["router", "fullstack", "server"] }
+dioxus-server = "0.7.1"
+getrandom = "0.3"
 ui = { workspace = true, features = ["server"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+singbox = { workspace = true }
 
 [features]
 default = []

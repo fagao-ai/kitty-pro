@@ -28,6 +28,45 @@ func TestValidateRuleSetFileRejectsInvalidContent(t *testing.T) {
 	}
 }
 
+func TestCheckConfigAcceptsTunWithoutStartingIt(t *testing.T) {
+	config := `{
+		"log":{"level":"error"},
+		"inbounds":[{
+			"type":"tun",
+			"tag":"tun-in",
+			"address":["172.19.0.1/30","fdfe:dcba:9876::1/126"],
+			"auto_route":true,
+			"strict_route":true,
+			"stack":"system"
+		}],
+		"outbounds":[{"type":"direct","tag":"direct"}],
+		"route":{"auto_detect_interface":true,"final":"direct"}
+	}`
+	before, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("list network interfaces before check: %v", err)
+	}
+
+	if err = checkConfig(config); err != nil {
+		t.Fatalf("check valid TUN config: %v", err)
+	}
+
+	after, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("list network interfaces after check: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("config check changed interface count from %d to %d", len(before), len(after))
+	}
+}
+
+func TestCheckConfigRejectsInvalidConfig(t *testing.T) {
+	config := `{"inbounds":[{"type":"not-a-real-inbound"}]}`
+	if err := checkConfig(config); err == nil {
+		t.Fatal("invalid config unexpectedly passed validation")
+	}
+}
+
 func TestBridgeLogBufferReturnsIncrementalInfoLogs(t *testing.T) {
 	var logs bridgeLogBuffer
 	logs.setEnabled(true)

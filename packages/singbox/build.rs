@@ -6,8 +6,13 @@ const DEFAULT_PROXY: &str = "http://100.64.0.2:11080";
 
 fn main() {
     println!("cargo:rerun-if-changed=bridge/go.mod");
+    println!("cargo:rerun-if-changed=bridge/go.sum");
     println!("cargo:rerun-if-changed=bridge/main.go");
+    println!("cargo:rerun-if-changed=bridge/file_owner_unix.go");
+    println!("cargo:rerun-if-changed=bridge/file_owner_windows.go");
+    println!("cargo:rerun-if-changed=bridge/file_owner_unix_test.go");
     println!("cargo:rerun-if-changed=bridge/android_bridge.go");
+    println!("cargo:rerun-if-changed=bridge/unified_urltest.go");
     println!("cargo:rerun-if-env-changed=HTTP_PROXY");
     println!("cargo:rerun-if-env-changed=HTTPS_PROXY");
     println!("cargo:rerun-if-env-changed=ALL_PROXY");
@@ -107,9 +112,9 @@ fn main() {
             "-buildmode",
             build_mode,
             "-tags",
-            "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0",
+            "with_dhcp,with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0",
             "-ldflags",
-            "-checklinkname=0 -X github.com/sagernet/sing-box/constant.Version=kitty-pro-embedded",
+            "-checklinkname=0 -X internal/godebug.defaultGODEBUG=multipathtcp=0 -X github.com/sagernet/sing-box/constant.Version=kitty-pro-embedded/1.13.14",
             "-o",
         ])
         .arg(&archive)
@@ -130,6 +135,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Security");
         println!("cargo:rustc-link-lib=framework=SystemConfiguration");
+        println!("cargo:rustc-link-lib=resolv");
     }
     if target_os == "linux" {
         println!("cargo:rustc-link-lib=dl");

@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use url::Url;
 
@@ -35,6 +35,9 @@ pub struct SingBoxOptions {
     /// Validated local rule-set files. Local rule sets are watched by
     /// sing-box and reloaded when the updater atomically replaces them.
     pub rule_set_cache: Option<RuleSetCachePaths>,
+    /// Persistent sing-box cache used to keep FakeIP-to-domain mappings
+    /// stable across TUN core restarts.
+    pub fakeip_cache_file: Option<String>,
 }
 
 impl Default for SingBoxOptions {
@@ -46,6 +49,7 @@ impl Default for SingBoxOptions {
             traffic_api_port: None,
             traffic_api_secret: None,
             rule_set_cache: None,
+            fakeip_cache_file: None,
         }
     }
 }
@@ -61,12 +65,15 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         let mut tun_inbound = json!({
             "type": "tun",
             "tag": "tun-in",
+            // Keep both address families captured. FakeIP below restores the
+            // original domain before dialing, so an IPv4-only upstream does
+            // not receive a browser-selected IPv6 literal.
             "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
             "auto_route": true,
             "strict_route": true,
             "stack": "system",
         });
-        let route_exclusions = selected_proxy_endpoint_routes(request);
+        let route_exclusions = proxy_endpoint_routes(request);
         if !route_exclusions.is_empty() {
             tun_inbound["route_exclude_address"] = json!(route_exclusions);
         }
@@ -176,13 +183,30 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
             "final": route_final,
         },
     });
+    let mut experimental = Map::new();
+    if request.tun && request.mode != TunnelMode::Direct {
+        if let Some(path) = options.fakeip_cache_file.as_deref() {
+            experimental.insert(
+                "cache_file".to_string(),
+                json!({
+                    "enabled": true,
+                    "path": path,
+                    "store_fakeip": true,
+                }),
+            );
+        }
+    }
     if let Some(port) = options.traffic_api_port {
-        config["experimental"] = json!({
-            "clash_api": {
+        experimental.insert(
+            "clash_api".to_string(),
+            json!({
                 "external_controller": format!("127.0.0.1:{port}"),
                 "secret": options.traffic_api_secret,
-            },
-        });
+            }),
+        );
+    }
+    if !experimental.is_empty() {
+        config["experimental"] = Value::Object(experimental);
     }
     config
 }
@@ -261,14 +285,30 @@ fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
         }));
     }
 
-    (
-        json!({
-            "servers": servers,
-            "rules": rules,
-            "final": "dns-proxy",
-        }),
-        has_subscription_dns,
-    )
+    let use_fakeip = request.tun;
+    if use_fakeip {
+        servers.push(json!({
+            "type": "fakeip",
+            "tag": "dns-fakeip",
+            "inet4_range": "198.18.0.0/15",
+            "inet6_range": "fc00::/18",
+        }));
+        rules.push(json!({
+            "query_type": ["A", "AAAA"],
+            "action": "route",
+            "server": "dns-fakeip",
+        }));
+    }
+
+    let mut dns = json!({
+        "servers": servers,
+        "rules": rules,
+        "final": "dns-proxy",
+    });
+    if use_fakeip {
+        dns["independent_cache"] = json!(true);
+    }
+    (dns, has_subscription_dns)
 }
 
 fn subscription_https_dns_server(value: &str) -> Option<Value> {
@@ -496,18 +536,19 @@ fn node_to_outbound(node: &ProxyNode) -> Value {
     Value::Object(object)
 }
 
-fn selected_proxy_endpoint_routes(request: &ConnectionRequest) -> Vec<String> {
+// Selectors can switch at runtime without rebuilding TUN routes, so every
+// literal proxy endpoint must bypass the TUN from startup.
+fn proxy_endpoint_routes(request: &ConnectionRequest) -> Vec<String> {
+    let mut seen = HashSet::new();
     request
         .nodes
         .iter()
-        .find(|node| node.tag == request.selected_tag)
-        .or_else(|| request.nodes.first())
-        .and_then(|node| node.server.parse::<IpAddr>().ok())
+        .filter_map(|node| node.server.parse::<IpAddr>().ok())
+        .filter(|address| seen.insert(*address))
         .map(|address| match address {
             IpAddr::V4(address) => format!("{address}/32"),
             IpAddr::V6(address) => format!("{address}/128"),
         })
-        .into_iter()
         .collect()
 }
 
@@ -595,6 +636,11 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert_eq!(config["outbounds"][0]["type"], "hysteria2");
         assert_eq!(config["outbounds"][2]["type"], "selector");
         assert_eq!(config["inbounds"][1]["type"], "tun");
+        assert_eq!(
+            config["inbounds"][1]["address"],
+            json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+        );
+        assert!(config["dns"].get("strategy").is_none());
         assert_eq!(config["route"]["final"], "proxy");
         assert_eq!(config["route"]["auto_detect_interface"], true);
         assert_eq!(config["route"]["rules"][0]["port"], 53);
@@ -621,7 +667,17 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert!(config["dns"]["servers"][1].get("detour").is_none());
         assert_eq!(config["dns"]["servers"][2]["server"], "1.1.1.1");
         assert_eq!(config["dns"]["servers"][2]["detour"], "proxy");
+        assert_eq!(config["dns"]["servers"][3]["type"], "fakeip");
+        assert_eq!(config["dns"]["servers"][3]["tag"], "dns-fakeip");
+        assert_eq!(config["dns"]["servers"][3]["inet4_range"], "198.18.0.0/15");
+        assert_eq!(config["dns"]["servers"][3]["inet6_range"], "fc00::/18");
         assert_eq!(config["dns"]["rules"][2]["rule_set"], "geosite-cn");
+        assert_eq!(
+            config["dns"]["rules"][3]["query_type"],
+            json!(["A", "AAAA"])
+        );
+        assert_eq!(config["dns"]["rules"][3]["server"], "dns-fakeip");
+        assert_eq!(config["dns"]["independent_cache"], true);
         assert_eq!(config["route"]["default_domain_resolver"], "dns-bootstrap");
         assert_eq!(
             config["experimental"]["clash_api"]["external_controller"],
@@ -655,6 +711,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
 
             assert_eq!(config["route"]["final"], expected_final);
             assert_eq!(config["route"]["auto_detect_interface"], false);
+            assert!(config["dns"].get("strategy").is_none());
             assert_eq!(config["route"]["rules"].as_array().map(Vec::len), Some(1));
             assert!(config["route"]["rule_set"]
                 .as_array()
@@ -770,7 +827,59 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert_eq!(dns_rules[2]["domain_suffix"], json!(["corp.example"]));
         assert_eq!(dns_rules[2]["server"], "dns-direct");
         assert_eq!(dns_rules[3]["rule_set"], "geosite-cn");
-        assert_eq!(dns_rules.len(), 4);
+        assert_eq!(dns_rules[4]["server"], "dns-fakeip");
+        assert_eq!(dns_rules.len(), 5);
+    }
+
+    #[test]
+    fn fakeip_is_enabled_only_for_proxy_tun_configs() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",
+        )
+        .nodes;
+        let mut request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Global,
+            tun: true,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let options = SingBoxOptions {
+            fakeip_cache_file: Some("/app-data/cache/sing-box.db".to_string()),
+            ..SingBoxOptions::default()
+        };
+        let config = build_singbox_config(&request, &options);
+        assert!(config["dns"]["servers"]
+            .as_array()
+            .is_some_and(|servers| { servers.iter().any(|server| server["tag"] == "dns-fakeip") }));
+        assert_eq!(config["dns"]["independent_cache"], true);
+        assert_eq!(config["experimental"]["cache_file"]["enabled"], true);
+        assert_eq!(
+            config["experimental"]["cache_file"]["path"],
+            "/app-data/cache/sing-box.db"
+        );
+        assert_eq!(config["experimental"]["cache_file"]["store_fakeip"], true);
+
+        request.tun = false;
+        let config = build_singbox_config(&request, &options);
+        assert!(config["dns"]["servers"]
+            .as_array()
+            .is_some_and(|servers| { servers.iter().all(|server| server["tag"] != "dns-fakeip") }));
+        assert!(config["dns"].get("independent_cache").is_none());
+        assert!(config.get("experimental").is_none());
+
+        request.tun = true;
+        request.mode = TunnelMode::Direct;
+        let config = build_singbox_config(&request, &options);
+        assert_eq!(config["dns"]["final"], "dns-direct");
+        assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(1));
+        assert!(config["dns"].get("independent_cache").is_none());
+        assert!(config.get("experimental").is_none());
     }
 
     #[test]
@@ -897,7 +1006,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
     }
 
     #[test]
-    fn builds_http_and_socks_outbounds_and_excludes_ip_endpoints_from_tun() {
+    fn builds_http_and_socks_outbounds_and_excludes_all_ip_endpoints_from_tun() {
         let nodes = parse_subscription(
             "http://100.64.0.2:11080#Company\n\
 socks5://alice:secret@127.0.0.1:1080#Socks",
@@ -924,8 +1033,43 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
         assert_eq!(config["outbounds"][1]["username"], "alice");
         assert_eq!(
             config["inbounds"][1]["route_exclude_address"],
-            json!(["100.64.0.2/32"])
+            json!(["100.64.0.2/32", "127.0.0.1/32"])
         );
+    }
+
+    #[test]
+    fn tun_excludes_literal_endpoints_for_runtime_selection_without_inventing_domain_routes() {
+        let mut nodes = parse_subscription(
+            "http://proxy.example.com:8080#Domain\n\
+http://192.0.2.10:8080#IPv4\n\
+http://198.51.100.20:8080#IPv6\n\
+http://192.0.2.10:8081#Duplicate",
+        )
+        .nodes;
+        nodes[2].server = "2001:db8::7".to_string();
+        let mut request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Global,
+            tun: true,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+
+        assert_eq!(
+            config["inbounds"][1]["route_exclude_address"],
+            json!(["192.0.2.10/32", "2001:db8::7/128"])
+        );
+
+        request.tun = false;
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        assert_eq!(config["inbounds"].as_array().map(Vec::len), Some(1));
+        assert!(config["inbounds"][0].get("route_exclude_address").is_none());
     }
 
     #[test]
