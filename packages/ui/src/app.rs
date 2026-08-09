@@ -1,20 +1,20 @@
 use api::{
     CoreLogEntry, CoreTraffic, NodeLatency, RouteDecision, RouteLogDetail, RouteTargetKind,
-    SystemProxyStatus,
+    SyncConfig, SyncProviderKind, SystemProxyStatus,
 };
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
     LdActivity, LdArrowDown, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight,
-    LdCircleAlert, LdCircleCheck, LdClock3, LdGauge, LdGlobe, LdInfo, LdLanguages, LdListFilter,
-    LdMoon, LdNetwork, LdPause, LdPencil, LdPlay, LdPlus, LdPower, LdRadioTower, LdRefreshCw,
-    LdRoute, LdSave, LdScrollText, LdSearch, LdServer, LdSettings, LdShieldCheck, LdSun, LdTrash2,
-    LdWifi, LdX, LdZap,
+    LdCircleAlert, LdCircleCheck, LdClock3, LdCloud, LdCloudDownload, LdCloudUpload, LdGauge,
+    LdGlobe, LdInfo, LdLanguages, LdListFilter, LdMoon, LdNetwork, LdPause, LdPencil, LdPlay,
+    LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRoute, LdSave, LdScrollText, LdSearch, LdServer,
+    LdSettings, LdShieldCheck, LdSun, LdTrash2, LdWifi, LdX, LdZap,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
     validate_custom_rules, AppProfile, ConnectionRequest, CustomRule, CustomRuleAction,
     CustomRuleMatch, ParseReport, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol,
-    Subscription, TunnelMode, MAX_CUSTOM_RULES,
+    Subscription, SyncSnapshot, TunnelMode, MAX_CUSTOM_RULES,
 };
 use std::collections::HashMap;
 
@@ -160,6 +160,14 @@ enum LogFilter {
 enum RefreshTarget {
     One(u64),
     All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAction {
+    Save,
+    Pull,
+    Push,
+    ForcePush,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -861,6 +869,8 @@ pub fn ProxyApp(platform: String) -> Element {
                             dark_mode,
                             nodes,
                             selected_tag,
+                            subscriptions,
+                            active_subscription_id,
                             proxy_server_nameservers: active_subscription_proxy_server_nameservers(
                                 &subscriptions(),
                                 active_subscription_id(),
@@ -3075,6 +3085,410 @@ fn route_target_kind_label(kind: RouteTargetKind) -> &'static str {
 }
 
 #[component]
+fn SyncSettings(
+    mut subscriptions: Signal<Vec<Subscription>>,
+    mut active_subscription_id: Signal<Option<u64>>,
+    mut nodes: Signal<Vec<ProxyNode>>,
+    mut selected_tag: Signal<String>,
+    mut custom_rules: Signal<Vec<CustomRule>>,
+    mut group_selections: Signal<HashMap<String, String>>,
+    tunnel_mode: Signal<TunnelMode>,
+    tun_enabled: Signal<bool>,
+    allow_lan: Signal<bool>,
+    dark_mode: Signal<bool>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
+    connected: Signal<bool>,
+) -> Element {
+    let toast = use_context::<ToastManager>();
+    let mut config = use_signal(SyncConfig::default);
+    let mut loaded = use_signal(|| false);
+    let mut busy = use_signal(|| None::<SyncAction>);
+    let mut confirm = use_signal(|| None::<SyncAction>);
+
+    use_effect(move || {
+        spawn(async move {
+            match api::load_sync_config().await {
+                Ok(saved) => config.set(saved),
+                Err(error) => toast.error(format!("同步配置读取失败: {error}")),
+            }
+            loaded.set(true);
+        });
+    });
+
+    let current = config();
+    let provider = current.provider;
+    let sync_enabled = current.enabled;
+    let sync_busy = busy().is_some();
+    let last_sync_at = current.last_sync_at;
+
+    rsx! {
+        section { class: "settings-section sync-settings glass-surface",
+            div { class: "section-heading",
+                div {
+                    p { class: "eyebrow", "REMOTE SYNC" }
+                    h2 { "规则与订阅同步" }
+                }
+                span {
+                    class: if last_sync_at > 0 { "status-badge ready" } else if sync_enabled { "status-badge pending" } else { "status-badge" },
+                    if !loaded() { "读取中" } else if last_sync_at > 0 { "已同步" } else if sync_enabled { "待同步" } else { "未启用" }
+                }
+            }
+
+            div { class: "sync-provider-row",
+                div { class: "segmented-control sync-provider-control", aria_label: "同步存储类型",
+                    button {
+                        class: if provider == SyncProviderKind::WebDav { "active" } else { "" },
+                        disabled: sync_busy,
+                        onclick: move |_| config.write().provider = SyncProviderKind::WebDav,
+                        "WebDAV"
+                    }
+                    button {
+                        class: if provider == SyncProviderKind::S3 { "active" } else { "" },
+                        disabled: sync_busy,
+                        onclick: move |_| config.write().provider = SyncProviderKind::S3,
+                        "S3 兼容"
+                    }
+                }
+                label { class: "setting-row toggle-row sync-enable-row",
+                    span { class: "setting-icon", Icon { icon: LdCloud, width: 19, height: 19 } }
+                    div {
+                        strong { "远端同步" }
+                        small { if sync_enabled { "已启用" } else { "已停用" } }
+                    }
+                    input {
+                        r#type: "checkbox",
+                        checked: sync_enabled,
+                        disabled: sync_busy,
+                        onchange: move |event| config.write().enabled = event.checked(),
+                    }
+                    span { class: "switch" }
+                }
+            }
+
+            div { class: "inline-note sync-security-note",
+                Icon { icon: LdInfo, width: 16, height: 16 }
+                span { "远端文件包含订阅地址、节点凭据和自定义规则" }
+            }
+
+            div { class: "sync-form-grid",
+                label { class: "sync-field sync-endpoint-field",
+                    span { if provider == SyncProviderKind::WebDav { "WebDAV 地址" } else { "S3 Endpoint" } }
+                    input {
+                        value: current.endpoint,
+                        disabled: sync_busy,
+                        placeholder: if provider == SyncProviderKind::WebDav { "https://dav.example.com/remote.php/dav/files/user" } else { "留空使用 AWS，或填写 https://minio.example.com" },
+                        spellcheck: "false",
+                        oninput: move |event| config.write().endpoint = event.value(),
+                    }
+                }
+                label { class: "sync-field",
+                    span { "远程文件" }
+                    input {
+                        value: current.path,
+                        disabled: sync_busy,
+                        placeholder: "kitty-pro-sync.json",
+                        spellcheck: "false",
+                        oninput: move |event| config.write().path = event.value(),
+                    }
+                }
+
+                if provider == SyncProviderKind::WebDav {
+                    label { class: "sync-field",
+                        span { "用户名" }
+                        input {
+                            value: current.username,
+                            disabled: sync_busy,
+                            autocomplete: "username",
+                            oninput: move |event| config.write().username = event.value(),
+                        }
+                    }
+                    label { class: "sync-field",
+                        span { "密码 / 应用密码" }
+                        input {
+                            r#type: "password",
+                            value: current.password,
+                            disabled: sync_busy,
+                            autocomplete: "current-password",
+                            oninput: move |event| config.write().password = event.value(),
+                        }
+                    }
+                } else {
+                    label { class: "sync-field",
+                        span { "Bucket" }
+                        input {
+                            value: current.bucket,
+                            disabled: sync_busy,
+                            spellcheck: "false",
+                            oninput: move |event| config.write().bucket = event.value(),
+                        }
+                    }
+                    label { class: "sync-field",
+                        span { "Region" }
+                        input {
+                            value: current.region,
+                            disabled: sync_busy,
+                            placeholder: "us-east-1",
+                            spellcheck: "false",
+                            oninput: move |event| config.write().region = event.value(),
+                        }
+                    }
+                    label { class: "sync-field",
+                        span { "Access Key" }
+                        input {
+                            value: current.access_key,
+                            disabled: sync_busy,
+                            autocomplete: "off",
+                            spellcheck: "false",
+                            oninput: move |event| config.write().access_key = event.value(),
+                        }
+                    }
+                    label { class: "sync-field",
+                        span { "Secret Key" }
+                        input {
+                            r#type: "password",
+                            value: current.secret_key,
+                            disabled: sync_busy,
+                            autocomplete: "off",
+                            oninput: move |event| config.write().secret_key = event.value(),
+                        }
+                    }
+                }
+            }
+
+            div { class: "sync-actions",
+                button {
+                    class: "secondary-button compact",
+                    disabled: !loaded() || sync_busy,
+                    onclick: move |_| {
+                        confirm.set(None);
+                        let value = config();
+                        async move {
+                            busy.set(Some(SyncAction::Save));
+                            match api::save_sync_config(value).await {
+                                Ok(saved) => {
+                                    config.set(saved);
+                                    toast.success("同步配置已保存");
+                                }
+                                Err(error) => toast.error(format!("同步配置保存失败: {error}")),
+                            }
+                            busy.set(None);
+                        }
+                    },
+                    if busy() == Some(SyncAction::Save) { span { class: "spinner" } }
+                    else { Icon { icon: LdSave, width: 16, height: 16 } }
+                    "保存"
+                }
+                button {
+                    class: "secondary-button compact",
+                    disabled: !loaded() || sync_busy || !sync_enabled,
+                    title: "使用远程规则和订阅替换本机数据",
+                    onclick: move |_| async move {
+                        if confirm() != Some(SyncAction::Pull) {
+                            confirm.set(Some(SyncAction::Pull));
+                            return;
+                        }
+                        confirm.set(None);
+                        let value = config();
+                        busy.set(Some(SyncAction::Pull));
+                        match api::sync_pull(value.clone()).await {
+                            Ok(downloaded) => {
+                                let snapshot = downloaded.snapshot;
+                                let profile = AppProfile {
+                                    subscriptions: subscriptions(),
+                                    active_subscription_id: active_subscription_id(),
+                                    selected_tag: selected_tag(),
+                                    tunnel_mode: tunnel_mode(),
+                                    tun_enabled: tun_enabled(),
+                                    allow_lan: allow_lan(),
+                                    dark_mode: dark_mode(),
+                                    custom_rules: custom_rules(),
+                                    config_script_enabled: config_script_enabled(),
+                                    config_script: config_script(),
+                                    group_selections: group_selections(),
+                                    ..AppProfile::default()
+                                };
+                                let result = api::commit_sync_pull(
+                                    value,
+                                    profile,
+                                    snapshot.clone(),
+                                    downloaded.remote_revision,
+                                )
+                                .await;
+                                let result = match result {
+                                    Ok(result) => result,
+                                    Err(error) => {
+                                        toast.error(format!(
+                                            "远端数据已下载，但保存到本机失败: {error}"
+                                        ));
+                                        busy.set(None);
+                                        return;
+                                    }
+                                };
+                                apply_sync_snapshot(
+                                    snapshot,
+                                    subscriptions,
+                                    active_subscription_id,
+                                    nodes,
+                                    selected_tag,
+                                    custom_rules,
+                                    group_selections,
+                                );
+                                if result.checkpoint_saved {
+                                    let mut current = config.write();
+                                    current.last_sync_at = result.updated_at;
+                                    current.last_remote_revision = result.remote_revision.clone();
+                                }
+                                toast.success(format!(
+                                    "已下载 {} 个订阅和 {} 条规则{}",
+                                    result.subscription_count,
+                                    result.rule_count,
+                                    if connected() { "，重新连接后生效" } else { "" }
+                                ));
+                                if let Some(warning) = result.warning {
+                                    toast.info(warning);
+                                }
+                            }
+                            Err(error) => toast.error(format!("远端下载失败: {error}")),
+                        }
+                        busy.set(None);
+                    },
+                    if busy() == Some(SyncAction::Pull) { span { class: "spinner" } }
+                    else { Icon { icon: LdCloudDownload, width: 17, height: 17 } }
+                    if confirm() == Some(SyncAction::Pull) { "确认覆盖本机" } else { "下载覆盖本机" }
+                }
+                button {
+                    class: "primary-button compact",
+                    disabled: !loaded() || sync_busy || !sync_enabled,
+                    onclick: move |_| {
+                        confirm.set(None);
+                        let value = config();
+                        let snapshot = build_sync_snapshot(
+                            &subscriptions(),
+                            active_subscription_id(),
+                            &selected_tag(),
+                            &custom_rules(),
+                            &group_selections(),
+                            value.last_sync_at,
+                        );
+                        async move {
+                            busy.set(Some(SyncAction::Push));
+                            let result = api::sync_push(value, snapshot, false).await;
+                            match result {
+                                Ok(result) => {
+                                    if result.checkpoint_saved {
+                                        let mut current = config.write();
+                                        current.last_sync_at = result.updated_at;
+                                        current.last_remote_revision = result.remote_revision.clone();
+                                    }
+                                    toast.success(format!(
+                                        "已上传 {} 个订阅和 {} 条规则",
+                                        result.subscription_count, result.rule_count
+                                    ));
+                                    if let Some(warning) = result.warning {
+                                        toast.info(warning);
+                                    }
+                                }
+                                Err(error) => toast.error(format!("远端上传失败: {error}")),
+                            }
+                            busy.set(None);
+                        }
+                    },
+                    if busy() == Some(SyncAction::Push) { span { class: "spinner" } }
+                    else { Icon { icon: LdCloudUpload, width: 17, height: 17 } }
+                    "上传"
+                }
+                button {
+                    class: "secondary-button compact danger-text-button",
+                    disabled: !loaded() || sync_busy || !sync_enabled,
+                    title: "忽略远端版本并使用本机数据覆盖",
+                    onclick: move |_| async move {
+                        if confirm() != Some(SyncAction::ForcePush) {
+                            confirm.set(Some(SyncAction::ForcePush));
+                            return;
+                        }
+                        confirm.set(None);
+                        let value = config();
+                        let snapshot = build_sync_snapshot(
+                            &subscriptions(),
+                            active_subscription_id(),
+                            &selected_tag(),
+                            &custom_rules(),
+                            &group_selections(),
+                            value.last_sync_at,
+                        );
+                        busy.set(Some(SyncAction::ForcePush));
+                        let result = api::sync_push(value, snapshot, true).await;
+                        match result {
+                            Ok(result) => {
+                                if result.checkpoint_saved {
+                                    let mut current = config.write();
+                                    current.last_sync_at = result.updated_at;
+                                    current.last_remote_revision = result.remote_revision.clone();
+                                }
+                                toast.success("已覆盖远端同步文件");
+                                if let Some(warning) = result.warning {
+                                    toast.info(warning);
+                                }
+                            }
+                            Err(error) => toast.error(format!("覆盖远端失败: {error}")),
+                        }
+                        busy.set(None);
+                    },
+                    if busy() == Some(SyncAction::ForcePush) { span { class: "spinner" } }
+                    else { Icon { icon: LdCloudUpload, width: 17, height: 17 } }
+                    if confirm() == Some(SyncAction::ForcePush) { "确认覆盖远端" } else { "覆盖远端" }
+                }
+            }
+        }
+    }
+}
+
+fn build_sync_snapshot(
+    subscriptions: &[Subscription],
+    active_subscription_id: Option<u64>,
+    selected_tag: &str,
+    custom_rules: &[CustomRule],
+    group_selections: &HashMap<String, String>,
+    updated_at: u64,
+) -> SyncSnapshot {
+    SyncSnapshot {
+        format: proxy_core::SYNC_SNAPSHOT_FORMAT.to_string(),
+        version: 1,
+        updated_at,
+        subscriptions: subscriptions.to_vec(),
+        active_subscription_id,
+        selected_tag: selected_tag.to_string(),
+        custom_rules: custom_rules.to_vec(),
+        group_selections: group_selections.clone(),
+    }
+}
+
+fn apply_sync_snapshot(
+    snapshot: SyncSnapshot,
+    mut subscriptions: Signal<Vec<Subscription>>,
+    mut active_subscription_id: Signal<Option<u64>>,
+    mut nodes: Signal<Vec<ProxyNode>>,
+    mut selected_tag: Signal<String>,
+    mut custom_rules: Signal<Vec<CustomRule>>,
+    mut group_selections: Signal<HashMap<String, String>>,
+) {
+    let restored_active_id = resolve_active_subscription_id(
+        &snapshot.subscriptions,
+        snapshot.active_subscription_id,
+        &snapshot.selected_tag,
+    );
+    let restored_nodes = collect_subscription_nodes(&snapshot.subscriptions, restored_active_id);
+    let restored_tag = select_available_tag(&restored_nodes, &snapshot.selected_tag);
+    subscriptions.set(snapshot.subscriptions);
+    active_subscription_id.set(restored_active_id);
+    nodes.set(restored_nodes);
+    selected_tag.set(restored_tag);
+    custom_rules.set(snapshot.custom_rules);
+    group_selections.set(snapshot.group_selections);
+}
+
+#[component]
 fn SettingsView(
     platform: String,
     mut core_state: Signal<String>,
@@ -3086,13 +3500,15 @@ fn SettingsView(
     mut tun_enabled: Signal<bool>,
     mut allow_lan: Signal<bool>,
     mut dark_mode: Signal<bool>,
-    nodes: Signal<Vec<ProxyNode>>,
-    selected_tag: Signal<String>,
+    mut nodes: Signal<Vec<ProxyNode>>,
+    mut selected_tag: Signal<String>,
+    mut subscriptions: Signal<Vec<Subscription>>,
+    mut active_subscription_id: Signal<Option<u64>>,
     proxy_server_nameservers: Vec<String>,
-    custom_rules: Signal<Vec<CustomRule>>,
+    mut custom_rules: Signal<Vec<CustomRule>>,
     mut config_script_enabled: Signal<bool>,
     mut config_script: Signal<String>,
-    group_selections: Signal<HashMap<String, String>>,
+    mut group_selections: Signal<HashMap<String, String>>,
 ) -> Element {
     let mut script_check_busy = use_signal(|| false);
     let mut script_editor_open = use_signal(|| false);
@@ -3173,6 +3589,22 @@ fn SettingsView(
                         span { class: "switch" }
                     }
                 }
+            }
+
+            SyncSettings {
+                subscriptions,
+                active_subscription_id,
+                nodes,
+                selected_tag,
+                custom_rules,
+                group_selections,
+                tunnel_mode,
+                tun_enabled,
+                allow_lan,
+                dark_mode,
+                config_script_enabled,
+                config_script,
+                connected,
             }
 
             section { class: "settings-section glass-surface",

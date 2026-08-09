@@ -3,6 +3,7 @@
 use dioxus::prelude::*;
 use proxy_core::{
     AppProfile, ConnectionRequest, ParseReport, ProxyGroup, ProxyNode, RuleSetCachePaths,
+    SyncSnapshot,
 };
 
 #[cfg(target_os = "macos")]
@@ -12,6 +13,11 @@ use proxy_core::{
     SingBoxOptions, TunnelMode, CHINA_GEOIP_RULE_SET_URL, CHINA_GEOSITE_RULE_SET_URL,
 };
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(target_arch = "wasm32"))]
+mod sync;
+#[cfg(not(target_arch = "wasm32"))]
+use sync::{load_native_sync_config, save_native_sync_config, save_native_sync_state};
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -131,6 +137,91 @@ pub struct SystemProxyStatus {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncProviderKind {
+    WebDav,
+    S3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub provider: SyncProviderKind,
+    /// WebDAV base URL or S3-compatible endpoint.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Remote object path. For S3 this is the object key.
+    #[serde(default = "default_sync_path")]
+    pub path: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default = "default_sync_region")]
+    pub region: String,
+    #[serde(default)]
+    pub access_key: String,
+    #[serde(default)]
+    pub secret_key: String,
+    /// Timestamp of the last successful remote read/write, kept locally.
+    #[serde(default)]
+    pub last_sync_at: u64,
+    /// Opaque ETag returned by the current remote target, kept locally.
+    #[serde(default)]
+    pub last_remote_revision: String,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: SyncProviderKind::WebDav,
+            endpoint: String::new(),
+            path: default_sync_path(),
+            username: String::new(),
+            password: String::new(),
+            bucket: String::new(),
+            region: default_sync_region(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            last_sync_at: 0,
+            last_remote_revision: String::new(),
+        }
+    }
+}
+
+fn default_sync_path() -> String {
+    "kitty-pro-sync.json".to_string()
+}
+
+fn default_sync_region() -> String {
+    "us-east-1".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncResult {
+    pub updated_at: u64,
+    pub subscription_count: usize,
+    pub rule_count: usize,
+    #[serde(default)]
+    pub remote_revision: String,
+    #[serde(default)]
+    pub checkpoint_saved: bool,
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncPullResult {
+    pub snapshot: SyncSnapshot,
+    #[serde(default)]
+    pub remote_revision: String,
+}
+
 #[cfg_attr(
     all(
         not(any(target_os = "android", target_os = "ios")),
@@ -154,6 +245,177 @@ pub async fn save_profile(profile: AppProfile) -> Result<(), ServerFnError> {
         save_native_profile(&profile)
     })
     .await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    get("/api/sync/config")
+)]
+pub async fn load_sync_config() -> Result<SyncConfig, ServerFnError> {
+    run_native_blocking("读取同步配置任务失败", load_native_sync_config).await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/sync/config")
+)]
+pub async fn save_sync_config(config: SyncConfig) -> Result<SyncConfig, ServerFnError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _guard = sync::operation_lock().lock().await;
+        run_native_blocking("保存同步配置任务失败", move || {
+            save_native_sync_config(&config)
+        })
+        .await
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = config;
+        Err(ServerFnError::new("浏览器端不能直接写入同步配置"))
+    }
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/sync/push")
+)]
+pub async fn sync_push(
+    config: SyncConfig,
+    snapshot: SyncSnapshot,
+    force: bool,
+) -> Result<SyncResult, ServerFnError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _guard = sync::operation_lock().lock().await;
+        let config = save_native_sync_config(&config)?;
+        let mut result = sync::push(&config, snapshot, force).await?;
+        let mut saved = config;
+        saved.last_sync_at = result.updated_at;
+        saved.last_remote_revision = result.remote_revision.clone();
+        match save_native_sync_state(&saved) {
+            Ok(()) => result.checkpoint_saved = true,
+            Err(error) => {
+                append_sync_warning(
+                    &mut result,
+                    format!("远端上传成功，但本地同步基线保存失败: {error}"),
+                );
+            }
+        }
+        Ok(result)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (config, snapshot, force);
+        Err(ServerFnError::new("浏览器目标不能直接同步配置"))
+    }
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/sync/pull")
+)]
+pub async fn sync_pull(config: SyncConfig) -> Result<SyncPullResult, ServerFnError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _guard = sync::operation_lock().lock().await;
+        let config = save_native_sync_config(&config)?;
+        let downloaded = sync::pull(&config).await?;
+        Ok(SyncPullResult {
+            snapshot: downloaded.snapshot,
+            remote_revision: downloaded.remote_revision,
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = config;
+        Err(ServerFnError::new("浏览器目标不能直接同步配置"))
+    }
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    post("/api/sync/pull/commit")
+)]
+pub async fn commit_sync_pull(
+    config: SyncConfig,
+    mut current_profile: AppProfile,
+    snapshot: SyncSnapshot,
+    remote_revision: String,
+) -> Result<SyncResult, ServerFnError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _guard = sync::operation_lock().lock().await;
+        sync::validate_snapshot(&snapshot)?;
+        sync::validate_remote_revision(&remote_revision)?;
+        let config = save_native_sync_config(&config)?;
+        snapshot.apply_to_profile(&mut current_profile);
+        let profile = current_profile;
+        run_native_blocking("保存下载的同步配置失败", move || {
+            save_native_profile(&profile)
+        })
+        .await?;
+
+        let mut saved = config;
+        saved.last_sync_at = snapshot.updated_at;
+        saved.last_remote_revision = remote_revision.clone();
+        let mut result = SyncResult {
+            updated_at: snapshot.updated_at,
+            subscription_count: snapshot.subscriptions.len(),
+            rule_count: snapshot.custom_rules.len(),
+            remote_revision,
+            checkpoint_saved: false,
+            warning: None,
+        };
+        match save_native_sync_state(&saved) {
+            Ok(()) => result.checkpoint_saved = true,
+            Err(error) => {
+                result.warning = Some(format!("远端数据已保存到本机，但同步基线保存失败: {error}"));
+            }
+        }
+        Ok(result)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (config, current_profile, snapshot, remote_revision);
+        Err(ServerFnError::new("浏览器目标不能直接提交同步配置"))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn append_sync_warning(result: &mut SyncResult, warning: String) {
+    if let Some(existing) = &mut result.warning {
+        existing.push('；');
+        existing.push_str(&warning);
+    } else {
+        result.warning = Some(warning);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+fn load_native_sync_config() -> Result<SyncConfig, ServerFnError> {
+    Ok(SyncConfig::default())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+fn save_native_sync_config(_config: &SyncConfig) -> Result<SyncConfig, ServerFnError> {
+    Err(ServerFnError::new("浏览器端不能直接写入同步配置"))
 }
 
 #[cfg_attr(

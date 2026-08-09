@@ -2127,6 +2127,94 @@ body {
   grid-column: 1 / -1;
 }
 
+.sync-settings {
+  grid-column: 1 / -1;
+}
+
+.sync-provider-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(280px, 1.2fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.sync-provider-control {
+  width: 100%;
+}
+
+.sync-enable-row {
+  margin-top: 0;
+}
+
+.sync-security-note {
+  margin-top: 12px;
+}
+
+.sync-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.sync-field {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.sync-field > span {
+  color: var(--text-faint);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.sync-field input {
+  width: 100%;
+  height: 40px;
+  min-width: 0;
+  padding: 0 11px;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: 0;
+  background: var(--surface-soft);
+  font: inherit;
+  font-size: 11px;
+}
+
+.sync-field input:focus {
+  border-color: rgba(19, 122, 97, 0.5);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.sync-field input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.sync-endpoint-field {
+  grid-column: 1 / -1;
+}
+
+.sync-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.danger-text-button {
+  color: var(--coral);
+}
+
+.danger-text-button:hover:not(:disabled) {
+  border-color: rgba(185, 78, 78, 0.24);
+  background: var(--coral-soft);
+}
+
 .script-setting-row .icon-button {
   flex: 0 0 38px;
 }
@@ -2529,6 +2617,10 @@ body {
   .script-settings {
     grid-column: auto;
   }
+
+  .sync-settings {
+    grid-column: auto;
+  }
 }
 
 @media (max-width: 760px) {
@@ -2784,6 +2876,29 @@ body {
 
   .script-settings {
     grid-column: auto;
+  }
+
+  .sync-settings {
+    grid-column: auto;
+  }
+
+  .sync-provider-row,
+  .sync-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .sync-endpoint-field {
+    grid-column: auto;
+  }
+
+  .sync-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sync-actions .primary-button,
+  .sync-actions .secondary-button {
+    width: 100%;
   }
 
   .workspace-toolbar {

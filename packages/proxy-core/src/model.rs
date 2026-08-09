@@ -4,6 +4,7 @@ use std::fmt;
 use thiserror::Error;
 
 pub const MAX_CUSTOM_RULES: usize = 256;
+pub const SYNC_SNAPSHOT_FORMAT: &str = "kitty-pro-sync";
 const MAX_CUSTOM_RULE_VALUE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -391,6 +392,60 @@ pub struct AppProfile {
     pub group_selections: HashMap<String, String>,
 }
 
+/// The portable part of a profile shared between devices.
+///
+/// Device-local networking and UI preferences deliberately stay out of this
+/// structure. `updated_at` is a Unix timestamp used for optimistic conflict
+/// detection by the remote storage adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSnapshot {
+    pub format: String,
+    pub version: u32,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub subscriptions: Vec<Subscription>,
+    #[serde(default)]
+    pub active_subscription_id: Option<u64>,
+    #[serde(default)]
+    pub selected_tag: String,
+    #[serde(default)]
+    pub custom_rules: Vec<CustomRule>,
+    #[serde(default)]
+    pub group_selections: HashMap<String, String>,
+}
+
+impl SyncSnapshot {
+    pub fn from_profile(profile: &AppProfile, updated_at: u64) -> Self {
+        Self {
+            format: default_sync_snapshot_format(),
+            version: default_sync_snapshot_version(),
+            updated_at,
+            subscriptions: profile.subscriptions.clone(),
+            active_subscription_id: profile.active_subscription_id,
+            selected_tag: profile.selected_tag.clone(),
+            custom_rules: profile.custom_rules.clone(),
+            group_selections: profile.group_selections.clone(),
+        }
+    }
+
+    pub fn apply_to_profile(&self, profile: &mut AppProfile) {
+        profile.subscriptions = self.subscriptions.clone();
+        profile.active_subscription_id = self.active_subscription_id;
+        profile.selected_tag = self.selected_tag.clone();
+        profile.custom_rules = self.custom_rules.clone();
+        profile.group_selections = self.group_selections.clone();
+    }
+}
+
+fn default_sync_snapshot_format() -> String {
+    SYNC_SNAPSHOT_FORMAT.to_string()
+}
+
+const fn default_sync_snapshot_version() -> u32 {
+    1
+}
+
 impl Default for AppProfile {
     fn default() -> Self {
         Self {
@@ -461,6 +516,43 @@ mod tests {
             vec!["https://resolver.example.com/dns-query"]
         );
         assert_eq!(restored.custom_rules.len(), 1);
+    }
+
+    #[test]
+    fn sync_snapshot_only_applies_portable_profile_fields() {
+        let source = AppProfile {
+            active_subscription_id: Some(7),
+            selected_tag: "subscription-7-node".to_string(),
+            dark_mode: true,
+            tun_enabled: true,
+            allow_lan: true,
+            custom_rules: vec![CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::DomainSuffix,
+                value: "example.com".to_string(),
+                action: CustomRuleAction::Proxy,
+            }],
+            ..AppProfile::default()
+        };
+        let snapshot = SyncSnapshot::from_profile(&source, 42);
+        let mut target = AppProfile {
+            dark_mode: false,
+            tun_enabled: false,
+            allow_lan: false,
+            ..AppProfile::default()
+        };
+
+        snapshot.apply_to_profile(&mut target);
+
+        assert_eq!(snapshot.format, SYNC_SNAPSHOT_FORMAT);
+        assert_eq!(snapshot.updated_at, 42);
+        assert_eq!(target.active_subscription_id, Some(7));
+        assert_eq!(target.selected_tag, "subscription-7-node");
+        assert_eq!(target.custom_rules, source.custom_rules);
+        assert!(!target.dark_mode);
+        assert!(!target.tun_enabled);
+        assert!(!target.allow_lan);
     }
 
     #[test]

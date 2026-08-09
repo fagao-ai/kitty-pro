@@ -87,6 +87,29 @@ cannot complete. AppImage/portable builds do not install a persistent root
 service; Linux desktops without polkit should install the distribution's
 polkit package and agent before using TUN.
 
+## Remote rule and subscription sync
+
+The Settings page can synchronize custom rules and subscriptions, including
+their last parsed nodes, through WebDAV or an S3-compatible object store. TUN,
+system proxy, LAN exposure, and appearance settings remain device-local.
+
+- WebDAV accepts an HTTP/HTTPS base URL, optional Basic Auth credentials, and
+  creates missing collections in the configured remote path.
+- S3 uses AWS Signature Version 4. Leave the endpoint empty for AWS S3; custom
+  MinIO, R2, NAS, and other compatible endpoints use path-style object URLs.
+- Normal uploads use the remote ETag with conditional writes, so another
+  device cannot overwrite the object between the version check and upload.
+  Changing the provider, endpoint, bucket/account, or object path resets the
+  local sync baseline. Stores that do not expose ETags require the separate,
+  two-step confirmed remote overwrite action.
+- Downloads persist the merged local profile before advancing the remote
+  revision. The UI provides a separate two-step confirmation before replacing
+  local rules and subscriptions.
+
+Remote snapshots contain subscription URLs and proxy credentials. Use a
+trusted server and HTTPS. Storage credentials stay in Kitty Pro's private
+local `sync.json` and are never included in the remote snapshot.
+
 ## Build an Android APK
 
 On macOS, install Go 1.24, OpenJDK 17, the Android SDK command-line tools,
