@@ -154,6 +154,11 @@ jobs:
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
+      - name: Preserve Dioxus source line endings
+        if: matrix.id == 'windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - name: Checkout Dioxus CLI source
         if: matrix.id == 'windows'
         uses: actions/checkout@v5
