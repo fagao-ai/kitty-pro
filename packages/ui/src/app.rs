@@ -28,6 +28,88 @@ const LATENCY_CACHE_KEY: &str = "kitty-pro.node-latency.v1";
 
 type LatencyCacheEntry = (String, String, u64);
 
+fn build_connection_request(
+    nodes: Vec<ProxyNode>,
+    selected_tag: String,
+    proxy_server_nameservers: Vec<String>,
+    tunnel_mode: Signal<TunnelMode>,
+    tun_enabled: Signal<bool>,
+    allow_lan: Signal<bool>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
+    group_selections: HashMap<String, String>,
+) -> ConnectionRequest {
+    let script_enabled = config_script_enabled();
+    let script = config_script();
+    let custom_rules = connection_custom_rules(script_enabled, &script, custom_rules());
+    let config_script = if script_enabled && !script.trim().is_empty() {
+        Some(script)
+    } else {
+        None
+    };
+
+    ConnectionRequest {
+        nodes,
+        selected_tag,
+        proxy_server_nameservers,
+        mode: tunnel_mode(),
+        tun: tun_enabled(),
+        allow_lan: allow_lan(),
+        custom_rules,
+        config_script,
+        group_selections,
+    }
+}
+
+async fn restart_core_from_ui(
+    request: ConnectionRequest,
+    mut connected: Signal<bool>,
+    mut core_restarting: Signal<bool>,
+    mut core_state: Signal<String>,
+    mut core_version: Signal<Option<String>>,
+    mut core_note: Signal<Option<String>>,
+    toast: ToastManager,
+    success_message: impl Into<String>,
+) -> bool {
+    let success_message = success_message.into();
+    core_restarting.set(true);
+    let success = match api::restart_core(request).await {
+        Ok(status) => {
+            let is_running = status.state == "running";
+            connected.set(is_running);
+            core_state.set(status.state);
+            core_version.set(status.version);
+            core_note.set(status.note);
+            if is_running {
+                toast.success(success_message);
+            } else {
+                toast.info(ANDROID_VPN_WAITING_NOTICE);
+            }
+            true
+        }
+        Err(error) => {
+            toast.error(format!("内核重启失败: {error}"));
+            match api::core_status().await {
+                Ok(status) => {
+                    connected.set(status.state == "running");
+                    core_state.set(status.state);
+                    core_version.set(status.version);
+                    core_note.set(status.note);
+                }
+                Err(status_error) => {
+                    connected.set(false);
+                    core_state.set("unavailable".to_string());
+                    core_note.set(Some(status_error.to_string()));
+                }
+            }
+            false
+        }
+    };
+    core_restarting.set(false);
+    success
+}
+
 fn load_latency_cache_script() -> String {
     r#"
 const key = __CACHE_KEY__;
@@ -823,6 +905,17 @@ pub fn ProxyApp(platform: String) -> Element {
                             all_count: nodes().len(),
                             group_selections,
                             connected,
+                            core_restarting,
+                            core_state,
+                            core_version,
+                            core_note,
+                            selected_tag,
+                            tunnel_mode,
+                            tun_enabled,
+                            allow_lan,
+                            custom_rules,
+                            config_script_enabled,
+                            config_script,
                             search,
                             latency_results,
                             latency_busy,
@@ -837,6 +930,19 @@ pub fn ProxyApp(platform: String) -> Element {
                             nodes,
                             selected_tag,
                             refresh_busy,
+                            connected,
+                            core_busy,
+                            core_restarting,
+                            core_state,
+                            core_version,
+                            core_note,
+                            tunnel_mode,
+                            tun_enabled,
+                            allow_lan,
+                            custom_rules,
+                            config_script_enabled,
+                            config_script,
+                            group_selections,
                         }
                     },
                     AppView::Rules => rsx! {
@@ -955,7 +1061,10 @@ pub fn ProxyApp(platform: String) -> Element {
                             }
                             button {
                                 class: "primary-button",
-                                disabled: import_busy() || import_source().trim().is_empty(),
+                                disabled: import_busy()
+                                    || core_busy()
+                                    || core_restarting()
+                                    || import_source().trim().is_empty(),
                                 onclick: move |_| async move {
                                     import_busy.set(true);
                                     import_error.set(None);
@@ -984,15 +1093,27 @@ pub fn ProxyApp(platform: String) -> Element {
                                                 proxy_server_nameservers,
                                                 rejected_count: rejected,
                                             });
-                                            active_subscription_id.set(Some(id));
-                                            let active_nodes = collect_subscription_nodes(
-                                                &subscriptions(),
-                                                Some(id),
-                                            );
-                                            let next_tag = select_available_tag(&active_nodes, "");
-                                            nodes.set(active_nodes);
-                                            selected_tag.set(next_tag);
-                                            toast.success(format!("已导入并切换到 {name}，共 {count} 个节点"));
+                                            if connected() {
+                                                toast.success(format!("已导入 {name}，共 {count} 个节点"));
+                                            } else {
+                                                active_subscription_id.set(Some(id));
+                                                let active_nodes = collect_subscription_nodes(
+                                                    &subscriptions(),
+                                                    Some(id),
+                                                );
+                                                let next_tag = select_available_tag(&active_nodes, "");
+                                                let mut next_selections = group_selections();
+                                                if next_tag.is_empty() {
+                                                    next_selections.remove("proxy");
+                                                } else {
+                                                    next_selections
+                                                        .insert("proxy".to_string(), next_tag.clone());
+                                                }
+                                                nodes.set(active_nodes);
+                                                selected_tag.set(next_tag);
+                                                group_selections.set(next_selections);
+                                                toast.success(format!("已导入并切换到 {name}，共 {count} 个节点"));
+                                            }
                                             import_source.set(String::new());
                                             import_name.set(String::new());
                                             import_open.set(false);
@@ -1520,6 +1641,17 @@ fn NodesView(
     all_count: usize,
     mut group_selections: Signal<HashMap<String, String>>,
     connected: Signal<bool>,
+    core_restarting: Signal<bool>,
+    core_state: Signal<String>,
+    core_version: Signal<Option<String>>,
+    core_note: Signal<Option<String>>,
+    selected_tag: Signal<String>,
+    tunnel_mode: Signal<TunnelMode>,
+    tun_enabled: Signal<bool>,
+    allow_lan: Signal<bool>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
     mut search: Signal<String>,
     mut latency_results: Signal<HashMap<String, NodeLatency>>,
     mut latency_busy: Signal<bool>,
@@ -1733,6 +1865,19 @@ fn NodesView(
                                         member,
                                         selected: current_selected.clone().unwrap_or_default(),
                                         connected,
+                                        core_restarting,
+                                        core_state,
+                                        core_version,
+                                        core_note,
+                                        nodes: nodes.clone(),
+                                        proxy_server_nameservers: proxy_server_nameservers.clone(),
+                                        selected_tag,
+                                        tunnel_mode,
+                                        tun_enabled,
+                                        allow_lan,
+                                        custom_rules,
+                                        config_script_enabled,
+                                        config_script,
                                         group_selections,
                                         latency_results,
                                     }
@@ -1799,6 +1944,19 @@ fn ProxyGroupMemberRow(
     member: ProxyGroupMember,
     selected: String,
     connected: Signal<bool>,
+    core_restarting: Signal<bool>,
+    core_state: Signal<String>,
+    core_version: Signal<Option<String>>,
+    core_note: Signal<Option<String>>,
+    nodes: Vec<ProxyNode>,
+    proxy_server_nameservers: Vec<String>,
+    mut selected_tag: Signal<String>,
+    tunnel_mode: Signal<TunnelMode>,
+    tun_enabled: Signal<bool>,
+    allow_lan: Signal<bool>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
     mut group_selections: Signal<HashMap<String, String>>,
     latency_results: Signal<HashMap<String, NodeLatency>>,
 ) -> Element {
@@ -1828,14 +1986,56 @@ fn ProxyGroupMemberRow(
             onclick: move |_| {
                 let group = target_group.clone();
                 let outbound = member_tag.clone();
+                let nodes = nodes.clone();
+                let proxy_server_nameservers = proxy_server_nameservers.clone();
                 async move {
-                    if connected() {
-                        if let Err(error) = api::select_proxy_group(group.clone(), outbound.clone()).await {
-                            toast.error(format!("切换 {group} 失败: {error}"));
-                            return;
-                        }
+                    let previous_tag = selected_tag();
+                    let previous_selections = group_selections();
+                    let mut next_selections = previous_selections.clone();
+                    next_selections.insert(group.clone(), outbound.clone());
+                    if group == "proxy" {
+                        selected_tag.set(outbound.clone());
                     }
-                    group_selections.write().insert(group.clone(), outbound.clone());
+                    if connected() {
+                        match api::select_proxy_group(group.clone(), outbound.clone()).await {
+                            Ok(()) => {
+                                group_selections.set(next_selections);
+                                toast.success(format!("{group} 已切换到 {outbound}"));
+                            }
+                            Err(_) => {
+                                group_selections.set(next_selections.clone());
+                                let request = build_connection_request(
+                                    nodes,
+                                    selected_tag(),
+                                    proxy_server_nameservers,
+                                    tunnel_mode,
+                                    tun_enabled,
+                                    allow_lan,
+                                    custom_rules,
+                                    config_script_enabled,
+                                    config_script,
+                                    next_selections,
+                                );
+                                let restarted = restart_core_from_ui(
+                                    request,
+                                    connected,
+                                    core_restarting,
+                                    core_state,
+                                    core_version,
+                                    core_note,
+                                    toast,
+                                    format!("{group} 已切换到 {outbound}，内核已重启"),
+                                )
+                                .await;
+                                if !restarted {
+                                    selected_tag.set(previous_tag);
+                                    group_selections.set(previous_selections);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    group_selections.set(next_selections);
                     toast.success(format!("{group} 已切换到 {outbound}"));
                 }
             },
@@ -2024,6 +2224,19 @@ fn SubscriptionsView(
     nodes: Signal<Vec<ProxyNode>>,
     selected_tag: Signal<String>,
     refresh_busy: Signal<Option<RefreshTarget>>,
+    connected: Signal<bool>,
+    core_busy: Signal<bool>,
+    core_restarting: Signal<bool>,
+    core_state: Signal<String>,
+    core_version: Signal<Option<String>>,
+    core_note: Signal<Option<String>>,
+    tunnel_mode: Signal<TunnelMode>,
+    tun_enabled: Signal<bool>,
+    allow_lan: Signal<bool>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
+    group_selections: Signal<HashMap<String, String>>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
     rsx! {
@@ -2108,6 +2321,19 @@ fn SubscriptionsView(
                             nodes,
                             selected_tag,
                             refresh_busy,
+                            connected,
+                            core_busy,
+                            core_restarting,
+                            core_state,
+                            core_version,
+                            core_note,
+                            tunnel_mode,
+                            tun_enabled,
+                            allow_lan,
+                            custom_rules,
+                            config_script_enabled,
+                            config_script,
+                            group_selections,
                         }
                     }
                 }
@@ -2124,6 +2350,19 @@ fn SubscriptionRow(
     mut nodes: Signal<Vec<ProxyNode>>,
     mut selected_tag: Signal<String>,
     mut refresh_busy: Signal<Option<RefreshTarget>>,
+    connected: Signal<bool>,
+    core_busy: Signal<bool>,
+    core_restarting: Signal<bool>,
+    core_state: Signal<String>,
+    core_version: Signal<Option<String>>,
+    core_note: Signal<Option<String>>,
+    tunnel_mode: Signal<TunnelMode>,
+    tun_enabled: Signal<bool>,
+    allow_lan: Signal<bool>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
+    group_selections: Signal<HashMap<String, String>>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
     let subscription_id = subscription.id;
@@ -2148,15 +2387,63 @@ fn SubscriptionRow(
             }
             button {
                 class: if active { "subscription-use-button active" } else { "subscription-use-button" },
-                disabled: active || refresh_busy().is_some(),
+                disabled: active || refresh_busy().is_some() || core_busy() || core_restarting(),
                 onclick: move |_| {
-                    active_subscription_id.set(Some(subscription_id));
-                    let active_nodes =
-                        collect_subscription_nodes(&subscriptions(), Some(subscription_id));
-                    let next_tag = select_available_tag(&active_nodes, "");
-                    nodes.set(active_nodes);
-                    selected_tag.set(next_tag);
-                    toast.success("已切换订阅");
+                    async move {
+                        let previous_subscription_id = active_subscription_id();
+                        let previous_nodes = nodes();
+                        let previous_tag = selected_tag();
+                        let previous_selections = group_selections();
+                        active_subscription_id.set(Some(subscription_id));
+                        let active_nodes =
+                            collect_subscription_nodes(&subscriptions(), Some(subscription_id));
+                        let next_tag = select_available_tag(&active_nodes, "");
+                        let mut next_selections = previous_selections.clone();
+                        if next_tag.is_empty() {
+                            next_selections.remove("proxy");
+                        } else {
+                            next_selections.insert("proxy".to_string(), next_tag.clone());
+                        }
+                        nodes.set(active_nodes.clone());
+                        selected_tag.set(next_tag.clone());
+                        group_selections.set(next_selections.clone());
+                        if connected() {
+                            let request = build_connection_request(
+                                active_nodes,
+                                next_tag,
+                                active_subscription_proxy_server_nameservers(
+                                    &subscriptions(),
+                                    Some(subscription_id),
+                                ),
+                                tunnel_mode,
+                                tun_enabled,
+                                allow_lan,
+                                custom_rules,
+                                config_script_enabled,
+                                config_script,
+                                next_selections,
+                            );
+                            let restarted = restart_core_from_ui(
+                                request,
+                                connected,
+                                core_restarting,
+                                core_state,
+                                core_version,
+                                core_note,
+                                toast,
+                                "已切换订阅，内核已重启",
+                            )
+                            .await;
+                            if !restarted {
+                                active_subscription_id.set(previous_subscription_id);
+                                nodes.set(previous_nodes);
+                                selected_tag.set(previous_tag);
+                                group_selections.set(previous_selections);
+                            }
+                        } else {
+                            toast.success("已切换订阅");
+                        }
+                    }
                 },
                 if active {
                     Icon { icon: LdCircleCheck, width: 15, height: 15 }
