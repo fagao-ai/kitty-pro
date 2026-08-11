@@ -45,7 +45,7 @@ jobs:
             os: windows-latest
             platform_flag: --windows
             target_args: --target x86_64-pc-windows-gnu
-            bundle_args: --package-types msi --package-types nsis
+            bundle_args: --package-types msi
           - name: Linux
             id: linux
             os: ubuntu-24.04
@@ -112,6 +112,43 @@ jobs:
         shell: bash
         run: rustup target add x86_64-pc-windows-gnu
 
+      - name: Set tagged desktop version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          release_version="$(
+            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
+          )"
+          if ! jq -en --arg version "$release_version" \
+              '$version | test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$")' \
+              >/dev/null; then
+            echo "Release tag $GITHUB_REF_NAME is not a supported package version" >&2
+            exit 1
+          fi
+
+          desktop_manifest="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages[] | select(.name == "desktop") | .manifest_path'
+          )"
+          updated_manifest="$RUNNER_TEMP/desktop-Cargo.toml"
+          jq -Rrsj --arg version "$release_version" '
+            sub(
+              "(?<prefix>\\[package\\]\\s+name\\s*=\\s*\"desktop\"\\s+version\\s*=\\s*\")[^\"]+(?<suffix>\")";
+              "\(.prefix)\($version)\(.suffix)"
+            )
+          ' "$desktop_manifest" > "$updated_manifest"
+          mv "$updated_manifest" "$desktop_manifest"
+
+          # Confirm that all later --locked builds see the tag-derived version.
+          package_version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages[] | select(.name == "desktop") | .version'
+          )"
+          if [[ "$package_version" != "$release_version" ]]; then
+            echo "desktop package version $package_version does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
       - name: Cache Rust builds
         if: matrix.id != 'windows'
         uses: Swatinem/rust-cache@v2
@@ -143,8 +180,8 @@ jobs:
           set -o pipefail
           log="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-build.log"
           if [[ "${{ matrix.id }}" == "windows" ]]; then
-            # dx bundle currently fails inside its Windows GNU workspace
-            # wrapper before exposing the underlying compiler diagnostics.
+            # Pre-build the GNU binary so Cargo emits the WebView2 loader that
+            # Dioxus then picks up through bundle.external_bin.
             if cargo build \
                 --package desktop \
                 --features desktop \
@@ -152,17 +189,90 @@ jobs:
                 --release \
                 --locked \
                 2>&1 | tee "$log"; then
-              build_status=0
-              mkdir -p dist/windows
-              cp target/x86_64-pc-windows-gnu/release/kitty-pro.exe dist/windows/Kitty-Pro.exe
-              (
-                cd dist/windows
-                7z a -tzip -mx=9 Kitty-Pro-windows-x86_64.zip \
-                  Kitty-Pro.exe >/dev/null
-                sha256sum Kitty-Pro.exe > Kitty-Pro.exe.sha256
-                sha256sum Kitty-Pro-windows-x86_64.zip \
-                  > Kitty-Pro-windows-x86_64.zip.sha256
-              )
+              webview2_loader="$(find \
+                target/x86_64-pc-windows-gnu/release/build \
+                -type f \
+                -path '*/webview2-com-sys-*/out/x64/WebView2Loader.dll' \
+                -print -quit)"
+              if [[ -z "$webview2_loader" ]]; then
+                echo 'Unable to locate the x64 WebView2Loader.dll build output' >&2
+                exit 1
+              fi
+
+              mkdir -p target/windows-bundle
+              cp "$webview2_loader" \
+                target/windows-bundle/WebView2Loader.dll-x86_64-pc-windows-gnu
+
+              bundle_output="$RUNNER_TEMP/kitty-pro-windows-bundle.jsonl"
+              if dx bundle \
+                  --package desktop \
+                  ${{ matrix.platform_flag }} \
+                  ${{ matrix.target_args }} \
+                  --fullstack false \
+                  --release \
+                  --verbose \
+                  --json-output \
+                  --locked \
+                  --out-dir dist/windows \
+                  ${{ matrix.bundle_args }} \
+                  2>&1 | tee -a "$log" "$bundle_output"; then
+                build_status=0
+                # Dioxus guarantees that the final JSON line contains the
+                # structured BundleOutput with the generated artifact paths.
+                mapfile -t msi_paths < <(
+                  tail -n 1 "$bundle_output" \
+                    | jq -er \
+                      '.json | fromjson | .BundleOutput.bundles[] | select(ascii_downcase | endswith(".msi"))'
+                )
+                if [[ "${#msi_paths[@]}" -ne 1 ]]; then
+                  echo 'Dioxus did not report exactly one Windows MSI output' >&2
+                  exit 1
+                fi
+
+                msi_path="${msi_paths[0]}"
+                installer="$(pwd -P)/dist/windows/Kitty-Pro-windows-x86_64.msi"
+                test -f "$msi_path"
+                if [[ "$msi_path" != "$installer" ]]; then
+                  mv "$msi_path" "$installer"
+                fi
+
+                extracted_dir="$RUNNER_TEMP/kitty-pro-windows-msi-package"
+                package_dir="$RUNNER_TEMP/kitty-pro-windows-package"
+                mkdir -p "$extracted_dir"
+                mkdir -p "$package_dir"
+                installer_windows="$(cygpath -w "$installer")"
+                extracted_dir_windows="$(cygpath -w "$extracted_dir")"
+                MSYS2_ARG_CONV_EXCL='*' msiexec.exe \
+                  /a "$installer_windows" \
+                  /qn \
+                  TARGETDIR="$extracted_dir_windows"
+                msi_executable="$(find "$extracted_dir" \
+                  -type f -iname 'kitty-pro.exe' -print -quit)"
+                msi_webview2_loader="$(find "$extracted_dir" \
+                  -type f -name 'WebView2Loader.dll' -print -quit)"
+                if [[ -z "$msi_executable" || -z "$msi_webview2_loader" ]]; then
+                  echo 'Dioxus MSI is missing Kitty Pro or WebView2Loader.dll' >&2
+                  exit 1
+                fi
+                cp "$msi_executable" "$package_dir/Kitty-Pro.exe"
+                cp "$msi_webview2_loader" "$package_dir/"
+                (
+                  cd "$package_dir"
+                  7z a -tzip -mx=9 Kitty-Pro-windows-x86_64.zip \
+                    Kitty-Pro.exe WebView2Loader.dll >/dev/null
+                )
+                mv "$package_dir/Kitty-Pro-windows-x86_64.zip" \
+                  "$(dirname "$installer")/"
+                (
+                  cd "$(dirname "$installer")"
+                  sha256sum Kitty-Pro-windows-x86_64.zip \
+                    > Kitty-Pro-windows-x86_64.zip.sha256
+                  sha256sum "$(basename "$installer")" \
+                    > Kitty-Pro-windows-x86_64.msi.sha256
+                )
+              else
+                build_status=${PIPESTATUS[0]}
+              fi
             else
               build_status=${PIPESTATUS[0]}
             fi
@@ -178,6 +288,7 @@ jobs:
                   --package desktop \
                   ${{ matrix.platform_flag }} \
                   ${{ matrix.target_args }} \
+                  --fullstack false \
                   --release \
                   --verbose \
                   --locked \
@@ -199,6 +310,7 @@ jobs:
               --package desktop \
               ${{ matrix.platform_flag }} \
               ${{ matrix.target_args }} \
+              --fullstack false \
               --release \
               --verbose \
               --locked \
@@ -236,24 +348,53 @@ jobs:
               test -n "$(find dist/macos -type f -name '*.dmg' -print -quit)"
               ;;
             windows)
-              test -n "$(find dist/windows -type f -name '*.exe' -print -quit)"
-              test -n "$(find dist/windows -type f -name '*.zip' -print -quit)"
-              objdump -p dist/windows/Kitty-Pro.exe \
+              archive=dist/windows/Kitty-Pro-windows-x86_64.zip
+              installer=dist/windows/Kitty-Pro-windows-x86_64.msi
+              verify_dir="$RUNNER_TEMP/kitty-pro-windows-verify"
+              msi_verify_dir="$RUNNER_TEMP/kitty-pro-windows-msi-verify"
+              test -f "$archive"
+              test -f "$archive.sha256"
+              test -f "$installer"
+              test -f "$installer.sha256"
+              mkdir -p "$verify_dir"
+              7z x -y -o"$verify_dir" "$archive" >/dev/null
+              test -f "$verify_dir/Kitty-Pro.exe"
+              test -f "$verify_dir/WebView2Loader.dll"
+              objdump -p "$verify_dir/Kitty-Pro.exe" \
                 | grep -Eq 'Subsystem.*Windows GUI'
-              if objdump -p dist/windows/Kitty-Pro.exe \
+              objdump -p "$verify_dir/Kitty-Pro.exe" \
+                | grep -Eqi 'DLL Name: WebView2Loader\.dll'
+              objdump -f "$verify_dir/WebView2Loader.dll" \
+                | grep -Eq 'architecture: i386:x86-64'
+              if objdump -p "$verify_dir/Kitty-Pro.exe" \
                   | grep -Eqi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)[^ ]*\.dll'; then
                 echo 'Windows package depends on an unbundled MinGW runtime DLL' >&2
                 exit 1
               fi
-              grep -aFq '.proxy-app' dist/windows/Kitty-Pro.exe
+              grep -aFq '.proxy-app' "$verify_dir/Kitty-Pro.exe"
               if grep -aFq \
                   'This should be replaced by dx as part of the build process' \
-                  dist/windows/Kitty-Pro.exe; then
+                  "$verify_dir/Kitty-Pro.exe"; then
                 echo 'Windows executable still contains unresolved Dioxus asset paths' >&2
                 exit 1
               fi
-              7z l dist/windows/Kitty-Pro-windows-x86_64.zip \
-                | grep -Eq '(^|[[:space:]])Kitty-Pro\.exe([[:space:]]|$)'
+
+              mkdir -p "$msi_verify_dir"
+              installer_windows="$(cygpath -w "$installer")"
+              msi_verify_dir_windows="$(cygpath -w "$msi_verify_dir")"
+              MSYS2_ARG_CONV_EXCL='*' msiexec.exe \
+                /a "$installer_windows" \
+                /qn \
+                TARGETDIR="$msi_verify_dir_windows"
+              msi_executable="$(find "$msi_verify_dir" \
+                -type f -iname 'kitty-pro.exe' -print -quit)"
+              msi_webview2_loader="$(find "$msi_verify_dir" \
+                -type f -name 'WebView2Loader.dll' -print -quit)"
+              test -n "$msi_executable"
+              test -n "$msi_webview2_loader"
+              cmp "$verify_dir/Kitty-Pro.exe" "$msi_executable"
+              cmp "$verify_dir/WebView2Loader.dll" "$msi_webview2_loader"
+              (cd dist/windows && sha256sum -c *.sha256)
               ;;
             linux)
               test -n "$(find dist/linux -type f -name '*.AppImage' -print -quit)"
@@ -509,8 +650,8 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-assets/**/*.dmg
-            release-assets/**/*.exe
             release-assets/**/*.zip
+            release-assets/**/*.msi
             release-assets/**/*.AppImage
             release-assets/**/*.deb
             release-assets/**/*.tar.gz

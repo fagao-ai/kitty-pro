@@ -9,7 +9,7 @@ name = "kitty-pro"
 path = "src/main.rs"
 
 [dependencies]
-dioxus = { workspace = true, features = ["router", "fullstack"] }
+dioxus = { workspace = true, features = ["router"] }
 api = { workspace = true }
 ui = { workspace = true }
 
@@ -22,4 +22,4 @@ winresource = "0.1"
 [features]
 default = []
 desktop = ["dioxus/desktop"]
-server = ["dioxus/server", "ui/server"]
+server = ["dioxus/fullstack", "dioxus/server", "ui/server"]

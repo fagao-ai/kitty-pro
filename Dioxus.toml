@@ -17,3 +17,4 @@ icon = [
 ]
 short_description = "A cross-platform sing-box proxy client."
 long_description = "Kitty Pro is a Dioxus proxy client backed by an embedded sing-box core."
+external_bin = ["target/windows-bundle/WebView2Loader.dll"]

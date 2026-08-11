@@ -137,11 +137,12 @@ the app clears its subscriptions and settings.
 
 ## GitHub Actions packages
 
-The `Build release packages` workflow builds on each operating system's native
-GitHub runner and produces:
+The `Build release packages` workflow runs Dioxus `dx bundle` on each operating
+system's native GitHub runner and produces:
 
 - macOS: `.app` and `.dmg`
-- Windows: `.msi` and NSIS `.exe`
+- Windows: an `.msi` installer and a portable `.zip` containing
+  `Kitty-Pro.exe` and `WebView2Loader.dll`
 - Linux: `.AppImage` and `.deb`
 - Web: macOS and Linux x86_64 fullstack servers, each with its `public` assets
 - Android: an arm64-v8a `.apk`
@@ -160,7 +161,7 @@ would conflict with earlier installations. Add these GitHub Actions secrets:
 - `ANDROID_KEY_PASSWORD`: Key password; may be omitted when it matches the
   keystore password
 
-The macOS app uses ad-hoc signing and the Windows installers are unsigned.
+The macOS app uses ad-hoc signing and the Windows packages are unsigned.
 Apple notarization and Windows Authenticode signing require developer
 certificates and should be added before public distribution. iOS packaging is
 intentionally deferred until its NetworkExtension and signing setup are ready.
