@@ -258,7 +258,9 @@ jobs:
                   exit 1
                 fi
 
-                msi_path="${msi_paths[0]}"
+                # BundleOutput uses a native Windows path, while this step
+                # runs in Git Bash and needs its POSIX representation.
+                msi_path="$(cygpath -u "${msi_paths[0]}")"
                 installer="$(pwd -P)/dist/windows/Kitty-Pro-windows-x86_64.msi"
                 test -f "$msi_path"
                 if [[ "$msi_path" != "$installer" ]]; then
