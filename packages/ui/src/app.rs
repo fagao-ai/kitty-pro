@@ -14,7 +14,7 @@ use dioxus_free_icons::Icon;
 use proxy_core::{
     validate_custom_rules, AppProfile, ConnectionRequest, CustomRule, CustomRuleAction,
     CustomRuleMatch, ParseReport, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol,
-    Subscription, SyncSnapshot, TunnelMode, MAX_CUSTOM_RULES,
+    Subscription, SyncSnapshot, SyncSubscription, TunnelMode, MAX_CUSTOM_RULES,
 };
 use std::collections::HashMap;
 
@@ -1580,7 +1580,7 @@ fn SystemProxyToggle(
     };
     let proxy_detail = if proxy_busy {
         if proxy_enabled {
-            "正在恢复启用前的系统代理设置".to_string()
+            "正在关闭系统代理".to_string()
         } else {
             "正在应用到系统网络服务".to_string()
         }
@@ -1632,7 +1632,7 @@ fn SystemProxyToggle(
                                     if enabled {
                                         toast.success("系统代理已启用");
                                     } else {
-                                        toast.success("系统代理已恢复为启用前的设置");
+                                        toast.success("系统代理已关闭");
                                     }
                                 }
                                 Err(error) => {
@@ -3506,7 +3506,6 @@ fn SyncSettings(
     dark_mode: Signal<bool>,
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
-    connected: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
     let mut config = use_signal(SyncConfig::default);
@@ -3576,7 +3575,7 @@ fn SyncSettings(
 
             div { class: "inline-note sync-security-note",
                 Icon { icon: LdInfo, width: 16, height: 16 }
-                span { "远端文件包含订阅地址、节点凭据和自定义规则" }
+                span { "远端文件包含订阅来源和自定义规则" }
             }
 
             div { class: "sync-form-grid",
@@ -3751,7 +3750,11 @@ fn SyncSettings(
                                     "已下载 {} 个订阅和 {} 条规则{}",
                                     result.subscription_count,
                                     result.rule_count,
-                                    if connected() { "，重新连接后生效" } else { "" }
+                                    if result.subscription_count > 0 {
+                                        "，订阅需刷新后使用"
+                                    } else {
+                                        ""
+                                    }
                                 ));
                                 if let Some(warning) = result.warning {
                                     toast.info(warning);
@@ -3773,10 +3776,7 @@ fn SyncSettings(
                         let value = config();
                         let snapshot = build_sync_snapshot(
                             &subscriptions(),
-                            active_subscription_id(),
-                            &selected_tag(),
                             &custom_rules(),
-                            &group_selections(),
                             value.last_sync_at,
                         );
                         async move {
@@ -3819,10 +3819,7 @@ fn SyncSettings(
                         let value = config();
                         let snapshot = build_sync_snapshot(
                             &subscriptions(),
-                            active_subscription_id(),
-                            &selected_tag(),
                             &custom_rules(),
-                            &group_selections(),
                             value.last_sync_at,
                         );
                         busy.set(Some(SyncAction::ForcePush));
@@ -3854,21 +3851,15 @@ fn SyncSettings(
 
 fn build_sync_snapshot(
     subscriptions: &[Subscription],
-    active_subscription_id: Option<u64>,
-    selected_tag: &str,
     custom_rules: &[CustomRule],
-    group_selections: &HashMap<String, String>,
     updated_at: u64,
 ) -> SyncSnapshot {
     SyncSnapshot {
         format: proxy_core::SYNC_SNAPSHOT_FORMAT.to_string(),
         version: 1,
         updated_at,
-        subscriptions: subscriptions.to_vec(),
-        active_subscription_id,
-        selected_tag: selected_tag.to_string(),
+        subscriptions: subscriptions.iter().map(SyncSubscription::from).collect(),
         custom_rules: custom_rules.to_vec(),
-        group_selections: group_selections.clone(),
     }
 }
 
@@ -3881,19 +3872,18 @@ fn apply_sync_snapshot(
     mut custom_rules: Signal<Vec<CustomRule>>,
     mut group_selections: Signal<HashMap<String, String>>,
 ) {
-    let restored_active_id = resolve_active_subscription_id(
-        &snapshot.subscriptions,
-        snapshot.active_subscription_id,
-        &snapshot.selected_tag,
+    subscriptions.set(
+        snapshot
+            .subscriptions
+            .into_iter()
+            .map(Subscription::from)
+            .collect(),
     );
-    let restored_nodes = collect_subscription_nodes(&snapshot.subscriptions, restored_active_id);
-    let restored_tag = select_available_tag(&restored_nodes, &snapshot.selected_tag);
-    subscriptions.set(snapshot.subscriptions);
-    active_subscription_id.set(restored_active_id);
-    nodes.set(restored_nodes);
-    selected_tag.set(restored_tag);
+    active_subscription_id.set(None);
+    nodes.set(Vec::new());
+    selected_tag.set(String::new());
     custom_rules.set(snapshot.custom_rules);
-    group_selections.set(snapshot.group_selections);
+    group_selections.set(HashMap::new());
 }
 
 #[component]
@@ -4015,7 +4005,6 @@ fn SettingsView(
                 dark_mode,
                 config_script_enabled,
                 config_script,
-                connected,
             }
 
             section { class: "settings-section glass-surface",

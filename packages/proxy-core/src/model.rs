@@ -398,21 +398,45 @@ pub struct AppProfile {
 /// structure. `updated_at` is a Unix timestamp used for optimistic conflict
 /// detection by the remote storage adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSubscription {
+    pub id: u64,
+    pub name: String,
+    pub source: String,
+}
+
+impl From<&Subscription> for SyncSubscription {
+    fn from(subscription: &Subscription) -> Self {
+        Self {
+            id: subscription.id,
+            name: subscription.name.clone(),
+            source: subscription.source.clone(),
+        }
+    }
+}
+
+impl From<SyncSubscription> for Subscription {
+    fn from(subscription: SyncSubscription) -> Self {
+        Self {
+            id: subscription.id,
+            name: subscription.name,
+            source: subscription.source,
+            nodes: Vec::new(),
+            proxy_server_nameservers: Vec::new(),
+            rejected_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncSnapshot {
     pub format: String,
     pub version: u32,
     #[serde(default)]
     pub updated_at: u64,
     #[serde(default)]
-    pub subscriptions: Vec<Subscription>,
-    #[serde(default)]
-    pub active_subscription_id: Option<u64>,
-    #[serde(default)]
-    pub selected_tag: String,
+    pub subscriptions: Vec<SyncSubscription>,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
-    #[serde(default)]
-    pub group_selections: HashMap<String, String>,
 }
 
 impl SyncSnapshot {
@@ -421,20 +445,26 @@ impl SyncSnapshot {
             format: default_sync_snapshot_format(),
             version: default_sync_snapshot_version(),
             updated_at,
-            subscriptions: profile.subscriptions.clone(),
-            active_subscription_id: profile.active_subscription_id,
-            selected_tag: profile.selected_tag.clone(),
+            subscriptions: profile
+                .subscriptions
+                .iter()
+                .map(SyncSubscription::from)
+                .collect(),
             custom_rules: profile.custom_rules.clone(),
-            group_selections: profile.group_selections.clone(),
         }
     }
 
     pub fn apply_to_profile(&self, profile: &mut AppProfile) {
-        profile.subscriptions = self.subscriptions.clone();
-        profile.active_subscription_id = self.active_subscription_id;
-        profile.selected_tag = self.selected_tag.clone();
+        profile.subscriptions = self
+            .subscriptions
+            .iter()
+            .cloned()
+            .map(Subscription::from)
+            .collect();
+        profile.active_subscription_id = None;
+        profile.selected_tag.clear();
         profile.custom_rules = self.custom_rules.clone();
-        profile.group_selections = self.group_selections.clone();
+        profile.group_selections.clear();
     }
 }
 
@@ -519,8 +549,22 @@ mod tests {
     }
 
     #[test]
-    fn sync_snapshot_only_applies_portable_profile_fields() {
+    fn sync_snapshot_only_contains_subscription_sources_and_rules() {
+        let node = crate::parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443?security=tls#Edge",
+        )
+        .nodes
+        .pop()
+        .expect("fixture should parse");
         let source = AppProfile {
+            subscriptions: vec![Subscription {
+                id: 7,
+                name: "Primary".to_string(),
+                source: "https://example.com/subscription?token=secret".to_string(),
+                nodes: vec![node],
+                proxy_server_nameservers: vec!["https://resolver.example/dns-query".to_string()],
+                rejected_count: 2,
+            }],
             active_subscription_id: Some(7),
             selected_tag: "subscription-7-node".to_string(),
             dark_mode: true,
@@ -533,6 +577,7 @@ mod tests {
                 value: "example.com".to_string(),
                 action: CustomRuleAction::Proxy,
             }],
+            group_selections: HashMap::from([("proxy".to_string(), "edge".to_string())]),
             ..AppProfile::default()
         };
         let snapshot = SyncSnapshot::from_profile(&source, 42);
@@ -547,12 +592,22 @@ mod tests {
 
         assert_eq!(snapshot.format, SYNC_SNAPSHOT_FORMAT);
         assert_eq!(snapshot.updated_at, 42);
-        assert_eq!(target.active_subscription_id, Some(7));
-        assert_eq!(target.selected_tag, "subscription-7-node");
+        assert_eq!(target.subscriptions.len(), 1);
+        assert!(target.subscriptions[0].nodes.is_empty());
+        assert!(target.subscriptions[0].proxy_server_nameservers.is_empty());
+        assert_eq!(target.active_subscription_id, None);
+        assert!(target.selected_tag.is_empty());
         assert_eq!(target.custom_rules, source.custom_rules);
+        assert!(target.group_selections.is_empty());
         assert!(!target.dark_mode);
         assert!(!target.tun_enabled);
         assert!(!target.allow_lan);
+
+        let serialized = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+        assert!(serialized.get("active_subscription_id").is_none());
+        assert!(serialized.get("selected_tag").is_none());
+        assert!(serialized.get("group_selections").is_none());
+        assert!(serialized["subscriptions"][0].get("nodes").is_none());
     }
 
     #[test]

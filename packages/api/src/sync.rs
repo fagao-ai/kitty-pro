@@ -276,7 +276,6 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
         return Err(ServerFnError::new("远程订阅数量超过 1024 个限制"));
     }
     let mut subscription_ids = HashSet::with_capacity(snapshot.subscriptions.len());
-    let mut node_tags = HashSet::new();
     for subscription in &snapshot.subscriptions {
         if subscription.id == 0 {
             return Err(ServerFnError::new("远程订阅 ID 不能为 0"));
@@ -287,26 +286,12 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
                 subscription.id
             )));
         }
-        for node in &subscription.nodes {
-            if node.tag.trim().is_empty() {
-                return Err(ServerFnError::new("远程节点 tag 不能为空"));
-            }
-            if node.server.trim().is_empty() || node.port == 0 {
-                return Err(ServerFnError::new(format!("远程节点不可用: {}", node.name)));
-            }
-            if !node_tags.insert(node.tag.as_str()) {
-                return Err(ServerFnError::new(format!(
-                    "远程节点 tag 重复: {}",
-                    node.tag
-                )));
-            }
+        if subscription.source.trim().is_empty() {
+            return Err(ServerFnError::new(format!(
+                "远程订阅来源为空: {}",
+                subscription.name
+            )));
         }
-    }
-    if snapshot
-        .active_subscription_id
-        .is_some_and(|id| !subscription_ids.contains(&id))
-    {
-        return Err(ServerFnError::new("远程活动订阅 ID 不存在"));
     }
     Ok(())
 }
@@ -859,13 +844,10 @@ mod tests {
 
     #[test]
     fn snapshot_rejects_duplicate_subscription_ids() {
-        let subscription = proxy_core::Subscription {
+        let subscription = proxy_core::SyncSubscription {
             id: 7,
             name: "primary".to_string(),
             source: "https://example.com/subscription".to_string(),
-            nodes: Vec::new(),
-            proxy_server_nameservers: Vec::new(),
-            rejected_count: 0,
         };
         let mut snapshot = SyncSnapshot::from_profile(&Default::default(), 0);
         snapshot.subscriptions = vec![subscription.clone(), subscription];
