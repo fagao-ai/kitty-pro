@@ -732,12 +732,16 @@ fn launch_elevated(
     token_path: &std::path::Path,
     owner_id: u32,
 ) -> Result<Child, CoreError> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
     let executable = executable.to_string_lossy().replace('\'', "''");
     let token_path = format!("\"{}\"", token_path.to_string_lossy()).replace('\'', "''");
     let script = format!(
         "$p=Start-Process -FilePath '{executable}' -ArgumentList @('{HELPER_FLAG}','{rpc_port}','{lease_port}','{token_path}','{owner_id}') -Verb RunAs -PassThru -Wait; exit $p.ExitCode"
     );
     Command::new("powershell.exe")
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -816,16 +820,9 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
-        let arguments = vec![
-            "kitty-pro".to_string(),
-            HELPER_FLAG.to_string(),
-            "41001".to_string(),
-            "41002".to_string(),
-            path.to_string_lossy().into_owned(),
-            session_owner_id().to_string(),
-        ];
-        let parsed = parse_helper_arguments(&arguments).expect("session should be parsed");
-        assert_eq!(parsed.token, token);
+        let parsed =
+            read_session_token(&path, session_owner_id()).expect("session token should be read");
+        assert_eq!(parsed, token);
         fs::remove_file(path).expect("session token should be removed");
     }
 
