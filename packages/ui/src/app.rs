@@ -692,7 +692,10 @@ pub fn ProxyApp(platform: String) -> Element {
                             title: if core_restarting() { "正在重启内核" } else { "重启内核" },
                             aria_label: "重启内核",
                             aria_busy: core_restarting(),
-                            disabled: !connected() || core_busy() || core_restarting(),
+                            disabled: !connected()
+                                || core_busy()
+                                || core_restarting()
+                                || system_proxy_busy(),
                             onclick: move |_| async move {
                                 core_restarting.set(true);
                                 let request = ConnectionRequest {
@@ -774,7 +777,10 @@ pub fn ProxyApp(platform: String) -> Element {
                             title: if core_restarting() { "正在重启内核" } else { "重启内核" },
                             aria_label: "重启内核",
                             aria_busy: core_restarting(),
-                            disabled: !connected() || core_busy() || core_restarting(),
+                            disabled: !connected()
+                                || core_busy()
+                                || core_restarting()
+                                || system_proxy_busy(),
                             onclick: move |_| async move {
                                 core_restarting.set(true);
                                 let request = ConnectionRequest {
@@ -1252,9 +1258,12 @@ fn OverviewView(
     let is_connected = connected();
     let is_core_busy = core_busy();
     let is_core_restarting = core_restarting();
-    let is_core_action_busy = is_core_busy || is_core_restarting;
+    let is_system_proxy_busy = system_proxy_busy();
+    let is_core_action_busy = is_core_busy || is_core_restarting || is_system_proxy_busy;
     let status_title = if is_core_restarting {
         "正在重启"
+    } else if is_system_proxy_busy {
+        "系统代理设置中"
     } else if is_core_busy {
         if is_connected {
             "正在断开"
@@ -1273,6 +1282,8 @@ fn OverviewView(
     let mode_name = mode_label(tunnel_mode());
     let note = if is_core_restarting {
         "正在重启 sing-box 内核，请稍候".to_string()
+    } else if is_system_proxy_busy {
+        "正在设置系统代理，请稍候".to_string()
     } else if is_core_busy {
         if is_connected {
             "正在停止 sing-box 内核".to_string()
@@ -1321,7 +1332,7 @@ fn OverviewView(
                 div { class: "connection-controls",
                     button {
                         class: if is_core_action_busy && is_connected { "power-button active loading" } else if is_core_action_busy { "power-button loading" } else if is_connected { "power-button active" } else { "power-button" },
-                        title: if is_core_restarting { "正在重启内核" } else if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
+                        title: if is_core_restarting { "正在重启内核" } else if is_system_proxy_busy { "正在设置系统代理" } else if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
                         aria_label: if is_connected { "停止内核" } else { "启动内核" },
                         aria_busy: is_core_action_busy,
                         disabled: is_core_action_busy || (!is_connected && !connection_allowed),
@@ -1404,6 +1415,7 @@ fn OverviewView(
                     }
                     SystemProxyToggle {
                         core_running: is_connected,
+                        core_action_busy: is_core_busy || is_core_restarting,
                         system_proxy,
                         system_proxy_busy,
                     }
@@ -1487,6 +1499,7 @@ fn OverviewView(
 #[component]
 fn SystemProxyToggle(
     core_running: bool,
+    core_action_busy: bool,
     mut system_proxy: Signal<SystemProxyLoadState>,
     mut system_proxy_busy: Signal<bool>,
 ) -> Element {
@@ -1547,7 +1560,10 @@ fn SystemProxyToggle(
                     r#type: "checkbox",
                     aria_label: "系统代理",
                     checked: proxy_enabled,
-                    disabled: !proxy_ready || !proxy_supported || (!proxy_enabled && !core_running),
+                    disabled: core_action_busy
+                        || !proxy_ready
+                        || !proxy_supported
+                        || (!proxy_enabled && !core_running),
                     onchange: move |event| {
                         let enabled = event.checked();
                         async move {
