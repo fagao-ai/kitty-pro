@@ -84,18 +84,6 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
 
-      - name: Add MinGW to PATH
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          msys2_root='${{ steps.msys2.outputs.msys2-location }}'
-          msys2_root="${msys2_root//\\//}"
-          mingw_bin="$msys2_root/mingw64/bin"
-          echo "$mingw_bin" >> "$GITHUB_PATH"
-          echo "CC=$mingw_bin/gcc.exe" >> "$GITHUB_ENV"
-          echo "CXX=$mingw_bin/g++.exe" >> "$GITHUB_ENV"
-          echo 'CGO_ENABLED=1' >> "$GITHUB_ENV"
-
       - name: Install Go
         uses: actions/setup-go@v6
         with:
@@ -161,9 +149,40 @@ jobs:
           cache-all-crates: true
 
       - name: Install Dioxus CLI
+        if: matrix.id != 'windows'
         uses: taiki-e/install-action@v2
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
+
+      - name: Checkout Dioxus CLI source
+        if: matrix.id == 'windows'
+        uses: actions/checkout@v5
+        with:
+          repository: DioxusLabs/dioxus
+          ref: v${{ env.DIOXUS_CLI_VERSION }}
+          path: .dioxus-cli-source
+
+      - name: Install patched Dioxus CLI for Windows GNU
+        if: matrix.id == 'windows'
+        shell: bash
+        run: |
+          git -C .dioxus-cli-source apply \
+            "$(pwd -P)/.github/patches/dioxus-cli-0.7.9-windows-gnu.patch"
+          cargo install \
+            --path .dioxus-cli-source/packages/cli \
+            --locked
+
+      - name: Add MinGW to PATH
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          msys2_root='${{ steps.msys2.outputs.msys2-location }}'
+          msys2_root="${msys2_root//\\//}"
+          mingw_bin="$msys2_root/mingw64/bin"
+          echo "$mingw_bin" >> "$GITHUB_PATH"
+          echo "CC=$mingw_bin/gcc.exe" >> "$GITHUB_ENV"
+          echo "CXX=$mingw_bin/g++.exe" >> "$GITHUB_ENV"
+          echo 'CGO_ENABLED=1' >> "$GITHUB_ENV"
 
       - name: Test Windows embedded core bridge
         if: matrix.id == 'windows'
