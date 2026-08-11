@@ -343,6 +343,7 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut dark_mode = use_signal(|| false);
     let mut connected = use_signal(|| false);
     let core_busy = use_signal(|| false);
+    let runtime_action_busy = use_signal(|| false);
     let mut core_restarting = use_signal(|| false);
     let mut core_state = use_signal(|| "checking".to_string());
     let mut core_version = use_signal(|| None::<String>);
@@ -695,9 +696,20 @@ pub fn ProxyApp(platform: String) -> Element {
                             disabled: !connected()
                                 || core_busy()
                                 || core_restarting()
+                                || runtime_action_busy()
                                 || system_proxy_busy(),
-                            onclick: move |_| async move {
-                                core_restarting.set(true);
+                            onclick: move |_| {
+                                let blocked = core_busy()
+                                    || core_restarting()
+                                    || runtime_action_busy()
+                                    || system_proxy_busy();
+                                if !blocked {
+                                    core_restarting.set(true);
+                                }
+                                async move {
+                                if blocked {
+                                    return;
+                                }
                                 let request = ConnectionRequest {
                                     nodes: nodes(),
                                     selected_tag: selected_tag(),
@@ -754,6 +766,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                     }
                                 }
                                 core_restarting.set(false);
+                                }
                             },
                             if core_restarting() {
                                 span { class: "spinner" }
@@ -780,9 +793,20 @@ pub fn ProxyApp(platform: String) -> Element {
                             disabled: !connected()
                                 || core_busy()
                                 || core_restarting()
+                                || runtime_action_busy()
                                 || system_proxy_busy(),
-                            onclick: move |_| async move {
-                                core_restarting.set(true);
+                            onclick: move |_| {
+                                let blocked = core_busy()
+                                    || core_restarting()
+                                    || runtime_action_busy()
+                                    || system_proxy_busy();
+                                if !blocked {
+                                    core_restarting.set(true);
+                                }
+                                async move {
+                                if blocked {
+                                    return;
+                                }
                                 let request = ConnectionRequest {
                                     nodes: nodes(),
                                     selected_tag: selected_tag(),
@@ -839,6 +863,7 @@ pub fn ProxyApp(platform: String) -> Element {
                                     }
                                 }
                                 core_restarting.set(false);
+                                }
                             },
                             if core_restarting() {
                                 span { class: "spinner" }
@@ -896,6 +921,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             group_selections,
                             system_proxy,
                             system_proxy_busy,
+                            runtime_action_busy,
                         }
                     },
                     AppView::Nodes => rsx! {
@@ -911,7 +937,10 @@ pub fn ProxyApp(platform: String) -> Element {
                             all_count: nodes().len(),
                             group_selections,
                             connected,
+                            core_busy,
                             core_restarting,
+                            system_proxy_busy,
+                            runtime_action_busy,
                             core_state,
                             core_version,
                             core_note,
@@ -939,6 +968,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             connected,
                             core_busy,
                             core_restarting,
+                            system_proxy_busy,
                             core_state,
                             core_version,
                             core_note,
@@ -949,6 +979,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             config_script_enabled,
                             config_script,
                             group_selections,
+                            runtime_action_busy,
                         }
                     },
                     AppView::Rules => rsx! {
@@ -974,7 +1005,9 @@ pub fn ProxyApp(platform: String) -> Element {
                             core_version,
                             core_note,
                             connected,
+                            core_busy,
                             core_restarting,
+                            system_proxy_busy,
                             tunnel_mode,
                             tun_enabled,
                             allow_lan,
@@ -991,6 +1024,7 @@ pub fn ProxyApp(platform: String) -> Element {
                             config_script_enabled,
                             config_script,
                             group_selections,
+                            runtime_action_busy,
                         }
                     },
                 }
@@ -1252,6 +1286,7 @@ fn OverviewView(
     group_selections: Signal<HashMap<String, String>>,
     mut system_proxy: Signal<SystemProxyLoadState>,
     system_proxy_busy: Signal<bool>,
+    runtime_action_busy: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
@@ -1259,11 +1294,15 @@ fn OverviewView(
     let is_core_busy = core_busy();
     let is_core_restarting = core_restarting();
     let is_system_proxy_busy = system_proxy_busy();
-    let is_core_action_busy = is_core_busy || is_core_restarting || is_system_proxy_busy;
+    let is_runtime_action_busy = runtime_action_busy();
+    let is_core_action_busy =
+        is_core_busy || is_core_restarting || is_system_proxy_busy || is_runtime_action_busy;
     let status_title = if is_core_restarting {
         "正在重启"
     } else if is_system_proxy_busy {
         "系统代理设置中"
+    } else if is_runtime_action_busy {
+        "正在应用设置"
     } else if is_core_busy {
         if is_connected {
             "正在断开"
@@ -1284,6 +1323,8 @@ fn OverviewView(
         "正在重启 sing-box 内核，请稍候".to_string()
     } else if is_system_proxy_busy {
         "正在设置系统代理，请稍候".to_string()
+    } else if is_runtime_action_busy {
+        "正在应用运行时设置，请稍候".to_string()
     } else if is_core_busy {
         if is_connected {
             "正在停止 sing-box 内核".to_string()
@@ -1332,15 +1373,24 @@ fn OverviewView(
                 div { class: "connection-controls",
                     button {
                         class: if is_core_action_busy && is_connected { "power-button active loading" } else if is_core_action_busy { "power-button loading" } else if is_connected { "power-button active" } else { "power-button" },
-                        title: if is_core_restarting { "正在重启内核" } else if is_system_proxy_busy { "正在设置系统代理" } else if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
+                        title: if is_core_restarting { "正在重启内核" } else if is_system_proxy_busy { "正在设置系统代理" } else if is_runtime_action_busy { "正在应用运行时设置" } else if is_core_busy { "正在切换连接状态" } else if is_connected { "断开连接" } else { "建立连接" },
                         aria_label: if is_connected { "停止内核" } else { "启动内核" },
                         aria_busy: is_core_action_busy,
                         disabled: is_core_action_busy || (!is_connected && !connection_allowed),
                         onclick: move |_| {
                             let proxy_server_nameservers = proxy_server_nameservers.clone();
+                            let blocked = core_busy()
+                                || core_restarting()
+                                || system_proxy_busy()
+                                || runtime_action_busy();
+                            if !blocked {
+                                core_busy.set(true);
+                            }
                             async move {
+                            if blocked {
+                                return;
+                            }
                             let target = !connected();
-                            core_busy.set(true);
                             let request = target.then(|| ConnectionRequest {
                                 nodes: nodes(),
                                 selected_tag: selected_tag(),
@@ -1415,7 +1465,9 @@ fn OverviewView(
                     }
                     SystemProxyToggle {
                         core_running: is_connected,
-                        core_action_busy: is_core_busy || is_core_restarting,
+                        core_action_busy: is_core_busy
+                            || is_core_restarting
+                            || is_runtime_action_busy,
                         system_proxy,
                         system_proxy_busy,
                     }
@@ -1566,8 +1618,14 @@ fn SystemProxyToggle(
                         || (!proxy_enabled && !core_running),
                     onchange: move |event| {
                         let enabled = event.checked();
-                        async move {
+                        let blocked = core_action_busy || system_proxy_busy();
+                        if !blocked {
                             system_proxy_busy.set(true);
+                        }
+                        async move {
+                            if blocked {
+                                return;
+                            }
                             match api::set_system_proxy(enabled).await {
                                 Ok(status) => {
                                     system_proxy.set(SystemProxyLoadState::Ready(status));
@@ -1657,7 +1715,10 @@ fn NodesView(
     all_count: usize,
     mut group_selections: Signal<HashMap<String, String>>,
     connected: Signal<bool>,
+    core_busy: Signal<bool>,
     core_restarting: Signal<bool>,
+    system_proxy_busy: Signal<bool>,
+    runtime_action_busy: Signal<bool>,
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
@@ -1881,7 +1942,10 @@ fn NodesView(
                                         member,
                                         selected: current_selected.clone().unwrap_or_default(),
                                         connected,
+                                        core_busy,
                                         core_restarting,
+                                        system_proxy_busy,
+                                        runtime_action_busy,
                                         core_state,
                                         core_version,
                                         core_note,
@@ -1960,7 +2024,10 @@ fn ProxyGroupMemberRow(
     member: ProxyGroupMember,
     selected: String,
     connected: Signal<bool>,
+    core_busy: Signal<bool>,
     core_restarting: Signal<bool>,
+    system_proxy_busy: Signal<bool>,
+    mut runtime_action_busy: Signal<bool>,
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
@@ -1998,13 +2065,27 @@ fn ProxyGroupMemberRow(
     rsx! {
         button {
             class: if is_selected { "node-row group-member-row selected" } else { "node-row group-member-row" },
-            disabled: !selectable,
+            disabled: !selectable
+                || core_busy()
+                || core_restarting()
+                || system_proxy_busy()
+                || runtime_action_busy(),
             onclick: move |_| {
                 let group = target_group.clone();
                 let outbound = member_tag.clone();
                 let nodes = nodes.clone();
                 let proxy_server_nameservers = proxy_server_nameservers.clone();
+                let blocked = core_busy()
+                    || core_restarting()
+                    || system_proxy_busy()
+                    || runtime_action_busy();
+                if !blocked {
+                    runtime_action_busy.set(true);
+                }
                 async move {
+                    if blocked {
+                        return;
+                    }
                     let previous_tag = selected_tag();
                     let previous_selections = group_selections();
                     let mut next_selections = previous_selections.clone();
@@ -2049,10 +2130,12 @@ fn ProxyGroupMemberRow(
                                 }
                             }
                         }
+                        runtime_action_busy.set(false);
                         return;
                     }
                     group_selections.set(next_selections);
                     toast.success(format!("{group} 已切换到 {outbound}"));
+                    runtime_action_busy.set(false);
                 }
             },
             if let Some(node) = member.node {
@@ -2243,6 +2326,8 @@ fn SubscriptionsView(
     connected: Signal<bool>,
     core_busy: Signal<bool>,
     core_restarting: Signal<bool>,
+    system_proxy_busy: Signal<bool>,
+    runtime_action_busy: Signal<bool>,
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
@@ -2340,6 +2425,8 @@ fn SubscriptionsView(
                             connected,
                             core_busy,
                             core_restarting,
+                            system_proxy_busy,
+                            runtime_action_busy,
                             core_state,
                             core_version,
                             core_note,
@@ -2369,6 +2456,8 @@ fn SubscriptionRow(
     connected: Signal<bool>,
     core_busy: Signal<bool>,
     core_restarting: Signal<bool>,
+    system_proxy_busy: Signal<bool>,
+    mut runtime_action_busy: Signal<bool>,
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
@@ -2403,9 +2492,24 @@ fn SubscriptionRow(
             }
             button {
                 class: if active { "subscription-use-button active" } else { "subscription-use-button" },
-                disabled: active || refresh_busy().is_some() || core_busy() || core_restarting(),
+                disabled: active
+                    || refresh_busy().is_some()
+                    || core_busy()
+                    || core_restarting()
+                    || system_proxy_busy()
+                    || runtime_action_busy(),
                 onclick: move |_| {
+                    let blocked = core_busy()
+                        || core_restarting()
+                        || system_proxy_busy()
+                        || runtime_action_busy();
+                    if !blocked {
+                        runtime_action_busy.set(true);
+                    }
                     async move {
+                        if blocked {
+                            return;
+                        }
                         let previous_subscription_id = active_subscription_id();
                         let previous_nodes = nodes();
                         let previous_tag = selected_tag();
@@ -2459,6 +2563,7 @@ fn SubscriptionRow(
                         } else {
                             toast.success("已切换订阅");
                         }
+                        runtime_action_busy.set(false);
                     }
                 },
                 if active {
@@ -3798,7 +3903,10 @@ fn SettingsView(
     mut core_version: Signal<Option<String>>,
     mut core_note: Signal<Option<String>>,
     mut connected: Signal<bool>,
+    core_busy: Signal<bool>,
     mut core_restarting: Signal<bool>,
+    system_proxy_busy: Signal<bool>,
+    mut runtime_action_busy: Signal<bool>,
     mut tunnel_mode: Signal<TunnelMode>,
     mut tun_enabled: Signal<bool>,
     mut allow_lan: Signal<bool>,
@@ -3940,15 +4048,28 @@ fn SettingsView(
                         input {
                             r#type: "checkbox",
                             checked: tun_enabled,
-                            disabled: core_restarting(),
+                            disabled: core_busy()
+                                || core_restarting()
+                                || system_proxy_busy()
+                                || runtime_action_busy(),
                             onclick: move |event| {
                             event.prevent_default();
                             let enabled = !tun_enabled();
                             let proxy_server_nameservers =
                                 tun_proxy_server_nameservers.clone();
-                            tun_busy.set(true);
-                            core_restarting.set(true);
+                            let blocked = core_busy()
+                                || core_restarting()
+                                || system_proxy_busy()
+                                || runtime_action_busy();
+                            if !blocked {
+                                runtime_action_busy.set(true);
+                                tun_busy.set(true);
+                                core_restarting.set(true);
+                            }
                             async move {
+                                if blocked {
+                                    return;
+                                }
                                 let previous_enabled = tun_enabled();
                                 let request = ConnectionRequest {
                                     nodes: nodes(),
@@ -3997,6 +4118,7 @@ fn SettingsView(
                                     }
                                     tun_busy.set(false);
                                     core_restarting.set(false);
+                                    runtime_action_busy.set(false);
                                     return;
                                 }
 
@@ -4032,6 +4154,7 @@ fn SettingsView(
                                 }
                                 tun_busy.set(false);
                                 core_restarting.set(false);
+                                runtime_action_busy.set(false);
                             }
                         },
                         }
@@ -4054,11 +4177,24 @@ fn SettingsView(
                         r#type: "checkbox",
                         aria_label: "允许局域网连接",
                         checked: allow_lan,
-                        disabled: core_restarting(),
+                        disabled: core_busy()
+                            || core_restarting()
+                            || system_proxy_busy()
+                            || runtime_action_busy(),
                         onchange: move |event| {
                             let proxy_server_nameservers =
                                 allow_lan_proxy_server_nameservers.clone();
+                            let blocked = core_busy()
+                                || core_restarting()
+                                || system_proxy_busy()
+                                || runtime_action_busy();
+                            if !blocked {
+                                runtime_action_busy.set(true);
+                            }
                             async move {
+                                if blocked {
+                                    return;
+                                }
                                 let enabled = event.checked();
                                 if !connected() {
                                     allow_lan.set(enabled);
@@ -4067,6 +4203,7 @@ fn SettingsView(
                                     } else {
                                         "仅本机访问将在下次启动内核时生效"
                                     });
+                                    runtime_action_busy.set(false);
                                     return;
                                 }
 
@@ -4124,6 +4261,7 @@ fn SettingsView(
                                     }
                                 }
                                 core_restarting.set(false);
+                                runtime_action_busy.set(false);
                             }
                         },
                     }
