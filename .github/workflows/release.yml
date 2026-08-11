@@ -171,8 +171,9 @@ jobs:
         if: matrix.id == 'windows'
         shell: bash
         run: |
-          git -C .dioxus-cli-source apply \
-            "$(pwd -P)/.github/patches/dioxus-cli-0.7.9-windows-gnu.patch"
+          sed 's/\r$//' \
+            .github/patches/dioxus-cli-0.7.9-windows-gnu.patch \
+            | git -C .dioxus-cli-source apply -
           cargo install \
             --path .dioxus-cli-source/packages/cli \
             --locked
