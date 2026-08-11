@@ -16,9 +16,6 @@ ui = { workspace = true }
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 singbox = { workspace = true }
 
-[build-dependencies]
-winresource = "0.1"
-
 [features]
 default = []
 desktop = ["dioxus/desktop"]
