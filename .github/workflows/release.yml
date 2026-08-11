@@ -139,9 +139,13 @@ jobs:
           ' "$desktop_manifest" > "$updated_manifest"
           mv "$updated_manifest" "$desktop_manifest"
 
+          # Cargo.lock records workspace package versions. Refresh only that
+          # local metadata after the manifest edit, without changing deps.
+          cargo metadata --offline --format-version 1 >/dev/null
+
           # Confirm that all later --locked builds see the tag-derived version.
           package_version="$(
-            cargo metadata --locked --no-deps --format-version 1 \
+            cargo metadata --locked --format-version 1 \
               | jq -er '.packages[] | select(.name == "desktop") | .version'
           )"
           if [[ "$package_version" != "$release_version" ]]; then
