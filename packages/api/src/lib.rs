@@ -2098,12 +2098,45 @@ fn toggle_native_core(
         return native_core_status();
     }
     core.config = None;
-    if let Err(error) = core.engine.start_config(&config) {
-        return Err(ServerFnError::new(error.to_string()));
+    if let Err(error) = start_config_with_bind_retry(&mut core.engine, &config) {
+        return Err(ServerFnError::new(error));
     }
     core.config = Some(config);
     drop(guard);
     native_core_status()
+}
+
+/// Start the core, retrying while the mixed-in port is still held by
+/// TIME_WAIT sockets from the previous core.
+///
+/// On macOS, connections accepted by the Go runtime do not carry
+/// SO_REUSEADDR, and their TIME_WAIT state keeps blocking a cross-process
+/// rebind of the same port for 30 seconds (2 * MSL). With the system proxy
+/// enabled this happens on every restart: apps hold active connections to
+/// 127.0.0.1:7890, the stopped core closes them (server-side close => TIME_WAIT),
+/// and the replacement core immediately fails to bind. Retrying over the
+/// TIME_WAIT window makes toggling TUN / switching configs succeed instead of
+/// erroring with "bind: address already in use".
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn start_config_with_bind_retry(
+    engine: &mut singbox::SingBox,
+    config: &serde_json::Value,
+) -> Result<(), String> {
+    // 45 attempts * 1s covers the macOS 30s TIME_WAIT window with margin.
+    const MAX_ATTEMPTS: u32 = 45;
+    for attempt in 0..MAX_ATTEMPTS {
+        match engine.start_config(config) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("address already in use") || attempt + 1 >= MAX_ATTEMPTS {
+                    return Err(message);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+    unreachable!("retry loop always returns")
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
@@ -2125,7 +2158,7 @@ impl RestartCoreEngine for singbox::SingBox {
     }
 
     fn restart_start(&mut self, config: &serde_json::Value) -> Result<(), String> {
-        self.start_config(config).map_err(|error| error.to_string())
+        start_config_with_bind_retry(self, config)
     }
 
     fn restart_force_shutdown(&mut self) {
@@ -2239,11 +2272,33 @@ where
                     };
                 }
                 Ok(false) => {
-                    return restore_previous_core(
-                        engine,
-                        previous,
-                        format!("停止旧 sing-box 内核返回错误且内核已停止: {stop_error}"),
-                    );
+                    // The stop reported an error but the core is confirmed
+                    // stopped, so the shutdown actually completed. Apply the
+                    // candidate instead of resurrecting the previous config:
+                    // turning TUN off must not bounce back to the TUN config
+                    // just because the old core reported a noisy stop.
+                    return match start_core_and_observe(engine, candidate) {
+                        CoreStartObservation::Running => CoreRestartOutcome::CandidateRunning,
+                        CoreStartObservation::Stopped {
+                            error: candidate_error,
+                        } => restore_previous_core(
+                            engine,
+                            previous,
+                            format!(
+                                "停止旧 sing-box 内核返回错误且内核已停止: {stop_error}；新配置启动失败: {candidate_error}"
+                            ),
+                        ),
+                        CoreStartObservation::Unknown {
+                            error: candidate_error,
+                        } => {
+                            engine.restart_force_shutdown();
+                            CoreRestartOutcome::CoreOffline {
+                                error: format!(
+                                    "停止旧 sing-box 内核返回错误且内核已停止: {stop_error}；新配置启动后无法确认内核状态，已强制关闭内核: {candidate_error}"
+                                ),
+                            }
+                        }
+                    };
                 }
                 Err(status_error) => {
                     engine.restart_force_shutdown();
@@ -2314,7 +2369,13 @@ where
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn disable_managed_system_proxy_before_core_outage() -> Result<(), String> {
-    let status = native_system_proxy_status().map_err(|error| error.to_string())?;
+    let status = match native_system_proxy_status() {
+        Ok(status) => status,
+        // A transient read failure must not block shutting the core down.
+        // The next core start re-applies the managed proxy anyway, so the
+        // only cost of skipping cleanup here is a briefly dangling setting.
+        Err(_) => return Ok(()),
+    };
     if !status.enabled {
         return Ok(());
     }
@@ -2873,7 +2934,17 @@ fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnE
         apply_native_auto_proxy(&sysproxy::Autoproxy::default())?;
         apply_native_system_proxy(&proxy)?;
     } else {
-        apply_native_system_proxy(&sysproxy::Sysproxy::default())?;
+        // sysproxy always rewrites the bypass list on macOS, and its default
+        // (empty) bypass makes `networksetup -setproxybypassdomains` fail with
+        // an argument count error. Reuse the managed bypass list so disabling
+        // the proxy stays idempotent instead of erroring out.
+        let proxy = sysproxy::Sysproxy {
+            host: SYSTEM_PROXY_HOST.to_string(),
+            bypass: SYSTEM_PROXY_BYPASS.to_string(),
+            port: SYSTEM_PROXY_PORT,
+            enable: false,
+        };
+        apply_native_system_proxy(&proxy)?;
         apply_native_auto_proxy(&sysproxy::Autoproxy::default())?;
     }
 
@@ -3401,25 +3472,25 @@ mod tests {
 
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
     #[test]
-    fn failed_stop_after_shutdown_restores_previous_config() {
+    fn failed_stop_after_shutdown_continues_with_candidate() {
+        // A noisy stop error after the core is confirmed stopped must not
+        // resurrect the previous config (e.g. turning TUN off bouncing back
+        // to the TUN config); the candidate config is what the user asked for.
         let (candidate, previous, events, mut core) = restart_fixture();
         core.fail_stop = true;
         core.stop_error_after_shutdown = true;
 
         let outcome = restart_core_transaction(&mut core, &candidate, Some(&previous), |_| Ok(()));
 
-        assert!(matches!(
-            outcome,
-            CoreRestartOutcome::PreviousRestored { .. }
-        ));
+        assert!(matches!(outcome, CoreRestartOutcome::CandidateRunning));
         assert!(core.running);
         assert_eq!(
             *events.lock().unwrap(),
-            ["status", "stop", "status", "start:previous"]
+            ["status", "stop", "status", "start:candidate"]
         );
         assert_eq!(
-            core_config_after_restart(&outcome, candidate, Some(previous.clone())),
-            Some(previous)
+            core_config_after_restart(&outcome, candidate.clone(), Some(previous.clone())),
+            Some(candidate)
         );
 
         let restore_calls = std::cell::Cell::new(0);
@@ -3427,7 +3498,7 @@ mod tests {
             restore_calls.set(restore_calls.get() + 1);
             Ok(())
         })
-        .is_err());
+        .is_ok());
         assert_eq!(restore_calls.get(), 0);
     }
 
