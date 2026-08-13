@@ -72,6 +72,12 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
             "auto_route": true,
             "strict_route": true,
             "stack": "system",
+            // Without an explicit MTU the system stack inherits the utun
+            // maximum (65535), so clients negotiate huge TCP segments and
+            // throughput collapses to ~1 Mbps through the userspace forwarder
+            // (WeChat image uploads crawl while small text packets are fine).
+            // Match the physical link so MSS negotiation stays normal.
+            "mtu": 1500,
         });
         let route_exclusions = proxy_endpoint_routes(request);
         if !route_exclusions.is_empty() {
@@ -276,10 +282,15 @@ fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
                 .filter(|rule| rule.enabled && rule.action == CustomRuleAction::Direct)
                 .filter_map(custom_direct_dns_rule_to_value),
         );
+        // Chinese/domestic domains are answered only with IPv4. WeChat and
+        // other Tencent apps prefer IPv6 for media uploads; if the host has
+        // no real IPv6 connectivity the direct IPv6 dial fails (image send
+        // breaks) while IPv4 text traffic keeps working.
         rules.push(json!({
             "rule_set": "geosite-cn",
             "action": "route",
             "server": "dns-direct",
+            "strategy": "ipv4_only",
         }));
     }
 
@@ -350,6 +361,10 @@ fn custom_direct_dns_rule_to_value(rule: &CustomRule) -> Option<Value> {
         rule.match_type.singbox_field(): [value],
         "action": "route",
         "server": "dns-direct",
+        // Direct egress needs the host's real connectivity, so only IPv4 is
+        // handed out. Many domestic apps (WeChat media uploads) prefer IPv6
+        // and fail when the host has no IPv6 route.
+        "strategy": "ipv4_only",
     }))
 }
 
@@ -638,6 +653,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             config["inbounds"][1]["address"],
             json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
         );
+        assert_eq!(config["inbounds"][1]["mtu"], 1500);
         assert!(config["dns"].get("strategy").is_none());
         assert_eq!(config["route"]["final"], "proxy");
         assert_eq!(config["route"]["auto_detect_interface"], true);
@@ -670,6 +686,8 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         assert_eq!(config["dns"]["servers"][3]["inet4_range"], "198.18.0.0/15");
         assert_eq!(config["dns"]["servers"][3]["inet6_range"], "fc00::/18");
         assert_eq!(config["dns"]["rules"][2]["rule_set"], "geosite-cn");
+        assert_eq!(config["dns"]["rules"][2]["server"], "dns-direct");
+        assert_eq!(config["dns"]["rules"][2]["strategy"], "ipv4_only");
         assert_eq!(
             config["dns"]["rules"][3]["query_type"],
             json!(["A", "AAAA"])
@@ -824,9 +842,59 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
 
         assert_eq!(dns_rules[2]["domain_suffix"], json!(["corp.example"]));
         assert_eq!(dns_rules[2]["server"], "dns-direct");
+        assert_eq!(dns_rules[2]["strategy"], "ipv4_only");
         assert_eq!(dns_rules[3]["rule_set"], "geosite-cn");
+        assert_eq!(dns_rules[3]["server"], "dns-direct");
+        assert_eq!(dns_rules[3]["strategy"], "ipv4_only");
         assert_eq!(dns_rules[4]["server"], "dns-fakeip");
         assert_eq!(dns_rules.len(), 5);
+    }
+
+    #[test]
+    fn direct_dns_is_ipv4_only_but_proxied_fakeip_keeps_both_families() {
+        // WeChat prefers IPv6 for media uploads. Domains routed DIRECT must
+        // never receive AAAA answers, otherwise the direct IPv6 dial fails on
+        // hosts without real IPv6 connectivity (image send breaks). Proxied
+        // domains keep the fake-ip AAAA range because the proxy dials them.
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: true,
+            allow_lan: false,
+            custom_rules: vec![CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::DomainSuffix,
+                value: "corp.example".to_string(),
+                action: CustomRuleAction::Direct,
+            }],
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        let rules = config["dns"]["rules"]
+            .as_array()
+            .expect("DNS rules should be an array");
+
+        assert_eq!(rules[2]["domain_suffix"], json!(["corp.example"]));
+        assert_eq!(rules[2]["server"], "dns-direct");
+        assert_eq!(rules[2]["strategy"], "ipv4_only");
+        assert_eq!(rules[3]["rule_set"], "geosite-cn");
+        assert_eq!(rules[3]["server"], "dns-direct");
+        assert_eq!(rules[3]["strategy"], "ipv4_only");
+        let fakeip = rules
+            .iter()
+            .find(|rule| rule["server"] == "dns-fakeip")
+            .expect("fakeip DNS rule should exist");
+        assert!(fakeip.get("strategy").is_none());
+        assert_eq!(config["dns"]["servers"][3]["inet6_range"], "fc00::/18");
     }
 
     #[test]

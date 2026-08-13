@@ -1226,6 +1226,34 @@ mod tests {
     }
 
     #[test]
+    fn rule_mode_tun_dns_ipv4_only_strategy_passes_embedded_parser() {
+        // Regression guard for the WeChat image-send fix: the embedded
+        // sing-box parser must accept `strategy: "ipv4_only"` on DNS route
+        // rules that serve directly-routed (geosite-cn) domains.
+        let request = ConnectionRequest {
+            selected_tag: "direct-node".to_string(),
+            nodes: proxy_core::parse_subscription("socks5://127.0.0.1:1080#DirectNode").nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: proxy_core::TunnelMode::Rule,
+            tun: true,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: Default::default(),
+        };
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        let direct_rule = config["dns"]["rules"]
+            .as_array()
+            .expect("DNS rules should be an array")
+            .iter()
+            .find(|rule| rule["rule_set"] == "geosite-cn")
+            .expect("geosite-cn DNS rule should exist");
+        assert_eq!(direct_rule["strategy"], "ipv4_only");
+
+        check_config(&config).expect("Rule-mode TUN config should pass static validation");
+    }
+
+    #[test]
     fn embedded_probe_without_clash_api_returns_node_errors() {
         let config = serde_json::json!({
             "log": { "level": "error" },
