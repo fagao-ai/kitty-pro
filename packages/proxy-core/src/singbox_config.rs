@@ -978,6 +978,94 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
     }
 
     #[test]
+    fn process_rules_map_to_process_name_and_process_path_fields() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: false,
+            allow_lan: false,
+            custom_rules: vec![
+                CustomRule {
+                    id: 1,
+                    enabled: true,
+                    match_type: crate::CustomRuleMatch::ProcessName,
+                    value: "Telegram".to_string(),
+                    action: crate::CustomRuleAction::Direct,
+                },
+                CustomRule {
+                    id: 2,
+                    enabled: true,
+                    match_type: crate::CustomRuleMatch::ProcessPath,
+                    value: "/Applications/Telegram.app/Contents/MacOS/Telegram".to_string(),
+                    action: crate::CustomRuleAction::Proxy,
+                },
+            ],
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        let rules = config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array");
+
+        assert_eq!(rules[3]["process_name"], json!(["Telegram"]));
+        assert_eq!(rules[3]["outbound"], "direct");
+        assert_eq!(
+            rules[4]["process_path"],
+            json!(["/Applications/Telegram.app/Contents/MacOS/Telegram"])
+        );
+        assert_eq!(rules[4]["outbound"], "proxy");
+        assert_eq!(rules.len(), 7);
+
+        let request_global = ConnectionRequest {
+            mode: TunnelMode::Global,
+            ..request
+        };
+        let config_global = build_singbox_config(&request_global, &SingBoxOptions::default());
+        assert_eq!(
+            config_global["route"]["rules"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn process_name_normalization_strips_path_to_basename() {
+        let normalized = crate::normalize_custom_rule_value(
+            crate::CustomRuleMatch::ProcessName,
+            "/Applications/Telegram.app/Contents/MacOS/Telegram",
+        )
+        .expect("path should normalize to basename");
+        assert_eq!(normalized, "Telegram");
+
+        assert!(
+            crate::normalize_custom_rule_value(crate::CustomRuleMatch::ProcessName, "").is_err()
+        );
+        assert!(
+            crate::normalize_custom_rule_value(crate::CustomRuleMatch::ProcessName, "a b c")
+                .is_ok()
+        );
+
+        let normalized_path = crate::normalize_custom_rule_value(
+            crate::CustomRuleMatch::ProcessPath,
+            "/Applications/Telegram.app/",
+        )
+        .expect("absolute path should be accepted");
+        assert_eq!(normalized_path, "/Applications/Telegram.app");
+        assert!(crate::normalize_custom_rule_value(
+            crate::CustomRuleMatch::ProcessPath,
+            "Telegram"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn custom_rules_are_inactive_outside_rule_mode() {
         let nodes = parse_subscription(
             "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443#Node",

@@ -137,6 +137,13 @@ pub struct SystemProxyStatus {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningProcess {
+    pub pid: u32,
+    pub name: String,
+    pub exe_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncProviderKind {
@@ -690,6 +697,17 @@ pub async fn set_system_proxy(enabled: bool) -> Result<SystemProxyStatus, Server
         set_native_system_proxy(enabled)
     })
     .await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
+    get("/api/processes")
+)]
+pub async fn list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
+    run_native_blocking("进程列表读取任务失败", native_list_running_processes).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2877,6 +2895,81 @@ fn set_native_system_proxy(_enabled: bool) -> Result<SystemProxyStatus, ServerFn
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn native_list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
+    use std::collections::BTreeMap;
+
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .without_tasks(),
+    );
+
+    let current_pid = std::process::id();
+    let mut by_identity = BTreeMap::new();
+    for process in system.processes().values() {
+        let pid = process.pid().as_u32();
+        if pid == current_pid {
+            continue;
+        }
+        let Some(exe_path) = process.exe() else {
+            continue;
+        };
+        insert_running_process(&mut by_identity, pid, exe_path);
+    }
+
+    Ok(by_identity.into_values().collect())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn insert_running_process(
+    by_identity: &mut std::collections::BTreeMap<(String, String), RunningProcess>,
+    pid: u32,
+    exe_path: &std::path::Path,
+) {
+    let Some(name) = exe_path.file_name() else {
+        return;
+    };
+    let name = name.to_string_lossy().into_owned();
+    let exe_path = exe_path.to_string_lossy().into_owned();
+    if name.is_empty() || exe_path.is_empty() {
+        return;
+    }
+
+    let process = RunningProcess {
+        pid,
+        name: name.clone(),
+        exe_path: Some(exe_path.clone()),
+    };
+    by_identity
+        .entry((name, exe_path))
+        .and_modify(|existing| {
+            if pid < existing.pid {
+                existing.pid = pid;
+            }
+        })
+        .or_insert(process);
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+))]
+fn native_list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+fn native_list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
+    Ok(Vec::new())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn ensure_core_is_running() -> Result<(), ServerFnError> {
     use singbox::CoreState;
 
@@ -2981,6 +3074,61 @@ mod tests {
         proxy.port = SYSTEM_PROXY_PORT;
         proxy.enable = false;
         assert!(!is_kitty_system_proxy(&proxy));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn list_running_processes_excludes_self_and_sorts_by_name() {
+        let processes = native_list_running_processes().expect("process list should succeed");
+        // 当前测试进程自身应被过滤
+        let self_pid = std::process::id();
+        assert!(
+            !processes.iter().any(|p| p.pid == self_pid),
+            "self process should be excluded from the list"
+        );
+        // 至少能列出一些系统进程（本机必然有多个进程在跑）
+        assert!(!processes.is_empty(), "expected at least some processes");
+
+        let identities = processes
+            .iter()
+            .map(|process| (&process.name, &process.exe_path))
+            .collect::<Vec<_>>();
+        let mut sorted = identities.clone();
+        sorted.sort();
+        assert_eq!(identities, sorted, "processes should be sorted by identity");
+
+        for p in &processes {
+            assert!(!p.name.is_empty(), "name must not be empty");
+            assert!(
+                p.exe_path.as_deref().is_some_and(|path| !path.is_empty()),
+                "exe_path must not be empty"
+            );
+            assert_eq!(
+                p.exe_path
+                    .as_deref()
+                    .and_then(|path| std::path::Path::new(path).file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .as_deref(),
+                Some(p.name.as_str()),
+                "name must match the executable basename"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn process_identity_keeps_distinct_paths_and_lowest_pid() {
+        let mut processes = std::collections::BTreeMap::new();
+        insert_running_process(&mut processes, 20, std::path::Path::new("/opt/one/tool"));
+        insert_running_process(&mut processes, 10, std::path::Path::new("/opt/one/tool"));
+        insert_running_process(&mut processes, 30, std::path::Path::new("/opt/two/tool"));
+
+        let processes = processes.into_values().collect::<Vec<_>>();
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].pid, 10);
+        assert_eq!(processes[0].name, "tool");
+        assert_eq!(processes[0].exe_path.as_deref(), Some("/opt/one/tool"));
+        assert_eq!(processes[1].exe_path.as_deref(), Some("/opt/two/tool"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

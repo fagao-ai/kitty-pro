@@ -5,6 +5,7 @@ use thiserror::Error;
 
 pub const MAX_CUSTOM_RULES: usize = 256;
 pub const SYNC_SNAPSHOT_FORMAT: &str = "kitty-pro-sync";
+pub const SYNC_SNAPSHOT_VERSION: u32 = 2;
 const MAX_CUSTOM_RULE_VALUE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -182,6 +183,8 @@ pub enum CustomRuleMatch {
     DomainSuffix,
     DomainKeyword,
     IpCidr,
+    ProcessName,
+    ProcessPath,
 }
 
 impl CustomRuleMatch {
@@ -191,6 +194,8 @@ impl CustomRuleMatch {
             Self::DomainSuffix => "domain_suffix",
             Self::DomainKeyword => "domain_keyword",
             Self::IpCidr => "ip_cidr",
+            Self::ProcessName => "process_name",
+            Self::ProcessPath => "process_path",
         }
     }
 }
@@ -224,6 +229,10 @@ pub enum CustomRuleValidationError {
     InvalidDomainKeyword,
     #[error("CIDR 格式无效，请输入类似 192.168.0.0/16 或 2001:db8::/32")]
     InvalidCidr,
+    #[error("进程名不能为空或包含控制字符，请直接填进程名（如 Telegram）")]
+    InvalidProcessName,
+    #[error("进程路径必须是绝对路径，如 /Applications/Telegram.app/Contents/MacOS/Telegram 或 C:\\Program Files\\Telegram\\Telegram.exe")]
+    InvalidProcessPath,
     #[error("自定义规则不能超过 {MAX_CUSTOM_RULES} 条")]
     TooManyRules,
     #[error("规则 ID 必须唯一且不能为 0")]
@@ -274,7 +283,59 @@ pub fn normalize_custom_rule_value(
             .parse::<ipnet::IpNet>()
             .map(|network| network.trunc().to_string())
             .map_err(|_| CustomRuleValidationError::InvalidCidr),
+        CustomRuleMatch::ProcessName => {
+            let name = value
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|name| !name.is_empty())
+                .ok_or(CustomRuleValidationError::InvalidProcessName)?;
+            if name.chars().any(char::is_control) {
+                return Err(CustomRuleValidationError::InvalidProcessName);
+            }
+            Ok(name.to_string())
+        }
+        CustomRuleMatch::ProcessPath => {
+            if value.chars().any(char::is_control) || !is_portable_absolute_path(value) {
+                return Err(CustomRuleValidationError::InvalidProcessPath);
+            }
+            Ok(trim_process_path(value))
+        }
     }
+}
+
+fn is_portable_absolute_path(value: &str) -> bool {
+    if value.starts_with('/') {
+        return true;
+    }
+
+    let bytes = value.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let unc_absolute = value.starts_with("\\\\")
+        && value[2..]
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty())
+            .take(2)
+            .count()
+            == 2;
+    drive_absolute || unc_absolute
+}
+
+fn trim_process_path(value: &str) -> String {
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    if trimmed.len() == 2
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':'
+    {
+        return value[..3].to_string();
+    }
+    trimmed.to_string()
 }
 
 pub fn validate_custom_rules(rules: &[CustomRule]) -> Result<(), CustomRuleValidationError> {
@@ -473,7 +534,7 @@ fn default_sync_snapshot_format() -> String {
 }
 
 const fn default_sync_snapshot_version() -> u32 {
-    1
+    SYNC_SNAPSHOT_VERSION
 }
 
 impl Default for AppProfile {
@@ -591,6 +652,7 @@ mod tests {
         snapshot.apply_to_profile(&mut target);
 
         assert_eq!(snapshot.format, SYNC_SNAPSHOT_FORMAT);
+        assert_eq!(snapshot.version, SYNC_SNAPSHOT_VERSION);
         assert_eq!(snapshot.updated_at, 42);
         assert_eq!(target.subscriptions.len(), 1);
         assert!(target.subscriptions[0].nodes.is_empty());
@@ -661,6 +723,44 @@ mod tests {
             normalize_custom_rule_value(CustomRuleMatch::Domain, "https://example.com").is_err()
         );
         assert!(normalize_custom_rule_value(CustomRuleMatch::IpCidr, "192.168.0.1").is_err());
+    }
+
+    #[test]
+    fn process_rules_use_portable_path_semantics() {
+        assert_eq!(
+            normalize_custom_rule_value(
+                CustomRuleMatch::ProcessName,
+                r"C:\Program Files\Telegram Desktop\Telegram.exe",
+            ),
+            Ok("Telegram.exe".to_string())
+        );
+        assert_eq!(
+            normalize_custom_rule_value(
+                CustomRuleMatch::ProcessName,
+                "/Applications/Telegram.app/Contents/MacOS/Telegram",
+            ),
+            Ok("Telegram".to_string())
+        );
+        assert_eq!(
+            normalize_custom_rule_value(
+                CustomRuleMatch::ProcessPath,
+                r"C:\Program Files\Telegram Desktop\Telegram.exe",
+            ),
+            Ok(r"C:\Program Files\Telegram Desktop\Telegram.exe".to_string())
+        );
+        assert_eq!(
+            normalize_custom_rule_value(
+                CustomRuleMatch::ProcessPath,
+                "/Applications/Telegram.app/Contents/MacOS/Telegram/",
+            ),
+            Ok("/Applications/Telegram.app/Contents/MacOS/Telegram".to_string())
+        );
+        assert_eq!(
+            normalize_custom_rule_value(CustomRuleMatch::ProcessPath, "/"),
+            Ok("/".to_string())
+        );
+        assert!(normalize_custom_rule_value(CustomRuleMatch::ProcessName, "/").is_err());
+        assert!(normalize_custom_rule_value(CustomRuleMatch::ProcessPath, "Telegram").is_err());
     }
 
     #[test]

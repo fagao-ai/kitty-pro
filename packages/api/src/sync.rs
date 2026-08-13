@@ -1,9 +1,11 @@
 use super::{profile_path, SyncConfig, SyncProviderKind, SyncResult};
 use dioxus::prelude::ServerFnError;
-use proxy_core::{validate_custom_rules, SyncSnapshot, SYNC_SNAPSHOT_FORMAT};
+use proxy_core::{
+    validate_custom_rules, SyncSnapshot, SYNC_SNAPSHOT_FORMAT, SYNC_SNAPSHOT_VERSION,
+};
 use reqwest::header::{ETAG, IF_MATCH, IF_NONE_MATCH};
 use reqwest::{Method, Response, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::Write;
@@ -11,6 +13,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_SYNC_BYTES: usize = 20 * 1024 * 1024;
+const LEGACY_SYNC_SNAPSHOT_VERSION: u32 = 1;
+
+#[derive(Deserialize)]
+struct SyncSnapshotEnvelope {
+    format: String,
+    version: u32,
+}
 
 pub(super) struct DownloadedSnapshot {
     pub snapshot: SyncSnapshot,
@@ -72,6 +81,7 @@ pub(super) async fn push(
 ) -> Result<SyncResult, ServerFnError> {
     validate_config(config)?;
     validate_snapshot(&snapshot)?;
+    snapshot.version = SYNC_SNAPSHOT_VERSION;
 
     let condition = if force {
         UploadCondition::Unconditional
@@ -264,7 +274,10 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
             snapshot.format
         )));
     }
-    if snapshot.version != 1 {
+    if !matches!(
+        snapshot.version,
+        LEGACY_SYNC_SNAPSHOT_VERSION | SYNC_SNAPSHOT_VERSION
+    ) {
         return Err(ServerFnError::new(format!(
             "不支持的同步快照版本: {}",
             snapshot.version
@@ -294,6 +307,31 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
         }
     }
     Ok(())
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Result<SyncSnapshot, ServerFnError> {
+    let envelope: SyncSnapshotEnvelope = serde_json::from_slice(bytes)
+        .map_err(|error| ServerFnError::new(format!("远程同步文件无效: {error}")))?;
+    if envelope.format != SYNC_SNAPSHOT_FORMAT {
+        return Err(ServerFnError::new(format!(
+            "不支持的同步快照格式: {}",
+            envelope.format
+        )));
+    }
+    if !matches!(
+        envelope.version,
+        LEGACY_SYNC_SNAPSHOT_VERSION | SYNC_SNAPSHOT_VERSION
+    ) {
+        return Err(ServerFnError::new(format!(
+            "不支持的同步快照版本: {}",
+            envelope.version
+        )));
+    }
+
+    let snapshot = serde_json::from_slice(bytes)
+        .map_err(|error| ServerFnError::new(format!("远程同步文件无效: {error}")))?;
+    validate_snapshot(&snapshot)?;
+    Ok(snapshot)
 }
 
 pub(super) fn validate_remote_revision(revision: &str) -> Result<(), ServerFnError> {
@@ -334,9 +372,7 @@ async fn download_snapshot(
         return Err(ServerFnError::new("远程同步文件超过 20 MiB 限制"));
     }
     let bytes = read_limited_body(response, MAX_SYNC_BYTES, "读取远程同步文件").await?;
-    let snapshot = serde_json::from_slice(&bytes)
-        .map_err(|error| ServerFnError::new(format!("远程同步文件无效: {error}")))?;
-    validate_snapshot(&snapshot)?;
+    let snapshot = decode_snapshot(&bytes)?;
     Ok(Some(DownloadedSnapshot {
         snapshot,
         remote_revision,
@@ -369,7 +405,7 @@ fn http_client() -> Result<reqwest::Client, ServerFnError> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(45))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("kitty-pro-sync/1")
+        .user_agent("kitty-pro-sync/2")
         .build()
         .map_err(|error| ServerFnError::new(format!("创建同步客户端失败: {error}")))
 }
@@ -840,6 +876,64 @@ mod tests {
             action: proxy_core::CustomRuleAction::Direct,
         }];
         assert!(validate_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn snapshot_accepts_process_paths_from_other_desktop_platforms() {
+        let mut snapshot = SyncSnapshot::from_profile(&Default::default(), 0);
+        snapshot.custom_rules = vec![
+            proxy_core::CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: proxy_core::CustomRuleMatch::ProcessPath,
+                value: r"C:\Program Files\Telegram Desktop\Telegram.exe".to_string(),
+                action: proxy_core::CustomRuleAction::Proxy,
+            },
+            proxy_core::CustomRule {
+                id: 2,
+                enabled: true,
+                match_type: proxy_core::CustomRuleMatch::ProcessPath,
+                value: "/Applications/Telegram.app/Contents/MacOS/Telegram".to_string(),
+                action: proxy_core::CustomRuleAction::Direct,
+            },
+        ];
+
+        assert!(validate_snapshot(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn snapshot_decoder_accepts_v1_and_writes_v2() {
+        let mut legacy = SyncSnapshot::from_profile(&Default::default(), 7);
+        legacy.version = LEGACY_SYNC_SNAPSHOT_VERSION;
+        let bytes = serde_json::to_vec(&legacy).expect("legacy snapshot should serialize");
+
+        let decoded = decode_snapshot(&bytes).expect("v1 snapshot should remain readable");
+        assert_eq!(decoded.version, LEGACY_SYNC_SNAPSHOT_VERSION);
+        assert_eq!(
+            SyncSnapshot::from_profile(&Default::default(), 0).version,
+            SYNC_SNAPSHOT_VERSION
+        );
+    }
+
+    #[test]
+    fn snapshot_decoder_rejects_future_version_before_payload() {
+        let bytes = br#"{
+            "format": "kitty-pro-sync",
+            "version": 3,
+            "custom_rules": [{
+                "id": 1,
+                "enabled": true,
+                "match_type": "future_process_match",
+                "value": "Telegram",
+                "action": "proxy"
+            }]
+        }"#;
+
+        let error = decode_snapshot(bytes).expect_err("future snapshot should be rejected");
+        assert!(
+            error.to_string().contains("不支持的同步快照版本: 3"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

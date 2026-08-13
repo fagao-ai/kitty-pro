@@ -15,6 +15,7 @@ use proxy_core::{
     validate_custom_rules, AppProfile, ConnectionRequest, CustomRule, CustomRuleAction,
     CustomRuleMatch, ParseReport, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol,
     Subscription, SyncSnapshot, SyncSubscription, TunnelMode, MAX_CUSTOM_RULES,
+    SYNC_SNAPSHOT_VERSION,
 };
 use std::collections::HashMap;
 
@@ -2665,7 +2666,17 @@ fn RulesView(
     let mut draft_action = use_signal(|| CustomRuleAction::Direct);
     let mut draft_value = use_signal(String::new);
     let mut editor_error = use_signal(|| None::<String>);
-    let stored = rules();
+    let mut process_picker_open = use_signal(|| false);
+    let mut process_picker_loaded = use_signal(|| false);
+    let mut process_picker_error = use_signal(|| None::<String>);
+    let process_picker_list = use_signal(Vec::<api::RunningProcess>::new);
+    let include_process_rules = process_rules_available();
+    let all_stored = rules();
+    let stored_rule_count = all_stored.len();
+    let stored = all_stored
+        .into_iter()
+        .filter(|rule| custom_rule_visible(rule.match_type, include_process_rules))
+        .collect::<Vec<_>>();
     let enabled_count = stored.iter().filter(|rule| rule.enabled).count();
     let total = stored.len();
     let rule_mode_active = tunnel_mode() == TunnelMode::Rule;
@@ -2742,7 +2753,7 @@ fn RulesView(
                     }
                     button {
                         class: "primary-button compact",
-                        disabled: override_active || total >= MAX_CUSTOM_RULES,
+                        disabled: override_active || stored_rule_count >= MAX_CUSTOM_RULES,
                         onclick: move |_| open_new_editor(),
                         Icon { icon: LdPlus, width: 17, height: 17 }
                         span { "添加规则" }
@@ -2757,6 +2768,13 @@ fn RulesView(
                         strong { "JavaScript 配置覆写已启用" }
                         span { "自定义分流规则暂不可用" }
                     }
+                }
+            }
+
+            if !override_active && include_process_rules {
+                div { class: "process-rule-hint",
+                    Icon { icon: LdInfo, width: 15, height: 15 }
+                    span { "进程分流需开启 TUN 才能覆盖所有进程；仅系统代理模式下，进程规则只作用于走代理的进程。" }
                 }
             }
 
@@ -2783,18 +2801,65 @@ fn RulesView(
                             RuleSelect {
                                 label: "匹配类型".to_string(),
                                 value: custom_rule_match_value(draft_match()).to_string(),
-                                options: vec![
-                                    RuleSelectOption::new("domain", "精确域名"),
-                                    RuleSelectOption::new("domain_suffix", "域名后缀"),
-                                    RuleSelectOption::new("domain_keyword", "域名关键字"),
-                                    RuleSelectOption::new("ip_cidr", "IP CIDR"),
-                                ],
+                                options: custom_rule_match_options(include_process_rules),
                                 on_select: move |value: String| {
                                     draft_match.set(parse_custom_rule_match(&value));
                                     editor_error.set(None);
                                 },
                             }
                         }
+                        if include_process_rules
+                            && (draft_match() == CustomRuleMatch::ProcessName
+                                || draft_match() == CustomRuleMatch::ProcessPath)
+                        {
+                            div { class: "rule-field rule-value-field",
+                                span { "匹配内容" }
+                                div { class: "rule-value-row",
+                                    input {
+                                        value: draft_value,
+                                        placeholder,
+                                        spellcheck: "false",
+                                        oninput: move |event| {
+                                            draft_value.set(event.value());
+                                            editor_error.set(None);
+                                        },
+                                        onkeydown: move |event| {
+                                            if event.key() == Key::Enter {
+                                                match save_custom_rule(
+                                                    &mut rules.write(),
+                                                    editing_id(),
+                                                    draft_match(),
+                                                    draft_action(),
+                                                    &draft_value(),
+                                                ) {
+                                                    Ok(()) => {
+                                                        editor_open.set(false);
+                                                        notify_rule_change(connected(), toast);
+                                                    }
+                                                    Err(error) => editor_error.set(Some(error)),
+                                                }
+                                            }
+                                        },
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "secondary-button compact process-pick-button",
+                                        onclick: move |_| {
+                                            process_picker_open.set(true);
+                                            process_picker_loaded.set(false);
+                                            process_picker_error.set(None);
+                                            load_running_processes(
+                                                process_picker_list,
+                                                process_picker_loaded,
+                                                process_picker_error,
+                                            );
+                                        },
+                                        Icon { icon: LdListFilter, width: 15, height: 15 }
+                                        "选择进程"
+                                    }
+                                }
+                            }
+                        } else {
                         label { class: "rule-field rule-value-field",
                             span { "匹配内容" }
                             input {
@@ -2823,6 +2888,7 @@ fn RulesView(
                                     }
                                 },
                             }
+                        }
                         }
                     }
                     if let Some(error) = editor_error() {
@@ -2864,6 +2930,25 @@ fn RulesView(
                 }
             }
 
+            if process_picker_open() {
+                ProcessPicker {
+                    list: process_picker_list,
+                    loaded: process_picker_loaded,
+                    error: process_picker_error,
+                    on_close: move |_| process_picker_open.set(false),
+                    on_pick: move |process: api::RunningProcess| {
+                        let value = if draft_match() == CustomRuleMatch::ProcessPath {
+                            process.exe_path.clone().unwrap_or_else(|| process.name.clone())
+                        } else {
+                            process.name.clone()
+                        };
+                        draft_value.set(value);
+                        editor_error.set(None);
+                        process_picker_open.set(false);
+                    },
+                }
+            }
+
             if stored.is_empty() {
                 div { class: "large-empty rules-empty",
                     span { class: "empty-icon", Icon { icon: LdListFilter, width: 28, height: 28 } }
@@ -2880,7 +2965,107 @@ fn RulesView(
                             rules,
                             connected: connected(),
                             locked: override_active,
+                            include_process_rules,
                             on_edit,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn load_running_processes(
+    mut list: Signal<Vec<api::RunningProcess>>,
+    mut loaded: Signal<bool>,
+    mut error: Signal<Option<String>>,
+) {
+    spawn(async move {
+        match api::list_running_processes().await {
+            Ok(processes) => {
+                list.set(processes);
+                loaded.set(true);
+            }
+            Err(load_error) => {
+                error.set(Some(load_error.to_string()));
+            }
+        }
+    });
+}
+
+#[component]
+fn ProcessPicker(
+    list: Signal<Vec<api::RunningProcess>>,
+    loaded: Signal<bool>,
+    error: Signal<Option<String>>,
+    on_close: EventHandler<()>,
+    mut on_pick: EventHandler<api::RunningProcess>,
+) -> Element {
+    let mut query = use_signal(String::new);
+    let filtered = list
+        .iter()
+        .filter(|process| {
+            let needle = query().to_lowercase();
+            needle.is_empty()
+                || process.name.to_lowercase().contains(&needle)
+                || process
+                    .exe_path
+                    .as_deref()
+                    .map(|path| path.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    rsx! {
+        div { class: "process-picker-backdrop", aria_hidden: "true", onclick: move |_| on_close.call(()) }
+        div { class: "process-picker", role: "dialog", aria_label: "选择进程",
+            div { class: "process-picker-header",
+                h3 { "选择进程" }
+                button {
+                    r#type: "button",
+                    class: "icon-button",
+                    aria_label: "关闭",
+                    onclick: move |_| on_close.call(()),
+                    Icon { icon: LdX, width: 17, height: 17 }
+                }
+            }
+            div { class: "process-picker-search",
+                input {
+                    value: query,
+                    placeholder: "搜索进程名或路径…",
+                    spellcheck: "false",
+                    oninput: move |event| query.set(event.value()),
+                }
+            }
+            if let Some(message) = error() {
+                div { class: "process-picker-status error", "{message}" }
+            } else if !loaded() {
+                div { class: "process-picker-status", span { class: "spinner" } "正在读取进程列表…" }
+            } else if filtered.is_empty() {
+                div { class: "process-picker-status", "没有匹配的进程" }
+            } else {
+                div { class: "process-picker-list", role: "listbox",
+                    for process in filtered {
+                        {
+                            let name = process.name.clone();
+                            let path = process.exe_path.clone().unwrap_or_default();
+                            let picked = process.clone();
+                            rsx! {
+                                button {
+                                    key: "{process.pid}",
+                                    r#type: "button",
+                                    class: "process-picker-item",
+                                    role: "option",
+                                    onclick: move |_| on_pick.call(picked.clone()),
+                                    div { class: "process-picker-item-main",
+                                        span { class: "process-picker-item-name", "{name}" }
+                                        if !path.is_empty() {
+                                            span { class: "process-picker-item-path", "{path}" }
+                                        }
+                                    }
+                                    span { class: "process-picker-item-pid", "PID {process.pid}" }
+                                }
+                            }
                         }
                     }
                 }
@@ -2978,6 +3163,7 @@ fn RuleListItem(
     mut rules: Signal<Vec<CustomRule>>,
     connected: bool,
     locked: bool,
+    include_process_rules: bool,
     on_edit: EventHandler<CustomRule>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
@@ -3030,7 +3216,12 @@ fn RuleListItem(
                     title: "上移",
                     disabled: locked || index == 0,
                     onclick: move |_| {
-                        move_custom_rule(&mut rules.write(), rule_id, -1);
+                        move_custom_rule(
+                            &mut rules.write(),
+                            rule_id,
+                            -1,
+                            include_process_rules,
+                        );
                         notify_rule_change(connected, toast);
                     },
                     Icon { icon: LdArrowUp, width: 16, height: 16 }
@@ -3040,7 +3231,12 @@ fn RuleListItem(
                     title: "下移",
                     disabled: locked || index + 1 >= total,
                     onclick: move |_| {
-                        move_custom_rule(&mut rules.write(), rule_id, 1);
+                        move_custom_rule(
+                            &mut rules.write(),
+                            rule_id,
+                            1,
+                            include_process_rules,
+                        );
                         notify_rule_change(connected, toast);
                     },
                     Icon { icon: LdArrowDown, width: 16, height: 16 }
@@ -3113,10 +3309,27 @@ fn connection_custom_rules(
     config_script: &str,
     custom_rules: Vec<CustomRule>,
 ) -> Vec<CustomRule> {
+    connection_custom_rules_for_platform(
+        config_script_enabled,
+        config_script,
+        custom_rules,
+        process_rules_available(),
+    )
+}
+
+fn connection_custom_rules_for_platform(
+    config_script_enabled: bool,
+    config_script: &str,
+    custom_rules: Vec<CustomRule>,
+    include_process_rules: bool,
+) -> Vec<CustomRule> {
     if config_script_enabled && !config_script.trim().is_empty() {
         Vec::new()
     } else {
         custom_rules
+            .into_iter()
+            .filter(|rule| custom_rule_visible(rule.match_type, include_process_rules))
+            .collect()
     }
 }
 
@@ -3124,15 +3337,25 @@ fn next_custom_rule_id(rules: &[CustomRule]) -> Option<u64> {
     (1..=(rules.len() as u64 + 1)).find(|id| rules.iter().all(|rule| rule.id != *id))
 }
 
-fn move_custom_rule(rules: &mut [CustomRule], id: u64, offset: isize) {
-    let Some(index) = rules.iter().position(|rule| rule.id == id) else {
+fn move_custom_rule(rules: &mut [CustomRule], id: u64, offset: isize, include_process_rules: bool) {
+    let visible_indices = rules
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rule)| {
+            custom_rule_visible(rule.match_type, include_process_rules).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(visible_index) = visible_indices
+        .iter()
+        .position(|index| rules[*index].id == id)
+    else {
         return;
     };
-    let Some(target) = index.checked_add_signed(offset) else {
+    let Some(target) = visible_index.checked_add_signed(offset) else {
         return;
     };
-    if target < rules.len() {
-        rules.swap(index, target);
+    if let Some(target_index) = visible_indices.get(target) {
+        rules.swap(visible_indices[visible_index], *target_index);
     }
 }
 
@@ -3166,7 +3389,35 @@ fn custom_rule_match_value(match_type: CustomRuleMatch) -> &'static str {
         CustomRuleMatch::DomainSuffix => "domain_suffix",
         CustomRuleMatch::DomainKeyword => "domain_keyword",
         CustomRuleMatch::IpCidr => "ip_cidr",
+        CustomRuleMatch::ProcessName => "process_name",
+        CustomRuleMatch::ProcessPath => "process_path",
     }
+}
+
+const fn process_rules_available() -> bool {
+    !cfg!(any(target_os = "android", target_os = "ios"))
+}
+
+fn custom_rule_match_options(include_process_rules: bool) -> Vec<RuleSelectOption> {
+    let mut options = vec![
+        RuleSelectOption::new("domain", "精确域名"),
+        RuleSelectOption::new("domain_suffix", "域名后缀"),
+        RuleSelectOption::new("domain_keyword", "域名关键字"),
+        RuleSelectOption::new("ip_cidr", "IP CIDR"),
+    ];
+    if include_process_rules {
+        options.push(RuleSelectOption::new("process_name", "进程名"));
+        options.push(RuleSelectOption::new("process_path", "进程路径"));
+    }
+    options
+}
+
+fn custom_rule_visible(match_type: CustomRuleMatch, include_process_rules: bool) -> bool {
+    include_process_rules
+        || !matches!(
+            match_type,
+            CustomRuleMatch::ProcessName | CustomRuleMatch::ProcessPath
+        )
 }
 
 fn parse_custom_rule_match(value: &str) -> CustomRuleMatch {
@@ -3174,6 +3425,8 @@ fn parse_custom_rule_match(value: &str) -> CustomRuleMatch {
         "domain" => CustomRuleMatch::Domain,
         "domain_keyword" => CustomRuleMatch::DomainKeyword,
         "ip_cidr" => CustomRuleMatch::IpCidr,
+        "process_name" => CustomRuleMatch::ProcessName,
+        "process_path" => CustomRuleMatch::ProcessPath,
         _ => CustomRuleMatch::DomainSuffix,
     }
 }
@@ -3184,6 +3437,8 @@ fn custom_rule_match_label(match_type: CustomRuleMatch) -> &'static str {
         CustomRuleMatch::DomainSuffix => "域名后缀",
         CustomRuleMatch::DomainKeyword => "域名关键字",
         CustomRuleMatch::IpCidr => "IP CIDR",
+        CustomRuleMatch::ProcessName => "进程名",
+        CustomRuleMatch::ProcessPath => "进程路径",
     }
 }
 
@@ -3193,6 +3448,8 @@ fn custom_rule_placeholder(match_type: CustomRuleMatch) -> &'static str {
         CustomRuleMatch::DomainSuffix => "example.com",
         CustomRuleMatch::DomainKeyword => "google",
         CustomRuleMatch::IpCidr => "203.0.113.0/24",
+        CustomRuleMatch::ProcessName => "Telegram",
+        CustomRuleMatch::ProcessPath => "/Applications/Telegram.app/Contents/MacOS/Telegram",
     }
 }
 
@@ -3856,7 +4113,7 @@ fn build_sync_snapshot(
 ) -> SyncSnapshot {
     SyncSnapshot {
         format: proxy_core::SYNC_SNAPSHOT_FORMAT.to_string(),
-        version: 1,
+        version: SYNC_SNAPSHOT_VERSION,
         updated_at,
         subscriptions: subscriptions.iter().map(SyncSubscription::from).collect(),
         custom_rules: custom_rules.to_vec(),
@@ -4924,6 +5181,24 @@ mod tests {
     }
 
     #[test]
+    fn mobile_rule_options_hide_process_matches() {
+        let options = custom_rule_match_options(false);
+        let values = options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            vec!["domain", "domain_suffix", "domain_keyword", "ip_cidr"]
+        );
+        assert!(!values.contains(&"process_name"));
+        assert!(!values.contains(&"process_path"));
+        assert!(!custom_rule_visible(CustomRuleMatch::ProcessName, false));
+        assert!(custom_rule_visible(CustomRuleMatch::Domain, false));
+    }
+
+    #[test]
     fn script_override_excludes_custom_rules_from_connection_config() {
         let rules = vec![CustomRule {
             id: 1,
@@ -4940,6 +5215,30 @@ mod tests {
         )
         .is_empty());
         assert_eq!(connection_custom_rules(false, "", rules.clone()), rules);
+    }
+
+    #[test]
+    fn mobile_connection_excludes_preserved_process_rules() {
+        let rules = vec![
+            CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::Domain,
+                value: "example.com".to_string(),
+                action: CustomRuleAction::Proxy,
+            },
+            CustomRule {
+                id: 2,
+                enabled: true,
+                match_type: CustomRuleMatch::ProcessName,
+                value: "Telegram".to_string(),
+                action: CustomRuleAction::Block,
+            },
+        ];
+
+        let filtered = connection_custom_rules_for_platform(false, "", rules, false);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].match_type, CustomRuleMatch::Domain);
     }
 
     #[test]
@@ -4972,15 +5271,48 @@ mod tests {
         assert!(!rules[0].enabled);
         assert_eq!(rules[0].value, "media");
 
-        move_custom_rule(&mut rules, 2, -1);
+        move_custom_rule(&mut rules, 2, -1, true);
         assert_eq!(
             rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
             vec![2, 1]
         );
-        move_custom_rule(&mut rules, 2, -1);
+        move_custom_rule(&mut rules, 2, -1, true);
         assert_eq!(
             rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
             vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn moving_visible_mobile_rules_preserves_hidden_process_rules() {
+        let mut rules = vec![
+            CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::Domain,
+                value: "one.example".to_string(),
+                action: CustomRuleAction::Direct,
+            },
+            CustomRule {
+                id: 2,
+                enabled: true,
+                match_type: CustomRuleMatch::ProcessName,
+                value: "Telegram".to_string(),
+                action: CustomRuleAction::Proxy,
+            },
+            CustomRule {
+                id: 3,
+                enabled: true,
+                match_type: CustomRuleMatch::Domain,
+                value: "three.example".to_string(),
+                action: CustomRuleAction::Block,
+            },
+        ];
+
+        move_custom_rule(&mut rules, 3, -1, false);
+        assert_eq!(
+            rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
+            vec![3, 2, 1]
         );
     }
 }
