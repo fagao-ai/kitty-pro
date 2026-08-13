@@ -159,10 +159,41 @@ fn same_origin(headers: &HeaderMap, host: &str, dev_server_authority: Option<&st
     let Ok(uri) = origin.parse::<Uri>() else {
         return false;
     };
-    matches!(uri.scheme_str(), Some("http" | "https"))
-        && uri.authority().is_some_and(|authority| {
-            authority.as_str() == host || Some(authority.as_str()) == dev_server_authority
-        })
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let authority = authority.as_str();
+    if authority == host {
+        return true;
+    }
+    // The dev server proxies requests to an internal loopback port and
+    // rewrites the `Host` header, so the browser's Origin no longer matches
+    // the request Host. Accept the same dev server reached through any
+    // loopback alias (http://localhost:8080 vs http://127.0.0.1:8080) while
+    // still rejecting cross-site origins from other local ports.
+    match dev_server_authority {
+        Some(dev) => dev_server_origin_matches(authority, dev),
+        None => false,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dev_server_origin_matches(origin_authority: &str, dev_server_authority: &str) -> bool {
+    if origin_authority == dev_server_authority {
+        return true;
+    }
+    let Some((dev_host, dev_port)) = dev_server_authority.rsplit_once(':') else {
+        return false;
+    };
+    let Some((origin_host, origin_port)) = origin_authority.rsplit_once(':') else {
+        return false;
+    };
+    dev_port == origin_port
+        && matches!(dev_host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+        && matches!(origin_host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -283,5 +314,23 @@ mod tests {
             ),
             &session
         ));
+    }
+
+    #[test]
+    fn proxied_dev_server_requests_accept_loopback_origin_aliases() {
+        // dx serve rewrites the Host header to the internal loopback port, so
+        // the browser Origin must be matched against the configured dev server
+        // authority instead of the request Host.
+        assert!(dev_server_origin_matches("localhost:8080", "127.0.0.1:8080"));
+        assert!(dev_server_origin_matches("127.0.0.1:8080", "127.0.0.1:8080"));
+        assert!(dev_server_origin_matches("[::1]:8080", "127.0.0.1:8080"));
+        assert!(dev_server_origin_matches("127.0.0.1:8080", "localhost:8080"));
+        assert!(dev_server_origin_matches("localhost:8080", "localhost:8080"));
+        // A different local port is a different site and must stay rejected:
+        // SameSite cookies still travel between same-site localhost origins.
+        assert!(!dev_server_origin_matches("localhost:9090", "127.0.0.1:8080"));
+        assert!(!dev_server_origin_matches("example.com:8080", "127.0.0.1:8080"));
+        assert!(!dev_server_origin_matches("127.0.0.1", "127.0.0.1:8080"));
+        assert!(!dev_server_origin_matches("localhost:8080", ""));
     }
 }
