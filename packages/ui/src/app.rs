@@ -1413,6 +1413,48 @@ fn OverviewView(
                                 },
                                 group_selections: group_selections(),
                             });
+                            // With TUN toggled on but the core stopped, the
+                            // privileged helper is gone and starting would
+                            // fail with "TUN 权限尚未准备". Re-acquire the
+                            // permission (prompting for administrator access
+                            // only when no authorized helper exists) before
+                            // starting, so the TUN switch stays a persistent
+                            // preference instead of a one-shot setup.
+                            if target && tun_enabled() {
+                                if let Some(tun_request) = request.clone() {
+                                    match api::prepare_tun_mode(tun_request).await {
+                                        Ok(()) => {}
+                                        Err(error) => {
+                                            // The core may actually already
+                                            // be running behind a stale local
+                                            // state; refresh before giving up
+                                            // to keep the button idempotent.
+                                            match api::core_status().await {
+                                                Ok(status)
+                                                    if status.state == "running" =>
+                                                {
+                                                    // Fall through: toggling
+                                                    // again is a no-op.
+                                                }
+                                                Ok(_) => {
+                                                    core_busy.set(false);
+                                                    toast.error(format!(
+                                                        "准备 TUN 权限失败，内核未启动: {error}"
+                                                    ));
+                                                    return;
+                                                }
+                                                Err(status_error) => {
+                                                    core_busy.set(false);
+                                                    toast.error(format!(
+                                                        "准备 TUN 权限失败: {error}；刷新内核状态失败: {status_error}"
+                                                    ));
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             match api::set_core_enabled(target, request).await {
                                 Ok(status) => {
                                     let is_running = status.state == "running";
@@ -4340,7 +4382,7 @@ fn SettingsView(
                                 };
                                 if !connected() {
                                     let result = if enabled {
-                                        api::prepare_tun_mode(request).await
+                                        api::prepare_tun_mode(request.clone()).await
                                     } else {
                                         api::release_tun_mode().await
                                     };
@@ -4355,11 +4397,54 @@ fn SettingsView(
                                         }
                                         Err(error) => {
                                             tun_enabled.set(previous_enabled);
-                                            toast.error(if enabled {
-                                                format!("TUN 权限准备失败: {error}")
+                                            if !enabled {
+                                                // The local `connected` state
+                                                // can be stale (page reload,
+                                                // failed status poll), so the
+                                                // core may actually still be
+                                                // running and refuse a bare
+                                                // helper release. Refresh the
+                                                // real state and fall back to
+                                                // restarting the core without
+                                                // TUN when that is the case.
+                                                match api::core_status().await {
+                                                    Ok(status)
+                                                        if status.state == "running" =>
+                                                    {
+                                                        match api::restart_core(request).await {
+                                                            Ok(status) => {
+                                                                let is_running =
+                                                                    status.state == "running";
+                                                                tun_enabled.set(false);
+                                                                connected.set(is_running);
+                                                                core_state.set(status.state);
+                                                                core_version.set(status.version);
+                                                                core_note.set(status.note);
+                                                                toast.success("TUN 模式已关闭");
+                                                            }
+                                                            Err(restart_error) => {
+                                                                toast.error(format!(
+                                                                    "关闭 TUN 失败: {restart_error}"
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(_) => {
+                                                        toast.error(format!(
+                                                            "关闭 TUN 失败: {error}"
+                                                        ));
+                                                    }
+                                                    Err(status_error) => {
+                                                        toast.error(format!(
+                                                            "关闭 TUN 失败: {error}；刷新内核状态失败: {status_error}"
+                                                        ));
+                                                    }
+                                                }
                                             } else {
-                                                format!("关闭 TUN 失败: {error}")
-                                            });
+                                                toast.error(format!(
+                                                    "TUN 权限准备失败: {error}"
+                                                ));
+                                            }
                                         }
                                     }
                                     tun_busy.set(false);
