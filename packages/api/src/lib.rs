@@ -1267,38 +1267,38 @@ fn native_rule_set_cache_paths() -> Result<RuleSetCachePaths, ServerFnError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn prepare_native_fakeip_cache_file() -> Result<String, ServerFnError> {
+fn prepare_native_cache_file() -> Result<String, ServerFnError> {
     let profile = profile_path()?;
     let directory = profile
         .parent()
-        .ok_or_else(|| ServerFnError::new("无法确定 FakeIP 缓存目录"))?
+        .ok_or_else(|| ServerFnError::new("无法确定 sing-box 缓存目录"))?
         .join("cache");
     std::fs::create_dir_all(&directory)
-        .map_err(|error| ServerFnError::new(format!("创建 FakeIP 缓存目录失败: {error}")))?;
+        .map_err(|error| ServerFnError::new(format!("创建 sing-box 缓存目录失败: {error}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).map_err(
-            |error| ServerFnError::new(format!("限制 FakeIP 缓存目录权限失败: {error}")),
+            |error| ServerFnError::new(format!("限制 sing-box 缓存目录权限失败: {error}")),
         )?;
     }
 
     let path = directory.join("sing-box.db");
-    prepare_private_fakeip_cache_file(&path)?;
+    prepare_private_cache_file(&path)?;
     path.to_str()
         .map(str::to_string)
-        .ok_or_else(|| ServerFnError::new("FakeIP 缓存路径不是有效 UTF-8"))
+        .ok_or_else(|| ServerFnError::new("sing-box 缓存路径不是有效 UTF-8"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn prepare_private_fakeip_cache_file(path: &std::path::Path) -> Result<(), ServerFnError> {
+fn prepare_private_cache_file(path: &std::path::Path) -> Result<(), ServerFnError> {
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
-            return Err(ServerFnError::new("FakeIP 缓存文件不能是符号链接"));
+            return Err(ServerFnError::new("sing-box 缓存文件不能是符号链接"));
         }
         if !metadata.file_type().is_file() {
-            return Err(ServerFnError::new("FakeIP 缓存路径不是普通文件"));
+            return Err(ServerFnError::new("sing-box 缓存路径不是普通文件"));
         }
     }
     let mut options = std::fs::OpenOptions::new();
@@ -1311,13 +1311,13 @@ fn prepare_private_fakeip_cache_file(path: &std::path::Path) -> Result<(), Serve
     }
     let file = options
         .open(path)
-        .map_err(|error| ServerFnError::new(format!("准备 FakeIP 缓存文件失败: {error}")))?;
+        .map_err(|error| ServerFnError::new(format!("准备 sing-box 缓存文件失败: {error}")))?;
     if !file
         .metadata()
-        .map_err(|error| ServerFnError::new(format!("检查 FakeIP 缓存文件失败: {error}")))?
+        .map_err(|error| ServerFnError::new(format!("检查 sing-box 缓存文件失败: {error}")))?
         .is_file()
     {
-        return Err(ServerFnError::new("FakeIP 缓存路径不是普通文件"));
+        return Err(ServerFnError::new("sing-box 缓存路径不是普通文件"));
     }
     #[cfg(unix)]
     {
@@ -1913,7 +1913,8 @@ fn build_native_config(
             config.remove("__kitty_context");
         }
     }
-    apply_owned_fakeip_cache_config(&mut config, request, options);
+    apply_remote_rule_set_download_detour(&mut config);
+    apply_owned_cache_config(&mut config, request, options);
     proxy_core::apply_proxy_group_selections(&mut config, &request.group_selections);
     #[cfg(target_os = "macos")]
     macos_route::pin_non_default_outbound_sources(&mut config)
@@ -1922,15 +1923,45 @@ fn build_native_config(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn apply_owned_fakeip_cache_config(
+fn apply_remote_rule_set_download_detour(config: &mut serde_json::Value) {
+    const DOWNLOAD_OUTBOUND: &str = "__kitty-rule-set-download";
+
+    let Some(rule_sets) = config["route"]["rule_set"].as_array_mut() else {
+        return;
+    };
+    let needs_download_outbound = rule_sets
+        .iter()
+        .any(|rule_set| rule_set["type"] == "remote" && rule_set["download_detour"] == "direct");
+    if !needs_download_outbound {
+        return;
+    }
+    for rule_set in rule_sets {
+        if rule_set["type"] == "remote" && rule_set["download_detour"] == "direct" {
+            rule_set["download_detour"] = serde_json::Value::String(DOWNLOAD_OUTBOUND.to_string());
+        }
+    }
+    let Some(outbounds) = config["outbounds"].as_array_mut() else {
+        return;
+    };
+    if !outbounds
+        .iter()
+        .any(|outbound| outbound["tag"] == DOWNLOAD_OUTBOUND)
+    {
+        outbounds.push(serde_json::json!({
+            "type": "direct",
+            "tag": DOWNLOAD_OUTBOUND,
+            "domain_resolver": "dns-local",
+        }));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_owned_cache_config(
     config: &mut serde_json::Value,
     request: &ConnectionRequest,
     options: &SingBoxOptions,
 ) {
-    if !request.tun || request.mode == TunnelMode::Direct {
-        return;
-    }
-    let Some(path) = options.fakeip_cache_file.as_deref() else {
+    let Some(path) = options.cache_file.as_deref() else {
         return;
     };
     let Some(config) = config.as_object_mut() else {
@@ -1945,7 +1976,7 @@ fn apply_owned_fakeip_cache_config(
     experimental["cache_file"] = serde_json::json!({
         "enabled": true,
         "path": path,
-        "store_fakeip": true,
+        "store_fakeip": request.tun && request.mode != TunnelMode::Direct,
     });
 }
 
@@ -2023,11 +2054,7 @@ fn toggle_native_core(
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
-        fakeip_cache_file: if request.tun && request.mode != TunnelMode::Direct {
-            Some(prepare_native_fakeip_cache_file()?)
-        } else {
-            None
-        },
+        cache_file: Some(prepare_native_cache_file()?),
         ..SingBoxOptions::default()
     };
     let config = build_native_config(&request, &options)?;
@@ -2301,11 +2328,7 @@ fn restart_native_core(
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
-        fakeip_cache_file: if request.tun && request.mode != TunnelMode::Direct {
-            Some(prepare_native_fakeip_cache_file()?)
-        } else {
-            None
-        },
+        cache_file: Some(prepare_native_cache_file()?),
         ..SingBoxOptions::default()
     };
     let candidate = build_native_config(&request, &options)?;
@@ -2364,11 +2387,7 @@ fn prepare_native_tun_mode(
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
-        fakeip_cache_file: if request.mode != TunnelMode::Direct {
-            Some(prepare_native_fakeip_cache_file()?)
-        } else {
-            None
-        },
+        cache_file: Some(prepare_native_cache_file()?),
         ..SingBoxOptions::default()
     };
     let candidate = build_native_config(&request, &options)?;
@@ -2459,11 +2478,7 @@ fn toggle_native_core(
         traffic_api_port: Some(allocate_loopback_port()?),
         traffic_api_secret: Some(generate_traffic_api_secret()?),
         rule_set_cache,
-        fakeip_cache_file: if request.tun && request.mode != TunnelMode::Direct {
-            Some(prepare_native_fakeip_cache_file()?)
-        } else {
-            None
-        },
+        cache_file: Some(prepare_native_cache_file()?),
         ..SingBoxOptions::default()
     };
     let mut config = build_native_config(&request, &options)?;
@@ -3438,18 +3453,18 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn fakeip_cache_file_is_private_and_reused() {
-        let directory = TestDirectory::new("fakeip-cache");
+    fn singbox_cache_file_is_private_and_reused() {
+        let directory = TestDirectory::new("singbox-cache");
         let path = directory.0.join("sing-box.db");
 
-        prepare_private_fakeip_cache_file(&path).expect("cache file should be created");
-        std::fs::write(&path, b"persistent fakeip mapping")
+        prepare_private_cache_file(&path).expect("cache file should be created");
+        std::fs::write(&path, b"persistent sing-box cache")
             .expect("cache fixture should be written");
-        prepare_private_fakeip_cache_file(&path).expect("cache file should be reusable");
+        prepare_private_cache_file(&path).expect("cache file should be reusable");
 
         assert_eq!(
             std::fs::read(&path).expect("cache fixture should be readable"),
-            b"persistent fakeip mapping"
+            b"persistent sing-box cache"
         );
         #[cfg(unix)]
         {
@@ -3468,17 +3483,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn fakeip_cache_file_rejects_symbolic_links() {
+    fn singbox_cache_file_rejects_symbolic_links() {
         use std::os::unix::fs::symlink;
 
-        let directory = TestDirectory::new("fakeip-cache-symlink");
+        let directory = TestDirectory::new("singbox-cache-symlink");
         let target = directory.0.join("target.db");
         let path = directory.0.join("sing-box.db");
         std::fs::write(&target, b"unrelated data").expect("target should be written");
         symlink(&target, &path).expect("cache symlink should be created");
 
         let error =
-            prepare_private_fakeip_cache_file(&path).expect_err("cache symlink should be rejected");
+            prepare_private_cache_file(&path).expect_err("cache symlink should be rejected");
 
         assert!(error.to_string().contains("符号链接"));
         assert_eq!(
@@ -3529,7 +3544,65 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn app_owned_fakeip_cache_path_overrides_script_output() {
+    fn native_config_resolves_script_rule_set_downloads_with_system_dns() {
+        let nodes = proxy_core::parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: false,
+            allow_lan: true,
+            custom_rules: Vec::new(),
+            config_script: Some(
+                "function main(config) {\
+                    config.route.rule_set.push({\
+                        type: 'remote',\
+                        tag: 'script-rule-set',\
+                        format: 'binary',\
+                        url: 'https://rules.example.com/script.srs',\
+                        download_detour: 'direct'\
+                    });\
+                    return config;\
+                }"
+                .to_string(),
+            ),
+            group_selections: Default::default(),
+        };
+
+        let config = build_native_config(&request, &SingBoxOptions::default())
+            .expect("script rule set should be accepted");
+        let script_rule_set = config["route"]["rule_set"]
+            .as_array()
+            .and_then(|rule_sets| {
+                rule_sets
+                    .iter()
+                    .find(|rule_set| rule_set["tag"] == "script-rule-set")
+            })
+            .expect("script rule set should remain in the config");
+
+        assert_eq!(
+            script_rule_set["download_detour"],
+            "__kitty-rule-set-download"
+        );
+        let download_outbound = config["outbounds"]
+            .as_array()
+            .and_then(|outbounds| {
+                outbounds
+                    .iter()
+                    .find(|outbound| outbound["tag"] == "__kitty-rule-set-download")
+            })
+            .expect("rule-set download outbound should be generated");
+        assert_eq!(download_outbound["type"], "direct");
+        assert_eq!(download_outbound["domain_resolver"], "dns-local");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn app_owned_cache_path_overrides_script_output() {
         let nodes = proxy_core::parse_subscription(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443#Node",
         )
@@ -3546,7 +3619,7 @@ mod tests {
             group_selections: Default::default(),
         };
         let options = SingBoxOptions {
-            fakeip_cache_file: Some("/app-data/cache/sing-box.db".to_string()),
+            cache_file: Some("/app-data/cache/sing-box.db".to_string()),
             ..SingBoxOptions::default()
         };
         let mut config = serde_json::json!({
@@ -3559,7 +3632,7 @@ mod tests {
             }
         });
 
-        apply_owned_fakeip_cache_config(&mut config, &request, &options);
+        apply_owned_cache_config(&mut config, &request, &options);
 
         assert_eq!(
             config["experimental"]["cache_file"],
@@ -3569,6 +3642,46 @@ mod tests {
                 "store_fakeip": true,
             })
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn app_owned_cache_is_enabled_without_tun() {
+        let nodes = proxy_core::parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Node",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: false,
+            allow_lan: true,
+            custom_rules: Vec::new(),
+            config_script: None,
+            group_selections: Default::default(),
+        };
+        let options = SingBoxOptions {
+            cache_file: Some("/app-data/cache/sing-box.db".to_string()),
+            ..SingBoxOptions::default()
+        };
+        let mut config = serde_json::json!({
+            "route": {
+                "rule_set": [{
+                    "type": "remote",
+                    "tag": "script-rule-set",
+                    "format": "binary",
+                    "url": "https://rules.example.com/script.srs"
+                }]
+            }
+        });
+
+        apply_owned_cache_config(&mut config, &request, &options);
+
+        assert_eq!(config["experimental"]["cache_file"]["enabled"], true);
+        assert_eq!(config["experimental"]["cache_file"]["store_fakeip"], false);
+        assert_eq!(config["route"]["rule_set"][0]["tag"], "script-rule-set");
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -35,9 +35,9 @@ pub struct SingBoxOptions {
     /// Validated local rule-set files. Local rule sets are watched by
     /// sing-box and reloaded when the updater atomically replaces them.
     pub rule_set_cache: Option<RuleSetCachePaths>,
-    /// Persistent sing-box cache used to keep FakeIP-to-domain mappings
-    /// stable across TUN core restarts.
-    pub fakeip_cache_file: Option<String>,
+    /// Persistent sing-box cache used for remote rule sets and, in TUN mode,
+    /// stable FakeIP-to-domain mappings across core restarts.
+    pub cache_file: Option<String>,
 }
 
 impl Default for SingBoxOptions {
@@ -49,7 +49,7 @@ impl Default for SingBoxOptions {
             traffic_api_port: None,
             traffic_api_secret: None,
             rule_set_cache: None,
-            fakeip_cache_file: None,
+            cache_file: None,
         }
     }
 }
@@ -184,17 +184,15 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         },
     });
     let mut experimental = Map::new();
-    if request.tun && request.mode != TunnelMode::Direct {
-        if let Some(path) = options.fakeip_cache_file.as_deref() {
-            experimental.insert(
-                "cache_file".to_string(),
-                json!({
-                    "enabled": true,
-                    "path": path,
-                    "store_fakeip": true,
-                }),
-            );
-        }
+    if let Some(path) = options.cache_file.as_deref() {
+        experimental.insert(
+            "cache_file".to_string(),
+            json!({
+                "enabled": true,
+                "path": path,
+                "store_fakeip": request.tun && request.mode != TunnelMode::Direct,
+            }),
+        );
     }
     if let Some(port) = options.traffic_api_port {
         experimental.insert(
@@ -850,7 +848,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
         };
 
         let options = SingBoxOptions {
-            fakeip_cache_file: Some("/app-data/cache/sing-box.db".to_string()),
+            cache_file: Some("/app-data/cache/sing-box.db".to_string()),
             ..SingBoxOptions::default()
         };
         let config = build_singbox_config(&request, &options);
@@ -871,15 +869,17 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             .as_array()
             .is_some_and(|servers| { servers.iter().all(|server| server["tag"] != "dns-fakeip") }));
         assert!(config["dns"].get("independent_cache").is_none());
-        assert!(config.get("experimental").is_none());
+        assert_eq!(config["experimental"]["cache_file"]["enabled"], true);
+        assert_eq!(config["experimental"]["cache_file"]["store_fakeip"], false);
 
         request.tun = true;
         request.mode = TunnelMode::Direct;
         let config = build_singbox_config(&request, &options);
         assert_eq!(config["dns"]["final"], "dns-direct");
         assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(1));
+        assert_eq!(config["experimental"]["cache_file"]["enabled"], true);
+        assert_eq!(config["experimental"]["cache_file"]["store_fakeip"], false);
         assert!(config["dns"].get("independent_cache").is_none());
-        assert!(config.get("experimental").is_none());
     }
 
     #[test]

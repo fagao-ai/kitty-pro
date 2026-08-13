@@ -1318,7 +1318,7 @@ mod tests {
             traffic_api_port: Some(traffic_port),
             traffic_api_secret: Some("test-traffic-secret".to_string()),
             rule_set_cache: None,
-            fakeip_cache_file: None,
+            cache_file: None,
         };
         let mut core = SingBox::new().expect("embedded core should be linked");
 
