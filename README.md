@@ -30,6 +30,23 @@ traffic; desktop TUN additionally requires the platform's network privileges.
 Literal IP proxy endpoints are excluded from desktop TUN routes to prevent the
 upstream connection from looping back into the tunnel.
 
+### IPv6 behavior
+
+Domains routed DIRECT (geosite-cn plus custom direct rules) are answered
+IPv4-only, so applications never receive AAAA records for them. This avoids
+the classic failure where WeChat and other Tencent apps prefer IPv6 for media
+uploads and get stuck when the host has no real IPv6 connectivity (text
+traffic over IPv4 keeps working while image uploads fail). Clients with
+built-in IPv6 server lists (WeChat's Tencent endpoints) still attempt IPv6
+connections; those fail immediately with `no route to host` and fall back to
+IPv4.
+
+Proxied domains keep the fake-ip IPv6 range (`fc00::/18`), but the client
+only ever talks to a fake address that the TUN restores to the original
+domain before dialing through the proxy tunnel, so no real IPv6 packets leave
+the host on the proxied path either. IPv6-only destinations remain reachable
+because the remote proxy server performs the IPv6 dial.
+
 `proxy-core` owns parsing and sing-box JSON generation, so every Dioxus shell
 uses the same Rust types and configuration logic.
 
