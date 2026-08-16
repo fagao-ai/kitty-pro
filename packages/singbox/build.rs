@@ -19,6 +19,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NO_PROXY");
     println!("cargo:rerun-if-env-changed=GOPROXY");
     println!("cargo:rerun-if-env-changed=SINGBOX_GO");
+    println!("cargo:rerun-if-env-changed=SINGBOX_CC");
 
     if env::var_os("CARGO_FEATURE_EMBEDDED_CORE").is_none() {
         return;
@@ -74,6 +75,10 @@ fn main() {
         .current_dir(&bridge_dir)
         .env("GOOS", go_os)
         .env("GOARCH", go_arch);
+
+    if let Some(compiler) = env::var_os("SINGBOX_CC") {
+        command.env("CC", compiler);
+    }
 
     if target_os == "android" {
         command
