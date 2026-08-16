@@ -93,6 +93,7 @@ fn main() {
     let window_icon = icon_from_memory(APP_ICON).expect("embedded application icon must be valid");
     let config = Config::new()
         .with_window(WindowBuilder::new().with_title("Kitty Pro"))
+        .with_menu(None)
         .with_icon(window_icon)
         .with_custom_head(format!("<style>{MAIN_CSS}\n{APP_CSS}</style>"))
         .with_close_behaviour(WindowCloseBehaviour::WindowHides)
