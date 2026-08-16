@@ -29,6 +29,41 @@ const LATENCY_CACHE_KEY: &str = "kitty-pro.node-latency.v1";
 
 type LatencyCacheEntry = (String, String, u64);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DesktopTrayCommand {
+    SelectSubscription(u64),
+    SelectNode(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopTraySubscription {
+    pub id: u64,
+    pub name: String,
+    pub nodes: Vec<DesktopTrayNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopTrayNode {
+    pub tag: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DesktopTrayState {
+    pub ready: bool,
+    pub busy: bool,
+    pub connected: bool,
+    pub active_subscription_id: Option<u64>,
+    pub selected_tag: String,
+    pub subscriptions: Vec<DesktopTraySubscription>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct DesktopTrayBridge {
+    pub state: Signal<DesktopTrayState>,
+    pub command: Signal<Option<DesktopTrayCommand>>,
+}
+
 fn build_connection_request(
     nodes: Vec<ProxyNode>,
     selected_tag: String,
@@ -339,12 +374,12 @@ impl AppView {
 }
 
 #[component]
-pub fn ProxyApp(platform: String) -> Element {
+pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> Element {
     let active_view = use_signal(|| AppView::Overview);
     let mut dark_mode = use_signal(|| false);
     let mut connected = use_signal(|| false);
     let core_busy = use_signal(|| false);
-    let runtime_action_busy = use_signal(|| false);
+    let mut runtime_action_busy = use_signal(|| false);
     let mut core_restarting = use_signal(|| false);
     let mut core_state = use_signal(|| "checking".to_string());
     let mut core_version = use_signal(|| None::<String>);
@@ -384,6 +419,198 @@ pub fn ProxyApp(platform: String) -> Element {
     let mut profile_loaded = use_signal(|| false);
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
     let system_proxy_busy = use_signal(|| false);
+
+    use_effect(move || {
+        let Some(mut bridge) = desktop_tray else {
+            return;
+        };
+        bridge.state.set(DesktopTrayState {
+            ready: profile_loaded(),
+            busy: core_busy() || core_restarting() || system_proxy_busy() || runtime_action_busy(),
+            connected: connected(),
+            active_subscription_id: active_subscription_id(),
+            selected_tag: selected_tag(),
+            subscriptions: subscriptions()
+                .into_iter()
+                .map(|subscription| DesktopTraySubscription {
+                    id: subscription.id,
+                    name: subscription.name,
+                    nodes: subscription
+                        .nodes
+                        .into_iter()
+                        .map(|node| DesktopTrayNode {
+                            tag: node.tag,
+                            name: node.name,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        });
+    });
+
+    use_effect(move || {
+        let Some(mut bridge) = desktop_tray else {
+            return;
+        };
+        let Some(command) = (bridge.command)() else {
+            return;
+        };
+        bridge.command.set(None);
+
+        if !profile_loaded()
+            || core_busy()
+            || core_restarting()
+            || system_proxy_busy()
+            || runtime_action_busy()
+        {
+            return;
+        }
+
+        runtime_action_busy.set(true);
+        spawn(async move {
+            match command {
+                DesktopTrayCommand::SelectSubscription(subscription_id) => {
+                    if active_subscription_id() == Some(subscription_id) {
+                        runtime_action_busy.set(false);
+                        return;
+                    }
+                    if !subscriptions()
+                        .iter()
+                        .any(|subscription| subscription.id == subscription_id)
+                    {
+                        toast.error("托盘选择的订阅已不存在");
+                        runtime_action_busy.set(false);
+                        return;
+                    }
+
+                    let previous_subscription_id = active_subscription_id();
+                    let previous_nodes = nodes();
+                    let previous_tag = selected_tag();
+                    let previous_selections = group_selections();
+                    let active_nodes =
+                        collect_subscription_nodes(&subscriptions(), Some(subscription_id));
+                    let next_tag = select_available_tag(&active_nodes, "");
+                    let mut next_selections = previous_selections.clone();
+                    if next_tag.is_empty() {
+                        next_selections.remove("proxy");
+                    } else {
+                        next_selections.insert("proxy".to_string(), next_tag.clone());
+                    }
+
+                    active_subscription_id.set(Some(subscription_id));
+                    nodes.set(active_nodes.clone());
+                    selected_tag.set(next_tag.clone());
+                    group_selections.set(next_selections.clone());
+
+                    if connected() {
+                        let request = build_connection_request(
+                            active_nodes,
+                            next_tag,
+                            active_subscription_proxy_server_nameservers(
+                                &subscriptions(),
+                                Some(subscription_id),
+                            ),
+                            tunnel_mode,
+                            tun_enabled,
+                            allow_lan,
+                            custom_rules,
+                            config_script_enabled,
+                            config_script,
+                            next_selections,
+                        );
+                        if !restart_core_from_ui(
+                            request,
+                            connected,
+                            core_restarting,
+                            core_state,
+                            core_version,
+                            core_note,
+                            toast,
+                            "已从托盘切换订阅，内核已重启",
+                        )
+                        .await
+                        {
+                            active_subscription_id.set(previous_subscription_id);
+                            nodes.set(previous_nodes);
+                            selected_tag.set(previous_tag);
+                            group_selections.set(previous_selections);
+                        }
+                    } else {
+                        toast.success("已从托盘切换订阅");
+                    }
+                }
+                DesktopTrayCommand::SelectNode(outbound) => {
+                    if selected_tag() == outbound {
+                        runtime_action_busy.set(false);
+                        return;
+                    }
+                    let active_nodes = nodes();
+                    if !active_nodes.iter().any(|node| node.tag == outbound) {
+                        toast.error("托盘选择的节点已不存在");
+                        runtime_action_busy.set(false);
+                        return;
+                    }
+
+                    let previous_tag = selected_tag();
+                    let previous_selections = group_selections();
+                    let mut next_selections = previous_selections.clone();
+                    next_selections.insert("proxy".to_string(), outbound.clone());
+                    selected_tag.set(outbound.clone());
+
+                    if connected() {
+                        // TUN mode forwards this selector call to its existing
+                        // privileged helper, so a normal node switch does not
+                        // prompt for elevation or interrupt the tunnel.
+                        if api::select_proxy_group("proxy".to_string(), outbound.clone())
+                            .await
+                            .is_ok()
+                        {
+                            group_selections.set(next_selections);
+                            toast.success(format!("已从托盘切换到 {outbound}"));
+                        } else {
+                            // restart_core preflights the candidate and reuses
+                            // a live TUN helper before stopping the old core.
+                            group_selections.set(next_selections.clone());
+                            let request = build_connection_request(
+                                active_nodes,
+                                outbound.clone(),
+                                active_subscription_proxy_server_nameservers(
+                                    &subscriptions(),
+                                    active_subscription_id(),
+                                ),
+                                tunnel_mode,
+                                tun_enabled,
+                                allow_lan,
+                                custom_rules,
+                                config_script_enabled,
+                                config_script,
+                                next_selections,
+                            );
+                            if !restart_core_from_ui(
+                                request,
+                                connected,
+                                core_restarting,
+                                core_state,
+                                core_version,
+                                core_note,
+                                toast,
+                                format!("已从托盘切换到 {outbound}，内核已重启"),
+                            )
+                            .await
+                            {
+                                selected_tag.set(previous_tag);
+                                group_selections.set(previous_selections);
+                            }
+                        }
+                    } else {
+                        group_selections.set(next_selections);
+                        toast.success(format!("已从托盘选择 {outbound}"));
+                    }
+                }
+            }
+            runtime_action_busy.set(false);
+        });
+    });
 
     #[cfg(not(target_os = "android"))]
     use_effect(move || {

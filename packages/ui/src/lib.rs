@@ -2,7 +2,10 @@
 
 mod app;
 
-pub use app::ProxyApp;
+pub use app::{
+    DesktopTrayBridge, DesktopTrayCommand, DesktopTrayNode, DesktopTrayState,
+    DesktopTraySubscription, ProxyApp,
+};
 
 /// Complete application styling for native shells that need CSS in their
 /// initial WebView document before Dioxus mounts the first frame.

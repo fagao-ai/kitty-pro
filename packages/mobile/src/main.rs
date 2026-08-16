@@ -21,6 +21,6 @@ fn main() {
 fn App() -> Element {
     rsx! {
         document::Style { "{MAIN_CSS}" }
-        ProxyApp { platform: "Mobile".to_string() }
+        ProxyApp { platform: "Mobile".to_string(), desktop_tray: None }
     }
 }
