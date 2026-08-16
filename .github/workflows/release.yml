@@ -183,8 +183,8 @@ jobs:
           set -o pipefail
           log="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-build.log"
           if [[ "${{ matrix.id }}" == "windows" ]]; then
-            # Pre-build so Cargo emits both native DLLs that Dioxus picks up
-            # through bundle.external_bin.
+            # Pre-build so Cargo emits the Go bridge DLL that Dioxus picks up
+            # through bundle.external_bin. MSVC links WebView2Loader statically.
             if cargo build \
                 --package desktop \
                 --features desktop \
@@ -192,24 +192,17 @@ jobs:
                 --release \
                 --locked \
                 2>&1 | tee "$log"; then
-              webview2_loader="$(find \
-                target/x86_64-pc-windows-msvc/release/build \
-                -type f \
-                -path '*/webview2-com-sys-*/out/x64/WebView2Loader.dll' \
-                -print -quit)"
               singbox_bridge="$(find \
                 target/x86_64-pc-windows-msvc/release/build \
                 -type f \
                 -path '*/singbox-*/out/kitty_singbox.dll' \
                 -print -quit)"
-              if [[ -z "$webview2_loader" || -z "$singbox_bridge" ]]; then
-                echo 'Unable to locate the Windows native DLL build outputs' >&2
+              if [[ -z "$singbox_bridge" ]]; then
+                echo 'Unable to locate the Windows sing-box bridge DLL' >&2
                 exit 1
               fi
 
               mkdir -p target/windows-bundle
-              cp "$webview2_loader" \
-                target/windows-bundle/WebView2Loader.dll-x86_64-pc-windows-msvc
               cp "$singbox_bridge" \
                 target/windows-bundle/kitty_singbox.dll-x86_64-pc-windows-msvc
 
@@ -260,22 +253,18 @@ jobs:
                   TARGETDIR="$extracted_dir_windows"
                 msi_executable="$(find "$extracted_dir" \
                   -type f -iname 'kitty-pro.exe' -print -quit)"
-                msi_webview2_loader="$(find "$extracted_dir" \
-                  -type f -name 'WebView2Loader.dll' -print -quit)"
                 msi_singbox_bridge="$(find "$extracted_dir" \
                   -type f -name 'kitty_singbox.dll' -print -quit)"
-                if [[ -z "$msi_executable" || -z "$msi_webview2_loader" || \
-                    -z "$msi_singbox_bridge" ]]; then
-                  echo 'Dioxus MSI is missing Kitty Pro or a native DLL' >&2
+                if [[ -z "$msi_executable" || -z "$msi_singbox_bridge" ]]; then
+                  echo 'Dioxus MSI is missing Kitty Pro or kitty_singbox.dll' >&2
                   exit 1
                 fi
                 cp "$msi_executable" "$package_dir/Kitty-Pro.exe"
-                cp "$msi_webview2_loader" "$package_dir/"
                 cp "$msi_singbox_bridge" "$package_dir/"
                 (
                   cd "$package_dir"
                   7z a -tzip -mx=9 Kitty-Pro-windows-x86_64.zip \
-                    Kitty-Pro.exe WebView2Loader.dll kitty_singbox.dll >/dev/null
+                    Kitty-Pro.exe kitty_singbox.dll >/dev/null
                 )
                 mv "$package_dir/Kitty-Pro-windows-x86_64.zip" \
                   "$(dirname "$installer")/"
@@ -375,16 +364,11 @@ jobs:
               mkdir -p "$verify_dir"
               7z x -y -o"$verify_dir" "$archive" >/dev/null
               test -f "$verify_dir/Kitty-Pro.exe"
-              test -f "$verify_dir/WebView2Loader.dll"
               test -f "$verify_dir/kitty_singbox.dll"
               objdump -p "$verify_dir/Kitty-Pro.exe" \
                 | grep -Eq 'Subsystem.*Windows GUI'
               objdump -h "$verify_dir/Kitty-Pro.exe" \
                 | grep -Eq '\.rsrc'
-              objdump -p "$verify_dir/Kitty-Pro.exe" \
-                | grep -Eqi 'DLL Name: WebView2Loader\.dll'
-              objdump -f "$verify_dir/WebView2Loader.dll" \
-                | grep -Eq 'architecture: i386:x86-64'
               objdump -f "$verify_dir/kitty_singbox.dll" \
                 | grep -Eq 'architecture: i386:x86-64'
               objdump -p "$verify_dir/kitty_singbox.dll" \
@@ -421,15 +405,11 @@ jobs:
                 TARGETDIR="$msi_verify_dir_windows"
               msi_executable="$(find "$msi_verify_dir" \
                 -type f -iname 'kitty-pro.exe' -print -quit)"
-              msi_webview2_loader="$(find "$msi_verify_dir" \
-                -type f -name 'WebView2Loader.dll' -print -quit)"
               msi_singbox_bridge="$(find "$msi_verify_dir" \
                 -type f -name 'kitty_singbox.dll' -print -quit)"
               test -n "$msi_executable"
-              test -n "$msi_webview2_loader"
               test -n "$msi_singbox_bridge"
               cmp "$verify_dir/Kitty-Pro.exe" "$msi_executable"
-              cmp "$verify_dir/WebView2Loader.dll" "$msi_webview2_loader"
               cmp "$verify_dir/kitty_singbox.dll" "$msi_singbox_bridge"
               (cd dist/windows && sha256sum -c *.sha256)
               ;;
