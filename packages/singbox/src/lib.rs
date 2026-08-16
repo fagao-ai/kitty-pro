@@ -92,6 +92,8 @@ impl PlatformCapabilities {
 pub enum CoreError {
     #[error("当前构建未包含嵌入式 sing-box 内核")]
     EmbeddedCoreUnavailable,
+    #[error("sing-box 桥接不可用: {0}")]
+    BridgeUnavailable(String),
     #[error("嵌入式 sing-box 配置无效: {0}")]
     InvalidConfig(String),
     #[error("嵌入式 sing-box 已经在运行")]
@@ -119,6 +121,9 @@ pub enum CoreError {
     #[error("TUN 权限尚未准备，请先关闭并重新开启 TUN 模式")]
     TunPermissionNotPrepared,
 }
+
+#[cfg(all(feature = "embedded-core", target_os = "windows", target_env = "msvc"))]
+mod windows_bridge;
 
 #[cfg(feature = "embedded-core")]
 #[derive(Debug)]
@@ -256,6 +261,7 @@ impl SingBox {
     pub fn new() -> Result<Self, CoreError> {
         #[cfg(feature = "embedded-core")]
         {
+            ffi::ensure_available()?;
             Ok(Self {
                 backend: CoreBackend::Stopped,
                 version: ffi::version(),
@@ -826,6 +832,7 @@ mod ffi {
     use std::ffi::{CStr, CString};
     use std::os::raw::c_char;
 
+    #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
     unsafe extern "C" {
         fn kitty_singbox_probe(
             config_content: *const c_char,
@@ -881,10 +888,38 @@ mod ffi {
         ) -> *mut c_char;
     }
 
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    macro_rules! bridge_call {
+        ($field:ident($($argument:expr),* $(,)?)) => {{
+            let bridge = crate::windows_bridge::bridge()?;
+            unsafe { (bridge.$field)($($argument),*) }
+        }};
+    }
+
+    #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+    macro_rules! bridge_call {
+        (probe($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_probe($($argument),*) } };
+        (probe_outbound($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_probe_outbound($($argument),*) } };
+        (start($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_start($($argument),*) } };
+        (stop($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_stop($($argument),*) } };
+        (traffic($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_traffic($($argument),*) } };
+        (logs($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_logs($($argument),*) } };
+        (set_log_enabled($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_set_log_enabled($($argument),*) } };
+        (validate_rule_set_file($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_validate_rule_set_file($($argument),*) } };
+        (check_config($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_check_config($($argument),*) } };
+        (select_outbound($($argument:expr),* $(,)?)) => { unsafe { kitty_singbox_select_outbound($($argument),*) } };
+    }
+
+    pub fn ensure_available() -> Result<(), CoreError> {
+        #[cfg(all(target_os = "windows", target_env = "msvc"))]
+        crate::windows_bridge::bridge()?;
+        Ok(())
+    }
+
     pub fn start(config: &str) -> Result<u64, CoreError> {
         let config = CString::new(config)
             .map_err(|_| CoreError::InvalidConfig("配置中包含 NUL 字符".to_string()))?;
-        let handle = unsafe { kitty_singbox_start(config.as_ptr()) };
+        let handle = bridge_call!(start(config.as_ptr()));
         if handle == 0 {
             return Err(CoreError::InvalidConfig(last_error()));
         }
@@ -898,9 +933,11 @@ mod ffi {
             .map_err(|_| CoreError::ProbeUnavailable("节点标识中包含 NUL 字符".to_string()))?;
         let probe_url = CString::new(probe_url)
             .map_err(|_| CoreError::ProbeUnavailable("探测地址中包含 NUL 字符".to_string()))?;
-        let payload = take_string(unsafe {
-            kitty_singbox_probe(config.as_ptr(), node_tags_json.as_ptr(), probe_url.as_ptr())
-        });
+        let payload = take_string(bridge_call!(probe(
+            config.as_ptr(),
+            node_tags_json.as_ptr(),
+            probe_url.as_ptr()
+        )));
         if payload.is_empty() {
             return Err(CoreError::ProbeUnavailable(last_error()));
         }
@@ -916,9 +953,11 @@ mod ffi {
             .map_err(|_| CoreError::ProbeUnavailable("节点标识中包含 NUL 字符".to_string()))?;
         let probe_url = CString::new(probe_url)
             .map_err(|_| CoreError::ProbeUnavailable("探测地址中包含 NUL 字符".to_string()))?;
-        let payload = take_string(unsafe {
-            kitty_singbox_probe_outbound(handle, tag.as_ptr(), probe_url.as_ptr())
-        });
+        let payload = take_string(bridge_call!(probe_outbound(
+            handle,
+            tag.as_ptr(),
+            probe_url.as_ptr()
+        )));
         if payload.is_empty() {
             return Err(CoreError::ProbeUnavailable(last_error()));
         }
@@ -927,18 +966,25 @@ mod ffi {
     }
 
     pub fn stop(handle: u64) -> Result<(), CoreError> {
-        if unsafe { kitty_singbox_stop(handle) } == 0 {
+        if bridge_call!(stop(handle)) == 0 {
             return Err(CoreError::NotRunning);
         }
         Ok(())
     }
 
     pub fn version() -> String {
-        take_string(unsafe { kitty_singbox_version() })
+        #[cfg(all(target_os = "windows", target_env = "msvc"))]
+        let value = match crate::windows_bridge::bridge() {
+            Ok(bridge) => unsafe { (bridge.version)() },
+            Err(_) => return String::new(),
+        };
+        #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+        let value = unsafe { kitty_singbox_version() };
+        take_string(value)
     }
 
     pub fn traffic(handle: u64) -> Result<String, CoreError> {
-        let payload = take_string(unsafe { kitty_singbox_traffic(handle) });
+        let payload = take_string(bridge_call!(traffic(handle)));
         if payload.is_empty() {
             return Err(CoreError::TrafficUnavailable(last_error()));
         }
@@ -946,7 +992,7 @@ mod ffi {
     }
 
     pub fn logs(handle: u64, cursor: u64) -> Result<String, CoreError> {
-        let payload = take_string(unsafe { kitty_singbox_logs(handle, cursor) });
+        let payload = take_string(bridge_call!(logs(handle, cursor)));
         if payload.is_empty() {
             return Err(CoreError::LogsUnavailable(last_error()));
         }
@@ -954,7 +1000,7 @@ mod ffi {
     }
 
     pub fn set_log_enabled(handle: u64, enabled: bool) -> Result<(), CoreError> {
-        if unsafe { kitty_singbox_set_log_enabled(handle, i32::from(enabled)) } == 0 {
+        if bridge_call!(set_log_enabled(handle, i32::from(enabled))) == 0 {
             return Err(CoreError::LogsUnavailable(last_error()));
         }
         Ok(())
@@ -965,8 +1011,7 @@ mod ffi {
             .map_err(|_| CoreError::SelectionUnavailable("分组名称包含 NUL 字符".to_string()))?;
         let outbound = CString::new(outbound)
             .map_err(|_| CoreError::SelectionUnavailable("节点名称包含 NUL 字符".to_string()))?;
-        if unsafe { kitty_singbox_select_outbound(handle, group.as_ptr(), outbound.as_ptr()) } == 0
-        {
+        if bridge_call!(select_outbound(handle, group.as_ptr(), outbound.as_ptr())) == 0 {
             return Err(CoreError::SelectionUnavailable(last_error()));
         }
         Ok(())
@@ -978,7 +1023,7 @@ mod ffi {
             .ok_or_else(|| CoreError::RuleSetInvalid("规则文件路径不是有效 UTF-8".to_string()))?;
         let path = CString::new(path)
             .map_err(|_| CoreError::RuleSetInvalid("规则文件路径包含 NUL 字符".to_string()))?;
-        let error = unsafe { kitty_singbox_validate_rule_set_file(path.as_ptr()) };
+        let error = bridge_call!(validate_rule_set_file(path.as_ptr()));
         if error.is_null() {
             Ok(())
         } else {
@@ -989,7 +1034,7 @@ mod ffi {
     pub fn check_config(config: &str) -> Result<(), CoreError> {
         let config = CString::new(config)
             .map_err(|_| CoreError::InvalidConfig("配置中包含 NUL 字符".to_string()))?;
-        let error = unsafe { kitty_singbox_check_config(config.as_ptr()) };
+        let error = bridge_call!(check_config(config.as_ptr()));
         if error.is_null() {
             Ok(())
         } else {
@@ -1076,7 +1121,14 @@ mod ffi {
     }
 
     fn last_error() -> String {
-        let message = take_string(unsafe { kitty_singbox_last_error() });
+        #[cfg(all(target_os = "windows", target_env = "msvc"))]
+        let value = match crate::windows_bridge::bridge() {
+            Ok(bridge) => unsafe { (bridge.last_error)() },
+            Err(error) => return error.to_string(),
+        };
+        #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+        let value = unsafe { kitty_singbox_last_error() };
+        let message = take_string(value);
         if message.is_empty() {
             "未知错误".to_string()
         } else {
@@ -1091,7 +1143,14 @@ mod ffi {
         let result = unsafe { CStr::from_ptr(value) }
             .to_string_lossy()
             .into_owned();
-        unsafe { kitty_singbox_free_string(value) };
+        #[cfg(all(target_os = "windows", target_env = "msvc"))]
+        if let Ok(bridge) = crate::windows_bridge::bridge() {
+            unsafe { (bridge.free_string)(value) };
+        }
+        #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+        unsafe {
+            kitty_singbox_free_string(value)
+        };
         result
     }
 

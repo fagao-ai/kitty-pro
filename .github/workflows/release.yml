@@ -44,7 +44,7 @@ jobs:
             id: windows
             os: windows-latest
             platform_flag: --windows
-            target_args: --target x86_64-pc-windows-gnu
+            target_args: --target x86_64-pc-windows-msvc
             bundle_args: --package-types msi
           - name: Linux
             id: linux
@@ -95,10 +95,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      - name: Install Windows GNU target
+      - name: Install Windows MSVC target
         if: matrix.id == 'windows'
         shell: bash
-        run: rustup target add x86_64-pc-windows-gnu
+        run: rustup target add x86_64-pc-windows-msvc
 
       - name: Set tagged desktop version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -149,34 +149,9 @@ jobs:
           cache-all-crates: true
 
       - name: Install Dioxus CLI
-        if: matrix.id != 'windows'
         uses: taiki-e/install-action@v2
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
-
-      - name: Preserve Dioxus source line endings
-        if: matrix.id == 'windows'
-        shell: bash
-        run: git config --global core.autocrlf false
-
-      - name: Checkout Dioxus CLI source
-        if: matrix.id == 'windows'
-        uses: actions/checkout@v5
-        with:
-          repository: DioxusLabs/dioxus
-          ref: v${{ env.DIOXUS_CLI_VERSION }}
-          path: .dioxus-cli-source
-
-      - name: Install patched Dioxus CLI for Windows GNU
-        if: matrix.id == 'windows'
-        shell: bash
-        run: |
-          sed 's/\r$//' \
-            .github/patches/dioxus-cli-0.7.9-windows-gnu.patch \
-            | git -C .dioxus-cli-source apply -
-          cargo install \
-            --path .dioxus-cli-source/packages/cli \
-            --locked
 
       - name: Add MinGW to PATH
         if: runner.os == 'Windows'
@@ -197,7 +172,7 @@ jobs:
           (cd packages/singbox/bridge && go test ./...)
           cargo test \
             --package singbox \
-            --target x86_64-pc-windows-gnu \
+            --target x86_64-pc-windows-msvc \
             --release \
             --locked
 
@@ -209,28 +184,35 @@ jobs:
           set -o pipefail
           log="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-build.log"
           if [[ "${{ matrix.id }}" == "windows" ]]; then
-            # Pre-build the GNU binary so Cargo emits the WebView2 loader that
-            # Dioxus then picks up through bundle.external_bin.
+            # Pre-build so Cargo emits both native DLLs that Dioxus picks up
+            # through bundle.external_bin.
             if cargo build \
                 --package desktop \
                 --features desktop \
-                --target x86_64-pc-windows-gnu \
+                --target x86_64-pc-windows-msvc \
                 --release \
                 --locked \
                 2>&1 | tee "$log"; then
               webview2_loader="$(find \
-                target/x86_64-pc-windows-gnu/release/build \
+                target/x86_64-pc-windows-msvc/release/build \
                 -type f \
                 -path '*/webview2-com-sys-*/out/x64/WebView2Loader.dll' \
                 -print -quit)"
-              if [[ -z "$webview2_loader" ]]; then
-                echo 'Unable to locate the x64 WebView2Loader.dll build output' >&2
+              singbox_bridge="$(find \
+                target/x86_64-pc-windows-msvc/release/build \
+                -type f \
+                -path '*/singbox-*/out/kitty_singbox.dll' \
+                -print -quit)"
+              if [[ -z "$webview2_loader" || -z "$singbox_bridge" ]]; then
+                echo 'Unable to locate the Windows native DLL build outputs' >&2
                 exit 1
               fi
 
               mkdir -p target/windows-bundle
               cp "$webview2_loader" \
-                target/windows-bundle/WebView2Loader.dll-x86_64-pc-windows-gnu
+                target/windows-bundle/WebView2Loader.dll-x86_64-pc-windows-msvc
+              cp "$singbox_bridge" \
+                target/windows-bundle/kitty_singbox.dll-x86_64-pc-windows-msvc
 
               bundle_output="$RUNNER_TEMP/kitty-pro-windows-bundle.jsonl"
               if dx bundle \
@@ -281,16 +263,20 @@ jobs:
                   -type f -iname 'kitty-pro.exe' -print -quit)"
                 msi_webview2_loader="$(find "$extracted_dir" \
                   -type f -name 'WebView2Loader.dll' -print -quit)"
-                if [[ -z "$msi_executable" || -z "$msi_webview2_loader" ]]; then
-                  echo 'Dioxus MSI is missing Kitty Pro or WebView2Loader.dll' >&2
+                msi_singbox_bridge="$(find "$extracted_dir" \
+                  -type f -name 'kitty_singbox.dll' -print -quit)"
+                if [[ -z "$msi_executable" || -z "$msi_webview2_loader" || \
+                    -z "$msi_singbox_bridge" ]]; then
+                  echo 'Dioxus MSI is missing Kitty Pro or a native DLL' >&2
                   exit 1
                 fi
                 cp "$msi_executable" "$package_dir/Kitty-Pro.exe"
                 cp "$msi_webview2_loader" "$package_dir/"
+                cp "$msi_singbox_bridge" "$package_dir/"
                 (
                   cd "$package_dir"
                   7z a -tzip -mx=9 Kitty-Pro-windows-x86_64.zip \
-                    Kitty-Pro.exe WebView2Loader.dll >/dev/null
+                    Kitty-Pro.exe WebView2Loader.dll kitty_singbox.dll >/dev/null
                 )
                 mv "$package_dir/Kitty-Pro-windows-x86_64.zip" \
                   "$(dirname "$installer")/"
@@ -391,15 +377,32 @@ jobs:
               7z x -y -o"$verify_dir" "$archive" >/dev/null
               test -f "$verify_dir/Kitty-Pro.exe"
               test -f "$verify_dir/WebView2Loader.dll"
+              test -f "$verify_dir/kitty_singbox.dll"
               objdump -p "$verify_dir/Kitty-Pro.exe" \
                 | grep -Eq 'Subsystem.*Windows GUI'
+              objdump -h "$verify_dir/Kitty-Pro.exe" \
+                | grep -Eq '\.rsrc'
               objdump -p "$verify_dir/Kitty-Pro.exe" \
                 | grep -Eqi 'DLL Name: WebView2Loader\.dll'
               objdump -f "$verify_dir/WebView2Loader.dll" \
                 | grep -Eq 'architecture: i386:x86-64'
+              objdump -f "$verify_dir/kitty_singbox.dll" \
+                | grep -Eq 'architecture: i386:x86-64'
+              objdump -p "$verify_dir/kitty_singbox.dll" \
+                | grep -Eq 'kitty_singbox_version'
               if objdump -p "$verify_dir/Kitty-Pro.exe" \
                   | grep -Eqi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)[^ ]*\.dll'; then
                 echo 'Windows package depends on an unbundled MinGW runtime DLL' >&2
+                exit 1
+              fi
+              if objdump -p "$verify_dir/Kitty-Pro.exe" \
+                  | grep -Eqi 'DLL Name: (VCRUNTIME|MSVCP)[^ ]*\.dll'; then
+                echo 'Windows package depends on an unbundled Visual C++ runtime DLL' >&2
+                exit 1
+              fi
+              if objdump -p "$verify_dir/kitty_singbox.dll" \
+                  | grep -Eqi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)[^ ]*\.dll'; then
+                echo 'sing-box bridge depends on an unbundled MinGW runtime DLL' >&2
                 exit 1
               fi
               grep -aFq '.proxy-app' "$verify_dir/Kitty-Pro.exe"
@@ -421,10 +424,14 @@ jobs:
                 -type f -iname 'kitty-pro.exe' -print -quit)"
               msi_webview2_loader="$(find "$msi_verify_dir" \
                 -type f -name 'WebView2Loader.dll' -print -quit)"
+              msi_singbox_bridge="$(find "$msi_verify_dir" \
+                -type f -name 'kitty_singbox.dll' -print -quit)"
               test -n "$msi_executable"
               test -n "$msi_webview2_loader"
+              test -n "$msi_singbox_bridge"
               cmp "$verify_dir/Kitty-Pro.exe" "$msi_executable"
               cmp "$verify_dir/WebView2Loader.dll" "$msi_webview2_loader"
+              cmp "$verify_dir/kitty_singbox.dll" "$msi_singbox_bridge"
               (cd dist/windows && sha256sum -c *.sha256)
               ;;
             linux)

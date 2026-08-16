@@ -38,12 +38,15 @@ fn main() {
     let bridge_dir = manifest_dir.join("bridge");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing output dir"));
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    let archive = if target_os == "windows" && target_env == "gnu" {
+    let windows_msvc = target_os == "windows" && target_env == "msvc";
+    let artifact = if target_os == "windows" && target_env == "gnu" {
         // The GNU linker used by x86_64-pc-windows-gnu does not discover
         // MSVC-style .lib files when Cargo links `static=kitty_singbox`.
         out_dir.join("libkitty_singbox.a")
-    } else if target_os == "windows" {
-        out_dir.join("kitty_singbox.lib")
+    } else if windows_msvc {
+        // Go's Windows c-archive contains GNU unwind metadata that link.exe
+        // cannot consume. Keep the Go runtime behind a stable C DLL boundary.
+        out_dir.join("kitty_singbox.dll")
     } else if target_os == "android" {
         out_dir.join("libkitty_singbox.so")
     } else {
@@ -101,7 +104,7 @@ fn main() {
         command.env("MACOSX_DEPLOYMENT_TARGET", "11.0");
     }
 
-    let build_mode = if target_os == "android" {
+    let build_mode = if target_os == "android" || windows_msvc {
         "c-shared"
     } else {
         "c-archive"
@@ -117,7 +120,7 @@ fn main() {
             "-checklinkname=0 -X internal/godebug.defaultGODEBUG=multipathtcp=0 -X github.com/sagernet/sing-box/constant.Version=kitty-pro-embedded/1.13.14",
             "-o",
         ])
-        .arg(&archive)
+        .arg(&artifact)
         .arg(".")
         .status()
         .expect("Go 1.24.x is required to build the embedded sing-box core");
@@ -125,10 +128,17 @@ fn main() {
         panic!("failed to build the embedded sing-box core");
     }
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    if windows_msvc {
+        println!(
+            "cargo:rustc-env=KITTY_SINGBOX_BUILD_DLL={}",
+            artifact.display()
+        );
+    } else {
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+    }
     if target_os == "android" {
         println!("cargo:rustc-link-lib=dylib=kitty_singbox");
-    } else {
+    } else if !windows_msvc {
         println!("cargo:rustc-link-lib=static=kitty_singbox");
     }
     if target_os == "macos" {
