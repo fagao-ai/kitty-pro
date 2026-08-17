@@ -10,7 +10,7 @@ use dioxus::desktop::{
         init_tray_icon,
         menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     },
-    use_tray_menu_event_handler, use_window, Config, DesktopContext, WindowBuilder,
+    use_muda_event_handler, use_window, Config, DesktopContext, WindowBuilder,
     WindowCloseBehaviour,
 };
 #[cfg(all(feature = "desktop", target_os = "macos"))]
@@ -307,8 +307,10 @@ fn use_desktop_tray(bridge: DesktopTrayBridge) {
     };
 
     let mut app_command = bridge.command;
-    let _tray_menu_handler = use_tray_menu_event_handler(move |event| {
-        let Some(command) = tray_command(event.id.as_ref()) else {
+    // Dioxus registers the shared muda handler before its tray-specific handler,
+    // so tray menu clicks are delivered as regular muda events on Dioxus 0.7.
+    let _tray_menu_handler = use_muda_event_handler(move |event| {
+        let Some(command) = tray_command(event.id().as_ref()) else {
             return;
         };
 
@@ -397,6 +399,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "muda menus must be created on the macOS main thread"
+    )]
     fn tray_menu_marks_the_active_subscription_and_node() {
         let state = DesktopTrayState {
             ready: true,

@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::process::Command;
 
 const KITTY_TUN_IPV4: Ipv4Addr = Ipv4Addr::new(172, 19, 0, 1);
 const KITTY_TUN_IPV6: Ipv6Addr = Ipv6Addr::new(0xfdfe, 0xdcba, 0x9876, 0, 0, 0, 0, 1);
@@ -102,6 +103,37 @@ fn config_uses_tun(config: &Value) -> bool {
 }
 
 fn route_source(target: IpAddr, port: u16) -> Result<IpAddr, String> {
+    route_source_with(
+        target,
+        port,
+        route_source_via_udp,
+        route_source_without_kitty_tun,
+    )
+}
+
+fn route_source_with<U, F>(
+    target: IpAddr,
+    port: u16,
+    udp_source: U,
+    fallback_source: F,
+) -> Result<IpAddr, String>
+where
+    U: FnOnce(IpAddr, u16) -> Result<IpAddr, String>,
+    F: FnOnce(IpAddr) -> Result<IpAddr, String>,
+{
+    let source = udp_source(target, port)?;
+    if !is_kitty_tun_source(&source) {
+        return Ok(source);
+    }
+
+    // A candidate config is built while the old Kitty TUN is still running.
+    // UDP route selection therefore sees utun5 even though the proxy endpoint
+    // must be reached through the underlying interface. Ask macOS for the
+    // best route on every non-Kitty interface before treating this as a loop.
+    fallback_source(target).or(Ok(source))
+}
+
+fn route_source_via_udp(target: IpAddr, port: u16) -> Result<IpAddr, String> {
     let bind_address = match target {
         IpAddr::V4(_) => "0.0.0.0:0",
         IpAddr::V6(_) => "[::]:0",
@@ -116,6 +148,153 @@ fn route_source(target: IpAddr, port: u16) -> Result<IpAddr, String> {
         .local_addr()
         .map(|address| address.ip())
         .map_err(|error| format!("读取系统选择的源地址失败: {error}"))
+}
+
+fn route_source_without_kitty_tun(target: IpAddr) -> Result<IpAddr, String> {
+    let interfaces = command_stdout("/sbin/ifconfig", &["-l"])?
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let default_interface = route_info("default", None)
+        .ok()
+        .map(|route| route.interface);
+    let target_text = target.to_string();
+    let candidates = interfaces
+        .into_iter()
+        .filter_map(|interface| {
+            let addresses = interface_addresses(&interface).ok()?;
+            let route = route_info(&target_text, Some(&interface)).ok()?;
+            Some(InterfaceRoute {
+                interface,
+                addresses,
+                route,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    select_route_source(target, default_interface.as_deref(), &candidates)
+        .ok_or_else(|| "无法找到 Kitty TUN 之外的可用路由源地址".to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RouteInfo {
+    interface: String,
+    destination: String,
+}
+
+impl RouteInfo {
+    fn is_specific(&self) -> bool {
+        self.destination != "default"
+    }
+}
+
+#[derive(Debug)]
+struct InterfaceRoute {
+    interface: String,
+    addresses: Vec<IpAddr>,
+    route: RouteInfo,
+}
+
+fn select_route_source(
+    target: IpAddr,
+    default_interface: Option<&str>,
+    candidates: &[InterfaceRoute],
+) -> Option<IpAddr> {
+    let mut default_source = None;
+
+    for candidate in candidates {
+        if candidate.addresses.iter().any(is_kitty_tun_source)
+            || candidate.route.interface != candidate.interface
+        {
+            continue;
+        }
+        let Some(source) = candidate
+            .addresses
+            .iter()
+            .copied()
+            .find(|address| is_usable_source(*address, target))
+        else {
+            continue;
+        };
+        if candidate.route.is_specific() {
+            return Some(source);
+        }
+        if default_interface == Some(candidate.interface.as_str()) {
+            default_source = Some(source);
+        }
+    }
+
+    default_source
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("执行 {program} 失败: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{program} 返回失败状态 {}", output.status));
+    }
+    String::from_utf8(output.stdout).map_err(|error| format!("解析 {program} 输出失败: {error}"))
+}
+
+fn route_info(target: &str, interface: Option<&str>) -> Result<RouteInfo, String> {
+    let mut args = vec!["-n", "get"];
+    if let Some(interface) = interface {
+        args.extend(["-ifscope", interface]);
+    }
+    args.push(target);
+    let output = command_stdout("/sbin/route", &args)?;
+    parse_route_info(&output).ok_or_else(|| format!("/sbin/route 未返回 {target} 的完整路由"))
+}
+
+fn parse_route_info(output: &str) -> Option<RouteInfo> {
+    let field = |name: &str| {
+        output.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(name)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+    };
+    Some(RouteInfo {
+        interface: field("interface:")?.to_string(),
+        destination: field("destination:")?.to_string(),
+    })
+}
+
+fn interface_addresses(interface: &str) -> Result<Vec<IpAddr>, String> {
+    let output = command_stdout("/sbin/ifconfig", &[interface])?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let kind = fields.next()?;
+            if kind != "inet" && kind != "inet6" {
+                return None;
+            }
+            fields
+                .next()?
+                .split('%')
+                .next()
+                .and_then(|address| address.parse().ok())
+        })
+        .collect())
+}
+
+fn is_kitty_tun_source(address: &IpAddr) -> bool {
+    *address == IpAddr::V4(KITTY_TUN_IPV4) || *address == IpAddr::V6(KITTY_TUN_IPV6)
+}
+
+fn is_usable_source(address: IpAddr, target: IpAddr) -> bool {
+    if address.is_ipv4() != target.is_ipv4()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.is_loopback() != target.is_loopback()
+    {
+        return false;
+    }
+    !matches!(address, IpAddr::V6(address) if address.is_unicast_link_local())
 }
 
 #[cfg(test)]
@@ -156,6 +335,113 @@ mod tests {
             }
             IpAddr::V6(_) => Ok("2001:db8:1::20".parse().unwrap()),
         }
+    }
+
+    fn interface_route(interface: &str, addresses: &[&str], destination: &str) -> InterfaceRoute {
+        InterfaceRoute {
+            interface: interface.to_string(),
+            addresses: addresses
+                .iter()
+                .map(|address| address.parse().unwrap())
+                .collect(),
+            route: RouteInfo {
+                interface: interface.to_string(),
+                destination: destination.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn parses_macos_route_output() {
+        let route = parse_route_info(
+            "   route to: 155.248.218.187\n\
+             destination: default\n\
+             gateway: 192.168.50.1\n\
+             interface: en1\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            route,
+            RouteInfo {
+                interface: "en1".to_string(),
+                destination: "default".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn selects_physical_default_route_while_kitty_tun_is_running() {
+        let target = "155.248.218.187".parse().unwrap();
+        let candidates = vec![
+            interface_route("utun4", &["100.64.0.249"], "default"),
+            interface_route("utun5", &["172.19.0.1"], "152.0.0.0"),
+            interface_route("en1", &["192.168.50.13"], "default"),
+        ];
+
+        assert_eq!(
+            select_route_source(target, Some("en1"), &candidates),
+            Some("192.168.50.13".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn preserves_a_more_specific_route_from_another_vpn() {
+        let target = "100.64.0.2".parse().unwrap();
+        let candidates = vec![
+            interface_route("en1", &["192.168.50.13"], "default"),
+            interface_route("utun4", &["100.64.0.249"], "100.64.0.0"),
+            interface_route("utun5", &["172.19.0.1"], "96.0.0.0"),
+        ];
+
+        assert_eq!(
+            select_route_source(target, Some("en1"), &candidates),
+            Some("100.64.0.249".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn never_selects_the_kitty_tun_interface() {
+        let target = "155.248.218.187".parse().unwrap();
+        let candidates = vec![interface_route(
+            "utun5",
+            &["172.19.0.1", "fdfe:dcba:9876::1"],
+            "152.0.0.0",
+        )];
+
+        assert_eq!(
+            select_route_source(target, Some("utun5"), &candidates),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_ipv6_link_local_source_addresses() {
+        let target = "2001:db8:2::10".parse().unwrap();
+        let candidates = vec![interface_route(
+            "en1",
+            &["fe80::824:882c:44d5:116d", "2001:db8:1::20"],
+            "default",
+        )];
+
+        assert_eq!(
+            select_route_source(target, Some("en1"), &candidates),
+            Some("2001:db8:1::20".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn failed_fallback_keeps_the_kitty_source_for_loop_rejection() {
+        let target = "155.248.218.187".parse().unwrap();
+        let source = route_source_with(
+            target,
+            10086,
+            |_, _| Ok(IpAddr::V4(KITTY_TUN_IPV4)),
+            |_| Err("no non-Kitty route".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(source, IpAddr::V4(KITTY_TUN_IPV4));
     }
 
     #[test]

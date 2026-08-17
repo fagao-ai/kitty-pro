@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::CString;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -255,15 +255,30 @@ impl PrivilegedCore {
         let helper_pid = self.helper_pid.ok_or_else(|| {
             CoreError::MacosTunHelper("TUN helper 尚未建立可信生命周期租约".to_string())
         })?;
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(helper_connection_error)?;
-        validate_peer_identity(&stream, 0, helper_pid).map_err(CoreError::MacosTunHelper)?;
-        stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|_| stream.set_write_timeout(Some(timeout)))
-            .map_err(helper_connection_error)?;
-        let request = HelperRequest { action };
-        serde_json::to_writer(&mut stream, &request)
-            .map_err(|error| CoreError::MacosTunHelper(format!("发送请求失败: {error}")))?;
+        let payload = serialize_helper_request(action)?;
+        let mut retried_send = false;
+        let stream = loop {
+            let mut stream =
+                UnixStream::connect(&self.socket_path).map_err(helper_connection_error)?;
+            validate_peer_identity(&stream, 0, helper_pid).map_err(CoreError::MacosTunHelper)?;
+            stream
+                .set_read_timeout(Some(timeout))
+                .and_then(|_| stream.set_write_timeout(Some(timeout)))
+                .map_err(helper_connection_error)?;
+            match stream.write_all(&payload) {
+                Ok(()) => break stream,
+                Err(error) if !retried_send && is_retryable_send_error(&error) => {
+                    // The helper cannot dispatch a request until it receives
+                    // EOF, so retrying an incomplete write cannot duplicate
+                    // a Start/Stop action.
+                    retried_send = true;
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => {
+                    return Err(CoreError::MacosTunHelper(format!("发送请求失败: {error}")));
+                }
+            }
+        };
         stream
             .shutdown(std::net::Shutdown::Write)
             .map_err(helper_connection_error)?;
@@ -318,6 +333,31 @@ impl Drop for PrivilegedCore {
 struct HelperRequest {
     #[serde(flatten)]
     action: HelperAction,
+}
+
+fn serialize_helper_request(action: HelperAction) -> Result<Vec<u8>, CoreError> {
+    let payload = serde_json::to_vec(&HelperRequest { action })
+        .map_err(|error| CoreError::MacosTunHelper(format!("序列化请求失败: {error}")))?;
+    validate_helper_request_size(payload.len())?;
+    Ok(payload)
+}
+
+fn validate_helper_request_size(payload_len: usize) -> Result<(), CoreError> {
+    if payload_len as u64 > MAX_MESSAGE_BYTES {
+        return Err(CoreError::MacosTunHelper(format!(
+            "请求超过安全限制（{payload_len} > {MAX_MESSAGE_BYTES} 字节）"
+        )));
+    }
+    Ok(())
+}
+
+fn is_retryable_send_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1042,13 +1082,11 @@ mod tests {
 
     #[test]
     fn helper_protocol_preserves_probe_parameters() {
-        let request = HelperRequest {
-            action: HelperAction::ProbeOutbound {
-                tag: "proxy-a".to_string(),
-                probe_url: "https://example.com/generate_204".to_string(),
-            },
-        };
-        let payload = serde_json::to_vec(&request).expect("helper request should serialize");
+        let payload = serialize_helper_request(HelperAction::ProbeOutbound {
+            tag: "proxy-a".to_string(),
+            probe_url: "https://example.com/generate_204".to_string(),
+        })
+        .expect("helper request should serialize");
         let decoded =
             serde_json::from_slice::<HelperRequest>(&payload).expect("request should deserialize");
 
@@ -1057,6 +1095,29 @@ mod tests {
             HelperAction::ProbeOutbound { tag, probe_url }
                 if tag == "proxy-a" && probe_url == "https://example.com/generate_204"
         ));
+    }
+
+    #[test]
+    fn helper_request_size_is_checked_before_socket_io() {
+        assert!(validate_helper_request_size(MAX_MESSAGE_BYTES as usize).is_ok());
+        let error = validate_helper_request_size(MAX_MESSAGE_BYTES as usize + 1)
+            .expect_err("oversized helper request should be rejected");
+
+        assert!(error.to_string().contains("请求超过安全限制"));
+    }
+
+    #[test]
+    fn only_incomplete_connection_writes_are_retryable() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(is_retryable_send_error(&std::io::Error::from(kind)));
+        }
+        assert!(!is_retryable_send_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
     }
 
     #[test]
