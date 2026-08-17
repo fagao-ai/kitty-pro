@@ -8,7 +8,7 @@ use dioxus::desktop::{
     icon_from_memory,
     trayicon::{
         init_tray_icon,
-        menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+        menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     },
     use_muda_event_handler, use_window, Config, DesktopContext, WindowBuilder,
     WindowCloseBehaviour,
@@ -35,6 +35,10 @@ const TRAY_QUIT_ID: &str = "kitty-quit";
 const TRAY_SUBSCRIPTION_PREFIX: &str = "kitty-subscription:";
 #[cfg(feature = "desktop")]
 const TRAY_NODE_PREFIX: &str = "kitty-node:";
+#[cfg(feature = "desktop")]
+const TRAY_SYSTEM_PROXY_ID: &str = "kitty-system-proxy";
+#[cfg(feature = "desktop")]
+const TRAY_COPY_ENV_ID: &str = "kitty-copy-environment";
 
 #[cfg(feature = "desktop")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +53,10 @@ fn tray_command(id: &str) -> Option<TrayCommand> {
     match id {
         TRAY_SHOW_ID => Some(TrayCommand::Show),
         TRAY_QUIT_ID => Some(TrayCommand::Quit),
+        TRAY_SYSTEM_PROXY_ID => Some(TrayCommand::App(DesktopTrayCommand::ToggleSystemProxy)),
+        TRAY_COPY_ENV_ID => Some(TrayCommand::App(
+            DesktopTrayCommand::CopyEnvironmentVariables,
+        )),
         _ => id
             .strip_prefix(TRAY_SUBSCRIPTION_PREFIX)
             .and_then(|id| id.parse::<u64>().ok())
@@ -189,14 +197,35 @@ fn build_tray_menu(state: &DesktopTrayState) -> Menu {
         }
     }
 
+    let proxy_controls_separator = PredefinedMenuItem::separator();
+    let system_proxy = CheckMenuItem::with_id(
+        TRAY_SYSTEM_PROXY_ID,
+        "系统代理",
+        state.ready
+            && state.system_proxy_ready
+            && state.system_proxy_supported
+            && !state.busy
+            && (state.connected || state.system_proxy_enabled),
+        state.system_proxy_enabled,
+        None,
+    );
+    let copy_environment = MenuItem::with_id(
+        TRAY_COPY_ENV_ID,
+        "复制环境变量",
+        state.ready && !state.busy,
+        None,
+    );
+    let window_actions_separator = PredefinedMenuItem::separator();
     let show = MenuItem::with_id(TRAY_SHOW_ID, "显示 Kitty Pro", true, None);
-    let separator = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id(TRAY_QUIT_ID, "退出", true, None);
     menu.append_items(&[
         &status,
         &subscriptions_menu,
         &nodes_menu,
-        &separator,
+        &proxy_controls_separator,
+        &system_proxy,
+        &copy_environment,
+        &window_actions_separator,
         &show,
         &quit,
     ])
@@ -337,6 +366,16 @@ mod tests {
     fn tray_ids_map_to_expected_commands() {
         assert_eq!(tray_command(TRAY_SHOW_ID), Some(TrayCommand::Show));
         assert_eq!(tray_command(TRAY_QUIT_ID), Some(TrayCommand::Quit));
+        assert_eq!(
+            tray_command(TRAY_SYSTEM_PROXY_ID),
+            Some(TrayCommand::App(DesktopTrayCommand::ToggleSystemProxy))
+        );
+        assert_eq!(
+            tray_command(TRAY_COPY_ENV_ID),
+            Some(TrayCommand::App(
+                DesktopTrayCommand::CopyEnvironmentVariables
+            ))
+        );
         assert_eq!(tray_command("unknown"), None);
     }
 
@@ -408,6 +447,9 @@ mod tests {
             ready: true,
             busy: false,
             connected: true,
+            system_proxy_ready: true,
+            system_proxy_supported: true,
+            system_proxy_enabled: true,
             active_subscription_id: Some(2),
             selected_tag: "subscription-2:node-b".to_string(),
             subscriptions: vec![
@@ -467,5 +509,17 @@ mod tests {
             .expect("node should be selectable")
             .text()
             .starts_with('●'));
+        let system_proxy = root_items[4]
+            .as_check_menuitem()
+            .expect("system proxy should be a check item");
+        assert!(system_proxy.is_enabled());
+        assert!(system_proxy.is_checked());
+        assert_eq!(
+            root_items[5]
+                .as_menuitem()
+                .expect("environment copy should be selectable")
+                .text(),
+            "复制环境变量"
+        );
     }
 }

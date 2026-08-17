@@ -33,6 +33,8 @@ type LatencyCacheEntry = (String, String, u64);
 pub enum DesktopTrayCommand {
     SelectSubscription(u64),
     SelectNode(String),
+    ToggleSystemProxy,
+    CopyEnvironmentVariables,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +55,9 @@ pub struct DesktopTrayState {
     pub ready: bool,
     pub busy: bool,
     pub connected: bool,
+    pub system_proxy_ready: bool,
+    pub system_proxy_supported: bool,
+    pub system_proxy_enabled: bool,
     pub active_subscription_id: Option<u64>,
     pub selected_tag: String,
     pub subscriptions: Vec<DesktopTraySubscription>,
@@ -418,16 +423,26 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
     let log_collection_paused = use_signal(|| false);
     let mut profile_loaded = use_signal(|| false);
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
-    let system_proxy_busy = use_signal(|| false);
+    let mut system_proxy_busy = use_signal(|| false);
 
     use_effect(move || {
         let Some(mut bridge) = desktop_tray else {
             return;
         };
+        let (system_proxy_ready, system_proxy_supported, system_proxy_enabled) =
+            match system_proxy() {
+                SystemProxyLoadState::Ready(status) => (true, status.supported, status.enabled),
+                SystemProxyLoadState::Loading | SystemProxyLoadState::Failed(_) => {
+                    (false, false, false)
+                }
+            };
         bridge.state.set(DesktopTrayState {
             ready: profile_loaded(),
             busy: core_busy() || core_restarting() || system_proxy_busy() || runtime_action_busy(),
             connected: connected(),
+            system_proxy_ready,
+            system_proxy_supported,
+            system_proxy_enabled,
             active_subscription_id: active_subscription_id(),
             selected_tag: selected_tag(),
             subscriptions: subscriptions()
@@ -605,6 +620,51 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                     } else {
                         group_selections.set(next_selections);
                         toast.success(format!("已从托盘选择 {outbound}"));
+                    }
+                }
+                DesktopTrayCommand::ToggleSystemProxy => match system_proxy() {
+                    SystemProxyLoadState::Ready(status) if status.supported => {
+                        let enabled = !status.enabled;
+                        system_proxy_busy.set(true);
+                        match api::set_system_proxy(enabled).await {
+                            Ok(status) => {
+                                system_proxy.set(SystemProxyLoadState::Ready(status));
+                                if enabled {
+                                    toast.success("系统代理已启用");
+                                } else {
+                                    toast.success("系统代理已关闭");
+                                }
+                            }
+                            Err(error) => {
+                                toast.error(format!("系统代理设置失败: {error}"));
+                                match api::system_proxy_status().await {
+                                    Ok(status) => {
+                                        system_proxy.set(SystemProxyLoadState::Ready(status));
+                                    }
+                                    Err(refresh_error) => {
+                                        system_proxy.set(SystemProxyLoadState::Failed(
+                                            refresh_error.to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        system_proxy_busy.set(false);
+                    }
+                    SystemProxyLoadState::Ready(_) => {
+                        toast.error("当前平台不支持系统代理");
+                    }
+                    SystemProxyLoadState::Loading => {
+                        toast.info("系统代理状态仍在读取");
+                    }
+                    SystemProxyLoadState::Failed(error) => {
+                        toast.error(format!("系统代理状态不可用: {error}"));
+                    }
+                },
+                DesktopTrayCommand::CopyEnvironmentVariables => {
+                    match api::copy_proxy_environment_variables().await {
+                        Ok(()) => toast.success("代理环境变量已复制"),
+                        Err(error) => toast.error(format!("复制环境变量失败: {error}")),
                     }
                 }
             }

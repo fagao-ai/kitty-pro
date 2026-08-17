@@ -704,6 +704,21 @@ pub async fn set_system_proxy(enabled: bool) -> Result<SystemProxyStatus, Server
         not(any(target_os = "android", target_os = "ios")),
         any(target_arch = "wasm32", feature = "server")
     ),
+    post("/api/environment/copy")
+)]
+pub async fn copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+    run_native_blocking(
+        "代理环境变量复制任务失败",
+        native_copy_proxy_environment_variables,
+    )
+    .await
+}
+
+#[cfg_attr(
+    all(
+        not(any(target_os = "android", target_os = "ios")),
+        any(target_arch = "wasm32", feature = "server")
+    ),
     get("/api/processes")
 )]
 pub async fn list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
@@ -2813,6 +2828,97 @@ const SYSTEM_PROXY_HOST: &str = "127.0.0.1";
 const SYSTEM_PROXY_PORT: u16 = 7890;
 
 #[cfg(target_os = "windows")]
+fn proxy_environment_variables() -> String {
+    format!(
+        "$env:http_proxy=\"http://{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT}\"; \
+         $env:https_proxy=\"http://{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT}\"; \
+         $env:all_proxy=\"socks5://{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT}\""
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn proxy_environment_variables() -> String {
+    format!(
+        "export http_proxy=http://{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT} && \
+         export https_proxy=http://{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT} && \
+         export all_proxy=socks5://{SYSTEM_PROXY_HOST}:{SYSTEM_PROXY_PORT}"
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn pipe_text_to_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("启动 {program} 失败: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{program} 未提供标准输入"))?
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("写入 {program} 失败: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("等待 {program} 失败: {error}"))?;
+    if !status.success() {
+        return Err(format!("{program} 返回失败状态 {status}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+    pipe_text_to_command("/usr/bin/pbcopy", &[], &proxy_environment_variables())
+        .map_err(ServerFnError::new)
+}
+
+#[cfg(target_os = "windows")]
+fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+    pipe_text_to_command("clip.exe", &[], &proxy_environment_variables())
+        .map_err(ServerFnError::new)
+}
+
+#[cfg(target_os = "linux")]
+fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+    let text = proxy_environment_variables();
+    let commands: [(&str, &[&str]); 3] = [
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    let mut errors = Vec::new();
+    for (program, args) in commands {
+        match pipe_text_to_command(program, args, &text) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(ServerFnError::new(format!(
+        "未找到可用的系统剪贴板工具: {}",
+        errors.join("；")
+    )))
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+))]
+fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+    Err(ServerFnError::new("当前平台尚未实现系统剪贴板适配"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+    Err(ServerFnError::new("浏览器目标不能直接写入系统剪贴板"))
+}
+
+#[cfg(target_os = "windows")]
 const SYSTEM_PROXY_BYPASS: &str = "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>";
 #[cfg(target_os = "linux")]
 const SYSTEM_PROXY_BYPASS: &str = "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1";
@@ -3145,6 +3251,24 @@ mod tests {
         proxy.port = SYSTEM_PROXY_PORT;
         proxy.enable = false;
         assert!(!is_kitty_system_proxy(&proxy));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn copied_proxy_environment_targets_the_local_mixed_listener() {
+        let variables = proxy_environment_variables();
+
+        assert!(variables.contains("http://127.0.0.1:7890"));
+        assert!(variables.contains("socks5://127.0.0.1:7890"));
+        for name in ["http_proxy", "https_proxy", "all_proxy"] {
+            assert!(variables.contains(name));
+        }
+        assert!(!variables.contains("no_proxy"));
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert_eq!(variables.matches(" && ").count(), 2);
+        #[cfg(target_os = "windows")]
+        assert_eq!(variables.matches("; ").count(), 2);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
