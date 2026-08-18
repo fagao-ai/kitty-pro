@@ -2850,11 +2850,22 @@ fn pipe_text_to_command(program: &str, args: &[&str], text: &str) -> Result<(), 
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command
         .spawn()
         .map_err(|error| format!("启动 {program} 失败: {error}"))?;
     child
