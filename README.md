@@ -71,13 +71,38 @@ when no `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` is already configured.
 From the repository root, run the Web control surface:
 
 ```sh
-dx serve --package web --web --fullstack true --port 8080 --open false --interactive false
+dx serve --package web --web --fullstack true --port 7897 --open false --interactive false
 ```
 
-Open <http://127.0.0.1:8080>. The Web UI controls the native sing-box archive
+Open <http://127.0.0.1:7897>. The Web UI controls the native sing-box archive
 inside the local fullstack server. A browser cannot load a Go/C archive or
 create a system TUN interface directly, so its role is intentionally control
 plane only.
+
+### Released Web server
+
+Run these commands from the extracted release directory (keep `public/` next
+to the executable):
+
+```sh
+./kitty-pro-web-server                         # foreground, 127.0.0.1:7897
+./kitty-pro-web-server --port 9000              # custom port
+PORT=9000 ./kitty-pro-web-server                # environment variable also supported
+./kitty-pro-web-server --daemon                # background, default port
+./kitty-pro-web-server --daemon --port 9000 --log-file ./web.log
+./kitty-pro-web-server --help
+```
+
+Port priority is `--port` > `PORT` > `7897`. `IP` defaults to `127.0.0.1`
+and must be a loopback address because this is a local control surface.
+`--daemon` detaches from the terminal on macOS/Linux and Windows, appends
+stdout/stderr to `kitty-pro-web.log` (or `--log-file`), and prints the PID
+only after the new server is ready. A failed startup returns a nonzero exit
+code. Stop the background process with `kill <PID>` on macOS/Linux or
+`taskkill /PID <PID>` on Windows. This is not an autostart service or a
+crash-restart supervisor; use the OS service manager for those requirements.
+Do not use `--daemon` with `dx serve`; the development server still runs in
+the foreground and owns its listener configuration.
 
 Run the macOS desktop shell:
 

@@ -6491,6 +6491,7 @@ dependencies = [
  "dioxus",
  "dioxus-server",
  "getrandom 0.3.4",
+ "libc",
  "singbox",
  "ui",
 ]

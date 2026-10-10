@@ -5,13 +5,20 @@ use ui::ProxyApp;
 use dioxus_server::axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    http::{header, uri::Authority, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    routing::get,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+mod cli;
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
 const MAIN_CSS: Asset = asset!("/assets/main.css");
+
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_WEB_PORT: &str = "7897";
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -30,16 +37,27 @@ fn main() {
         std::process::exit(exit_code);
     }
 
+    match cli::prepare() {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            eprintln!("错误: {error}");
+            std::process::exit(2);
+        }
+    }
+
     let session = ControlSession::new().expect("control session token should be generated");
     dioxus_server::serve(move || {
         let session = session.clone();
         async move {
-            Ok(
-                dioxus_server::router(App).layer(middleware::from_fn_with_state(
-                    session,
-                    control_session_guard,
-                )),
-            )
+            let mut router = dioxus_server::router(App);
+            if let Some((path, token)) = cli::readiness_route() {
+                router = router.route(&path, get(move || async move { token }));
+            }
+            Ok(router.layer(middleware::from_fn_with_state(
+                session,
+                control_session_guard,
+            )))
         }
     });
 }
@@ -129,15 +147,35 @@ fn header_text(value: &HeaderValue) -> Option<&str> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn is_loopback_authority(authority: &str) -> bool {
-    authority
-        .parse::<dioxus_server::axum::http::uri::Authority>()
-        .map(|authority| {
-            matches!(
-                authority.host(),
-                "127.0.0.1" | "localhost" | "[::1]" | "::1"
-            )
-        })
-        .unwrap_or(false)
+    parse_loopback_authority(authority).is_some()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_loopback_authority(value: &str) -> Option<Authority> {
+    let authority = value.parse::<Authority>().ok()?;
+    // Authority 的语法解析允许 userinfo 和非法端口，不能仅靠 port() 判断。
+    let host = authority.host();
+    if value.contains('@') {
+        return None;
+    }
+    let suffix = value.strip_prefix(host)?;
+    if !suffix.is_empty() {
+        let port = suffix.strip_prefix(':')?;
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || !authority.port_u16().is_some_and(|port| port != 0)
+        {
+            return None;
+        }
+    }
+    let loopback = host == "localhost"
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host)
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    loopback.then_some(authority)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -182,26 +220,35 @@ fn same_origin(headers: &HeaderMap, host: &str, dev_server_authority: Option<&st
 
 #[cfg(not(target_arch = "wasm32"))]
 fn dev_server_origin_matches(origin_authority: &str, dev_server_authority: &str) -> bool {
-    if origin_authority == dev_server_authority {
-        return true;
+    let Some(origin) = parse_loopback_authority(origin_authority) else {
+        return false;
+    };
+    let Some(dev) = parse_loopback_authority(dev_server_authority) else {
+        return false;
+    };
+    match (origin.port_u16(), dev.port_u16()) {
+        (Some(origin_port), Some(dev_port)) => origin_port == dev_port,
+        _ => false,
     }
-    let Some((dev_host, dev_port)) = dev_server_authority.rsplit_once(':') else {
-        return false;
-    };
-    let Some((origin_host, origin_port)) = origin_authority.rsplit_once(':') else {
-        return false;
-    };
-    dev_port == origin_port
-        && matches!(dev_host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
-        && matches!(origin_host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn dev_server_authority() -> Option<String> {
     let ip = std::env::var("DIOXUS_DEVSERVER_IP").ok()?;
     let port = std::env::var("DIOXUS_DEVSERVER_PORT").ok()?;
-    let authority = format!("{ip}:{port}");
-    is_loopback_authority(&authority).then_some(authority)
+    dev_server_authority_from_parts(&ip, &port)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dev_server_authority_from_parts(ip: &str, port: &str) -> Option<String> {
+    let host = match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+        _ => ip.to_string(),
+    };
+    let value = format!("{host}:{port}");
+    let authority = parse_loopback_authority(&value)?;
+    authority.port_u16()?;
+    Some(value)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -288,6 +335,33 @@ mod tests {
     }
 
     #[test]
+    fn loopback_ip_environment_matches_host_guard() {
+        assert!(is_loopback_authority("127.0.0.2:7897"));
+        assert!(is_loopback_authority("[::1]:7897"));
+        assert!(!is_loopback_authority("192.168.1.1:7897"));
+        assert!(!is_loopback_authority("0.0.0.0:7897"));
+        assert!(!is_loopback_authority("127.0.0.1:65536"));
+        assert!(!is_loopback_authority("127.0.0.1:0"));
+        assert!(!is_loopback_authority("localhost:"));
+        assert!(!is_loopback_authority("localhost:invalid"));
+        assert!(!is_loopback_authority("user@127.0.0.1:7897"));
+    }
+
+    #[test]
+    fn dev_server_authority_formats_ipv6_without_mutating_environment() {
+        assert_eq!(
+            dev_server_authority_from_parts("::1", "7897").as_deref(),
+            Some("[::1]:7897")
+        );
+        assert_eq!(
+            dev_server_authority_from_parts("127.0.0.2", "7897").as_deref(),
+            Some("127.0.0.2:7897")
+        );
+        assert!(dev_server_authority_from_parts("::1", "65536").is_none());
+        assert!(dev_server_authority_from_parts("192.168.1.1", "7897").is_none());
+    }
+
+    #[test]
     fn post_without_origin_is_rejected() {
         let session = ControlSession {
             token: "secret".to_string(),
@@ -317,20 +391,99 @@ mod tests {
     }
 
     #[test]
+    fn proxied_requests_preserve_other_security_checks() {
+        let session = ControlSession {
+            token: "secret".to_string(),
+            dev_server_authority: Some("[::1]:8080".to_string()),
+        };
+        assert!(valid_control_request(
+            &request(
+                Method::POST,
+                "127.0.0.1:50622",
+                Some("http://127.0.0.2:8080"),
+                "secret"
+            ),
+            &session
+        ));
+        for (host, origin, token) in [
+            ("127.0.0.1:50622", Some("http://localhost:9090"), "secret"),
+            ("127.0.0.1:50622", Some("http://evil.test:8080"), "secret"),
+            ("127.0.0.1:50622", Some("ftp://localhost:8080"), "secret"),
+            ("127.0.0.1:50622", Some("http://localhost:8080"), "wrong"),
+            ("evil.test:50622", Some("http://localhost:8080"), "secret"),
+            ("127.0.0.1:50622", None, "secret"),
+        ] {
+            assert!(!valid_control_request(
+                &request(Method::POST, host, origin, token),
+                &session
+            ));
+        }
+    }
+
+    #[test]
     fn proxied_dev_server_requests_accept_loopback_origin_aliases() {
         // dx serve rewrites the Host header to the internal loopback port, so
         // the browser Origin must be matched against the configured dev server
         // authority instead of the request Host.
-        assert!(dev_server_origin_matches("localhost:8080", "127.0.0.1:8080"));
-        assert!(dev_server_origin_matches("127.0.0.1:8080", "127.0.0.1:8080"));
+        assert!(dev_server_origin_matches(
+            "localhost:8080",
+            "127.0.0.1:8080"
+        ));
+        assert!(dev_server_origin_matches(
+            "127.0.0.1:8080",
+            "127.0.0.1:8080"
+        ));
         assert!(dev_server_origin_matches("[::1]:8080", "127.0.0.1:8080"));
-        assert!(dev_server_origin_matches("127.0.0.1:8080", "localhost:8080"));
-        assert!(dev_server_origin_matches("localhost:8080", "localhost:8080"));
+        assert!(dev_server_origin_matches(
+            "127.0.0.1:8080",
+            "localhost:8080"
+        ));
+        assert!(dev_server_origin_matches(
+            "localhost:8080",
+            "localhost:8080"
+        ));
         // A different local port is a different site and must stay rejected:
         // SameSite cookies still travel between same-site localhost origins.
-        assert!(!dev_server_origin_matches("localhost:9090", "127.0.0.1:8080"));
-        assert!(!dev_server_origin_matches("example.com:8080", "127.0.0.1:8080"));
+        assert!(!dev_server_origin_matches(
+            "localhost:9090",
+            "127.0.0.1:8080"
+        ));
+        assert!(!dev_server_origin_matches(
+            "example.com:8080",
+            "127.0.0.1:8080"
+        ));
         assert!(!dev_server_origin_matches("127.0.0.1", "127.0.0.1:8080"));
         assert!(!dev_server_origin_matches("localhost:8080", ""));
+        for alias in ["127.0.0.2:8080", "[::1]:8080", "[0:0:0:0:0:0:0:1]:8080"] {
+            assert!(dev_server_origin_matches(alias, "localhost:8080"));
+            assert!(dev_server_origin_matches("localhost:8080", alias));
+        }
+        for invalid in [
+            "localhost",
+            "127.0.0.1",
+            "[::1]",
+            "::1:8080",
+            "localhost:",
+            "localhost:invalid",
+            "localhost:65536",
+            "localhost:0",
+            "192.168.1.1:8080",
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "example.com:8080",
+            "localhost.evil.test:8080",
+            "localhost@evil.test:8080",
+            "evil.test@localhost:8080",
+        ] {
+            assert!(
+                !dev_server_origin_matches(invalid, "localhost:8080"),
+                "{invalid}"
+            );
+            assert!(
+                !dev_server_origin_matches("localhost:8080", invalid),
+                "{invalid}"
+            );
+            assert!(!dev_server_origin_matches(invalid, invalid), "{invalid}");
+        }
     }
 }

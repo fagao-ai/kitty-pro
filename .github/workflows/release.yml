@@ -500,8 +500,12 @@ jobs:
           cp -R "$web_output/public" dist/web/package/public
           printf '%s\n' \
             'Run: ./kitty-pro-web-server' \
-            'Default address: http://127.0.0.1:8080' \
-            'Set IP and PORT environment variables to change the listen address.' \
+            'Default address: http://127.0.0.1:7897' \
+            'Use --port PORT or PORT=... to change the listen port.' \
+            'Background: ./kitty-pro-web-server --daemon --port 7897' \
+            'Use --log-file PATH with --daemon; default: kitty-pro-web.log.' \
+            'Startup prints the PID after readiness; stop with kill <PID>.' \
+            'IP defaults to 127.0.0.1 and must be a loopback address.' \
             > dist/web/package/README.txt
           archive="dist/web/${{ matrix.archive_name }}.tar.gz"
           tar -C dist/web/package -czf "$archive" .
