@@ -378,8 +378,12 @@ impl AppView {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DesktopAutostartCapability(bool);
+
 #[component]
 pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> Element {
+    use_context_provider(|| DesktopAutostartCapability(desktop_tray.is_some()));
     let active_view = use_signal(|| AppView::Overview);
     let mut dark_mode = use_signal(|| false);
     let mut connected = use_signal(|| false);
@@ -4472,6 +4476,112 @@ fn apply_sync_snapshot(
     group_selections.set(HashMap::new());
 }
 
+#[cfg(all(
+    feature = "native-desktop",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+fn desktop_autostart_settings() -> Element {
+    if use_context::<DesktopAutostartCapability>().0 {
+        rsx! { DesktopAutostartSettings {} }
+    } else {
+        rsx! {}
+    }
+}
+
+#[cfg(not(all(
+    feature = "native-desktop",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+)))]
+fn desktop_autostart_settings() -> Element {
+    let _ = use_context::<DesktopAutostartCapability>().0;
+    rsx! {}
+}
+
+#[cfg(all(
+    feature = "native-desktop",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+#[component]
+fn DesktopAutostartSettings() -> Element {
+    let mut enabled = use_signal(|| false);
+    let mut ready = use_signal(|| false);
+    let mut busy = use_signal(|| true);
+    let mut error = use_signal(|| None::<String>);
+    use_future(move || async move {
+        match api::autostart::status().await {
+            Ok(value) => {
+                enabled.set(value);
+                ready.set(true);
+            }
+            Err(err) => error.set(Some(err.to_string())),
+        }
+        busy.set(false);
+    });
+    rsx! {
+        section { class: "settings-section glass-surface",
+            div { class: "section-heading", h2 { "桌面启动" } }
+            label { class: "setting-row toggle-row",
+                div {
+                    strong { "用户登录时启动" }
+                    small { "仅启动 Kitty Pro，不自动连接代理或开启 TUN；默认关闭" }
+                }
+                input {
+                    r#type: "checkbox",
+                    aria_label: "用户登录时启动 Kitty Pro",
+                    checked: enabled(),
+                    disabled: busy() || !ready(),
+                    onclick: move |event| {
+                        event.prevent_default();
+                        if busy() || !ready() { return; }
+                        let target = !enabled();
+                        busy.set(true);
+                        error.set(None);
+                        spawn(async move {
+                            match api::autostart::set_enabled(target).await {
+                                Ok(value) => enabled.set(value),
+                                Err(err) => {
+                                    error.set(Some(err.to_string()));
+                                    // 设置可能已部分生效，回读真实状态避免开关显示反向。
+                                    // 只有回读值与操作目标一致才算真正成功；不一致时保留
+                                    // 失败提示，否则用户会看到开关静默弹回且没有任何说明。
+                                    if let Ok(value) = api::autostart::status().await {
+                                        enabled.set(value);
+                                        if value == target {
+                                            error.set(None);
+                                        }
+                                    }
+                                }
+                            }
+                            busy.set(false);
+                        });
+                    },
+                }
+                span { class: "switch" }
+            }
+            if busy() { div { class: "inline-note", aria_busy: "true", "正在读取或更新系统启动项…" } }
+            if let Some(message) = error() {
+                div { class: "inline-note", role: "alert", "{message}" }
+                button {
+                    disabled: busy(),
+                    onclick: move |_| {
+                        if busy() { return; }
+                        busy.set(true);
+                        error.set(None);
+                        spawn(async move {
+                            match api::autostart::status().await {
+                                Ok(value) => { enabled.set(value); ready.set(true); }
+                                Err(err) => { ready.set(false); error.set(Some(err.to_string())); }
+                            }
+                            busy.set(false);
+                        });
+                    },
+                    "重新读取系统状态"
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn SettingsView(
     platform: String,
@@ -4505,6 +4615,7 @@ fn SettingsView(
     let tun_proxy_server_nameservers = proxy_server_nameservers.clone();
     let allow_lan_proxy_server_nameservers = proxy_server_nameservers.clone();
     let script_proxy_server_nameservers = proxy_server_nameservers;
+    let autostart_settings = desktop_autostart_settings();
 
     rsx! {
         div { class: "settings-grid",
@@ -4577,6 +4688,8 @@ fn SettingsView(
                     }
                 }
             }
+
+            {autostart_settings}
 
             SyncSettings {
                 subscriptions,

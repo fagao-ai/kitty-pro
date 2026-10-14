@@ -23,6 +23,15 @@ sysinfo = "0.38"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+windows-registry = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies.auto-launch]
+version = "=0.6.0"
+optional = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
 
 [features]
+native-desktop = []
 server = ["dioxus/server"]

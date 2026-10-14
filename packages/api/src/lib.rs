@@ -1,6 +1,12 @@
 //! Shared fullstack APIs used by web, desktop, and mobile shells.
 
 use dioxus::prelude::*;
+
+#[cfg(all(
+    feature = "native-desktop",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+pub mod autostart;
 use proxy_core::{
     AppProfile, ConnectionRequest, ParseReport, ProxyGroup, ProxyNode, RuleSetCachePaths,
     SyncSnapshot,

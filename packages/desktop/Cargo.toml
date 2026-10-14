@@ -18,5 +18,5 @@ singbox = { workspace = true }
 
 [features]
 default = []
-desktop = ["dioxus/desktop"]
+desktop = ["dioxus/desktop", "ui/native-desktop"]
 server = ["dioxus/fullstack", "dioxus/server", "ui/server"]

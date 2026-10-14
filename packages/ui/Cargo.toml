@@ -16,4 +16,5 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 tokio = { version = "1", features = ["time"] }
 
 [features]
+native-desktop = ["api/native-desktop"]
 server = ["api/server"]
