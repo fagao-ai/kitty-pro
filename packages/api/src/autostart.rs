@@ -49,6 +49,11 @@ fn enable() -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     let path = path.canonicalize().map_err(|e| e.to_string())?;
     let path = launch_path(&path, None, cfg!(target_os = "macos"))?;
+    // 仅 Linux/Windows 分支使用 text；macOS 走 plist 路径。
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(unused_variables)
+    )]
     let text = path.to_str().ok_or("启动程序路径不是有效的 UTF-8")?;
     #[cfg(target_os = "linux")]
     {
@@ -78,6 +83,10 @@ fn disable() -> Result<(), String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.to_string()),
         }
+        // 只删 plist 的话，已加载的 LaunchAgent 会存活到下次登录。这里
+        // 顺带把它从当前登录会话卸载；服务本来就没加载时 bootout 会报
+        // "Could not find service"，属正常情况，保持幂等直接忽略。
+        let _ = launchctl("bootout");
     }
     #[cfg(target_os = "windows")]
     windows_disable()?;
@@ -96,7 +105,7 @@ fn read_enabled(_unused: bool) -> Result<bool, String> {
         if !launch_agent_path()?.is_file() {
             return Ok(false);
         }
-        return Ok(!launchctl_disabled(&launchctl("print-disabled")?)?);
+        Ok(!launchctl_disabled(&launchctl("print-disabled")?)?)
     }
     #[cfg(target_os = "windows")]
     return windows_enabled();
@@ -293,7 +302,7 @@ fn launchctl_args(action: &str, uid: &str) -> Result<Vec<String>, String> {
     }
     let domain = format!("gui/{uid}");
     match action {
-        "enable" => Ok(vec![action.into(), format!("{domain}/{ID}")]),
+        "enable" | "bootout" => Ok(vec![action.into(), format!("{domain}/{ID}")]),
         "print-disabled" => Ok(vec![action.into(), domain]),
         _ => Err("不支持的 launchctl 操作".into()),
     }
@@ -409,6 +418,11 @@ mod tests {
     fn macos_disabled_override() {
         assert_eq!(
             launchctl_args("enable", "501").unwrap()[1],
+            format!("gui/501/{ID}")
+        );
+        assert_eq!(launchctl_args("bootout", "501").unwrap()[0], "bootout");
+        assert_eq!(
+            launchctl_args("bootout", "501").unwrap()[1],
             format!("gui/501/{ID}")
         );
         assert!(launchctl_args("enable", "501/other").is_err());

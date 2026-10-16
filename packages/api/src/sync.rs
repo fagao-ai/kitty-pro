@@ -292,18 +292,14 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
     let mut dns_rule_suffixes = HashSet::with_capacity(snapshot.dns_overrides.len());
     for rule in &snapshot.dns_overrides {
         let (domain_suffix, server) = normalize_dns_override(&rule.domain_suffix, &rule.server)
-            .map_err(|error| {
-                ServerFnError::new(format!("远程专用 DNS 规则无效: {error}"))
-            })?;
+            .map_err(|error| ServerFnError::new(format!("远程专用 DNS 规则无效: {error}")))?;
         if !dns_rule_suffixes.insert(domain_suffix.clone()) {
             return Err(ServerFnError::new(format!(
                 "远程专用 DNS 域名后缀重复: {domain_suffix}"
             )));
         }
         if rule.server != server {
-            return Err(ServerFnError::new(
-                "远程专用 DNS 服务器与规范化结果不一致",
-            ));
+            return Err(ServerFnError::new("远程专用 DNS 服务器与规范化结果不一致"));
         }
     }
     if snapshot.subscriptions.len() > 1024 {

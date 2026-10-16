@@ -4813,24 +4813,36 @@ fn DesktopAutostartSettings() -> Element {
                 }
                 span { class: "switch" }
             }
-            if busy() { div { class: "inline-note", aria_busy: "true", "正在读取或更新系统启动项…" } }
+            if busy() {
+                div { class: "inline-note", aria_busy: "true",
+                    span { class: "spinner" }
+                    span { "正在读取或更新系统启动项…" }
+                }
+            }
             if let Some(message) = error() {
-                div { class: "inline-note", role: "alert", "{message}" }
-                button {
-                    disabled: busy(),
-                    onclick: move |_| {
-                        if busy() { return; }
-                        busy.set(true);
-                        error.set(None);
-                        spawn(async move {
-                            match api::autostart::status().await {
-                                Ok(value) => { enabled.set(value); ready.set(true); }
-                                Err(err) => { ready.set(false); error.set(Some(err.to_string())); }
-                            }
-                            busy.set(false);
-                        });
-                    },
-                    "重新读取系统状态"
+                div { class: "inline-note", role: "alert",
+                    Icon { icon: LdCircleAlert, width: 16, height: 16 }
+                    span { "{message}" }
+                }
+                div { class: "rule-editor-actions",
+                    button {
+                        class: "secondary-button compact",
+                        disabled: busy(),
+                        onclick: move |_| {
+                            if busy() { return; }
+                            busy.set(true);
+                            error.set(None);
+                            spawn(async move {
+                                match api::autostart::status().await {
+                                    Ok(value) => { enabled.set(value); ready.set(true); }
+                                    Err(err) => { ready.set(false); error.set(Some(err.to_string())); }
+                                }
+                                busy.set(false);
+                            });
+                        },
+                        Icon { icon: LdRefreshCw, width: 15, height: 15 }
+                        "重新读取系统状态"
+                    }
                 }
             }
         }
