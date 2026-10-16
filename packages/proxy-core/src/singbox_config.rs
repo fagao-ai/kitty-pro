@@ -1,6 +1,6 @@
 use crate::{
     normalize_custom_rule_value, ConnectionRequest, CustomRule, CustomRuleAction, CustomRuleMatch,
-    ProxyAuth, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol, TunnelMode,
+    DnsOverride, ProxyAuth, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol, TunnelMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -86,7 +86,11 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         inbounds.push(tun_inbound);
     }
 
-    let mut outbounds: Vec<Value> = request.nodes.iter().map(node_to_outbound).collect();
+    let mut outbounds: Vec<Value> = request
+        .nodes
+        .iter()
+        .map(|node| node_to_outbound(node, &request.dns_overrides))
+        .collect();
     let node_tags: Vec<&str> = request.nodes.iter().map(|node| node.tag.as_str()).collect();
     let selected = if request
         .nodes
@@ -111,6 +115,26 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         TunnelMode::Rule | TunnelMode::Global => "proxy",
     };
     let mut rules = vec![json!({ "port": 53, "action": "hijack-dns" })];
+    for (index, rule) in request
+        .dns_overrides
+        .iter()
+        .filter(|rule| rule.enabled)
+        .enumerate()
+    {
+        // `resolve` pre-resolves matching hosts with the dedicated server and
+        // leaves matching to continue. Once DestinationAddresses is populated,
+        // the eventual dial skips `default_domain_resolver` entirely.
+        rules.push(json!({
+            "domain_suffix": [rule.domain_suffix],
+            "action": "resolve",
+            "server": format!("dns-override-{index}"),
+        }));
+        rules.push(json!({
+            "domain_suffix": [rule.domain_suffix],
+            "action": "route",
+            "outbound": "direct",
+        }));
+    }
     if request.mode == TunnelMode::Rule {
         rules.push(json!({ "action": "sniff" }));
         rules.push(json!({ "ip_is_private": true, "action": "route", "outbound": "direct" }));
@@ -220,14 +244,30 @@ fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
         "type": "local",
         "tag": "dns-direct",
     })];
+    let mut rules = Vec::new();
+    for (index, rule) in request
+        .dns_overrides
+        .iter()
+        .filter(|rule| rule.enabled)
+        .enumerate()
+    {
+        let tag = format!("dns-override-{index}");
+        servers.push(dns_override_server(rule, &tag));
+        rules.push(json!({
+            "domain_suffix": [rule.domain_suffix],
+            "action": "route",
+            "server": tag,
+        }));
+    }
     if request.mode == TunnelMode::Direct {
-        return (
-            json!({
-                "servers": servers,
-                "final": "dns-direct",
-            }),
-            false,
-        );
+        let mut dns = json!({
+            "servers": servers,
+            "final": "dns-direct",
+        });
+        if !rules.is_empty() {
+            dns["rules"] = json!(rules);
+        }
+        return (dns, false);
     }
 
     servers.push(json!({
@@ -262,7 +302,7 @@ fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
         "detour": "proxy",
     }));
 
-    let mut rules = vec![
+    rules.extend([
         json!({
             "query_type": ["PTR"],
             "action": "route",
@@ -273,7 +313,7 @@ fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
             "action": "route",
             "server": "dns-direct",
         }),
-    ];
+    ]);
     if request.mode == TunnelMode::Rule {
         rules.extend(
             request
@@ -318,6 +358,40 @@ fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
         dns["independent_cache"] = json!(true);
     }
     (dns, has_subscription_dns)
+}
+
+fn dns_override_server(rule: &DnsOverride, tag: &str) -> Value {
+    let mut server = json!({
+        "type": "udp",
+        "tag": tag,
+        "server": rule.server,
+        "server_port": 53,
+    });
+    if rule.server.parse::<IpAddr>().is_err() {
+        server["domain_resolver"] = json!("dns-direct");
+    }
+    server
+}
+
+/// Mirrors the tag assignment in `build_dns_config`: enabled overrides are
+/// tagged `dns-override-{index}` in order. Returns the tag whose domain
+/// suffix matches an outbound server hostname.
+fn dns_override_tag_for_server(dns_overrides: &[DnsOverride], server: &str) -> Option<String> {
+    if server.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let host = server.trim_end_matches('.').to_ascii_lowercase();
+    dns_overrides
+        .iter()
+        .filter(|rule| rule.enabled)
+        .enumerate()
+        .find(|(_, rule)| {
+            host == rule.domain_suffix
+                || host
+                    .strip_suffix(&format!(".{}", rule.domain_suffix))
+                    .is_some()
+        })
+        .map(|(index, _)| format!("dns-override-{index}"))
 }
 
 fn subscription_https_dns_server(value: &str) -> Option<Value> {
@@ -444,7 +518,7 @@ pub fn extract_proxy_groups(config: &Value) -> Vec<ProxyGroup> {
         .collect()
 }
 
-fn node_to_outbound(node: &ProxyNode) -> Value {
+fn node_to_outbound(node: &ProxyNode, dns_overrides: &[DnsOverride]) -> Value {
     let mut object = Map::new();
     object.insert(
         "type".to_string(),
@@ -462,6 +536,14 @@ fn node_to_outbound(node: &ProxyNode) -> Value {
     object.insert("tag".to_string(), json!(node.tag));
     object.insert("server".to_string(), json!(node.server));
     object.insert("server_port".to_string(), json!(node.port));
+    // Defense in depth: normally the route-level `resolve` rule pre-resolves
+    // the node host with the dedicated DNS before dialing, so this
+    // `domain_resolver` never runs. It stays as a fallback for dial paths that
+    // bypass route pre-resolution (e.g. sing-box resolving the literal server
+    // field during startup validation or on future code paths).
+    if let Some(tag) = dns_override_tag_for_server(dns_overrides, &node.server) {
+        object.insert("domain_resolver".to_string(), json!(tag));
+    }
 
     match &node.auth {
         ProxyAuth::None => {}
@@ -604,6 +686,7 @@ mod tests {
             tun: false,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -616,6 +699,77 @@ mod tests {
         assert_eq!(outbound["tls"]["server_name"], "origin.example.com");
         assert_eq!(outbound["tls"]["utls"]["fingerprint"], "chrome");
         assert!(outbound.get("transport").is_none());
+    }
+
+    #[test]
+    fn dns_override_pins_domain_resolver_on_matching_outbound() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@hezz-gpu.et.net:3080#GPU\n\
+vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: false,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            dns_overrides: vec![DnsOverride {
+                id: 1,
+                enabled: true,
+                domain_suffix: "et.net".to_string(),
+                server: "100.100.100.101".to_string(),
+            }],
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        assert_eq!(config["outbounds"][0]["domain_resolver"], "dns-override-0");
+        assert!(config["outbounds"][1].get("domain_resolver").is_none());
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert_eq!(route_rules[1]["action"], "resolve");
+        assert_eq!(route_rules[1]["server"], "dns-override-0");
+        assert_eq!(route_rules[1]["domain_suffix"][0], "et.net");
+        assert_eq!(route_rules[2]["action"], "route");
+        assert_eq!(route_rules[2]["outbound"], "direct");
+        let override_server = config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["tag"] == "dns-override-0")
+            .expect("override server exists");
+        assert_eq!(override_server["server"], "100.100.100.101");
+    }
+
+    #[test]
+    fn disabled_dns_override_does_not_pin_domain_resolver() {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@hezz-gpu.et.net:3080#GPU",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: false,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            dns_overrides: vec![DnsOverride {
+                id: 1,
+                enabled: false,
+                domain_suffix: "et.net".to_string(),
+                server: "100.100.100.101".to_string(),
+            }],
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+        assert!(config["outbounds"][0].get("domain_resolver").is_none());
     }
 
     #[test]
@@ -633,6 +787,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             tun: true,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -720,6 +875,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
                 tun: false,
                 allow_lan: false,
                 custom_rules: Vec::new(),
+                dns_overrides: Vec::new(),
                 config_script: None,
                 group_selections: HashMap::new(),
             };
@@ -760,6 +916,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             tun: false,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -792,6 +949,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             tun: false,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -815,6 +973,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             mode: TunnelMode::Rule,
             tun: true,
             allow_lan: false,
+            dns_overrides: Vec::new(),
             custom_rules: vec![
                 CustomRule {
                     id: 1,
@@ -867,6 +1026,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             mode: TunnelMode::Rule,
             tun: true,
             allow_lan: false,
+            dns_overrides: Vec::new(),
             custom_rules: vec![CustomRule {
                 id: 1,
                 enabled: true,
@@ -911,6 +1071,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             tun: true,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -964,6 +1125,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             tun: false,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -1004,6 +1166,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             mode: TunnelMode::Rule,
             tun: false,
             allow_lan: false,
+            dns_overrides: Vec::new(),
             custom_rules: vec![
                 CustomRule {
                     id: 1,
@@ -1058,6 +1221,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             mode: TunnelMode::Rule,
             tun: false,
             allow_lan: false,
+            dns_overrides: Vec::new(),
             custom_rules: vec![
                 CustomRule {
                     id: 1,
@@ -1146,6 +1310,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
             mode: TunnelMode::Global,
             tun: false,
             allow_lan: false,
+            dns_overrides: Vec::new(),
             custom_rules: vec![CustomRule {
                 id: 1,
                 enabled: true,
@@ -1176,6 +1341,7 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
             tun: true,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -1211,6 +1377,7 @@ http://192.0.2.10:8081#Duplicate",
             tun: true,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };
@@ -1241,6 +1408,7 @@ http://192.0.2.10:8081#Duplicate",
             tun: false,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: HashMap::new(),
         };

@@ -784,6 +784,7 @@ async fn measure_native_latency(
         tun: false,
         allow_lan: false,
         custom_rules: Vec::new(),
+        dns_overrides: Vec::new(),
         config_script: None,
         group_selections: Default::default(),
     };
@@ -839,6 +840,7 @@ async fn measure_native_latency(
         tun: false,
         allow_lan: false,
         custom_rules: Vec::new(),
+        dns_overrides: Vec::new(),
         config_script: None,
         group_selections: Default::default(),
     };
@@ -896,6 +898,7 @@ async fn start_native_latency_session(
         tun: false,
         allow_lan: false,
         custom_rules: Vec::new(),
+        dns_overrides: Vec::new(),
         config_script: None,
         group_selections: Default::default(),
     };
@@ -3885,6 +3888,7 @@ mod tests {
             tun: false,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: Some(
                 "function main(config) {\
                     config.log.level = Object.values(config.__kitty_context.node_names)[0];\
@@ -3917,6 +3921,7 @@ mod tests {
             tun: false,
             allow_lan: true,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: Some(
                 "function main(config) {\
                     config.route.rule_set.push({\
@@ -3975,6 +3980,7 @@ mod tests {
             tun: true,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: Default::default(),
         };
@@ -4019,6 +4025,7 @@ mod tests {
             tun: false,
             allow_lan: true,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: Default::default(),
         };

@@ -361,6 +361,30 @@ const fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsOverride {
+    pub id: u64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub domain_suffix: String,
+    pub server: String,
+}
+
+pub fn normalize_dns_override(
+    domain_suffix: &str,
+    server: &str,
+) -> Result<(String, String), String> {
+    let domain = normalize_custom_rule_value(CustomRuleMatch::DomainSuffix, domain_suffix)
+        .map_err(|_| "域名后缀无效".to_string())?;
+    let server = server.trim();
+    let valid_server = server.parse::<std::net::IpAddr>().is_ok()
+        || normalize_custom_rule_value(CustomRuleMatch::Domain, server).is_ok();
+    if !valid_server {
+        return Err("DNS 服务器必须是 IP 或域名".to_string());
+    }
+    Ok((domain, server.to_string()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionRequest {
     pub nodes: Vec<ProxyNode>,
     pub selected_tag: String,
@@ -374,6 +398,8 @@ pub struct ConnectionRequest {
     pub allow_lan: bool,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
+    #[serde(default)]
+    pub dns_overrides: Vec<DnsOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_script: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -446,6 +472,8 @@ pub struct AppProfile {
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
     #[serde(default)]
+    pub dns_overrides: Vec<DnsOverride>,
+    #[serde(default)]
     pub config_script_enabled: bool,
     #[serde(default)]
     pub config_script: String,
@@ -498,6 +526,10 @@ pub struct SyncSnapshot {
     pub subscriptions: Vec<SyncSubscription>,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
+    /// Optional since version 2: older snapshots decode to an empty list, so
+    /// the additive field keeps wire compatibility without a version bump.
+    #[serde(default)]
+    pub dns_overrides: Vec<DnsOverride>,
 }
 
 impl SyncSnapshot {
@@ -512,6 +544,7 @@ impl SyncSnapshot {
                 .map(SyncSubscription::from)
                 .collect(),
             custom_rules: profile.custom_rules.clone(),
+            dns_overrides: profile.dns_overrides.clone(),
         }
     }
 
@@ -525,6 +558,7 @@ impl SyncSnapshot {
         profile.active_subscription_id = None;
         profile.selected_tag.clear();
         profile.custom_rules = self.custom_rules.clone();
+        profile.dns_overrides = self.dns_overrides.clone();
         profile.group_selections.clear();
     }
 }
@@ -549,6 +583,7 @@ impl Default for AppProfile {
             allow_lan: false,
             dark_mode: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script_enabled: false,
             config_script: String::new(),
             group_selections: HashMap::new(),
@@ -638,6 +673,12 @@ mod tests {
                 value: "example.com".to_string(),
                 action: CustomRuleAction::Proxy,
             }],
+            dns_overrides: vec![DnsOverride {
+                id: 1,
+                enabled: true,
+                domain_suffix: "et.net".to_string(),
+                server: "100.100.100.101".to_string(),
+            }],
             group_selections: HashMap::from([("proxy".to_string(), "edge".to_string())]),
             ..AppProfile::default()
         };
@@ -660,6 +701,7 @@ mod tests {
         assert_eq!(target.active_subscription_id, None);
         assert!(target.selected_tag.is_empty());
         assert_eq!(target.custom_rules, source.custom_rules);
+        assert_eq!(target.dns_overrides, source.dns_overrides);
         assert!(target.group_selections.is_empty());
         assert!(!target.dark_mode);
         assert!(!target.tun_enabled);
@@ -670,6 +712,32 @@ mod tests {
         assert!(serialized.get("selected_tag").is_none());
         assert!(serialized.get("group_selections").is_none());
         assert!(serialized["subscriptions"][0].get("nodes").is_none());
+    }
+
+    #[test]
+    fn sync_snapshot_without_dns_overrides_decodes_empty() {
+        // Version-2 snapshots uploaded before dns_overrides existed must keep
+        // decoding, syncing to an empty override list.
+        let legacy = r#"{
+            "format": "kitty-pro-sync",
+            "version": 2,
+            "updated_at": 7,
+            "subscriptions": [],
+            "custom_rules": []
+        }"#;
+        let snapshot: SyncSnapshot =
+            serde_json::from_str(legacy).expect("legacy snapshot should decode");
+        assert!(snapshot.dns_overrides.is_empty());
+
+        let mut profile = AppProfile::default();
+        profile.dns_overrides.push(DnsOverride {
+            id: 1,
+            enabled: true,
+            domain_suffix: "et.net".to_string(),
+            server: "100.100.100.101".to_string(),
+        });
+        snapshot.apply_to_profile(&mut profile);
+        assert!(profile.dns_overrides.is_empty());
     }
 
     #[test]

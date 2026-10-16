@@ -13,8 +13,8 @@ use dioxus_free_icons::icons::ld_icons::{
 use dioxus_free_icons::Icon;
 use proxy_core::{
     validate_custom_rules, AppProfile, ConnectionRequest, CustomRule, CustomRuleAction,
-    CustomRuleMatch, ParseReport, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol,
-    Subscription, SyncSnapshot, SyncSubscription, TunnelMode, MAX_CUSTOM_RULES,
+    CustomRuleMatch, DnsOverride, ParseReport, ProxyGroup, ProxyGroupKind, ProxyNode,
+    ProxyProtocol, Subscription, SyncSnapshot, SyncSubscription, TunnelMode, MAX_CUSTOM_RULES,
     SYNC_SNAPSHOT_VERSION,
 };
 use std::collections::HashMap;
@@ -69,18 +69,35 @@ pub struct DesktopTrayBridge {
     pub command: Signal<Option<DesktopTrayCommand>>,
 }
 
-fn build_connection_request(
-    nodes: Vec<ProxyNode>,
-    selected_tag: String,
-    proxy_server_nameservers: Vec<String>,
+/// Signals describing the current tunnel/routing configuration. Grouped so
+/// connection-request builders avoid a long positional argument list.
+#[derive(Clone, Copy)]
+struct RuntimeSettings {
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
     custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
+}
+
+fn build_connection_request(
+    nodes: Vec<ProxyNode>,
+    selected_tag: String,
+    proxy_server_nameservers: Vec<String>,
+    settings: RuntimeSettings,
     group_selections: HashMap<String, String>,
 ) -> ConnectionRequest {
+    let RuntimeSettings {
+        tunnel_mode,
+        tun_enabled,
+        allow_lan,
+        custom_rules,
+        dns_overrides,
+        config_script_enabled,
+        config_script,
+    } = settings;
     let script_enabled = config_script_enabled();
     let script = config_script();
     let custom_rules = connection_custom_rules(script_enabled, &script, custom_rules());
@@ -98,21 +115,36 @@ fn build_connection_request(
         tun: tun_enabled(),
         allow_lan: allow_lan(),
         custom_rules,
+        dns_overrides: dns_overrides(),
         config_script,
         group_selections,
     }
 }
 
+/// Signals mirroring the sing-box core status back into the UI after a
+/// (re)start, grouped to keep `restart_core_from_ui`'s signature small.
+#[derive(Clone, Copy)]
+struct CoreStatusSignals {
+    connected: Signal<bool>,
+    core_restarting: Signal<bool>,
+    core_state: Signal<String>,
+    core_version: Signal<Option<String>>,
+    core_note: Signal<Option<String>>,
+}
+
 async fn restart_core_from_ui(
     request: ConnectionRequest,
-    mut connected: Signal<bool>,
-    mut core_restarting: Signal<bool>,
-    mut core_state: Signal<String>,
-    mut core_version: Signal<Option<String>>,
-    mut core_note: Signal<Option<String>>,
+    status: CoreStatusSignals,
     toast: ToastManager,
     success_message: impl Into<String>,
 ) -> bool {
+    let CoreStatusSignals {
+        mut connected,
+        mut core_restarting,
+        mut core_state,
+        mut core_version,
+        mut core_note,
+    } = status;
     let success_message = success_message.into();
     core_restarting.set(true);
     let success = match api::restart_core(request).await {
@@ -402,6 +434,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
     let mut selected_tag = use_signal(String::new);
     let mut subscriptions = use_signal(Vec::<Subscription>::new);
     let mut custom_rules = use_signal(Vec::<CustomRule>::new);
+    let mut dns_overrides = use_signal(Vec::<DnsOverride>::new);
     let rule_sets_busy = use_signal(|| false);
     let mut active_subscription_id = use_signal(|| None::<u64>);
     let mut tunnel_mode = use_signal(|| TunnelMode::Rule);
@@ -529,21 +562,26 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                                 &subscriptions(),
                                 Some(subscription_id),
                             ),
-                            tunnel_mode,
-                            tun_enabled,
-                            allow_lan,
-                            custom_rules,
-                            config_script_enabled,
-                            config_script,
+                            RuntimeSettings {
+                                tunnel_mode,
+                                tun_enabled,
+                                allow_lan,
+                                custom_rules,
+                                dns_overrides,
+                                config_script_enabled,
+                                config_script,
+                            },
                             next_selections,
                         );
                         if !restart_core_from_ui(
                             request,
-                            connected,
-                            core_restarting,
-                            core_state,
-                            core_version,
-                            core_note,
+                            CoreStatusSignals {
+                                connected,
+                                core_restarting,
+                                core_state,
+                                core_version,
+                                core_note,
+                            },
                             toast,
                             "已从托盘切换订阅，内核已重启",
                         )
@@ -597,21 +635,26 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                                     &subscriptions(),
                                     active_subscription_id(),
                                 ),
-                                tunnel_mode,
-                                tun_enabled,
-                                allow_lan,
-                                custom_rules,
-                                config_script_enabled,
-                                config_script,
+                                RuntimeSettings {
+                                    tunnel_mode,
+                                    tun_enabled,
+                                    allow_lan,
+                                    custom_rules,
+                                    dns_overrides,
+                                    config_script_enabled,
+                                    config_script,
+                                },
                                 next_selections,
                             );
                             if !restart_core_from_ui(
                                 request,
-                                connected,
-                                core_restarting,
-                                core_state,
-                                core_version,
-                                core_note,
+                                CoreStatusSignals {
+                                    connected,
+                                    core_restarting,
+                                    core_state,
+                                    core_version,
+                                    core_note,
+                                },
                                 toast,
                                 format!("已从托盘切换到 {outbound}，内核已重启"),
                             )
@@ -752,6 +795,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                     let restored_tag = select_available_tag(&restored_nodes, &profile.selected_tag);
                     subscriptions.set(profile.subscriptions);
                     custom_rules.set(profile.custom_rules);
+                    dns_overrides.set(profile.dns_overrides);
                     active_subscription_id.set(restored_active_id);
                     nodes.set(restored_nodes);
                     selected_tag.set(restored_tag);
@@ -800,6 +844,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
             allow_lan: allow_lan(),
             dark_mode: dark_mode(),
             custom_rules: custom_rules(),
+            dns_overrides: dns_overrides(),
             config_script_enabled: config_script_enabled(),
             config_script: config_script(),
             group_selections: group_selections(),
@@ -928,6 +973,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                 &config_script(),
                 custom_rules(),
             ),
+            dns_overrides: dns_overrides(),
             config_script: if config_script_enabled() && !config_script().trim().is_empty() {
                 Some(config_script())
             } else {
@@ -1013,6 +1059,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
+                                    dns_overrides: dns_overrides(),
                                     custom_rules: connection_custom_rules(
                                         config_script_enabled(),
                                         &config_script(),
@@ -1110,6 +1157,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
+                                    dns_overrides: dns_overrides(),
                                     custom_rules: connection_custom_rules(
                                         config_script_enabled(),
                                         &config_script(),
@@ -1205,6 +1253,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             tun_enabled,
                             allow_lan,
                             custom_rules,
+                            dns_overrides,
                             connection_allowed,
                             latency_results,
                             traffic,
@@ -1241,6 +1290,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             tun_enabled,
                             allow_lan,
                             custom_rules,
+        dns_overrides,
                             config_script_enabled,
                             config_script,
                             search,
@@ -1268,6 +1318,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             tun_enabled,
                             allow_lan,
                             custom_rules,
+        dns_overrides,
                             config_script_enabled,
                             config_script,
                             group_selections,
@@ -1313,6 +1364,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                                 active_subscription_id(),
                             ),
                             custom_rules,
+        dns_overrides,
                             config_script_enabled,
                             config_script,
                             group_selections,
@@ -1570,6 +1622,7 @@ fn OverviewView(
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
     custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
     connection_allowed: bool,
     latency_results: Signal<HashMap<String, NodeLatency>>,
     traffic: Signal<TrafficDisplay>,
@@ -1690,6 +1743,7 @@ fn OverviewView(
                                 mode: tunnel_mode(),
                                 tun: tun_enabled(),
                                 allow_lan: allow_lan(),
+                                dns_overrides: dns_overrides(),
                                 custom_rules: connection_custom_rules(
                                     config_script_enabled(),
                                     &config_script(),
@@ -2061,6 +2115,7 @@ fn NodesView(
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
     custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
     mut search: Signal<String>,
@@ -2290,6 +2345,7 @@ fn NodesView(
                                         tun_enabled,
                                         allow_lan,
                                         custom_rules,
+        dns_overrides,
                                         config_script_enabled,
                                         config_script,
                                         group_selections,
@@ -2372,6 +2428,7 @@ fn ProxyGroupMemberRow(
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
     custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
     mut group_selections: Signal<HashMap<String, String>>,
@@ -2439,21 +2496,26 @@ fn ProxyGroupMemberRow(
                                     nodes,
                                     selected_tag(),
                                     proxy_server_nameservers,
-                                    tunnel_mode,
-                                    tun_enabled,
-                                    allow_lan,
-                                    custom_rules,
-                                    config_script_enabled,
-                                    config_script,
+                                    RuntimeSettings {
+                                        tunnel_mode,
+                                        tun_enabled,
+                                        allow_lan,
+                                        custom_rules,
+                                        dns_overrides,
+                                        config_script_enabled,
+                                        config_script,
+                                    },
                                     next_selections,
                                 );
                                 let restarted = restart_core_from_ui(
                                     request,
-                                    connected,
-                                    core_restarting,
-                                    core_state,
-                                    core_version,
-                                    core_note,
+                                    CoreStatusSignals {
+                                        connected,
+                                        core_restarting,
+                                        core_state,
+                                        core_version,
+                                        core_note,
+                                    },
                                     toast,
                                     format!("{group} 已切换到 {outbound}，内核已重启"),
                                 )
@@ -2669,6 +2731,7 @@ fn SubscriptionsView(
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
     custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
     group_selections: Signal<HashMap<String, String>>,
@@ -2768,6 +2831,7 @@ fn SubscriptionsView(
                             tun_enabled,
                             allow_lan,
                             custom_rules,
+        dns_overrides,
                             config_script_enabled,
                             config_script,
                             group_selections,
@@ -2799,6 +2863,7 @@ fn SubscriptionRow(
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
     custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
     group_selections: Signal<HashMap<String, String>>,
@@ -2869,21 +2934,26 @@ fn SubscriptionRow(
                                     &subscriptions(),
                                     Some(subscription_id),
                                 ),
-                                tunnel_mode,
-                                tun_enabled,
-                                allow_lan,
-                                custom_rules,
-                                config_script_enabled,
-                                config_script,
+                                RuntimeSettings {
+                                    tunnel_mode,
+                                    tun_enabled,
+                                    allow_lan,
+                                    custom_rules,
+                                    dns_overrides,
+                                    config_script_enabled,
+                                    config_script,
+                                },
                                 next_selections,
                             );
                             let restarted = restart_core_from_ui(
                                 request,
-                                connected,
-                                core_restarting,
-                                core_state,
-                                core_version,
-                                core_note,
+                                CoreStatusSignals {
+                                    connected,
+                                    core_restarting,
+                                    core_state,
+                                    core_version,
+                                    core_note,
+                                },
                                 toast,
                                 "已切换订阅，内核已重启",
                             )
@@ -4089,6 +4159,7 @@ fn SyncSettings(
     mut nodes: Signal<Vec<ProxyNode>>,
     mut selected_tag: Signal<String>,
     mut custom_rules: Signal<Vec<CustomRule>>,
+    mut dns_overrides: Signal<Vec<DnsOverride>>,
     mut group_selections: Signal<HashMap<String, String>>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
@@ -4324,12 +4395,15 @@ fn SyncSettings(
                                 };
                                 apply_sync_snapshot(
                                     snapshot,
-                                    subscriptions,
-                                    active_subscription_id,
-                                    nodes,
-                                    selected_tag,
-                                    custom_rules,
-                                    group_selections,
+                                    SyncTargetSignals {
+                                        subscriptions,
+                                        active_subscription_id,
+                                        nodes,
+                                        selected_tag,
+                                        custom_rules,
+                                        dns_overrides,
+                                        group_selections,
+                                    },
                                 );
                                 if result.checkpoint_saved {
                                     let mut current = config.write();
@@ -4367,6 +4441,7 @@ fn SyncSettings(
                         let snapshot = build_sync_snapshot(
                             &subscriptions(),
                             &custom_rules(),
+                            &dns_overrides(),
                             value.last_sync_at,
                         );
                         async move {
@@ -4410,6 +4485,7 @@ fn SyncSettings(
                         let snapshot = build_sync_snapshot(
                             &subscriptions(),
                             &custom_rules(),
+                            &dns_overrides(),
                             value.last_sync_at,
                         );
                         busy.set(Some(SyncAction::ForcePush));
@@ -4442,6 +4518,7 @@ fn SyncSettings(
 fn build_sync_snapshot(
     subscriptions: &[Subscription],
     custom_rules: &[CustomRule],
+    dns_overrides: &[DnsOverride],
     updated_at: u64,
 ) -> SyncSnapshot {
     SyncSnapshot {
@@ -4450,18 +4527,33 @@ fn build_sync_snapshot(
         updated_at,
         subscriptions: subscriptions.iter().map(SyncSubscription::from).collect(),
         custom_rules: custom_rules.to_vec(),
+        dns_overrides: dns_overrides.to_vec(),
     }
 }
 
-fn apply_sync_snapshot(
-    snapshot: SyncSnapshot,
-    mut subscriptions: Signal<Vec<Subscription>>,
-    mut active_subscription_id: Signal<Option<u64>>,
-    mut nodes: Signal<Vec<ProxyNode>>,
-    mut selected_tag: Signal<String>,
-    mut custom_rules: Signal<Vec<CustomRule>>,
-    mut group_selections: Signal<HashMap<String, String>>,
-) {
+/// Mutable signals a pulled snapshot writes back into, grouped to keep
+/// `apply_sync_snapshot` within the clippy argument budget.
+#[derive(Clone, Copy)]
+struct SyncTargetSignals {
+    subscriptions: Signal<Vec<Subscription>>,
+    active_subscription_id: Signal<Option<u64>>,
+    nodes: Signal<Vec<ProxyNode>>,
+    selected_tag: Signal<String>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
+    group_selections: Signal<HashMap<String, String>>,
+}
+
+fn apply_sync_snapshot(snapshot: SyncSnapshot, targets: SyncTargetSignals) {
+    let SyncTargetSignals {
+        mut subscriptions,
+        mut active_subscription_id,
+        mut nodes,
+        mut selected_tag,
+        mut custom_rules,
+        mut dns_overrides,
+        mut group_selections,
+    } = targets;
     subscriptions.set(
         snapshot
             .subscriptions
@@ -4473,6 +4565,7 @@ fn apply_sync_snapshot(
     nodes.set(Vec::new());
     selected_tag.set(String::new());
     custom_rules.set(snapshot.custom_rules);
+    dns_overrides.set(snapshot.dns_overrides);
     group_selections.set(HashMap::new());
 }
 
@@ -4582,6 +4675,144 @@ fn DesktopAutostartSettings() -> Element {
     }
 }
 
+fn add_dns_override_rule(
+    mut domain: Signal<String>,
+    mut server: Signal<String>,
+    mut dns_overrides: Signal<Vec<DnsOverride>>,
+    mut error: Signal<Option<String>>,
+) {
+    match proxy_core::normalize_dns_override(&domain(), &server()) {
+        Ok((domain_suffix, dns_server)) => {
+            let mut rules = dns_overrides.write();
+            if rules.iter().any(|item| item.domain_suffix == domain_suffix) {
+                error.set(Some(format!("已存在 {domain_suffix} 的专用 DNS")));
+                return;
+            }
+            let id = rules.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+            rules.push(DnsOverride {
+                id,
+                enabled: true,
+                domain_suffix,
+                server: dns_server,
+            });
+            domain.set(String::new());
+            server.set(String::new());
+            error.set(None);
+        }
+        Err(message) => error.set(Some(message)),
+    }
+}
+
+#[component]
+fn DnsOverrideSettings(mut dns_overrides: Signal<Vec<DnsOverride>>) -> Element {
+    let mut domain = use_signal(String::new);
+    let mut server = use_signal(String::new);
+    let error = use_signal(|| None::<String>);
+    let rules = dns_overrides();
+    rsx! {
+        section { class: "settings-section dns-settings glass-surface",
+            div { class: "section-heading",
+                div {
+                    p { class: "eyebrow", "DNS" }
+                    h2 { "专用 DNS" }
+                }
+                if !rules.is_empty() {
+                    span { class: "count-badge", "{rules.len()} 条规则" }
+                }
+            }
+            if rules.is_empty() {
+                div { class: "empty-state dns-empty",
+                    span { class: "empty-icon", Icon { icon: LdGlobe, width: 22, height: 22 } }
+                    div {
+                        strong { "尚未配置专用 DNS" }
+                        p { "域名后缀匹配的请求只使用指定的 DNS，不回退到其他 DNS" }
+                    }
+                }
+            } else {
+                div { class: "dns-list",
+                    for rule in rules {
+                        div {
+                            class: if rule.enabled { "dns-row" } else { "dns-row disabled" },
+                            key: "{rule.id}",
+                            span { class: "dns-rule-domain", title: "{rule.domain_suffix}", "{rule.domain_suffix}" }
+                            span { class: "dns-rule-arrow", Icon { icon: LdChevronRight, width: 14, height: 14 } }
+                            span { class: "dns-rule-server", title: "{rule.server}", "{rule.server}" }
+                            label {
+                                class: "rule-enabled-toggle",
+                                title: if rule.enabled { "停用这条规则" } else { "启用这条规则" },
+                                input {
+                                    r#type: "checkbox",
+                                    aria_label: if rule.enabled { "停用 {rule.domain_suffix} 的专用 DNS" } else { "启用 {rule.domain_suffix} 的专用 DNS" },
+                                    checked: rule.enabled,
+                                    onchange: move |event| {
+                                        let checked = event.checked();
+                                        dns_overrides.write().iter_mut().for_each(|item| {
+                                            if item.id == rule.id {
+                                                item.enabled = checked;
+                                            }
+                                        });
+                                    },
+                                }
+                                span { class: "switch" }
+                            }
+                            button {
+                                class: "icon-button danger",
+                                aria_label: "删除 {rule.domain_suffix} 的专用 DNS",
+                                title: "删除",
+                                onclick: move |_| {
+                                    dns_overrides.write().retain(|item| item.id != rule.id);
+                                },
+                                Icon { icon: LdTrash2, width: 16, height: 16 }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "dns-editor",
+                label { class: "dns-field",
+                    span { "域名后缀" }
+                    input {
+                        placeholder: "例如 et.net",
+                        value: "{domain}",
+                        oninput: move |event| domain.set(event.value()),
+                        onkeydown: move |event| {
+                            if event.key() == Key::Enter {
+                                add_dns_override_rule(domain, server, dns_overrides, error);
+                            }
+                        },
+                    }
+                }
+                label { class: "dns-field",
+                    span { "DNS 服务器" }
+                    input {
+                        placeholder: "例如 100.100.100.101",
+                        value: "{server}",
+                        oninput: move |event| server.set(event.value()),
+                        onkeydown: move |event| {
+                            if event.key() == Key::Enter {
+                                add_dns_override_rule(domain, server, dns_overrides, error);
+                            }
+                        },
+                    }
+                }
+                button {
+                    class: "secondary-button dns-add-button",
+                    title: "添加专用 DNS 规则",
+                    onclick: move |_| add_dns_override_rule(domain, server, dns_overrides, error),
+                    Icon { icon: LdPlus, width: 15, height: 15 }
+                    "添加"
+                }
+            }
+            if let Some(message) = error() {
+                div { class: "inline-note", role: "alert",
+                    Icon { icon: LdCircleAlert, width: 16, height: 16 }
+                    span { "{message}" }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn SettingsView(
     platform: String,
@@ -4603,6 +4834,7 @@ fn SettingsView(
     mut active_subscription_id: Signal<Option<u64>>,
     proxy_server_nameservers: Vec<String>,
     mut custom_rules: Signal<Vec<CustomRule>>,
+    mut dns_overrides: Signal<Vec<DnsOverride>>,
     mut config_script_enabled: Signal<bool>,
     mut config_script: Signal<String>,
     mut group_selections: Signal<HashMap<String, String>>,
@@ -4697,6 +4929,7 @@ fn SettingsView(
                 nodes,
                 selected_tag,
                 custom_rules,
+                dns_overrides,
                 group_selections,
                 tunnel_mode,
                 tun_enabled,
@@ -4766,6 +4999,7 @@ fn SettingsView(
                                     mode: tunnel_mode(),
                                     tun: enabled,
                                     allow_lan: allow_lan(),
+                                    dns_overrides: dns_overrides(),
                                     custom_rules: connection_custom_rules(
                                         config_script_enabled(),
                                         &config_script(),
@@ -4946,6 +5180,7 @@ fn SettingsView(
                                     mode: tunnel_mode(),
                                     tun: tun_enabled(),
                                     allow_lan: enabled,
+                                    dns_overrides: dns_overrides(),
                                     custom_rules: connection_custom_rules(
                                         config_script_enabled(),
                                         &config_script(),
@@ -4999,6 +5234,8 @@ fn SettingsView(
                     span { class: "switch" }
                 }
             }
+
+            DnsOverrideSettings { dns_overrides }
 
             section { class: "settings-section glass-surface",
                 div { class: "section-heading",
@@ -5094,6 +5331,7 @@ fn SettingsView(
                                     tun: tun_enabled(),
                                     allow_lan: allow_lan(),
                                     custom_rules: Vec::new(),
+                                    dns_overrides: dns_overrides(),
                                     config_script: Some(script_draft()),
                                     group_selections: group_selections(),
                                 };
