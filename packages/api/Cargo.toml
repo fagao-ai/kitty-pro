@@ -33,5 +33,5 @@ optional = true
 plist = "1"
 
 [features]
-native-desktop = []
+native-desktop = ["dep:auto-launch"]
 server = ["dioxus/server"]

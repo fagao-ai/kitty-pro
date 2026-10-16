@@ -52,7 +52,7 @@ fn enable() -> Result<(), String> {
     let text = path.to_str().ok_or("启动程序路径不是有效的 UTF-8")?;
     #[cfg(target_os = "linux")]
     {
-        linux_launcher(desktop_exec_path(text))?
+        linux_launcher(&desktop_exec_path(text))?
             .enable()
             .map_err(|e| e.to_string())?;
     }
@@ -244,7 +244,7 @@ fn windows_enable(command: &str) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 fn windows_disable() -> Result<(), String> {
     use windows_registry::CURRENT_USER;
-    const NOT_FOUND: windows_result::HRESULT = windows_result::HRESULT::from_win32(0x8007_0002);
+    const NOT_FOUND: windows_registry::HRESULT = windows_registry::HRESULT::from_win32(0x8007_0002);
     for key_path in [RUN_KEY, APPROVED_KEY] {
         match CURRENT_USER
             .options()
@@ -277,7 +277,7 @@ fn windows_enabled() -> Result<bool, String> {
         .open(APPROVED_KEY)
         .and_then(|key| key.get_value(ID))
     {
-        Ok(windows_registry::Data::Binary(bytes)) if bytes.len() == 12 => {
+        Ok(value) if value.ty() == windows_registry::Type::Bytes && value.len() == 12 => {
             Ok(matches!(bytes[0], 2 | 6))
         }
         Ok(_) => Ok(false),
