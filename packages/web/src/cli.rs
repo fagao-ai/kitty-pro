@@ -11,13 +11,38 @@ use std::{
 const DAEMON_CHILD: &str = "KITTY_PRO_WEB_DAEMON_CHILD";
 const READY_PATH: &str = "/__kitty_pro_daemon_ready";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-pub const HELP: &str = "用法: web [--port <1-65535>] [--daemon [--log-file <路径>]]\n\n  --port       覆盖 PORT 环境变量（默认 7897）\n  --daemon     后台启动，等待服务就绪后退出\n  --log-file   后台日志追加路径（默认 kitty-pro-web.log）\n  -h, --help   显示帮助\n\nIP 环境变量指定绑定 IP（默认 127.0.0.1，仅允许 loopback）。\n保留 dx serve 设置的 PORT/IP；不要在 dx serve 下使用 --daemon。";
+pub const HELP: &str = "用法: web [--port <1-65535>] [--allow-lan] [--daemon [--log-file <路径>]]\n\n  --port       覆盖 PORT 环境变量（默认 7897）\n  --allow-lan  允许 IP 环境变量绑定非 loopback 地址\n  --daemon     后台启动，等待服务就绪后退出\n  --log-file   后台日志追加路径（默认 kitty-pro-web.log）\n  -h, --help   显示帮助\n\nIP 环境变量指定绑定 IP（默认 127.0.0.1）。绑定非 loopback 需要\n--allow-lan（或 KITTY_PRO_ALLOW_LAN=1），并将直连主机名加入\nKITTY_PRO_ALLOWED_HOSTS（逗号分隔后缀白名单，IP 直连不受限）。\n保留 dx serve 设置的 PORT/IP；不要在 dx serve 下使用 --daemon。";
+
+/// 非 loopback 绑定的总开关：`--allow-lan` 会写入同名环境变量传给子进程。
+pub fn lan_mode_enabled() -> bool {
+    std::env::var("KITTY_PRO_ALLOW_LAN").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Host 白名单后缀（小写、去空白）。LAN 模式下额外放行这些主机名，
+/// IP 字面量直连始终放行；这是防 DNS rebinding 的兜底名单。
+pub fn allowed_host_suffixes() -> Vec<String> {
+    std::env::var("KITTY_PRO_ALLOWED_HOSTS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Default, PartialEq)]
 struct Options {
     port: Option<u16>,
     daemon: bool,
     log_file: Option<PathBuf>,
+    allow_lan: bool,
     help: bool,
 }
 
@@ -37,6 +62,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options, String> {
         match text {
             "-h" | "--help" => options.help = true,
             "--daemon" if !options.daemon => options.daemon = true,
+            "--allow-lan" => options.allow_lan = true,
             "--port" | "--log-file" => {
                 let value = args.next().ok_or_else(|| format!("{text} 缺少参数值"))?;
                 set_value(&mut options, text, value)?;
@@ -83,8 +109,8 @@ fn address(
         Some(ip) => ip.parse().map_err(|_| format!("无效 IP 环境变量 {ip:?}"))?,
         None => Ipv4Addr::LOCALHOST.into(),
     };
-    if !ip.is_loopback() {
-        return Err("IP 必须是 loopback 地址，当前控制接口不支持对外监听".into());
+    if !ip.is_loopback() && !(options.allow_lan || lan_mode_enabled()) {
+        return Err("IP 是 loopback 以外的地址，需要 --allow-lan 显式开启对外监听".into());
     }
     Ok(SocketAddr::new(ip, port))
 }
@@ -114,6 +140,22 @@ pub fn prepare() -> Result<bool, String> {
     // Dioxus 0.7 的 serve 从运行时 PORT/IP 读取绑定地址，devserver 变量不是监听端口。
     std::env::set_var("PORT", addr.port().to_string());
     std::env::set_var("IP", addr.ip().to_string());
+    if options.allow_lan {
+        // 透传给 control_session_guard 与 --daemon 子进程。
+        std::env::set_var("KITTY_PRO_ALLOW_LAN", "1");
+    }
+    if !addr.ip().is_loopback() {
+        let hosts = allowed_host_suffixes();
+        eprintln!(
+            "警告: 正在以 {} 对外监听，控制接口对可达网络开放；主机名白名单: {}",
+            addr,
+            if hosts.is_empty() {
+                "未配置（仅放行 IP 直连）"
+            } else {
+                "已启用"
+            }
+        );
+    }
     if options.daemon && std::env::var_os(DAEMON_CHILD).is_none() {
         if std::env::var_os("DIOXUS_CLI_ENABLED").is_some() {
             return Err("dx serve 下不支持 --daemon，请直接运行发布后的 web 程序".into());
@@ -289,6 +331,15 @@ mod tests {
         assert!(address(&Options::default(), Some("invalid"), None).is_err());
         assert!(address(&Options::default(), None, Some("0.0.0.0")).is_err());
         assert!(address(&Options::default(), None, Some("invalid")).is_err());
+        let opts = options(&["--allow-lan"]).unwrap();
+        assert_eq!(
+            address(&opts, None, Some("0.0.0.0")).unwrap(),
+            "0.0.0.0:7897".parse().unwrap()
+        );
+        assert_eq!(
+            address(&opts, Some("8080"), Some("192.168.50.3")).unwrap(),
+            "192.168.50.3:8080".parse().unwrap()
+        );
     }
 
     #[test]
@@ -299,9 +350,12 @@ mod tests {
                 port: Some(9000),
                 daemon: true,
                 log_file: Some("a.log".into()),
+                allow_lan: false,
                 help: false,
             }
         );
+        assert!(options(&["--allow-lan"]).unwrap().allow_lan);
+        assert!(options(&["--allow-lan", "--allow-lan"]).unwrap().allow_lan);
         assert!(options(&["--help"]).unwrap().help);
         assert!(options(&["-h"]).unwrap().help);
         for args in [

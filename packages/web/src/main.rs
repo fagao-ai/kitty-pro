@@ -20,6 +20,55 @@ const MAIN_CSS: Asset = asset!("/assets/main.css");
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_WEB_PORT: &str = "7897";
 
+/// 会话密钥持久化到本地数据目录，与 profile.json 同目录（权限 0600）。
+/// 服务重启（dx watch 重建、崩溃恢复、daemon 重启）后密钥不变，已登录的
+/// 远程设备不会因旧 cookie 失效而全线 403。文件不存在则生成并落盘。
+#[cfg(not(target_arch = "wasm32"))]
+fn persisted_session_token() -> Result<String, getrandom::Error> {
+    let path = session_token_path();
+    if let Some(path) = &path {
+        if let Ok(stored) = std::fs::read_to_string(path) {
+            let stored = stored.trim().to_string();
+            if stored.len() == 64 && stored.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Ok(stored);
+            }
+        }
+    }
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random)?;
+    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    if let Some(path) = &path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+            {
+                let _ = file.write_all(token.as_bytes());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(path, token.as_bytes());
+        }
+    }
+    Ok(token)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn session_token_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("com", "kitty", "kitty-pro")
+        .map(|dirs| dirs.data_local_dir().join("web-session.key"))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     #[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
@@ -72,17 +121,41 @@ fn main() {
 struct ControlSession {
     token: String,
     dev_server_authority: Option<String>,
+    lan_mode: bool,
+    allowed_hosts: Vec<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ControlSession {
     fn new() -> Result<Self, getrandom::Error> {
-        let mut random = [0_u8; 32];
-        getrandom::fill(&mut random)?;
         Ok(Self {
-            token: random.iter().map(|byte| format!("{byte:02x}")).collect(),
+            token: persisted_session_token()?,
             dev_server_authority: dev_server_authority(),
+            lan_mode: cli::lan_mode_enabled(),
+            allowed_hosts: cli::allowed_host_suffixes(),
         })
+    }
+
+    /// LAN 模式下的 Host 判定：loopback 或命中白名单后缀才放行；LAN 模式下
+    /// IP 字面量直连（tailnet/LAN 地址）始终放行。仅拒绝未登记的主机名，
+    /// 在放开绑定的同时保留防 DNS rebinding 的兜底。
+    fn host_allowed(&self, authority: &str) -> bool {
+        if parse_loopback_authority(authority).is_some() {
+            return true;
+        }
+        if !self.lan_mode {
+            return false;
+        }
+        let Some(host) = authority_host(authority) else {
+            return false;
+        };
+        // IP 直连不受白名单限制。
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return true;
+        }
+        self.allowed_hosts
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
     }
 
     fn cookie(&self) -> String {
@@ -99,23 +172,30 @@ async fn control_session_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    let loopback_host = request
+    let host_ok = request
         .headers()
         .get(header::HOST)
         .and_then(header_text)
-        .is_some_and(is_loopback_authority);
-    if !loopback_host {
-        return (StatusCode::MISDIRECTED_REQUEST, "loopback host required").into_response();
+        .is_some_and(|host| session.host_allowed(host));
+    if !host_ok {
+        return (StatusCode::MISDIRECTED_REQUEST, "host not allowed").into_response();
     }
 
     let is_api = request.uri().path().starts_with("/api/");
     if is_api && !valid_control_request(&request, &session) {
+        log_control_rejection(&request, &session);
         return (StatusCode::FORBIDDEN, "invalid local control session").into_response();
     }
 
     let issue_cookie = request.method() == Method::GET && !is_api;
     let mut response = next.run(request).await;
     if issue_cookie {
+        // 面板 HTML 无版本号且每次都会重发会话 cookie；不带缓存指令时
+        // iOS Safari/WebView 会启发式缓存旧 HTML，用户刷新拿不到新构建的
+        // hash 资源，界面停留在旧版本。no-store 同时满足会话安全要求。
+        if let Ok(value) = HeaderValue::from_str("no-store") {
+            response.headers_mut().insert(header::CACHE_CONTROL, value);
+        }
         if let Ok(cookie) = HeaderValue::from_str(&session.cookie()) {
             response.headers_mut().append(header::SET_COOKIE, cookie);
         }
@@ -123,21 +203,47 @@ async fn control_session_guard(
     response
 }
 
+/// 403 诊断：打印被拒 API 请求的关键头，用于排查远程设备的会话问题。
+/// 只输出 Host/Origin/是否带 cookie，不泄露 token 内容。
+#[cfg(not(target_arch = "wasm32"))]
+fn log_control_rejection(request: &Request<Body>, session: &ControlSession) {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(header_text)
+        .unwrap_or("(missing)");
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(header_text)
+        .unwrap_or("(none)");
+    let cookie_state = match request.headers().get_all(header::COOKIE).iter().next_back() {
+        Some(_) if has_session_cookie(request.headers(), &session.token) => "token-valid",
+        Some(_) => "present-but-wrong-token",
+        None => "missing",
+    };
+    eprintln!(
+        "[kitty-pro] 403 reject path={} method={} host={} origin={} cookie={} lan_mode={} allowed_hosts={:?}",
+        request.uri().path(),
+        request.method(),
+        host,
+        origin,
+        cookie_state,
+        session.lan_mode,
+        session.allowed_hosts,
+    );
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn valid_control_request(request: &Request<Body>, session: &ControlSession) -> bool {
     let Some(host) = request.headers().get(header::HOST).and_then(header_text) else {
         return false;
     };
-    if !is_loopback_authority(host) || !has_session_cookie(request.headers(), &session.token) {
+    if !session.host_allowed(host) || !has_session_cookie(request.headers(), &session.token) {
         return false;
     }
 
-    request.method() == Method::GET
-        || same_origin(
-            request.headers(),
-            host,
-            session.dev_server_authority.as_deref(),
-        )
+    request.method() == Method::GET || same_origin(request.headers(), host, session)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -145,7 +251,7 @@ fn header_text(value: &HeaderValue) -> Option<&str> {
     value.to_str().ok().map(str::trim)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn is_loopback_authority(authority: &str) -> bool {
     parse_loopback_authority(authority).is_some()
 }
@@ -190,7 +296,7 @@ fn has_session_cookie(headers: &HeaderMap, expected: &str) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn same_origin(headers: &HeaderMap, host: &str, dev_server_authority: Option<&str>) -> bool {
+fn same_origin(headers: &HeaderMap, host: &str, session: &ControlSession) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(header_text) else {
         return false;
     };
@@ -212,10 +318,37 @@ fn same_origin(headers: &HeaderMap, host: &str, dev_server_authority: Option<&st
     // the request Host. Accept the same dev server reached through any
     // loopback alias (http://localhost:8080 vs http://127.0.0.1:8080) while
     // still rejecting cross-site origins from other local ports.
-    match dev_server_authority {
-        Some(dev) => dev_server_origin_matches(authority, dev),
-        None => false,
+    if let Some(dev) = session.dev_server_authority.as_deref() {
+        if dev_server_origin_matches(authority, dev) {
+            return true;
+        }
     }
+    // LAN 模式：Origin 主机命中白名单/loopback/IP 直连即视为同源。攻击者的
+    // 外域不在名单内会被拒；配合 SameSite=Strict 的会话 Cookie，跨站请求
+    // 根本带不上 Cookie，DNS rebinding 与 CSRF 两条路径都被封住。
+    if session.lan_mode && session.host_allowed(authority) {
+        return true;
+    }
+    false
+}
+
+/// 从 authority（可能含端口、IPv6 方括号）取出主机部分。
+/// 与 `parse_loopback_authority` 同样的严格口径：拒绝 userinfo。
+#[cfg(not(target_arch = "wasm32"))]
+fn authority_host(authority: &str) -> Option<String> {
+    if authority.contains('@') {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, _) = rest.split_once(']')?;
+        return Some(host.to_ascii_lowercase());
+    }
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
+        Some((_, _)) => return None,
+        None => authority,
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -295,6 +428,8 @@ mod tests {
         let session = ControlSession {
             token: "secret".to_string(),
             dev_server_authority: None,
+            lan_mode: false,
+            allowed_hosts: Vec::new(),
         };
         assert!(valid_control_request(
             &request(
@@ -366,6 +501,8 @@ mod tests {
         let session = ControlSession {
             token: "secret".to_string(),
             dev_server_authority: None,
+            lan_mode: false,
+            allowed_hosts: Vec::new(),
         };
         assert!(!valid_control_request(
             &request(Method::POST, "localhost:8080", None, "secret"),
@@ -378,6 +515,8 @@ mod tests {
         let session = ControlSession {
             token: "secret".to_string(),
             dev_server_authority: Some("127.0.0.1:8080".to_string()),
+            lan_mode: false,
+            allowed_hosts: Vec::new(),
         };
         assert!(valid_control_request(
             &request(
@@ -395,6 +534,8 @@ mod tests {
         let session = ControlSession {
             token: "secret".to_string(),
             dev_server_authority: Some("[::1]:8080".to_string()),
+            lan_mode: false,
+            allowed_hosts: Vec::new(),
         };
         assert!(valid_control_request(
             &request(
@@ -485,5 +626,45 @@ mod tests {
             );
             assert!(!dev_server_origin_matches(invalid, invalid), "{invalid}");
         }
+    }
+
+    #[test]
+    fn lan_mode_host_allowlist() {
+        let session = ControlSession {
+            token: "secret".to_string(),
+            dev_server_authority: None,
+            lan_mode: true,
+            allowed_hosts: vec!["hezz-macmini".to_string(), "et.net".to_string()],
+        };
+        // loopback 恒放行
+        assert!(session.host_allowed("localhost:8080"));
+        assert!(session.host_allowed("127.0.0.1:8080"));
+        // 白名单主机名与其子域放行
+        assert!(session.host_allowed("hezz-macmini:8080"));
+        assert!(session.host_allowed("hezz-macmini.et.net:8080"));
+        assert!(session.host_allowed("foo.et.net:8080"));
+        // IP 字面量直连放行（tailnet / LAN 地址）
+        assert!(session.host_allowed("100.64.0.249:8080"));
+        assert!(session.host_allowed("192.168.50.3:8080"));
+        assert!(session.host_allowed("[::1]:8080"));
+        // 未登记的外域主机名拒绝（防 DNS rebinding）
+        assert!(!session.host_allowed("evil.test:8080"));
+        assert!(!session.host_allowed("nothezz-macmini:8080"));
+        // userinfo 伪装的 host 拒绝
+        assert!(!session.host_allowed("evil.test@hezz-macmini:8080"));
+    }
+
+    #[test]
+    fn loopback_mode_rejects_non_loopback_host() {
+        let session = ControlSession {
+            token: "secret".to_string(),
+            dev_server_authority: None,
+            lan_mode: false,
+            allowed_hosts: vec!["et.net".to_string()],
+        };
+        assert!(session.host_allowed("localhost:8080"));
+        // 未开启 LAN 模式时白名单不生效，外域与非 loopback 一律拒绝
+        assert!(!session.host_allowed("hezz-macmini:8080"));
+        assert!(!session.host_allowed("192.168.50.3:8080"));
     }
 }
