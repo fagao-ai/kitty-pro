@@ -1208,9 +1208,14 @@ mod tests {
 
     #[test]
     fn privileged_config_rejects_root_owned_file_writes() {
+        // "Absolute" is platform-specific: Windows requires a drive prefix.
+        #[cfg(windows)]
+        let absolute_cache = "C:\\kitty-pro\\cache.db";
+        #[cfg(not(windows))]
+        let absolute_cache = "/app/cache.db";
         let clean = serde_json::json!({
             "log": { "level": "info", "timestamp": true },
-            "experimental": { "cache_file": { "enabled": true, "path": "/app/cache.db" } },
+            "experimental": { "cache_file": { "enabled": true, "path": absolute_cache } },
         });
         assert!(validate_privileged_start_config(&clean).is_ok());
 
