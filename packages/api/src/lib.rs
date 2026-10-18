@@ -1693,9 +1693,20 @@ fn recover_rule_set_backup(path: &std::path::Path) -> Result<(), ServerFnError> 
 fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
     use singbox::{unavailable_status, SingBox};
 
-    let mut guard = core_slot()
-        .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    // Start/restart transactions keep the slot lock for as long as the bind
+    // retry window (up to 45s) or the TUN helper authorization wait (up to
+    // 120s). Status polling must never queue behind them, so when the lock is
+    // busy serve the last recorded snapshot instead of blocking.
+    let Some(mut guard) = try_lock_core_slot()? else {
+        if let Some(snapshot) = core_status_snapshot()
+            .read()
+            .ok()
+            .and_then(|snapshot| snapshot.clone())
+        {
+            return Ok(snapshot);
+        }
+        return Ok(api_core_status(unavailable_status()));
+    };
     let status = if let Some(core) = guard.as_mut() {
         core.engine.status()
     } else {
@@ -1708,7 +1719,12 @@ fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
             Err(_) => unavailable_status(),
         }
     };
-    Ok(api_core_status(status))
+    drop(guard);
+    let status = api_core_status(status);
+    if let Ok(mut snapshot) = core_status_snapshot().write() {
+        *snapshot = Some(status.clone());
+    }
+    Ok(status)
 }
 
 #[allow(dead_code)]
@@ -2125,6 +2141,9 @@ fn toggle_native_core(
         return native_core_status();
     }
     core.config = None;
+    // The bind retry below can hold the slot lock for up to 45s; publish the
+    // current status snapshot first so concurrent polls keep reporting it.
+    refresh_core_status_snapshot(core);
     if let Err(error) = start_config_with_bind_retry(&mut core.engine, &config) {
         return Err(ServerFnError::new(error));
     }
@@ -2451,6 +2470,9 @@ fn restart_native_core(
     }
     let core = guard.as_mut().expect("sing-box core was just initialized");
     let previous = core.config.clone();
+    // The restart transaction can keep the slot lock through the bind retry
+    // window and helper authorization wait; publish a fresh snapshot first.
+    refresh_core_status_snapshot(core);
     core.engine
         .prepare_config(&candidate)
         .map_err(|error| ServerFnError::new(format!("新配置预检失败，内核未重启: {error}")))?;
@@ -2517,6 +2539,9 @@ fn prepare_native_tun_mode(
             "sing-box 已在运行，请通过核心重启应用 TUN 设置",
         ));
     }
+    // prepare_config may wait for TUN helper authorization (up to 120s) while
+    // holding the slot lock; publish a snapshot so polls keep answering.
+    refresh_core_status_snapshot(core);
     core.engine
         .prepare_config(&candidate)
         .map_err(|error| ServerFnError::new(format!("TUN 配置或权限预检失败: {error}")))
@@ -2598,9 +2623,10 @@ fn toggle_native_core(
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
-    let guard = core_slot()
-        .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    // Frequent polling: never queue behind a long start/restart transaction.
+    let Some(guard) = try_lock_core_slot()? else {
+        return Ok(CoreTraffic::default());
+    };
     let Some(core) = guard.as_ref() else {
         return Ok(CoreTraffic::default());
     };
@@ -2643,9 +2669,13 @@ fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
-    let guard = core_slot()
-        .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+    // Frequent polling: never queue behind a long start/restart transaction.
+    let Some(guard) = try_lock_core_slot()? else {
+        return Ok(CoreLogBatch {
+            next_cursor: cursor,
+            entries: Vec::new(),
+        });
+    };
     let Some(core) = guard.as_ref() else {
         return Ok(CoreLogBatch {
             next_cursor: cursor,
@@ -3235,6 +3265,43 @@ fn core_slot() -> &'static std::sync::Mutex<Option<NativeCore>> {
 
     static CORE: OnceLock<Mutex<Option<NativeCore>>> = OnceLock::new();
     CORE.get_or_init(|| Mutex::new(None))
+}
+
+/// Lock the core slot unless a start/restart transaction holds it for a long
+/// running operation. Returns `None` when the slot is busy.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn try_lock_core_slot(
+) -> Result<Option<std::sync::MutexGuard<'static, Option<NativeCore>>>, ServerFnError> {
+    match core_slot().try_lock() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            Err(ServerFnError::new("sing-box 状态锁已损坏"))
+        }
+    }
+}
+
+/// Last successfully observed core status, refreshed whenever the slot lock
+/// is held by polling itself. Used to answer status polls while a long
+/// start/restart transaction keeps the slot lock busy.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn core_status_snapshot() -> &'static std::sync::RwLock<Option<ApiCoreStatus>> {
+    use std::sync::{OnceLock, RwLock};
+
+    static SNAPSHOT: OnceLock<RwLock<Option<ApiCoreStatus>>> = OnceLock::new();
+    SNAPSHOT.get_or_init(|| RwLock::new(None))
+}
+
+/// Refresh the status snapshot just before entering a long transaction that
+/// holds the slot lock, so concurrent polls keep reporting the state the UI
+/// showed right before the operation began.
+#[allow(dead_code)]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn refresh_core_status_snapshot(core: &NativeCore) {
+    let status = api_core_status(core.engine.status());
+    if let Ok(mut snapshot) = core_status_snapshot().write() {
+        *snapshot = Some(status);
+    }
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
