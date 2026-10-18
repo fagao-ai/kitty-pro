@@ -95,6 +95,11 @@ fn main() {
         }
     }
 
+    // Clear a system proxy that a previous Kitty Pro run left pointing at a
+    // dead core after it crashed or was killed before cleanup.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    api::cleanup_stale_system_proxy_sentinel();
+
     let session = ControlSession::new().expect("control session token should be generated");
     dioxus_server::serve(move || {
         let session = session.clone();

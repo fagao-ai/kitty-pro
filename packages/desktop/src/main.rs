@@ -254,6 +254,10 @@ fn main() {
     }
 
     let window_icon = icon_from_memory(APP_ICON).expect("embedded application icon must be valid");
+    // Clear a system proxy that a previous Kitty Pro run left pointing at a
+    // dead core after it crashed or was killed before cleanup.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    api::cleanup_stale_system_proxy_sentinel();
     let config = Config::new()
         .with_window(WindowBuilder::new().with_title("Kitty Pro"))
         .with_menu(None)

@@ -3078,6 +3078,72 @@ fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
     })
 }
 
+/// Sentinel written while Kitty Pro manages the system proxy. If the process
+/// dies (kill -9, crash, power loss) before it can restore the settings, the
+/// next startup notices the leftover and clears the now-dangling proxy.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn system_proxy_sentinel_path() -> Result<std::path::PathBuf, ServerFnError> {
+    let directories = directories::ProjectDirs::from("com", "kitty", "kitty-pro")
+        .ok_or_else(|| ServerFnError::new("无法确定本地配置目录"))?;
+    Ok(directories.data_local_dir().join("system-proxy.pending"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn write_system_proxy_sentinel() {
+    if let Ok(path) = system_proxy_sentinel_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, std::process::id().to_string());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn remove_system_proxy_sentinel() {
+    if let Ok(path) = system_proxy_sentinel_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Clear a system proxy left behind by a previous Kitty Pro run that exited
+/// without cleanup. Only touches proxies pointing at our own managed mixed
+/// listener while nothing is listening on it; anything owned by another
+/// application is left alone. Failures are silent best-effort cleanup.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub fn cleanup_stale_system_proxy_sentinel() {
+    let Ok(path) = system_proxy_sentinel_path() else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let Ok(proxy) = read_native_system_proxy() else {
+        return;
+    };
+    if is_kitty_system_proxy(&proxy) {
+        let endpoint = std::net::SocketAddr::from(([127, 0, 0, 1], SYSTEM_PROXY_PORT));
+        let listener_alive =
+            std::net::TcpStream::connect_timeout(&endpoint, std::time::Duration::from_millis(200))
+                .is_ok();
+        if listener_alive {
+            // Another core still serves the endpoint; keep managing it.
+            return;
+        }
+        let proxy = sysproxy::Sysproxy {
+            host: SYSTEM_PROXY_HOST.to_string(),
+            bypass: SYSTEM_PROXY_BYPASS.to_string(),
+            port: SYSTEM_PROXY_PORT,
+            enable: false,
+        };
+        if apply_native_system_proxy(&proxy).is_err() {
+            return;
+        }
+        let _ = apply_native_auto_proxy(&sysproxy::Autoproxy::default());
+        eprintln!("[kitty-pro] 已清理上次异常退出残留的系统代理设置");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
     let _operation = system_proxy_operation_lock()?;
@@ -3092,6 +3158,7 @@ fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnE
         };
         apply_native_auto_proxy(&sysproxy::Autoproxy::default())?;
         apply_native_system_proxy(&proxy)?;
+        write_system_proxy_sentinel();
     } else {
         // sysproxy always rewrites the bypass list on macOS, and its default
         // (empty) bypass makes `networksetup -setproxybypassdomains` fail with
@@ -3105,6 +3172,7 @@ fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnE
         };
         apply_native_system_proxy(&proxy)?;
         apply_native_auto_proxy(&sysproxy::Autoproxy::default())?;
+        remove_system_proxy_sentinel();
     }
 
     native_system_proxy_status_unlocked()
