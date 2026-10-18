@@ -1276,6 +1276,7 @@ mod tests {
             tun: true,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: Default::default(),
         };
@@ -1297,6 +1298,7 @@ mod tests {
             tun: true,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: Default::default(),
         };
@@ -1376,6 +1378,7 @@ mod tests {
             tun: false,
             allow_lan: false,
             custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
             config_script: None,
             group_selections: Default::default(),
         };
