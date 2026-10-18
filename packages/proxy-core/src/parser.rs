@@ -358,7 +358,61 @@ fn parse_shadowsocks(link: &str, index: usize) -> Result<ProxyNode, ParseError> 
     })
 }
 
+/// serde_yaml 在反序列化时会无上限地展开 anchor/alias，billion-laughs
+/// 文档能把 10 MiB 订阅膨胀成 GB 级内存打爆进程。Clash 订阅从不依赖
+/// YAML 锚点复用，因此解析前先检查是否存在“anchor 定义 + alias 引用”
+/// 的组合：单独出现 `&`/`*` 字符（密码、备注里的符号）不受影响，只有
+/// 定义并被引用时才拒绝。
+fn yaml_expansion_bomb(text: &str) -> bool {
+    let mut anchors: Vec<&str> = Vec::new();
+    let mut aliases: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let line = match line.find('#') {
+            // 仅当 # 前有空白才视为注释（值内的 # 不算），足够本检查使用。
+            Some(index) if index > 0 && line.as_bytes()[index - 1].is_ascii_whitespace() => {
+                &line[..index]
+            }
+            _ => line,
+        };
+        let bytes = line.as_bytes();
+        let mut position = 0;
+        while position < bytes.len() {
+            let byte = bytes[position];
+            let at_token_start = position == 0
+                || bytes[position - 1].is_ascii_whitespace()
+                || matches!(bytes[position - 1], b'[' | b'{' | b',');
+            if at_token_start && (byte == b'&' || byte == b'*') {
+                let name_start = position + 1;
+                let mut end = name_start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || matches!(bytes[end], b'_' | b'-' | b'.'))
+                {
+                    end += 1;
+                }
+                if end > name_start {
+                    let name = &line[name_start..end];
+                    if byte == b'&' {
+                        anchors.push(name);
+                    } else {
+                        aliases.push(name);
+                    }
+                    position = end;
+                    continue;
+                }
+            }
+            position += 1;
+        }
+    }
+    !anchors.is_empty() && aliases.iter().any(|alias| anchors.contains(alias))
+}
+
 fn parse_clash_yaml(text: &str) -> Result<ParseReport, ParseError> {
+    if yaml_expansion_bomb(text) {
+        return Err(ParseError::InvalidYaml(
+            "订阅使用了 YAML 锚点引用，出于资源安全考虑已拒绝解析".to_string(),
+        ));
+    }
     let root: YamlValue =
         serde_yaml::from_str(text).map_err(|error| ParseError::InvalidYaml(error.to_string()))?;
     let root = root
@@ -745,6 +799,28 @@ fn yaml_strings(mapping: &Mapping, key: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn yaml_alias_guard_rejects_bombs_and_keeps_normal_passwords() {
+        // anchor 定义 + alias 引用 = 拒绝（billion-laughs 展开炸弹）。
+        let bomb = "proxy: &a [{x: 1}]\nb: [*a, *a, *a]\nc: [*b, *b, *b]";
+        assert!(yaml_expansion_bomb(bomb));
+        // 普通订阅里密码/备注含 *、&、# 等符号不受影响。
+        let ordinary = "proxies:\n  - name: 节点 & 备注 #1\n    password: p@ss*word&x#\n    server: a*b.example.com\n";
+        assert!(!yaml_expansion_bomb(ordinary));
+        // 只有 alias 没有 anchor 定义（如 flow 标记 `*`）也放行。
+        assert!(!yaml_expansion_bomb("proxies:\n  - flow: xord***\n"));
+        // alias 引用了不存在的 anchor 不触发指数展开，放行给解析器处理。
+        assert!(!yaml_expansion_bomb("a: &x 1\nb: *y\n"));
+
+        // 端到端：恶意 Clash YAML 订阅被拒绝且不会 panic。
+        let report = parse_subscription("proxies: &a [1]\nother: [*a, *a]");
+        assert!(report.nodes.is_empty());
+        assert!(report
+            .rejected
+            .iter()
+            .any(|issue| issue.reason.contains("锚点")));
+    }
 
     #[test]
     fn parses_legacy_base64_subscription() {
