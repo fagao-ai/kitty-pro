@@ -379,6 +379,9 @@ pub async fn commit_sync_pull(
         sync::validate_snapshot(&snapshot)?;
         sync::validate_remote_revision(&remote_revision)?;
         let config = save_native_sync_config(&config)?;
+        // Keep a timestamped copy of the local profile before the remote
+        // snapshot overwrites it, so a bad pull can still be rolled back.
+        let backup_note = backup_local_profile_before_sync_pull();
         snapshot.apply_to_profile(&mut current_profile);
         let profile = current_profile;
         run_native_blocking("保存下载的同步配置失败", move || {
@@ -402,6 +405,9 @@ pub async fn commit_sync_pull(
             Err(error) => {
                 result.warning = Some(format!("远端数据已保存到本机，但同步基线保存失败: {error}"));
             }
+        }
+        if let Ok(Some(note)) = backup_note {
+            append_sync_warning(&mut result, note);
         }
         Ok(result)
     }
@@ -1776,6 +1782,69 @@ fn load_native_profile() -> Result<AppProfile, ServerFnError> {
 fn save_native_profile(profile: &AppProfile) -> Result<(), ServerFnError> {
     let path = profile_path()?;
     save_native_profile_to_path(profile, &path)
+}
+
+/// Number of pre-pull profile backups to retain.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PROFILE_BACKUPS: usize = 10;
+
+/// Copy the current local profile to `profile-backups/` before a sync pull
+/// overwrites it. Returns an optional user-visible note describing the backup
+/// (or the failure). Failures never block the pull itself.
+#[cfg(not(target_arch = "wasm32"))]
+fn backup_local_profile_before_sync_pull() -> Result<Option<String>, ServerFnError> {
+    use std::fs;
+
+    let path = profile_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| ServerFnError::new("本地配置目录无效"))?
+        .join("profile-backups");
+    fs::create_dir_all(&directory)
+        .map_err(|error| ServerFnError::new(format!("创建配置备份目录失败: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let backup = directory.join(format!("profile-{seconds}.json"));
+    fs::copy(&path, &backup)
+        .map_err(|error| ServerFnError::new(format!("备份本地配置失败: {error}")))?;
+
+    let mut entries = fs::read_dir(&directory)
+        .map(|reader| {
+            reader
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .map(|name| {
+                            let name = name.to_string_lossy();
+                            name.starts_with("profile-") && name.ends_with(".json")
+                        })
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Timestamped names sort chronologically; keep the newest ones.
+    entries.sort();
+    for stale in entries
+        .iter()
+        .take(entries.len().saturating_sub(MAX_PROFILE_BACKUPS))
+    {
+        let _ = fs::remove_file(stale);
+    }
+
+    Ok(Some(format!("覆盖前已备份本地配置到 {}", backup.display())))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

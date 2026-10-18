@@ -613,7 +613,7 @@ fn read_session_token(path: &std::path::Path, owner_id: u32) -> Result<String, S
         );
     }
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
