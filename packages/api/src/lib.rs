@@ -268,7 +268,10 @@ pub async fn save_profile(profile: AppProfile) -> Result<(), ServerFnError> {
     get("/api/sync/config")
 )]
 pub async fn load_sync_config() -> Result<SyncConfig, ServerFnError> {
-    run_native_blocking("读取同步配置任务失败", load_native_sync_config).await
+    run_native_blocking("读取同步配置任务失败", || {
+        load_native_sync_config().map(|config| sync::masked_for_client(&config))
+    })
+    .await
 }
 
 #[cfg_attr(
@@ -283,7 +286,7 @@ pub async fn save_sync_config(config: SyncConfig) -> Result<SyncConfig, ServerFn
     {
         let _guard = sync::operation_lock().lock().await;
         run_native_blocking("保存同步配置任务失败", move || {
-            save_native_sync_config(&config)
+            save_native_sync_config(&config).map(|saved| sync::masked_for_client(&saved))
         })
         .await
     }

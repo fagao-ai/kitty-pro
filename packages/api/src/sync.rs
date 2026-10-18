@@ -34,6 +34,11 @@ enum UploadCondition {
     Missing,
 }
 
+/// 回显给前端的凭据掩码。前端把原样带回的掩码在保存时还原为已存
+/// 真值，凭据因此永远不离开服务端——LAN 模式是纯 HTTP，响应体在局域网
+/// 内可被被动抓包，密码与 S3 SecretKey 不能原样下发。
+pub(super) const SECRET_PLACEHOLDER: &str = "••••••••";
+
 pub(super) fn load_native_sync_config() -> Result<SyncConfig, ServerFnError> {
     let path = sync_config_path()?;
     match std::fs::read(path) {
@@ -44,9 +49,38 @@ pub(super) fn load_native_sync_config() -> Result<SyncConfig, ServerFnError> {
     }
 }
 
-pub(super) fn save_native_sync_config(config: &SyncConfig) -> Result<SyncConfig, ServerFnError> {
+/// 把非空的密码/SecretKey 替换为掩码，供任何要下发到前端的副本使用。
+pub(super) fn masked_for_client(config: &SyncConfig) -> SyncConfig {
+    let mut masked = config.clone();
+    if !masked.password.is_empty() {
+        masked.password = SECRET_PLACEHOLDER.to_string();
+    }
+    if !masked.secret_key.is_empty() {
+        masked.secret_key = SECRET_PLACEHOLDER.to_string();
+    }
+    masked
+}
+
+/// 前端提交的掩码字段还原为磁盘上的真值；不含掩码时不读磁盘。
+fn resolve_secrets(config: &SyncConfig) -> Result<SyncConfig, ServerFnError> {
+    if config.password != SECRET_PLACEHOLDER && config.secret_key != SECRET_PLACEHOLDER {
+        return Ok(config.clone());
+    }
     let existing = load_native_sync_config()?;
-    let saved = merge_sync_metadata(&existing, config);
+    let mut resolved = config.clone();
+    if resolved.password == SECRET_PLACEHOLDER {
+        resolved.password = existing.password;
+    }
+    if resolved.secret_key == SECRET_PLACEHOLDER {
+        resolved.secret_key = existing.secret_key;
+    }
+    Ok(resolved)
+}
+
+pub(super) fn save_native_sync_config(config: &SyncConfig) -> Result<SyncConfig, ServerFnError> {
+    let config = resolve_secrets(config)?;
+    let existing = load_native_sync_config()?;
+    let saved = merge_sync_metadata(&existing, &config);
     save_native_sync_state(&saved)?;
     Ok(saved)
 }
@@ -819,6 +853,23 @@ mod tests {
     fn aws_timestamp_uses_utc_calendar_date() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+    }
+
+    #[test]
+    fn client_view_masks_non_empty_secrets_only() {
+        let mut config = SyncConfig::default();
+        let plain = masked_for_client(&config);
+        assert!(plain.password.is_empty() && plain.secret_key.is_empty());
+
+        config.password = "webdav-pass".into();
+        config.secret_key = "s3-secret".into();
+        let masked = masked_for_client(&config);
+        assert_eq!(masked.password, SECRET_PLACEHOLDER);
+        assert_eq!(masked.secret_key, SECRET_PLACEHOLDER);
+        // 非密字段原样保留（前端回显需要）。
+        assert_eq!(masked.endpoint, config.endpoint);
+        assert_eq!(masked.username, config.username);
+        assert_eq!(masked.access_key, config.access_key);
     }
 
     #[test]
