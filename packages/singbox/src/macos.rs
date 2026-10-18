@@ -226,7 +226,7 @@ impl PrivilegedCore {
                 })? {
                     let mut detail = String::new();
                     if let Some(stderr) = child.stderr.as_mut() {
-                        let _ = stderr.read_to_string(&mut detail);
+                        let _ = stderr.take(64 * 1024).read_to_string(&mut detail);
                     }
                     let detail = detail.trim();
                     return Err(CoreError::MacosTunHelper(if detail.is_empty() {

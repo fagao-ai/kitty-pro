@@ -18,6 +18,11 @@ use std::time::{Duration, Instant};
 
 const HELPER_FLAG: &str = "--kitty-pro-tun-helper";
 const MAX_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// Session tokens and lease hello lines are tiny; cap them so a misbehaving
+/// (or hijacked) helper cannot make us allocate unbounded memory.
+const MAX_CONTROL_LINE_BYTES: u64 = 4096;
+/// Diagnostic tail of a failed helper process, bounded for the same reason.
+const MAX_HELPER_STDERR_BYTES: u64 = 64 * 1024;
 const HELPER_START_TIMEOUT: Duration = Duration::from_secs(120);
 const HELPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HELPER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -161,7 +166,7 @@ impl PrivilegedCore {
                                 helper_error(format!("配置 helper 租约失败: {error}"))
                             })?;
                         let mut presented = String::new();
-                        BufReader::new(&mut lease)
+                        BufReader::new((&mut lease).take(MAX_CONTROL_LINE_BYTES))
                             .read_line(&mut presented)
                             .map_err(|error| {
                                 helper_error(format!("读取 helper 租约失败: {error}"))
@@ -189,7 +194,9 @@ impl PrivilegedCore {
                 {
                     let mut detail = String::new();
                     if let Some(stderr) = child.stderr.as_mut() {
-                        let _ = stderr.read_to_string(&mut detail);
+                        let _ = stderr
+                            .take(MAX_HELPER_STDERR_BYTES)
+                            .read_to_string(&mut detail);
                     }
                     return Err(helper_error(if detail.trim().is_empty() {
                         format!("授权被取消或 helper 启动失败 ({status})")
@@ -619,7 +626,8 @@ fn read_session_token(path: &std::path::Path, owner_id: u32) -> Result<String, S
         return Err("unsafe TUN helper session token file".to_string());
     }
     let mut token = String::new();
-    file.read_to_string(&mut token)
+    file.take(MAX_CONTROL_LINE_BYTES)
+        .read_to_string(&mut token)
         .map_err(|error| format!("read TUN helper session token: {error}"))?;
     Ok(token)
 }
@@ -654,7 +662,8 @@ fn read_session_token(path: &std::path::Path, _owner_id: u32) -> Result<String, 
         return Err("unsafe TUN helper session token file".to_string());
     }
     let mut token = String::new();
-    file.read_to_string(&mut token)
+    file.take(MAX_CONTROL_LINE_BYTES)
+        .read_to_string(&mut token)
         .map_err(|error| format!("read TUN helper session token: {error}"))?;
     Ok(token)
 }
