@@ -94,6 +94,10 @@ unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, Stri
 
 fn bridge_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    // Only honor the env override in debug builds (local dev convenience).
+    // In release builds an attacker-controlled environment must not be able
+    // to redirect us to an arbitrary DLL; ship the bridge next to the exe.
+    #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("KITTY_SINGBOX_DLL") {
         candidates.push(PathBuf::from(path));
     }
