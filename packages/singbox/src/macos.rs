@@ -429,6 +429,7 @@ impl HelperState {
             return Err(CoreError::AlreadyRunning);
         }
         crate::check_config(config)?;
+        crate::validate_privileged_start_config(config)?;
         if !crate::config_uses_tun(config) {
             return Err(CoreError::InvalidConfig(
                 "macOS TUN helper 只接受包含 TUN 入站的配置".to_string(),

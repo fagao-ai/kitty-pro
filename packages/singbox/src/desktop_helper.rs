@@ -483,9 +483,13 @@ fn handle_helper_connection(
 fn dispatch_helper_action(action: HelperAction, core: &mut EmbeddedCore) -> (HelperResponse, bool) {
     let result = match action {
         HelperAction::Ping => Ok(HelperResponse::success()),
-        HelperAction::Start { config } => core
-            .start_config(&config)
-            .map(|_| HelperResponse::success()),
+        HelperAction::Start { config } => {
+            if let Err(error) = crate::validate_privileged_start_config(&config) {
+                return (HelperResponse::error(error.to_string()), false);
+            }
+            core.start_config(&config)
+                .map(|_| HelperResponse::success())
+        }
         HelperAction::Stop => core.stop().map(|_| HelperResponse::success()),
         HelperAction::Exit => return (HelperResponse::success(), true),
         HelperAction::IsRunning => {

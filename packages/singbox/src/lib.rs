@@ -794,6 +794,45 @@ pub fn validate_rule_set_file(path: &std::path::Path) -> Result<(), CoreError> {
     }
 }
 
+/// Hardening checks for configs handed to the root/admin TUN helper. The
+/// helper runs with elevated privileges, so file-writing knobs that an app
+/// config never legitimately uses must be rejected outright: sing-box would
+/// otherwise create or truncate log files as root at attacker-chosen paths.
+pub(crate) fn validate_privileged_start_config(config: &Value) -> Result<(), CoreError> {
+    if let Some(log) = config.get("log") {
+        // Whitelist stance: an app-generated config never sets `path`, so any
+        // presence (even an empty string) is treated as an attempt to make
+        // the root helper create or truncate a file.
+        if log.get("path").is_some() {
+            return Err(CoreError::InvalidConfig(
+                "特权内核配置不允许指定日志文件路径".to_string(),
+            ));
+        }
+        if log.get("outputs").is_some() {
+            return Err(CoreError::InvalidConfig(
+                "特权内核配置不允许自定义日志输出".to_string(),
+            ));
+        }
+    }
+    if let Some(cache) = config
+        .get("experimental")
+        .and_then(|experimental| experimental.get("cache_file"))
+    {
+        if cache.get("enabled").and_then(Value::as_bool) == Some(true) {
+            let absolute = cache
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| std::path::Path::new(path).is_absolute());
+            if !absolute {
+                return Err(CoreError::InvalidConfig(
+                    "特权内核缓存文件必须使用绝对路径".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse and construct a sing-box configuration without starting any inbound,
 /// opening a TUN interface, or changing host routes.
 pub fn check_config(config: &Value) -> Result<(), CoreError> {
@@ -1166,6 +1205,35 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privileged_config_rejects_root_owned_file_writes() {
+        let clean = serde_json::json!({
+            "log": { "level": "info", "timestamp": true },
+            "experimental": { "cache_file": { "enabled": true, "path": "/app/cache.db" } },
+        });
+        assert!(validate_privileged_start_config(&clean).is_ok());
+
+        let no_cache_path = serde_json::json!({
+            "experimental": { "cache_file": { "enabled": true, "path": "relative.db" } },
+        });
+        assert!(validate_privileged_start_config(&no_cache_path).is_err());
+
+        let disabled_cache = serde_json::json!({
+            "experimental": { "cache_file": { "enabled": false, "path": "relative.db" } },
+        });
+        assert!(validate_privileged_start_config(&disabled_cache).is_ok());
+
+        for poisoned in [
+            serde_json::json!({ "log": { "path": "/etc/cron.d/evil" } }),
+            serde_json::json!({ "log": { "path": "" } }),
+            serde_json::json!({ "log": { "outputs": ["file:///tmp/x.log"] } }),
+        ] {
+            let error = validate_privileged_start_config(&poisoned)
+                .expect_err("file-writing log config must be rejected");
+            assert!(matches!(error, CoreError::InvalidConfig(_)));
+        }
+    }
 
     #[test]
     fn embedded_core_is_constructed_without_a_binary() {
