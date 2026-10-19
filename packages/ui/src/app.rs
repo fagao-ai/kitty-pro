@@ -25,6 +25,8 @@ const BRAND_ICON_SVG: &str = include_str!("../assets/kitty-pro.svg");
 const ANDROID_VPN_WAITING_NOTICE: &str = "正在等待 Android VPN 授权或启动服务";
 const RULE_SET_UPDATE_CHECK_SECS: u64 = 6 * 60 * 60;
 const TOAST_DISMISS_MILLIS: u64 = 4_500;
+const TOAST_SWEEP_MILLIS: u64 = 250;
+const TOAST_DISMISS_TICKS: u32 = (TOAST_DISMISS_MILLIS / TOAST_SWEEP_MILLIS) as u32;
 const LATENCY_CACHE_KEY: &str = "kitty-pro.node-latency.v1";
 
 type LatencyCacheEntry = (String, String, u64);
@@ -230,12 +232,14 @@ struct ToastMessage {
     id: u64,
     kind: ToastKind,
     message: String,
+    born_tick: u64,
 }
 
 #[derive(Clone, Copy)]
 struct ToastManager {
     messages: Signal<Vec<ToastMessage>>,
     next_id: Signal<u64>,
+    tick: Signal<u64>,
 }
 
 impl ToastManager {
@@ -264,11 +268,44 @@ impl ToastManager {
             if stored.len() >= 4 {
                 stored.remove(0);
             }
-            stored.push(ToastMessage { id, kind, message });
+            stored.push(ToastMessage {
+                id,
+                kind,
+                message,
+                born_tick: *self.tick.peek(),
+            });
         }
+    }
+
+    /// 由根组件（ProxyApp）调用一次：在根 scope 中周期性清理过期 toast。
+    /// 不能在 push 的调用方 scope 里 spawn 定时任务——组件卸载（切页、弹窗
+    /// 关闭、列表行删除）会取消任务，导致 toast 永远残留。
+    fn start_sweeper(self) {
+        let mut messages = self.messages;
+        let mut tick = self.tick;
         spawn(async move {
-            wait_for_toast_dismiss().await;
-            messages.write().retain(|toast| toast.id != id);
+            loop {
+                wait_for_toast_sweep().await;
+                if messages.peek().is_empty() {
+                    continue;
+                }
+                let now = {
+                    let mut value = tick.write();
+                    *value = value.wrapping_add(1);
+                    *value
+                };
+                // 所有 toast 展示时长相同，按 push 顺序过期；只在真的有
+                // toast 到期时才写 messages，避免每 tick 无谓重渲染视口。
+                let has_expired = messages
+                    .peek()
+                    .iter()
+                    .any(|toast| now.wrapping_sub(toast.born_tick) >= TOAST_DISMISS_TICKS as u64);
+                if has_expired {
+                    messages.write().retain(|toast| {
+                        now.wrapping_sub(toast.born_tick) < TOAST_DISMISS_TICKS as u64
+                    });
+                }
+            }
         });
     }
 
@@ -388,13 +425,13 @@ async fn wait_for_latency_poll() {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn wait_for_toast_dismiss() {
-    gloo_timers::future::TimeoutFuture::new(TOAST_DISMISS_MILLIS as u32).await;
+async fn wait_for_toast_sweep() {
+    gloo_timers::future::TimeoutFuture::new(TOAST_SWEEP_MILLIS as u32).await;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn wait_for_toast_dismiss() {
-    tokio::time::sleep(std::time::Duration::from_millis(TOAST_DISMISS_MILLIS)).await;
+async fn wait_for_toast_sweep() {
+    tokio::time::sleep(std::time::Duration::from_millis(TOAST_SWEEP_MILLIS)).await;
 }
 
 impl AppView {
@@ -428,8 +465,12 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
     let toast = ToastManager {
         messages: use_signal(Vec::<ToastMessage>::new),
         next_id: use_signal(|| 0),
+        tick: use_signal(|| 0u64),
     };
     use_context_provider(|| toast);
+    use_effect(move || {
+        toast.start_sweeper();
+    });
     let mut nodes = use_signal(Vec::<ProxyNode>::new);
     let mut selected_tag = use_signal(String::new);
     let mut subscriptions = use_signal(Vec::<Subscription>::new);
