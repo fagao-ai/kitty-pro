@@ -4162,16 +4162,24 @@ body {
     align-items: flex-end;
   }
 
+  /* Phones place the rules header on a fixed grid instead of a wrapping flex
+     row, and that row only breaks when its content overflows: the 添加规则 button
+     sat beside the title on 自定义分流 (short subtitle) but dropped to its own row
+     on 专用 DNS (long subtitle), so switching tabs moved both the button and the
+     pills. Grid tracks are sized by the layout instead of by the text, so both
+     tabs get identical geometry: title column left, button pinned top-right,
+     pills full width underneath. */
   .rules-toolbar {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
-    gap: 8px;
+    column-gap: 8px;
     row-gap: 10px;
   }
 
   .rules-toolbar > div:first-child {
-    flex: 1 1 auto;
+    grid-column: 1;
+    grid-row: 1;
     min-width: 0;
   }
 
@@ -4181,11 +4189,8 @@ body {
 
   .rules-toolbar-actions .segmented-control.rules-tab-control {
     display: flex;
-    flex-grow: 1;
-    flex-shrink: 1;
-    flex-basis: 100%;
-    order: 3;
-    width: 100%;
+    grid-column: 1 / -1;
+    grid-row: 2;
     min-width: 0;
     margin-top: 0;
   }
@@ -4199,10 +4204,26 @@ body {
 
   .rules-toolbar-actions .secondary-button.compact,
   .rules-toolbar-actions .primary-button.compact {
-    flex-grow: 0;
-    flex-shrink: 0;
-    flex-basis: auto;
-    order: 2;
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  /* The button keeps its text, so the title column is the only thing that can
+     overflow the first row: let the heading clip instead of pushing the badge
+     and the button around. */
+  .rules-toolbar .section-title-line {
+    min-width: 0;
+  }
+
+  .rules-toolbar .section-title-line h2 {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .rules-toolbar .section-title-line .status-badge {
+    flex: 0 0 auto;
   }
 
   .rule-editor-grid {
@@ -4416,6 +4437,32 @@ body {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 6px;
     padding: 12px;
+  }
+
+  /* Same reason for the rules header: the title column is whatever is left of
+     the pinned 添加规则 button, so at 320px "自定义分流" + its badge would clip.
+     Trimming the button and badge buys the title its ~15px back. */
+  .rules-toolbar {
+    column-gap: 6px;
+  }
+
+  .rules-toolbar-actions .primary-button.compact {
+    gap: 5px;
+    padding: 0 9px;
+    font-size: 12px;
+  }
+
+  .rules-toolbar .section-title-line {
+    gap: 6px;
+  }
+
+  .rules-toolbar .section-title-line h2 {
+    font-size: 15px;
+  }
+
+  .rules-toolbar .section-title-line .status-badge {
+    padding: 0 7px;
+    font-size: 10px;
   }
 }
 
