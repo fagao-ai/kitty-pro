@@ -939,7 +939,7 @@ proxies:
     #[test]
     fn parses_http_https_and_socks5_proxy_links() {
         let report = parse_subscription(
-            "http://100.64.0.2:11080#Company\n\
+            "http://198.51.100.20:11080#Company\n\
 https://alice:s%40cret@proxy.example.com:8443?insecure=1#Secure\n\
 socks5://bob:pass@127.0.0.1:1080#Socks",
         );
@@ -963,7 +963,7 @@ socks5://bob:pass@127.0.0.1:1080#Socks",
 
     #[test]
     fn distinguishes_http_proxy_links_from_subscription_urls() {
-        assert!(is_http_proxy_share_link("http://100.64.0.2:11080#Company"));
+        assert!(is_http_proxy_share_link("http://198.51.100.20:11080#Company"));
         assert!(is_http_proxy_share_link(
             "https://user:pass@proxy.example.com"
         ));
@@ -979,7 +979,7 @@ socks5://bob:pass@127.0.0.1:1080#Socks",
 proxies:
   - name: Company HTTP
     type: http
-    server: 100.64.0.2
+    server: 198.51.100.20
     port: 11080
   - name: Office SOCKS
     type: socks5

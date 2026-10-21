@@ -4400,7 +4400,7 @@ mod tests {
             .expect("native test runtime should start");
         let report = runtime
             .block_on(preview_subscription(
-                "socks5://100.64.0.2:11080#Company".to_string(),
+                "socks5://198.51.100.20:11080#Company".to_string(),
             ))
             .expect("SOCKS5 proxy URI should parse locally");
 
@@ -4408,7 +4408,7 @@ mod tests {
         let node = &report.nodes[0];
         assert_eq!(node.name, "Company");
         assert_eq!(node.protocol, proxy_core::ProxyProtocol::Socks5);
-        assert_eq!(node.server, "100.64.0.2");
+        assert_eq!(node.server, "198.51.100.20");
         assert_eq!(node.port, 11080);
     }
 

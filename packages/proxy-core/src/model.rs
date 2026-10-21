@@ -676,8 +676,8 @@ mod tests {
             dns_overrides: vec![DnsOverride {
                 id: 1,
                 enabled: true,
-                domain_suffix: "et.net".to_string(),
-                server: "100.100.100.101".to_string(),
+                domain_suffix: "example.net".to_string(),
+                server: "192.0.2.53".to_string(),
             }],
             group_selections: HashMap::from([("proxy".to_string(), "edge".to_string())]),
             ..AppProfile::default()
@@ -733,8 +733,8 @@ mod tests {
         profile.dns_overrides.push(DnsOverride {
             id: 1,
             enabled: true,
-            domain_suffix: "et.net".to_string(),
-            server: "100.100.100.101".to_string(),
+            domain_suffix: "example.net".to_string(),
+            server: "192.0.2.53".to_string(),
         });
         snapshot.apply_to_profile(&mut profile);
         assert!(profile.dns_overrides.is_empty());
@@ -767,7 +767,7 @@ mod tests {
                 "tag": "company",
                 "name": "Company",
                 "protocol": "mixed",
-                "server": "100.64.0.2",
+                "server": "198.51.100.20",
                 "port": 11080,
                 "auth": { "kind": "none" }
             }"#,

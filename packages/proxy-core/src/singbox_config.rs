@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn dns_override_pins_domain_resolver_on_matching_outbound() {
         let nodes = parse_subscription(
-            "vless://11111111-1111-1111-1111-111111111111@hezz-gpu.et.net:3080#GPU\n\
+            "vless://11111111-1111-1111-1111-111111111111@gpu.example.net:3080#GPU\n\
 vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
         )
         .nodes;
@@ -719,8 +719,8 @@ vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
             dns_overrides: vec![DnsOverride {
                 id: 1,
                 enabled: true,
-                domain_suffix: "et.net".to_string(),
-                server: "100.100.100.101".to_string(),
+                domain_suffix: "example.net".to_string(),
+                server: "192.0.2.53".to_string(),
             }],
             config_script: None,
             group_selections: HashMap::new(),
@@ -732,7 +732,7 @@ vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
         let route_rules = config["route"]["rules"].as_array().unwrap();
         assert_eq!(route_rules[1]["action"], "resolve");
         assert_eq!(route_rules[1]["server"], "dns-override-0");
-        assert_eq!(route_rules[1]["domain_suffix"][0], "et.net");
+        assert_eq!(route_rules[1]["domain_suffix"][0], "example.net");
         assert_eq!(route_rules[2]["action"], "route");
         assert_eq!(route_rules[2]["outbound"], "direct");
         let override_server = config["dns"]["servers"]
@@ -741,13 +741,13 @@ vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
             .iter()
             .find(|server| server["tag"] == "dns-override-0")
             .expect("override server exists");
-        assert_eq!(override_server["server"], "100.100.100.101");
+        assert_eq!(override_server["server"], "192.0.2.53");
     }
 
     #[test]
     fn disabled_dns_override_does_not_pin_domain_resolver() {
         let nodes = parse_subscription(
-            "vless://11111111-1111-1111-1111-111111111111@hezz-gpu.et.net:3080#GPU",
+            "vless://11111111-1111-1111-1111-111111111111@gpu.example.net:3080#GPU",
         )
         .nodes;
         let request = ConnectionRequest {
@@ -761,8 +761,8 @@ vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
             dns_overrides: vec![DnsOverride {
                 id: 1,
                 enabled: false,
-                domain_suffix: "et.net".to_string(),
-                server: "100.100.100.101".to_string(),
+                domain_suffix: "example.net".to_string(),
+                server: "192.0.2.53".to_string(),
             }],
             config_script: None,
             group_selections: HashMap::new(),
@@ -963,7 +963,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
     #[test]
     fn direct_domain_rules_use_local_dns_before_secure_dns_fallback() {
         let nodes = parse_subscription(
-            "hysteria2://secret@155.248.218.187:10086?sni=bing.com&insecure=1#HY2",
+            "hysteria2://secret@203.0.113.66:10086?sni=bing.com&insecure=1#HY2",
         )
         .nodes;
         let request = ConnectionRequest {
@@ -1329,7 +1329,7 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
     #[test]
     fn builds_http_and_socks_outbounds_and_excludes_all_ip_endpoints_from_tun() {
         let nodes = parse_subscription(
-            "http://100.64.0.2:11080#Company\n\
+            "http://198.51.100.20:11080#Company\n\
 socks5://alice:secret@127.0.0.1:1080#Socks",
         )
         .nodes;
@@ -1355,7 +1355,7 @@ socks5://alice:secret@127.0.0.1:1080#Socks",
         assert_eq!(config["outbounds"][1]["username"], "alice");
         assert_eq!(
             config["inbounds"][1]["route_exclude_address"],
-            json!(["100.64.0.2/32", "127.0.0.1/32"])
+            json!(["198.51.100.20/32", "127.0.0.1/32"])
         );
     }
 

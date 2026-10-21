@@ -18,7 +18,7 @@ HTTPS, and SOCKS5 clients. Add a fragment to give the node a useful display
 name:
 
 ```text
-socks5://100.64.0.2:11080#Company
+socks5://198.51.100.20:11080#Company
 http://proxy.example.com:8080#HTTP
 https://user:password@proxy.example.com:8443#Secure
 ```

@@ -639,24 +639,24 @@ mod tests {
             token: "secret".to_string(),
             dev_server_authority: None,
             lan_mode: true,
-            allowed_hosts: vec!["hezz-macmini".to_string(), "et.net".to_string()],
+            allowed_hosts: vec!["office-mac".to_string(), "example.net".to_string()],
         };
         // loopback 恒放行
         assert!(session.host_allowed("localhost:8080"));
         assert!(session.host_allowed("127.0.0.1:8080"));
         // 白名单主机名与其子域放行
-        assert!(session.host_allowed("hezz-macmini:8080"));
-        assert!(session.host_allowed("hezz-macmini.et.net:8080"));
-        assert!(session.host_allowed("foo.et.net:8080"));
+        assert!(session.host_allowed("office-mac:8080"));
+        assert!(session.host_allowed("office-mac.example.net:8080"));
+        assert!(session.host_allowed("foo.example.net:8080"));
         // IP 字面量直连放行（tailnet / LAN 地址）
-        assert!(session.host_allowed("100.64.0.249:8080"));
-        assert!(session.host_allowed("192.168.50.3:8080"));
+        assert!(session.host_allowed("198.51.100.9:8080"));
+        assert!(session.host_allowed("192.168.1.3:8080"));
         assert!(session.host_allowed("[::1]:8080"));
         // 未登记的外域主机名拒绝（防 DNS rebinding）
         assert!(!session.host_allowed("evil.test:8080"));
-        assert!(!session.host_allowed("nothezz-macmini:8080"));
+        assert!(!session.host_allowed("not-office-mac:8080"));
         // userinfo 伪装的 host 拒绝
-        assert!(!session.host_allowed("evil.test@hezz-macmini:8080"));
+        assert!(!session.host_allowed("evil.test@office-mac:8080"));
     }
 
     #[test]
@@ -665,11 +665,11 @@ mod tests {
             token: "secret".to_string(),
             dev_server_authority: None,
             lan_mode: false,
-            allowed_hosts: vec!["et.net".to_string()],
+            allowed_hosts: vec!["example.net".to_string()],
         };
         assert!(session.host_allowed("localhost:8080"));
         // 未开启 LAN 模式时白名单不生效，外域与非 loopback 一律拒绝
-        assert!(!session.host_allowed("hezz-macmini:8080"));
-        assert!(!session.host_allowed("192.168.50.3:8080"));
+        assert!(!session.host_allowed("office-mac:8080"));
+        assert!(!session.host_allowed("192.168.1.3:8080"));
     }
 }

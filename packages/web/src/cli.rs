@@ -337,8 +337,8 @@ mod tests {
             "0.0.0.0:7897".parse().unwrap()
         );
         assert_eq!(
-            address(&opts, Some("8080"), Some("192.168.50.3")).unwrap(),
-            "192.168.50.3:8080".parse().unwrap()
+            address(&opts, Some("8080"), Some("192.168.1.3")).unwrap(),
+            "192.168.1.3:8080".parse().unwrap()
         );
     }
 

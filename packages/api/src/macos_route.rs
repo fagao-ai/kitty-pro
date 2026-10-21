@@ -306,7 +306,7 @@ mod tests {
         json!({
             "inbounds": [{ "type": "tun" }],
             "outbounds": [
-                { "type": "http", "tag": "vpn-a", "server": "100.64.0.2", "server_port": 11080 },
+                { "type": "http", "tag": "vpn-a", "server": "198.51.100.20", "server_port": 11080 },
                 { "type": "socks", "tag": "public", "server": "198.51.100.8", "server_port": 1080 },
                 { "type": "http", "tag": "vpn-b", "server": "10.20.30.40", "server_port": 8080 },
                 { "type": "socks", "tag": "local", "server": "127.0.0.1", "server_port": 1081 },
@@ -318,10 +318,10 @@ mod tests {
     fn routed_source(target: IpAddr, _: u16) -> Result<IpAddr, String> {
         match target {
             IpAddr::V4(address) if address == DEFAULT_ROUTE_PROBE_IPV4 => {
-                Ok(IpAddr::V4(Ipv4Addr::new(192, 168, 50, 207)))
+                Ok(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 207)))
             }
-            IpAddr::V4(address) if address == Ipv4Addr::new(100, 64, 0, 2) => {
-                Ok(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 249)))
+            IpAddr::V4(address) if address == Ipv4Addr::new(198, 51, 100, 20) => {
+                Ok(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)))
             }
             IpAddr::V4(address) if address == Ipv4Addr::new(10, 20, 30, 40) => {
                 Ok(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)))
@@ -329,7 +329,7 @@ mod tests {
             IpAddr::V4(address) if address == Ipv4Addr::LOCALHOST => {
                 Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
             }
-            IpAddr::V4(_) => Ok(IpAddr::V4(Ipv4Addr::new(192, 168, 50, 207))),
+            IpAddr::V4(_) => Ok(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 207))),
             IpAddr::V6(address) if address == DEFAULT_ROUTE_PROBE_IPV6 => {
                 Ok("2001:db8:1::20".parse().unwrap())
             }
@@ -354,9 +354,9 @@ mod tests {
     #[test]
     fn parses_macos_route_output() {
         let route = parse_route_info(
-            "   route to: 155.248.218.187\n\
+            "   route to: 203.0.113.66\n\
              destination: default\n\
-             gateway: 192.168.50.1\n\
+             gateway: 192.168.1.1\n\
              interface: en1\n",
         )
         .unwrap();
@@ -372,37 +372,37 @@ mod tests {
 
     #[test]
     fn selects_physical_default_route_while_kitty_tun_is_running() {
-        let target = "155.248.218.187".parse().unwrap();
+        let target = "203.0.113.66".parse().unwrap();
         let candidates = vec![
-            interface_route("utun4", &["100.64.0.249"], "default"),
+            interface_route("utun4", &["198.51.100.9"], "default"),
             interface_route("utun5", &["172.19.0.1"], "152.0.0.0"),
-            interface_route("en1", &["192.168.50.13"], "default"),
+            interface_route("en1", &["192.168.1.13"], "default"),
         ];
 
         assert_eq!(
             select_route_source(target, Some("en1"), &candidates),
-            Some("192.168.50.13".parse().unwrap())
+            Some("192.168.1.13".parse().unwrap())
         );
     }
 
     #[test]
     fn preserves_a_more_specific_route_from_another_vpn() {
-        let target = "100.64.0.2".parse().unwrap();
+        let target = "198.51.100.20".parse().unwrap();
         let candidates = vec![
-            interface_route("en1", &["192.168.50.13"], "default"),
-            interface_route("utun4", &["100.64.0.249"], "100.64.0.0"),
+            interface_route("en1", &["192.168.1.13"], "default"),
+            interface_route("utun4", &["198.51.100.9"], "198.51.100.0"),
             interface_route("utun5", &["172.19.0.1"], "96.0.0.0"),
         ];
 
         assert_eq!(
             select_route_source(target, Some("en1"), &candidates),
-            Some("100.64.0.249".parse().unwrap())
+            Some("198.51.100.9".parse().unwrap())
         );
     }
 
     #[test]
     fn never_selects_the_kitty_tun_interface() {
-        let target = "155.248.218.187".parse().unwrap();
+        let target = "203.0.113.66".parse().unwrap();
         let candidates = vec![interface_route(
             "utun5",
             &["172.19.0.1", "fdfe:dcba:9876::1"],
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn failed_fallback_keeps_the_kitty_source_for_loop_rejection() {
-        let target = "155.248.218.187".parse().unwrap();
+        let target = "203.0.113.66".parse().unwrap();
         let source = route_source_with(
             target,
             10086,
@@ -450,7 +450,7 @@ mod tests {
 
         pin_non_default_outbound_sources_with(&mut config, routed_source).unwrap();
 
-        assert_eq!(config["outbounds"][0]["inet4_bind_address"], "100.64.0.249");
+        assert_eq!(config["outbounds"][0]["inet4_bind_address"], "198.51.100.9");
         assert!(config["outbounds"][1].get("inet4_bind_address").is_none());
         assert_eq!(config["outbounds"][2]["inet4_bind_address"], "10.8.0.2");
         assert_eq!(config["outbounds"][3]["inet4_bind_address"], "127.0.0.1");
@@ -475,7 +475,7 @@ mod tests {
             IpAddr::V4(address) if address == Ipv4Addr::LOCALHOST => {
                 Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
             }
-            IpAddr::V4(_) => Ok(IpAddr::V4(Ipv4Addr::new(192, 168, 50, 207))),
+            IpAddr::V4(_) => Ok(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 207))),
             IpAddr::V6(_) => Ok("2001:db8:1::20".parse().unwrap()),
         })
         .unwrap();
