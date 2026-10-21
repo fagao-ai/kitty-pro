@@ -433,7 +433,9 @@ fn spawn_core_toggle(
         // permission (prompting for administrator access only when no
         // authorized helper exists) before starting, so the TUN switch stays a
         // persistent preference instead of a one-shot setup.
-        if let (true, Some(tun_request)) = (target, request.clone()) {
+        // Only when TUN is actually enabled: the server rejects a pre-flight for
+        // a non-TUN config, which would otherwise block a plain proxy start.
+        if let Some(tun_request) = request.clone().filter(|req| target && req.tun) {
             if let Err(error) = api::prepare_tun_mode(tun_request).await {
                 // The core may already be running behind a stale local state;
                 // refresh before giving up so toggling again stays idempotent.
