@@ -57,14 +57,15 @@ On macOS the build script automatically selects Homebrew's keg-only
 `go@1.24`; a different toolchain can be supplied with `SINGBOX_GO`.
 
 ```sh
-HTTP_PROXY=http://100.64.0.2:11080 \
-HTTPS_PROXY=http://100.64.0.2:11080 \
-ALL_PROXY=http://100.64.0.2:11080 \
+HTTP_PROXY=http://proxy.example.com:11080 \
+HTTPS_PROXY=http://proxy.example.com:11080 \
+ALL_PROXY=http://proxy.example.com:11080 \
 brew install go@1.24
 ```
 
-The embedded-core build defaults its Go module downloads to that same proxy
-when no `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` is already configured.
+The build never assumes a proxy. Set `HTTP_PROXY`, `HTTPS_PROXY`, and
+`ALL_PROXY` as usual, or export `KITTY_BUILD_PROXY=http://host:port` to apply
+one proxy to the Go build when those three are unset.
 
 ## Run locally
 

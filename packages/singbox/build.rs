@@ -2,8 +2,6 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const DEFAULT_PROXY: &str = "http://100.64.0.2:11080";
-
 fn main() {
     println!("cargo:rerun-if-changed=bridge/go.mod");
     println!("cargo:rerun-if-changed=bridge/go.sum");
@@ -18,6 +16,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ALL_PROXY");
     println!("cargo:rerun-if-env-changed=NO_PROXY");
     println!("cargo:rerun-if-env-changed=GOPROXY");
+    println!("cargo:rerun-if-env-changed=KITTY_BUILD_PROXY");
     println!("cargo:rerun-if-env-changed=SINGBOX_GO");
     println!("cargo:rerun-if-env-changed=SINGBOX_CC");
 
@@ -89,16 +88,14 @@ fn main() {
         }
     }
 
-    // The workspace proxy is useful on the developer network, but it is not
-    // reachable from public CI runners. Keep it opt-in for CI while retaining
-    // the local default; `KITTY_USE_DEFAULT_PROXY=1` can force it anywhere.
-    let use_default_proxy = env::var("KITTY_USE_DEFAULT_PROXY")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or_else(|_| env::var_os("CI").is_none());
-    if use_default_proxy {
+    // Which proxy to reach the Go module mirror is a developer/network concern,
+    // so no address is baked into the build. Export `HTTP_PROXY`,
+    // `HTTPS_PROXY`, and `ALL_PROXY` as usual, or set `KITTY_BUILD_PROXY` once
+    // to apply a single proxy to all three when they are unset.
+    if let Some(proxy) = env::var_os("KITTY_BUILD_PROXY") {
         for variable in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
             if env::var_os(variable).is_none() {
-                command.env(variable, DEFAULT_PROXY);
+                command.env(variable, &proxy);
             }
         }
     }
