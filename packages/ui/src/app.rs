@@ -4,11 +4,12 @@ use api::{
 };
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
-    LdActivity, LdArrowDown, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight,
-    LdCircleAlert, LdCircleCheck, LdClock3, LdCloud, LdCloudDownload, LdCloudUpload, LdGauge,
-    LdGlobe, LdInfo, LdLanguages, LdListFilter, LdMoon, LdNetwork, LdPause, LdPencil, LdPlay,
-    LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRoute, LdSave, LdScrollText, LdSearch, LdServer,
-    LdSettings, LdShieldCheck, LdSun, LdTrash2, LdWifi, LdX, LdZap,
+    LdArrowDown, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight, LdCircleAlert,
+    LdCircleCheck, LdClipboardCopy, LdCloud, LdCloudDownload, LdCloudUpload, LdDownload, LdGauge,
+    LdGitFork, LdGlobe, LdInfo, LdLanguages, LdLayers, LdLayoutDashboard, LdListFilter, LdMoon,
+    LdNetwork, LdPause, LdPencil, LdPlay, LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRoute,
+    LdRss, LdSave, LdScrollText, LdSearch, LdShieldCheck, LdSlidersHorizontal, LdSplit, LdSun,
+    LdTerminal, LdTimer, LdTrash2, LdWifi, LdX,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
@@ -28,6 +29,8 @@ const TOAST_DISMISS_MILLIS: u64 = 4_500;
 const TOAST_SWEEP_MILLIS: u64 = 250;
 const TOAST_DISMISS_TICKS: u32 = (TOAST_DISMISS_MILLIS / TOAST_SWEEP_MILLIS) as u32;
 const LATENCY_CACHE_KEY: &str = "kitty-pro.node-latency.v1";
+/// Bars in the live traffic chart: one per second over the last minute.
+const TRAFFIC_HISTORY_LEN: usize = 60;
 
 type LatencyCacheEntry = (String, String, u64);
 
@@ -73,7 +76,7 @@ pub struct DesktopTrayBridge {
 
 /// Signals describing the current tunnel/routing configuration. Grouped so
 /// connection-request builders avoid a long positional argument list.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct RuntimeSettings {
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
@@ -125,7 +128,7 @@ fn build_connection_request(
 
 /// Signals mirroring the sing-box core status back into the UI after a
 /// (re)start, grouped to keep `restart_core_from_ui`'s signature small.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct CoreStatusSignals {
     connected: Signal<bool>,
     core_restarting: Signal<bool>,
@@ -183,6 +186,349 @@ async fn restart_core_from_ui(
     };
     core_restarting.set(false);
     success
+}
+
+/// Busy/status signals shared by every runtime knob that restarts the core
+/// (TUN, LAN listening, system proxy). Grouping them keeps the helpers below
+/// small enough for both the settings page and the phone quick toggles.
+#[derive(Clone, Copy, PartialEq)]
+struct RuntimeSignals {
+    status: CoreStatusSignals,
+    core_busy: Signal<bool>,
+    system_proxy_busy: Signal<bool>,
+    runtime_action_busy: Signal<bool>,
+}
+
+impl RuntimeSignals {
+    fn busy(self) -> bool {
+        (self.core_busy)()
+            || (self.status.core_restarting)()
+            || (self.system_proxy_busy)()
+            || (self.runtime_action_busy)()
+    }
+}
+
+/// Toggle TUN mode. With the core stopped the privileged helper is prepared or
+/// released; while running, the core restarts with the new config.
+/// Mirror a core status response back into the shared status signals.
+fn apply_core_status(status: api::ApiCoreStatus, signals: CoreStatusSignals) -> bool {
+    let CoreStatusSignals {
+        mut connected,
+        core_restarting: _,
+        mut core_state,
+        mut core_version,
+        mut core_note,
+    } = signals;
+    let is_running = status.state == "running";
+    connected.set(is_running);
+    core_state.set(status.state);
+    core_version.set(status.version);
+    core_note.set(status.note);
+    is_running
+}
+
+fn spawn_tun_toggle(
+    enabled: bool,
+    request: ConnectionRequest,
+    mut tun_enabled: Signal<bool>,
+    mut tun_busy: Signal<bool>,
+    runtime: RuntimeSignals,
+    toast: ToastManager,
+) {
+    if runtime.busy() {
+        return;
+    }
+    let CoreStatusSignals {
+        connected,
+        mut core_restarting,
+        core_state: _,
+        core_version: _,
+        mut core_note,
+    } = runtime.status;
+    let mut runtime_action_busy = runtime.runtime_action_busy;
+    let previous_enabled = tun_enabled();
+    tun_busy.set(true);
+    runtime_action_busy.set(true);
+    core_restarting.set(true);
+    spawn(async move {
+        if !connected() {
+            let result = if enabled {
+                api::prepare_tun_mode(request.clone()).await
+            } else {
+                api::release_tun_mode().await
+            };
+            match result {
+                Ok(()) => {
+                    tun_enabled.set(enabled);
+                    toast.success(if enabled {
+                        "TUN 权限已准备，启动内核时直接生效"
+                    } else {
+                        "TUN 模式已关闭"
+                    });
+                }
+                Err(error) => {
+                    tun_enabled.set(previous_enabled);
+                    if !enabled {
+                        // The local `connected` state can be stale (page reload,
+                        // failed status poll), so the core may actually still be
+                        // running and refuse a bare helper release. Refresh the
+                        // real state and fall back to restarting without TUN.
+                        match api::core_status().await {
+                            Ok(status) if status.state == "running" => {
+                                match api::restart_core(request).await {
+                                    Ok(status) => {
+                                        apply_core_status(status, runtime.status);
+                                        tun_enabled.set(false);
+                                        toast.success("TUN 模式已关闭");
+                                    }
+                                    Err(restart_error) => {
+                                        toast.error(format!("关闭 TUN 失败: {restart_error}"));
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                toast.error(format!("关闭 TUN 失败: {error}"));
+                            }
+                            Err(status_error) => {
+                                toast.error(format!(
+                                    "关闭 TUN 失败: {error}；刷新内核状态失败: {status_error}"
+                                ));
+                            }
+                        }
+                    } else {
+                        toast.error(format!("TUN 权限准备失败: {error}"));
+                    }
+                }
+            }
+            tun_busy.set(false);
+            core_restarting.set(false);
+            runtime_action_busy.set(false);
+            return;
+        }
+
+        match api::restart_core(request).await {
+            Ok(status) => {
+                apply_core_status(status, runtime.status);
+                tun_enabled.set(enabled);
+                toast.success(if enabled {
+                    "TUN 模式已启用"
+                } else {
+                    "TUN 模式已关闭"
+                });
+            }
+            Err(error) => {
+                tun_enabled.set(previous_enabled);
+                match api::core_status().await {
+                    Ok(status) => {
+                        apply_core_status(status, runtime.status);
+                    }
+                    Err(status_error) => {
+                        core_note.set(Some(status_error.to_string()));
+                    }
+                }
+                toast.error(format!("应用 TUN 设置失败: {error}"));
+            }
+        }
+        tun_busy.set(false);
+        core_restarting.set(false);
+        runtime_action_busy.set(false);
+    });
+}
+
+/// Toggle LAN listening. While the core runs it restarts on the new bind
+/// address; while stopped the preference applies to the next start.
+fn spawn_allow_lan_toggle(
+    enabled: bool,
+    request: ConnectionRequest,
+    mut allow_lan: Signal<bool>,
+    runtime: RuntimeSignals,
+    toast: ToastManager,
+) {
+    if runtime.busy() {
+        return;
+    }
+    let CoreStatusSignals {
+        connected,
+        mut core_restarting,
+        core_state: _,
+        core_version: _,
+        mut core_note,
+    } = runtime.status;
+    let mut runtime_action_busy = runtime.runtime_action_busy;
+    runtime_action_busy.set(true);
+    spawn(async move {
+        if !connected() {
+            allow_lan.set(enabled);
+            toast.info(if enabled {
+                "局域网连接将在下次启动内核时生效"
+            } else {
+                "仅本机访问将在下次启动内核时生效"
+            });
+            runtime_action_busy.set(false);
+            return;
+        }
+        core_restarting.set(true);
+        match api::restart_core(request).await {
+            Ok(status) => {
+                apply_core_status(status, runtime.status);
+                allow_lan.set(enabled);
+                toast.success(if enabled {
+                    "已允许局域网连接，sing-box 内核已重启"
+                } else {
+                    "已恢复仅本机访问，sing-box 内核已重启"
+                });
+            }
+            Err(error) => {
+                match api::core_status().await {
+                    Ok(status) => {
+                        apply_core_status(status, runtime.status);
+                    }
+                    Err(status_error) => {
+                        core_note.set(Some(status_error.to_string()));
+                    }
+                }
+                toast.error(format!("应用局域网监听设置失败: {error}"));
+            }
+        }
+        core_restarting.set(false);
+        runtime_action_busy.set(false);
+    });
+}
+
+/// Start or stop the core from the UI. The overview power button and the log
+/// page's "启动代理开始采集" affordance share this so both keep the TUN
+/// pre-flight, the status refresh on failure, and the system-proxy re-read.
+#[derive(Clone, Copy, PartialEq)]
+struct CoreToggleSignals {
+    status: CoreStatusSignals,
+    core_busy: Signal<bool>,
+    system_proxy: Signal<SystemProxyLoadState>,
+}
+
+fn spawn_core_toggle(
+    request: Option<ConnectionRequest>,
+    signals: CoreToggleSignals,
+    toast: ToastManager,
+) {
+    let CoreToggleSignals {
+        status,
+        mut core_busy,
+        mut system_proxy,
+    } = signals;
+    let CoreStatusSignals {
+        mut connected,
+        core_restarting,
+        mut core_state,
+        mut core_note,
+        ..
+    } = status;
+    if core_busy() || core_restarting() {
+        return;
+    }
+    core_busy.set(true);
+    let target = !connected();
+    spawn(async move {
+        // With TUN toggled on but the core stopped, the privileged helper is
+        // gone and starting would fail with "TUN 权限尚未准备". Re-acquire the
+        // permission (prompting for administrator access only when no
+        // authorized helper exists) before starting, so the TUN switch stays a
+        // persistent preference instead of a one-shot setup.
+        if let (true, Some(tun_request)) = (target, request.clone()) {
+            if let Err(error) = api::prepare_tun_mode(tun_request).await {
+                // The core may already be running behind a stale local state;
+                // refresh before giving up so toggling again stays idempotent.
+                match api::core_status().await {
+                    Ok(status) if status.state == "running" => {}
+                    Ok(_) => {
+                        core_busy.set(false);
+                        toast.error(format!("准备 TUN 权限失败，内核未启动: {error}"));
+                        return;
+                    }
+                    Err(status_error) => {
+                        core_busy.set(false);
+                        toast.error(format!(
+                            "准备 TUN 权限失败: {error}；刷新内核状态失败: {status_error}"
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        match api::set_core_enabled(target, request).await {
+            Ok(core_status) => {
+                let is_running = apply_core_status(core_status, status);
+                if !target {
+                    toast.success("连接已断开");
+                } else if is_running {
+                    toast.success("sing-box 已启动");
+                } else {
+                    toast.info(ANDROID_VPN_WAITING_NOTICE);
+                }
+            }
+            Err(error) => {
+                toast.error(error.to_string());
+                match api::core_status().await {
+                    Ok(core_status) => {
+                        apply_core_status(core_status, status);
+                    }
+                    Err(status_error) => {
+                        connected.set(false);
+                        core_state.set("unavailable".to_string());
+                        core_note.set(Some(status_error.to_string()));
+                    }
+                }
+            }
+        }
+        if !target {
+            match api::system_proxy_status().await {
+                Ok(proxy_status) => {
+                    system_proxy.set(SystemProxyLoadState::Ready(proxy_status));
+                }
+                Err(error) => {
+                    system_proxy.set(SystemProxyLoadState::Failed(error.to_string()));
+                }
+            }
+        }
+        core_busy.set(false);
+    });
+}
+
+/// Apply a system proxy change and always re-read the real status on failure.
+fn spawn_system_proxy_toggle(
+    enabled: bool,
+    mut system_proxy: Signal<SystemProxyLoadState>,
+    mut system_proxy_busy: Signal<bool>,
+    core_action_busy: bool,
+    toast: ToastManager,
+) {
+    if core_action_busy || system_proxy_busy() {
+        return;
+    }
+    system_proxy_busy.set(true);
+    spawn(async move {
+        match api::set_system_proxy(enabled).await {
+            Ok(status) => {
+                system_proxy.set(SystemProxyLoadState::Ready(status));
+                if enabled {
+                    toast.success("系统代理已启用");
+                } else {
+                    toast.success("系统代理已关闭");
+                }
+            }
+            Err(error) => {
+                toast.error(format!("系统代理设置失败: {error}"));
+                match api::system_proxy_status().await {
+                    Ok(status) => {
+                        system_proxy.set(SystemProxyLoadState::Ready(status));
+                    }
+                    Err(refresh_error) => {
+                        system_proxy.set(SystemProxyLoadState::Failed(refresh_error.to_string()));
+                    }
+                }
+            }
+        }
+        system_proxy_busy.set(false);
+    });
 }
 
 fn load_latency_cache_script() -> String {
@@ -339,13 +685,16 @@ enum AppView {
     Settings,
 }
 
+/// Which slice of the log buffer the page shows. Each variant is one chip in
+/// the count strip, so there is deliberately no "everything" filter: routed
+/// decisions and kernel chatter are separated by the last chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogFilter {
     Routes,
-    All,
     Direct,
     Proxy,
     Block,
+    Raw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,7 +718,10 @@ struct TrafficDisplay {
     upload_total: u64,
     download_total: u64,
     active_connections: u32,
-    history: Vec<u64>,
+    /// Per-second samples, oldest first, newest last. Download and upload are
+    /// kept apart so the live chart can stack them instead of summing them.
+    download_history: Vec<u64>,
+    upload_history: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +797,19 @@ impl AppView {
             Self::Settings => "设置",
         }
     }
+
+    /// Latin kicker above the page title, matching the design's
+    /// `SECTION / 中文副标题` eyebrow.
+    fn eyebrow(self) -> &'static str {
+        match self {
+            Self::Overview => "OVERVIEW / 实时状态",
+            Self::Nodes => "NODES / 节点管理",
+            Self::Subscriptions => "SUBSCRIPTIONS / 订阅来源",
+            Self::Rules => "RULES / 分流与 DNS",
+            Self::Logs => "LOGS / 连接日志",
+            Self::Settings => "SETTINGS / 内核与路由",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -458,7 +823,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
     let mut connected = use_signal(|| false);
     let core_busy = use_signal(|| false);
     let mut runtime_action_busy = use_signal(|| false);
-    let mut core_restarting = use_signal(|| false);
+    let core_restarting = use_signal(|| false);
     let mut core_state = use_signal(|| "checking".to_string());
     let mut core_version = use_signal(|| None::<String>);
     let mut core_note = use_signal(|| None::<String>);
@@ -496,12 +861,22 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
     let mut traffic = use_signal(TrafficDisplay::default);
     let mut traffic_poll_generation = use_signal(|| 0_u64);
     let mut core_logs = use_signal(Vec::<CoreLogEntry>::new);
+    // Seconds since the core reached `running`; None while it is stopped. A plain
+    // tick counter keeps this off platform clock APIs (wasm has none).
+    let mut uptime_seconds = use_signal(|| None::<u64>);
+    let mut uptime_generation = use_signal(|| 0_u32);
     let mut core_log_cursor = use_signal(|| 0_u64);
     let mut log_poll_generation = use_signal(|| 0_u64);
     let log_collection_paused = use_signal(|| false);
     let mut profile_loaded = use_signal(|| false);
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
     let mut system_proxy_busy = use_signal(|| false);
+    // Log page state lives here so the export action can hand the exact rows on
+    // screen to the CSV writer, and the rules tab drives the topbar eyebrow.
+    let log_filter = use_signal(|| LogFilter::Routes);
+    let log_search = use_signal(String::new);
+    let mut log_export_busy = use_signal(|| false);
+    let rules_tab = use_signal(|| RulesTab::Routing);
 
     use_effect(move || {
         let Some(mut bridge) = desktop_tray else {
@@ -915,7 +1290,8 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
         }
         spawn(async move {
             let mut previous = None::<CoreTraffic>;
-            let mut history = traffic.peek().history.clone();
+            let mut download_history = traffic.peek().download_history.clone();
+            let mut upload_history = traffic.peek().upload_history.clone();
             while *traffic_poll_generation.peek() == generation
                 && core_state.peek().as_str() == "running"
                 && *active_view.peek() == AppView::Overview
@@ -934,11 +1310,11 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             )
                         })
                         .unwrap_or((0, 0));
-                    let combined_rate =
-                        upload_bytes_per_second.saturating_add(download_bytes_per_second);
-                    history.push(combined_rate);
-                    if history.len() > 12 {
-                        history.remove(0);
+                    download_history.push(download_bytes_per_second);
+                    upload_history.push(upload_bytes_per_second);
+                    while download_history.len() > TRAFFIC_HISTORY_LEN {
+                        download_history.remove(0);
+                        upload_history.remove(0);
                     }
                     traffic.set(TrafficDisplay {
                         upload_bytes_per_second,
@@ -946,11 +1322,35 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                         upload_total: current.upload_total,
                         download_total: current.download_total,
                         active_connections: current.active_connections,
-                        history: history.clone(),
+                        download_history: download_history.clone(),
+                        upload_history: upload_history.clone(),
                     });
                     previous = Some(current);
                 }
                 wait_for_traffic_tick().await;
+            }
+        });
+    });
+
+    use_effect(move || {
+        let is_connected = connected();
+        let generation = {
+            let mut current = uptime_generation.write();
+            *current = current.wrapping_add(1);
+            *current
+        };
+        if !is_connected {
+            uptime_seconds.set(None);
+            return;
+        }
+        uptime_seconds.set(Some(0));
+        let mut uptime_seconds = uptime_seconds;
+        spawn(async move {
+            let mut seconds = 0_u64;
+            while *uptime_generation.peek() == generation && *connected.peek() {
+                wait_for_traffic_tick().await;
+                seconds = seconds.saturating_add(1);
+                uptime_seconds.set(Some(seconds));
             }
         });
     });
@@ -1034,6 +1434,10 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
     });
 
     let current_view = active_view();
+    let eyebrow = match current_view {
+        AppView::Rules if rules_tab() == RulesTab::Dns => "RULES / 专用 DNS",
+        other => other.eyebrow(),
+    };
     let (proxy_groups, proxy_groups_error, proxy_groups_loading) = match proxy_groups_resource() {
         Some(Ok(groups)) => (groups, None, false),
         Some(Err(error)) => (Vec::new(), Some(error), false),
@@ -1051,13 +1455,30 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
         div { class: root_class,
             div { class: "ambient-grid" }
             aside { class: "sidebar glass-surface",
-                Brand {}
+                Brand { kicker: brand_kicker(core_version()) }
+                div { class: "nav-group-label", "MAIN" }
                 nav { class: "primary-nav", aria_label: "主导航",
                     NavItem { view: AppView::Overview, active_view }
-                    NavItem { view: AppView::Nodes, active_view }
-                    NavItem { view: AppView::Subscriptions, active_view }
-                    NavItem { view: AppView::Rules, active_view }
-                    NavItem { view: AppView::Logs, active_view }
+                    NavItem {
+                        view: AppView::Nodes,
+                        active_view,
+                        count: nodes().len().to_string(),
+                    }
+                    NavItem {
+                        view: AppView::Subscriptions,
+                        active_view,
+                        count: subscriptions().len().to_string(),
+                    }
+                    NavItem {
+                        view: AppView::Rules,
+                        active_view,
+                        count: (custom_rules().len() + dns_overrides().len()).to_string(),
+                    }
+                    NavItem {
+                        view: AppView::Logs,
+                        active_view,
+                        count: core_logs().len().to_string(),
+                    }
                     NavItem { view: AppView::Settings, active_view }
                 }
                 div { class: "sidebar-footer",
@@ -1067,190 +1488,46 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             strong { {core_state_label(&core_state())} }
                             small { {core_version().unwrap_or_else(|| platform.clone())} }
                         }
-                        button {
-                            class: "core-restart-button",
-                            title: if core_restarting() { "正在重启内核" } else { "重启内核" },
-                            aria_label: "重启内核",
-                            aria_busy: core_restarting(),
-                            disabled: !connected()
-                                || core_busy()
-                                || core_restarting()
-                                || runtime_action_busy()
-                                || system_proxy_busy(),
-                            onclick: move |_| {
-                                let blocked = core_busy()
-                                    || core_restarting()
-                                    || runtime_action_busy()
-                                    || system_proxy_busy();
-                                if !blocked {
-                                    core_restarting.set(true);
-                                }
-                                async move {
-                                if blocked {
-                                    return;
-                                }
-                                let request = ConnectionRequest {
-                                    nodes: nodes(),
-                                    selected_tag: selected_tag(),
-                                    proxy_server_nameservers:
-                                        active_subscription_proxy_server_nameservers(
-                                            &subscriptions(),
-                                            active_subscription_id(),
-                                        ),
-                                    mode: tunnel_mode(),
-                                    tun: tun_enabled(),
-                                    allow_lan: allow_lan(),
-                                    dns_overrides: dns_overrides(),
-                                    custom_rules: connection_custom_rules(
-                                        config_script_enabled(),
-                                        &config_script(),
-                                        custom_rules(),
-                                    ),
-                                    config_script: if config_script_enabled()
-                                        && !config_script().trim().is_empty()
-                                    {
-                                        Some(config_script())
-                                    } else {
-                                        None
-                                    },
-                                    group_selections: group_selections(),
-                                };
-                                match api::restart_core(request).await {
-                                    Ok(status) => {
-                                        let is_running = status.state == "running";
-                                        connected.set(is_running);
-                                        core_state.set(status.state);
-                                        core_version.set(status.version);
-                                        core_note.set(status.note);
-                                        if is_running {
-                                            toast.success("sing-box 内核已重启");
-                                        } else {
-                                            toast.info(ANDROID_VPN_WAITING_NOTICE);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        toast.error(format!("内核重启失败: {error}"));
-                                        match api::core_status().await {
-                                            Ok(status) => {
-                                                connected.set(status.state == "running");
-                                                core_state.set(status.state);
-                                                core_version.set(status.version);
-                                                core_note.set(status.note);
-                                            }
-                                            Err(status_error) => {
-                                                connected.set(false);
-                                                core_state.set("unavailable".to_string());
-                                                core_note.set(Some(status_error.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                                core_restarting.set(false);
-                                }
-                            },
-                            if core_restarting() {
-                                span { class: "spinner" }
-                            } else {
-                                Icon { icon: LdRefreshCw, width: 15, height: 15 }
-                            }
-                        }
                     }
                 }
             }
 
             main { class: "main-content",
                 header { class: "topbar",
-                    div {
-                        p { class: "eyebrow", "KITTY PRO" }
+                    div { class: "topbar-titles",
+                        p { class: "eyebrow", "{eyebrow}" }
                         h1 { "{current_view.title()}" }
                     }
                     div { class: "topbar-actions",
-                        button {
-                            class: "icon-button glass-control mobile-core-restart-button",
-                            title: if core_restarting() { "正在重启内核" } else { "重启内核" },
-                            aria_label: "重启内核",
-                            aria_busy: core_restarting(),
-                            disabled: !connected()
-                                || core_busy()
-                                || core_restarting()
-                                || runtime_action_busy()
-                                || system_proxy_busy(),
-                            onclick: move |_| {
-                                let blocked = core_busy()
-                                    || core_restarting()
-                                    || runtime_action_busy()
-                                    || system_proxy_busy();
-                                if !blocked {
-                                    core_restarting.set(true);
-                                }
-                                async move {
-                                if blocked {
-                                    return;
-                                }
-                                let request = ConnectionRequest {
-                                    nodes: nodes(),
-                                    selected_tag: selected_tag(),
-                                    proxy_server_nameservers:
-                                        active_subscription_proxy_server_nameservers(
-                                            &subscriptions(),
-                                            active_subscription_id(),
-                                        ),
-                                    mode: tunnel_mode(),
-                                    tun: tun_enabled(),
-                                    allow_lan: allow_lan(),
-                                    dns_overrides: dns_overrides(),
-                                    custom_rules: connection_custom_rules(
-                                        config_script_enabled(),
-                                        &config_script(),
-                                        custom_rules(),
-                                    ),
-                                    config_script: if config_script_enabled()
-                                        && !config_script().trim().is_empty()
-                                    {
-                                        Some(config_script())
-                                    } else {
-                                        None
-                                    },
-                                    group_selections: group_selections(),
-                                };
-                                match api::restart_core(request).await {
-                                    Ok(status) => {
-                                        let is_running = status.state == "running";
-                                        connected.set(is_running);
-                                        core_state.set(status.state);
-                                        core_version.set(status.version);
-                                        core_note.set(status.note);
-                                        if is_running {
-                                            toast.success("sing-box 内核已重启");
-                                        } else {
-                                            toast.info(ANDROID_VPN_WAITING_NOTICE);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        toast.error(format!("内核重启失败: {error}"));
-                                        match api::core_status().await {
-                                            Ok(status) => {
-                                                connected.set(status.state == "running");
-                                                core_state.set(status.state);
-                                                core_version.set(status.version);
-                                                core_note.set(status.note);
-                                            }
-                                            Err(status_error) => {
-                                                connected.set(false);
-                                                core_state.set("unavailable".to_string());
-                                                core_note.set(Some(status_error.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                                core_restarting.set(false);
-                                }
+                        div { class: connection_chip_class(connected(), &core_state()),
+                            span { class: "status-badge-dot" }
+                            {connection_chip_label(connected(), &core_state())}
+                        }
+                        RestartCoreButton {
+                            status: CoreStatusSignals {
+                                connected,
+                                core_restarting,
+                                core_state,
+                                core_version,
+                                core_note,
                             },
-                            if core_restarting() {
-                                span { class: "spinner" }
-                            } else {
-                                Icon { icon: LdRefreshCw, width: 18, height: 18 }
-                            }
+                            settings: RuntimeSettings {
+                                tunnel_mode,
+                                tun_enabled,
+                                allow_lan,
+                                custom_rules,
+                                dns_overrides,
+                                config_script_enabled,
+                                config_script,
+                            },
+                            nodes,
+                            selected_tag,
+                            subscriptions,
+                            active_subscription_id,
+                            group_selections,
+                            core_busy,
+                            runtime_action_busy,
+                            system_proxy_busy,
                         }
                         button {
                             class: "icon-button glass-control",
@@ -1273,6 +1550,47 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                                 span { "添加订阅" }
                             }
                         }
+                        // The design keeps the destructive/export pair in the page
+                        // header so they are reachable without scrolling the log list.
+                        if current_view == AppView::Logs {
+                            button {
+                                class: "secondary-button log-clear-button",
+                                title: "清空当前缓冲区中的日志",
+                                disabled: core_logs().is_empty() || log_export_busy(),
+                                onclick: move |_| core_logs.write().clear(),
+                                Icon { icon: LdTrash2, width: 15, height: 15 }
+                                span { "清空日志" }
+                            }
+                            button {
+                                class: "primary-button compact log-export-button",
+                                title: "导出当前筛选结果为 CSV",
+                                aria_busy: log_export_busy(),
+                                disabled: core_logs().is_empty() || log_export_busy(),
+                                onclick: move |_| {
+                                    let rows = log_export_rows(&visible_log_entries(
+                                        &core_logs(),
+                                        log_filter(),
+                                        log_search().trim().to_lowercase().as_str(),
+                                    ));
+                                    log_export_busy.set(true);
+                                    spawn(async move {
+                                        match download_csv("kitty-pro-logs.csv", rows).await {
+                                            Ok(()) => toast.success("日志已导出为 CSV"),
+                                            Err(error) => {
+                                                toast.error(format!("日志导出失败: {error}"));
+                                            }
+                                        }
+                                        log_export_busy.set(false);
+                                    });
+                                },
+                                if log_export_busy() {
+                                    span { class: "spinner" }
+                                } else {
+                                    Icon { icon: LdDownload, width: 15, height: 15 }
+                                }
+                                span { "导出 CSV" }
+                            }
+                        }
                     }
                 }
 
@@ -1281,6 +1599,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                         OverviewView {
                             nodes,
                             selected_tag,
+                            active_view,
                             proxy_server_nameservers: active_subscription_proxy_server_nameservers(
                                 &subscriptions(),
                                 active_subscription_id(),
@@ -1290,6 +1609,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             core_restarting,
                             core_state,
                             core_note,
+                            core_version,
                             tunnel_mode,
                             tun_enabled,
                             allow_lan,
@@ -1298,12 +1618,15 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             connection_allowed,
                             latency_results,
                             traffic,
+                            uptime_seconds,
+                            subscription_count: subscriptions().len(),
                             config_script_enabled,
                             config_script,
                             group_selections,
                             system_proxy,
                             system_proxy_busy,
                             runtime_action_busy,
+                            dark_mode,
                         }
                     },
                     AppView::Nodes => rsx! {
@@ -1317,6 +1640,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                                 active_subscription_id(),
                             ),
                             all_count: nodes().len(),
+                            subscriptions: subscriptions(),
                             group_selections,
                             connected,
                             core_busy,
@@ -1370,6 +1694,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                         RulesView {
                             rules: custom_rules,
                             dns_overrides,
+                            active_tab: rules_tab,
                             connected,
                             tunnel_mode,
                             rule_sets_busy,
@@ -1381,6 +1706,48 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                             logs: core_logs,
                             connected,
                             collection_paused: log_collection_paused,
+                            core_version,
+                            filter: log_filter,
+                            search: log_search,
+                            on_start: move |_| {
+                                let target = !connected();
+                                if !target || nodes().is_empty() {
+                                    return;
+                                }
+                                spawn_core_toggle(
+                                    build_connection_request(
+                                        nodes(),
+                                        selected_tag(),
+                                        active_subscription_proxy_server_nameservers(
+                                            &subscriptions(),
+                                            active_subscription_id(),
+                                        ),
+                                        RuntimeSettings {
+                                            tunnel_mode,
+                                            tun_enabled,
+                                            allow_lan,
+                                            custom_rules,
+                                            dns_overrides,
+                                            config_script_enabled,
+                                            config_script,
+                                        },
+                                        group_selections(),
+                                    )
+                                    .into(),
+                                    CoreToggleSignals {
+                                        status: CoreStatusSignals {
+                                            connected,
+                                            core_restarting,
+                                            core_state,
+                                            core_version,
+                                            core_note,
+                                        },
+                                        core_busy,
+                                        system_proxy,
+                                    },
+                                    toast,
+                                );
+                            },
                         }
                     },
                     AppView::Settings => rsx! {
@@ -1417,12 +1784,13 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
             }
 
             nav { class: "mobile-nav glass-surface", aria_label: "移动端导航",
-                NavItem { view: AppView::Overview, active_view }
-                NavItem { view: AppView::Nodes, active_view }
-                NavItem { view: AppView::Subscriptions, active_view }
-                NavItem { view: AppView::Rules, active_view }
-                NavItem { view: AppView::Logs, active_view }
-                NavItem { view: AppView::Settings, active_view }
+                // The phone tab bar stays count-free: six slots leave no room for chips.
+                NavItem { view: AppView::Overview, active_view, count: None::<String> }
+                NavItem { view: AppView::Nodes, active_view, count: None::<String> }
+                NavItem { view: AppView::Subscriptions, active_view, count: None::<String> }
+                NavItem { view: AppView::Rules, active_view, count: None::<String> }
+                NavItem { view: AppView::Logs, active_view, count: None::<String> }
+                NavItem { view: AppView::Settings, active_view, count: None::<String> }
             }
 
             if import_open() {
@@ -1574,6 +1942,64 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
     }
 }
 
+/// Restart the embedded core. The design promotes this action from a bare
+/// sidebar icon to a labelled topbar button, so phone and desktop share it.
+#[component]
+fn RestartCoreButton(
+    status: CoreStatusSignals,
+    settings: RuntimeSettings,
+    nodes: Signal<Vec<ProxyNode>>,
+    selected_tag: Signal<String>,
+    subscriptions: Signal<Vec<Subscription>>,
+    active_subscription_id: Signal<Option<u64>>,
+    group_selections: Signal<HashMap<String, String>>,
+    core_busy: Signal<bool>,
+    runtime_action_busy: Signal<bool>,
+    system_proxy_busy: Signal<bool>,
+) -> Element {
+    let toast = use_context::<ToastManager>();
+    let restarting = status.core_restarting;
+    let is_restarting = restarting();
+    let is_connected = (status.connected)();
+    let busy = core_busy() || runtime_action_busy() || system_proxy_busy();
+    let disabled = !is_connected || busy || is_restarting;
+    rsx! {
+        button {
+            class: "secondary-button restart-core-button",
+            title: "重启内核",
+            aria_label: "重启内核",
+            aria_busy: is_restarting,
+            disabled,
+            onclick: move |_| {
+                let status = status;
+                let settings = settings;
+                let toast = toast;
+                let request = build_connection_request(
+                    nodes(),
+                    selected_tag(),
+                    active_subscription_proxy_server_nameservers(
+                        &subscriptions(),
+                        active_subscription_id(),
+                    ),
+                    settings,
+                    group_selections(),
+                );
+                async move {
+                    if core_busy() || runtime_action_busy() || system_proxy_busy() {
+                        return;
+                    }
+                    restart_core_from_ui(request, status, toast, "sing-box 内核已重启").await;
+                }
+            },
+            if is_restarting {
+                span { class: "spinner" }
+            } else {
+                Icon { icon: LdRefreshCw, width: 15, height: 15 }
+            }
+            span { "重启内核" }
+        }
+    }
+}
 #[component]
 fn ToastViewport() -> Element {
     let toast = use_context::<ToastManager>();
@@ -1613,7 +2039,10 @@ fn ToastViewport() -> Element {
 }
 
 #[component]
-fn Brand() -> Element {
+/// Sidebar identity. The kicker is the real build (`EMBEDDED · 1.13.14`), not a
+/// fixed tag, so the shell the user is driving is readable at a glance.
+#[component]
+fn Brand(kicker: String) -> Element {
     rsx! {
         div { class: "brand",
             div {
@@ -1623,14 +2052,32 @@ fn Brand() -> Element {
             }
             div {
                 strong { "Kitty Pro" }
-                small { "SING-BOX CLIENT" }
+                small { "{kicker}" }
             }
         }
     }
 }
 
+/// Render the reported core build as the sidebar kicker: a core that reports
+/// `kitty-pro-embedded/1.13.14` reads as `EMBEDDED · 1.13.14`.
+fn brand_kicker(core_version: Option<String>) -> String {
+    match core_version {
+        Some(version) => version
+            .strip_prefix("kitty-pro-")
+            .unwrap_or(&version)
+            .replace('/', " · ")
+            .to_uppercase(),
+        None => "SING-BOX CLIENT".to_string(),
+    }
+}
+
 #[component]
-fn NavItem(view: AppView, mut active_view: Signal<AppView>) -> Element {
+fn NavItem(
+    view: AppView,
+    mut active_view: Signal<AppView>,
+    /// Trailing count chip (nodes, subscriptions, rules, log entries).
+    count: Option<String>,
+) -> Element {
     let active = active_view() == view;
     rsx! {
         button {
@@ -1638,14 +2085,17 @@ fn NavItem(view: AppView, mut active_view: Signal<AppView>) -> Element {
             aria_current: if active { "page" },
             onclick: move |_| active_view.set(view),
             match view {
-                AppView::Overview => rsx! { Icon { icon: LdGauge, width: 20, height: 20 } },
-                AppView::Nodes => rsx! { Icon { icon: LdServer, width: 20, height: 20 } },
-                AppView::Subscriptions => rsx! { Icon { icon: LdRadioTower, width: 20, height: 20 } },
-                AppView::Rules => rsx! { Icon { icon: LdListFilter, width: 20, height: 20 } },
+                AppView::Overview => rsx! { Icon { icon: LdLayoutDashboard, width: 20, height: 20 } },
+                AppView::Nodes => rsx! { Icon { icon: LdGitFork, width: 20, height: 20 } },
+                AppView::Subscriptions => rsx! { Icon { icon: LdRss, width: 20, height: 20 } },
+                AppView::Rules => rsx! { Icon { icon: LdSplit, width: 20, height: 20 } },
                 AppView::Logs => rsx! { Icon { icon: LdScrollText, width: 20, height: 20 } },
-                AppView::Settings => rsx! { Icon { icon: LdSettings, width: 20, height: 20 } },
+                AppView::Settings => rsx! { Icon { icon: LdSlidersHorizontal, width: 20, height: 20 } },
             }
             span { "{view.title()}" }
+            if let Some(count) = count {
+                span { class: "nav-count", "{count}" }
+            }
         }
     }
 }
@@ -1654,12 +2104,14 @@ fn NavItem(view: AppView, mut active_view: Signal<AppView>) -> Element {
 fn OverviewView(
     nodes: Signal<Vec<ProxyNode>>,
     selected_tag: Signal<String>,
+    mut active_view: Signal<AppView>,
     proxy_server_nameservers: Vec<String>,
     mut connected: Signal<bool>,
     mut core_busy: Signal<bool>,
     core_restarting: Signal<bool>,
     mut core_state: Signal<String>,
     mut core_note: Signal<Option<String>>,
+    core_version: Signal<Option<String>>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
@@ -1668,12 +2120,15 @@ fn OverviewView(
     connection_allowed: bool,
     latency_results: Signal<HashMap<String, NodeLatency>>,
     traffic: Signal<TrafficDisplay>,
+    uptime_seconds: Signal<Option<u64>>,
+    subscription_count: usize,
     config_script_enabled: Signal<bool>,
     config_script: Signal<String>,
     group_selections: Signal<HashMap<String, String>>,
     mut system_proxy: Signal<SystemProxyLoadState>,
     system_proxy_busy: Signal<bool>,
     runtime_action_busy: Signal<bool>,
+    mut dark_mode: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
@@ -1733,8 +2188,46 @@ fn OverviewView(
             .and_then(|result| result.latency_ms)
     });
     let traffic = traffic();
-    let chart_peak = traffic.history.iter().copied().max().unwrap_or(1).max(1);
-    let chart_history = traffic.history.clone();
+    let chart_peak = traffic
+        .download_history
+        .iter()
+        .chain(traffic.upload_history.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let chart_bars: Vec<(String, String)> = (0..TRAFFIC_HISTORY_LEN)
+        .map(|index| {
+            let offset = index + TRAFFIC_HISTORY_LEN - traffic.download_history.len();
+            let download = traffic.download_history.get(offset).copied().unwrap_or(0);
+            let upload = traffic.upload_history.get(offset).copied().unwrap_or(0);
+            (
+                traffic_bar_height(download, chart_peak),
+                traffic_bar_height(upload, chart_peak),
+            )
+        })
+        .collect();
+    let chart_status = if traffic.active_connections > 0 {
+        format!("{} 个活动连接", traffic.active_connections)
+    } else if is_connected {
+        "等待代理流量".to_string()
+    } else {
+        "内核未启动".to_string()
+    };
+    let uptime = uptime_seconds();
+    let uptime_label = uptime
+        .map(format_uptime)
+        .unwrap_or_else(|| "--".to_string());
+    let uptime_unit = if uptime.is_some() {
+        "运行中"
+    } else {
+        "未启动"
+    };
+    let latency_unit = if selected_latency.is_some() {
+        "ms"
+    } else {
+        "ms · 未测试"
+    };
 
     rsx! {
         div { class: "overview-grid",
@@ -1742,18 +2235,25 @@ fn OverviewView(
                 div { class: "connection-copy",
                     div { class: "status-line", role: "status", aria_live: "polite",
                         span { class: if is_core_action_busy { "busy-dot" } else if is_connected { "live-dot" } else { "idle-dot" } }
-                        span { "{status_title}" }
+                        span { "{status_title} · {mode_name}" }
                     }
                     h2 { "{node_name}" }
                     p { "{note}" }
-                    div { class: "connection-meta",
-                        span {
-                            Icon { icon: LdRoute, width: 15, height: 15 }
-                            "{mode_name}"
+                    if let Some(node) = selected_node.as_ref() {
+                        div { class: "connection-meta",
+                            span { "{node.endpoint()}" }
+                            span { class: "meta-sep", aria_hidden: "true" }
+                            span { "{node.protocol.label()}" }
                         }
-                        span {
-                            Icon { icon: LdWifi, width: 15, height: 15 }
-                            if allow_lan() { "局域网代理 7890" } else { "本地代理 7890" }
+                    }
+                    // Design affordance: jump straight to the picker instead of
+                    // making the user hunt for the nodes page.
+                    if !nodes().is_empty() {
+                        button {
+                            class: "secondary-button compact switch-node-button",
+                            onclick: move |_| active_view.set(AppView::Nodes),
+                            Icon { icon: LdSplit, width: 15, height: 15 }
+                            span { "切换节点" }
                         }
                     }
                 }
@@ -1765,18 +2265,6 @@ fn OverviewView(
                         aria_busy: is_core_action_busy,
                         disabled: is_core_action_busy || (!is_connected && !connection_allowed),
                         onclick: move |_| {
-                            let proxy_server_nameservers = proxy_server_nameservers.clone();
-                            let blocked = core_busy()
-                                || core_restarting()
-                                || system_proxy_busy()
-                                || runtime_action_busy();
-                            if !blocked {
-                                core_busy.set(true);
-                            }
-                            async move {
-                            if blocked {
-                                return;
-                            }
                             let target = !connected();
                             let request = target.then(|| ConnectionRequest {
                                 nodes: nodes(),
@@ -1800,98 +2288,28 @@ fn OverviewView(
                                 },
                                 group_selections: group_selections(),
                             });
-                            // With TUN toggled on but the core stopped, the
-                            // privileged helper is gone and starting would
-                            // fail with "TUN 权限尚未准备". Re-acquire the
-                            // permission (prompting for administrator access
-                            // only when no authorized helper exists) before
-                            // starting, so the TUN switch stays a persistent
-                            // preference instead of a one-shot setup.
-                            if target && tun_enabled() {
-                                if let Some(tun_request) = request.clone() {
-                                    match api::prepare_tun_mode(tun_request).await {
-                                        Ok(()) => {}
-                                        Err(error) => {
-                                            // The core may actually already
-                                            // be running behind a stale local
-                                            // state; refresh before giving up
-                                            // to keep the button idempotent.
-                                            match api::core_status().await {
-                                                Ok(status)
-                                                    if status.state == "running" =>
-                                                {
-                                                    // Fall through: toggling
-                                                    // again is a no-op.
-                                                }
-                                                Ok(_) => {
-                                                    core_busy.set(false);
-                                                    toast.error(format!(
-                                                        "准备 TUN 权限失败，内核未启动: {error}"
-                                                    ));
-                                                    return;
-                                                }
-                                                Err(status_error) => {
-                                                    core_busy.set(false);
-                                                    toast.error(format!(
-                                                        "准备 TUN 权限失败: {error}；刷新内核状态失败: {status_error}"
-                                                    ));
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            match api::set_core_enabled(target, request).await {
-                                Ok(status) => {
-                                    let is_running = status.state == "running";
-                                    connected.set(is_running);
-                                    core_state.set(status.state);
-                                    core_note.set(status.note);
-                                    if !target {
-                                        toast.success("连接已断开");
-                                    } else if is_running {
-                                        toast.success("sing-box 已启动");
-                                    } else {
-                                        toast.info(ANDROID_VPN_WAITING_NOTICE);
-                                    }
-                                }
-                                Err(error) => {
-                                    toast.error(error.to_string());
-                                    match api::core_status().await {
-                                        Ok(status) => {
-                                            connected.set(status.state == "running");
-                                            core_state.set(status.state);
-                                            core_note.set(status.note);
-                                        }
-                                        Err(status_error) => {
-                                            connected.set(false);
-                                            core_state.set("unavailable".to_string());
-                                            core_note.set(Some(status_error.to_string()));
-                                        }
-                                    }
-                                }
-                            }
-                            if !target {
-                                match api::system_proxy_status().await {
-                                    Ok(status) => {
-                                        system_proxy.set(SystemProxyLoadState::Ready(status));
-                                    }
-                                    Err(error) => {
-                                        system_proxy.set(SystemProxyLoadState::Failed(
-                                            error.to_string(),
-                                        ));
-                                    }
-                                }
-                            }
-                            core_busy.set(false);
-                            }
+                            spawn_core_toggle(
+                                request,
+                                CoreToggleSignals {
+                                    status: CoreStatusSignals {
+                                        connected,
+                                        core_restarting,
+                                        core_state,
+                                        core_version,
+                                        core_note,
+                                    },
+                                    core_busy,
+                                    system_proxy,
+                                },
+                                toast,
+                            );
                         },
                         if is_core_action_busy {
                             span { class: "spinner large" }
                         } else {
                             Icon { icon: LdPower, width: 32, height: 32 }
                         }
+                        span { class: "power-label", if is_connected { "断开" } else { "启动代理" } }
                     }
                     SystemProxyToggle {
                         core_running: is_connected,
@@ -1906,64 +2324,98 @@ fn OverviewView(
 
             section { class: "traffic-panel glass-surface",
                 div { class: "section-heading",
-                    div {
-                        p { class: "eyebrow", "SESSION" }
+                    div { class: "chart-heading",
                         h2 { "实时流量" }
+                        span { class: "chart-window", "{TRAFFIC_HISTORY_LEN}s" }
                     }
-                    Icon { icon: LdActivity, width: 20, height: 20 }
-                }
-                div { class: "traffic-values",
-                    div {
-                        span { class: "metric-icon download", Icon { icon: LdArrowDown, width: 16, height: 16 } }
-                        p { "下载" }
-                        strong {
+                    div { class: "chart-legend",
+                        span {
+                            class: "down",
                             title: "累计下载 {format_data_amount(traffic.download_total)}",
-                            "{format_data_rate(traffic.download_bytes_per_second)}"
+                            i {}
+                            "下载 {format_data_rate(traffic.download_bytes_per_second)}"
                         }
-                        small { class: "traffic-total", "累计 {format_data_amount(traffic.download_total)}" }
-                    }
-                    div {
-                        span { class: "metric-icon upload", Icon { icon: LdArrowUp, width: 16, height: 16 } }
-                        p { "上传" }
-                        strong {
+                        span {
+                            class: "up",
                             title: "累计上传 {format_data_amount(traffic.upload_total)}",
-                            "{format_data_rate(traffic.upload_bytes_per_second)}"
+                            i {}
+                            "上传 {format_data_rate(traffic.upload_bytes_per_second)}"
                         }
-                        small { class: "traffic-total", "累计 {format_data_amount(traffic.upload_total)}" }
                     }
                 }
                 div { class: "traffic-chart",
-                    for sample in chart_history {
-                        span { style: "height: {traffic_chart_height(sample, chart_peak)}" }
-                    }
-                    if traffic.active_connections == 0 {
-                        small { class: "traffic-status", "等待代理流量" }
-                    } else {
-                        small { class: "traffic-status", "{traffic.active_connections} 个活动连接" }
+                    // One bar per second, download stacked under upload. An idle
+                    // second keeps a 2px stub so the baseline stays readable.
+                    for (download, upload) in chart_bars {
+                        div { class: "traffic-bar",
+                            span { class: "download", style: "height: {download}" }
+                            span { class: "upload", style: "height: {upload}" }
+                        }
                     }
                 }
+                div { class: "chart-foot",
+                    small { "累计 {format_data_amount(traffic.download_total + traffic.upload_total)}" }
+                    small { class: "traffic-status", "{chart_status} · {proxy_port_label(allow_lan())}" }
+                }
             }
+
+            // Phone-only: TUN / LAN / theme / system proxy in one row under the
+            // live traffic card, exactly where the design puts the quick toggles.
+                OverviewQuickToggles {
+                    nodes,
+                    selected_tag,
+                    proxy_server_nameservers: proxy_server_nameservers.clone(),
+                    connected,
+                    core_busy,
+                    core_restarting,
+                    core_state,
+                    core_version,
+                    core_note,
+                    tunnel_mode,
+                    tun_enabled,
+                    allow_lan,
+                    dark_mode,
+                    custom_rules,
+                    dns_overrides,
+                    config_script_enabled,
+                    config_script,
+                    group_selections,
+                    system_proxy,
+                    system_proxy_busy,
+                    runtime_action_busy,
+                }
         }
 
         div { class: "stats-grid",
-            MetricCard { label: "节点", value: nodes().len().to_string(), icon: "server" }
             MetricCard {
-                label: "延迟",
-                value: selected_latency
-                    .map(|latency| format!("{latency} ms"))
-                    .unwrap_or_else(|| "-- ms".to_string()),
-                icon: "zap",
+                label: "节点".to_string(),
+                icon: "nodes".to_string(),
+                value: nodes().len().to_string(),
+                unit: format!("/ 共 {subscription_count} 订阅"),
             }
-            MetricCard { label: "运行时间", value: if connected() { "刚刚".to_string() } else { "--".to_string() }, icon: "clock" }
+            MetricCard {
+                label: "运行时间".to_string(),
+                icon: "timer".to_string(),
+                value: uptime_label,
+                unit: uptime_unit.to_string(),
+            }
+            MetricCard {
+                label: "当前延迟".to_string(),
+                icon: "zap".to_string(),
+                value: selected_latency
+                    .map(|latency| latency.to_string())
+                    .unwrap_or_else(|| "--".to_string()),
+                unit: latency_unit.to_string(),
+            }
         }
 
         section { class: "list-section glass-surface",
             div { class: "section-heading",
-                div {
+                div { class: "list-heading",
                     p { class: "eyebrow", "PROXIES" }
                     h2 { "节点速览" }
                 }
-                span { class: "count-badge", "{nodes().len()}" }
+                span { class: "count-badge", "{nodes().len()} 个节点" }
             }
             if nodes().is_empty() {
                 EmptyNodes {}
@@ -1986,41 +2438,17 @@ fn SystemProxyToggle(
     mut system_proxy_busy: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
-    let (proxy_status, proxy_loading, proxy_error) = match system_proxy() {
-        SystemProxyLoadState::Loading => (None, true, None),
-        SystemProxyLoadState::Ready(status) => (Some(status), false, None),
-        SystemProxyLoadState::Failed(error) => (None, false, Some(error)),
-    };
-    let proxy_ready = proxy_status.is_some();
-    let proxy_supported = proxy_status.as_ref().is_some_and(|status| status.supported);
-    let proxy_enabled = proxy_status.as_ref().is_some_and(|status| status.enabled);
     let proxy_busy = system_proxy_busy();
-    let proxy_label = if proxy_busy {
-        "设置中"
-    } else if proxy_loading {
-        "读取中"
-    } else if proxy_enabled {
-        "已启用"
-    } else if proxy_error.is_some() {
-        "读取失败"
-    } else if !proxy_supported {
-        "不可用"
-    } else {
-        "未启用"
-    };
-    let proxy_detail = if proxy_busy {
-        if proxy_enabled {
-            "正在关闭系统代理".to_string()
-        } else {
-            "正在应用到系统网络服务".to_string()
-        }
-    } else {
-        proxy_status
-            .as_ref()
-            .map(|status| status.detail.clone())
-            .or(proxy_error)
-            .unwrap_or_else(|| "正在读取系统代理状态".to_string())
-    };
+    let proxy = system_proxy_view(system_proxy(), proxy_busy);
+    let SystemProxyView {
+        label: proxy_label,
+        detail: proxy_detail,
+        enabled: proxy_enabled,
+        supported: proxy_supported,
+        ready: proxy_ready,
+        loading: proxy_loading,
+        busy: _,
+    } = proxy;
 
     rsx! {
         label {
@@ -2089,13 +2517,38 @@ fn SystemProxyToggle(
     }
 }
 
-fn traffic_chart_height(sample: u64, peak: u64) -> String {
-    let percent = 12 + sample.saturating_mul(76).saturating_div(peak.max(1));
+/// Height of one stacked bar segment. The chart keeps a floor so an idle
+/// second still reads as a bar instead of collapsing to nothing.
+fn traffic_bar_height(sample: u64, peak: u64) -> String {
+    if sample == 0 {
+        return "2px".to_string();
+    }
+    let percent = 10 + sample.saturating_mul(84).saturating_div(peak.max(1));
     format!("{}%", percent.min(88))
+}
+
+fn format_uptime(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let secs = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes:02}:{secs:02}")
+    }
 }
 
 fn format_data_rate(bytes_per_second: u64) -> String {
     format!("{}/s", format_data_amount(bytes_per_second))
+}
+
+/// `7890` is the fixed mixed port the embedded core always listens on.
+fn proxy_port_label(allow_lan: bool) -> &'static str {
+    if allow_lan {
+        "局域网代理 7890"
+    } else {
+        "本地代理 7890"
+    }
 }
 
 fn format_data_amount(bytes: u64) -> String {
@@ -2114,23 +2567,305 @@ fn format_data_amount(bytes: u64) -> String {
     }
 }
 
+/// Derived display state of the system proxy control, shared by the desktop
+/// toggle row and the phone quick toggle tile.
+struct SystemProxyView {
+    label: &'static str,
+    detail: String,
+    enabled: bool,
+    supported: bool,
+    ready: bool,
+    loading: bool,
+    busy: bool,
+}
+
+fn system_proxy_view(state: SystemProxyLoadState, busy: bool) -> SystemProxyView {
+    let (status, loading, error) = match state {
+        SystemProxyLoadState::Loading => (None, true, None),
+        SystemProxyLoadState::Ready(status) => (Some(status), false, None),
+        SystemProxyLoadState::Failed(error) => (None, false, Some(error)),
+    };
+    let enabled = status.as_ref().is_some_and(|status| status.enabled);
+    let supported = status.as_ref().is_some_and(|status| status.supported);
+    let label = if busy {
+        "设置中"
+    } else if loading {
+        "读取中"
+    } else if enabled {
+        "已启用"
+    } else if error.is_some() {
+        "读取失败"
+    } else if !supported {
+        "不可用"
+    } else {
+        "未启用"
+    };
+    let detail = if busy {
+        if enabled {
+            "正在关闭系统代理".to_string()
+        } else {
+            "正在应用到系统网络服务".to_string()
+        }
+    } else {
+        status
+            .as_ref()
+            .map(|status| status.detail.clone())
+            .or(error)
+            .unwrap_or_else(|| "正在读取系统代理状态".to_string())
+    };
+    SystemProxyView {
+        label,
+        detail,
+        enabled,
+        supported,
+        ready: status.is_some(),
+        loading,
+        busy,
+    }
+}
+
+/// One tile of the phone quick-toggle grid: icon plus status dot on the first
+/// row, name and monospace value below, matching the design's 2x2 grid.
 #[component]
-fn MetricCard(label: String, value: String, icon: String) -> Element {
+fn QuickToggle(
+    icon: String,
+    title: String,
+    value: String,
+    checked: bool,
+    busy: bool,
+    disabled: bool,
+    hint: String,
+    on_toggle: EventHandler<bool>,
+) -> Element {
+    let control = if busy {
+        rsx! {
+            span {
+                class: if checked { "switch switch-loading active" } else { "switch switch-loading" },
+                aria_busy: "true",
+                aria_label: "{title}",
+                span { class: "spinner" }
+            }
+        }
+    } else {
+        rsx! {
+            input {
+                r#type: "checkbox",
+                aria_label: "{title}",
+                checked,
+                disabled,
+                onchange: move |event| on_toggle.call(event.checked()),
+            }
+            span { class: "switch" }
+        }
+    };
     rsx! {
-        div { class: "metric-card glass-surface",
-            span { class: "metric-symbol",
-                if icon == "server" {
-                    Icon { icon: LdNetwork, width: 19, height: 19 }
-                } else if icon == "zap" {
-                    Icon { icon: LdZap, width: 19, height: 19 }
+        label { class: if checked { "quick-toggle active" } else { "quick-toggle" }, title: "{hint}",
+            span { class: "quick-toggle-icon",
+                if icon == "network" {
+                    Icon { icon: LdNetwork, width: 16, height: 16 }
+                } else if icon == "wifi" {
+                    Icon { icon: LdWifi, width: 16, height: 16 }
+                } else if icon == "moon" {
+                    if checked {
+                        Icon { icon: LdMoon, width: 16, height: 16 }
+                    } else {
+                        Icon { icon: LdSun, width: 16, height: 16 }
+                    }
                 } else {
-                    Icon { icon: LdClock3, width: 19, height: 19 }
+                    Icon { icon: LdGlobe, width: 16, height: 16 }
+                }
+                span { class: if checked { "quick-toggle-dot on" } else { "quick-toggle-dot" } }
+            }
+            {control}
+            span { class: "quick-toggle-text",
+                strong { "{title}" }
+                small { "{value}" }
+            }
+        }
+    }
+}
+
+/// Phone-only 2x2 grid: the design keeps TUN, LAN, theme, and system proxy one
+/// tap away from the power button. Desktop keeps those in the settings page.
+#[component]
+fn OverviewQuickToggles(
+    nodes: Signal<Vec<ProxyNode>>,
+    selected_tag: Signal<String>,
+    proxy_server_nameservers: Vec<String>,
+    connected: Signal<bool>,
+    core_busy: Signal<bool>,
+    core_restarting: Signal<bool>,
+    core_state: Signal<String>,
+    core_version: Signal<Option<String>>,
+    core_note: Signal<Option<String>>,
+    tunnel_mode: Signal<TunnelMode>,
+    mut tun_enabled: Signal<bool>,
+    mut allow_lan: Signal<bool>,
+    mut dark_mode: Signal<bool>,
+    custom_rules: Signal<Vec<CustomRule>>,
+    dns_overrides: Signal<Vec<DnsOverride>>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
+    group_selections: Signal<HashMap<String, String>>,
+    system_proxy: Signal<SystemProxyLoadState>,
+    system_proxy_busy: Signal<bool>,
+    runtime_action_busy: Signal<bool>,
+) -> Element {
+    let toast = use_context::<ToastManager>();
+    let tun_busy = use_signal(|| false);
+    let runtime = RuntimeSignals {
+        status: CoreStatusSignals {
+            connected,
+            core_restarting,
+            core_state,
+            core_version,
+            core_note,
+        },
+        core_busy,
+        system_proxy_busy,
+        runtime_action_busy,
+    };
+    let proxy = system_proxy_view(system_proxy(), system_proxy_busy());
+    let runtime_settings = RuntimeSettings {
+        tunnel_mode,
+        tun_enabled,
+        allow_lan,
+        custom_rules,
+        dns_overrides,
+        config_script_enabled,
+        config_script,
+    };
+    let busy = runtime.busy();
+    let core_running = connected();
+    let show_tun = !cfg!(target_os = "android");
+    // Each tile handler needs its own copy of the nameserver list.
+    let tun_nameservers = proxy_server_nameservers.clone();
+
+    rsx! {
+        section { class: "quick-toggles glass-surface",
+            div { class: "quick-toggles-heading",
+                div {
+                    strong { "快捷开关" }
+                    p { class: "eyebrow", "QUICK TOGGLES" }
                 }
             }
-            div {
-                p { "{label}" }
-                strong { "{value}" }
+            div { class: "quick-toggle-grid",
+                if show_tun {
+                    QuickToggle {
+                        icon: "network".to_string(),
+                        title: "TUN 模式".to_string(),
+                        value: if tun_busy() {
+                            "处理中".to_string()
+                        } else if tun_enabled() {
+                            "已启用".to_string()
+                        } else {
+                            "未启用".to_string()
+                        },
+                        hint: "系统级网络接管".to_string(),
+                        checked: tun_enabled(),
+                        busy: tun_busy(),
+                        disabled: busy || nodes().is_empty(),
+                        on_toggle: move |enabled| {
+                            let request = build_connection_request(
+                                nodes(),
+                                selected_tag(),
+                                tun_nameservers.clone(),
+                                runtime_settings,
+                                group_selections(),
+                            );
+                            spawn_tun_toggle(
+                                enabled,
+                                request,
+                                tun_enabled,
+                                tun_busy,
+                                runtime,
+                                toast,
+                            );
+                        },
+                    }
+                }
+                QuickToggle {
+                    icon: "wifi".to_string(),
+                    title: "局域网".to_string(),
+                    value: if busy {
+                        "处理中".to_string()
+                    } else if allow_lan() {
+                        "0.0.0.0:7890".to_string()
+                    } else {
+                        "仅本机".to_string()
+                    },
+                    hint: "允许同一局域网设备使用此代理".to_string(),
+                    checked: allow_lan(),
+                    busy: false,
+                    disabled: busy || nodes().is_empty(),
+                    on_toggle: move |enabled| {
+                        let request = build_connection_request(
+                            nodes(),
+                            selected_tag(),
+                            proxy_server_nameservers.clone(),
+                            runtime_settings,
+                            group_selections(),
+                        );
+                        spawn_allow_lan_toggle(
+                            enabled,
+                            request,
+                            allow_lan,
+                            runtime,
+                            toast,
+                        );
+                    },
+                }
+                QuickToggle {
+                    icon: "moon".to_string(),
+                    title: "深色".to_string(),
+                    value: if dark_mode() { "已开启".to_string() } else { "已关闭".to_string() },
+                    hint: "切换界面配色".to_string(),
+                    checked: dark_mode(),
+                    busy: false,
+                    disabled: false,
+                    on_toggle: move |enabled| dark_mode.set(enabled),
+                }
+                QuickToggle {
+                    icon: "globe".to_string(),
+                    title: "系统代理".to_string(),
+                    value: proxy.label.to_string(),
+                    hint: proxy.detail,
+                    checked: proxy.enabled,
+                    busy: proxy.busy || proxy.loading,
+                    disabled: busy
+                        || !proxy.ready
+                        || !proxy.supported
+                        || (!proxy.enabled && !core_running),
+                    on_toggle: move |enabled| {
+                        spawn_system_proxy_toggle(
+                            enabled,
+                            system_proxy,
+                            system_proxy_busy,
+                            busy,
+                            toast,
+                        );
+                    },
+                }
             }
+        }
+    }
+}
+
+#[component]
+fn MetricCard(label: String, value: String, icon: String, unit: String) -> Element {
+    rsx! {
+        div { class: "metric-card glass-surface",
+            p {
+                if icon == "timer" {
+                    Icon { icon: LdTimer, width: 15, height: 15 }
+                } else if icon == "zap" {
+                    Icon { icon: LdWifi, width: 15, height: 15 }
+                } else {
+                    Icon { icon: LdGitFork, width: 15, height: 15 }
+                }
+                "{label}"
+            }
+            strong { "{value}" small { "{unit}" } }
         }
     }
 }
@@ -2143,6 +2878,7 @@ fn NodesView(
     nodes: Vec<ProxyNode>,
     proxy_server_nameservers: Vec<String>,
     all_count: usize,
+    subscriptions: Vec<Subscription>,
     mut group_selections: Signal<HashMap<String, String>>,
     connected: Signal<bool>,
     core_busy: Signal<bool>,
@@ -2166,61 +2902,39 @@ fn NodesView(
     mut import_open: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
-    let active_group = use_signal(String::new);
-    let requested_group = active_group();
-    let current_group = groups
-        .iter()
-        .find(|group| group.tag == requested_group)
-        .or_else(|| groups.first())
-        .cloned();
-    let current_group_tag = current_group
-        .as_ref()
-        .map(|group| group.tag.clone())
-        .unwrap_or_default();
-    let current_group_kind = current_group.as_ref().map(|group| group.kind);
-    let current_selected = current_group.as_ref().map(|group| {
-        group_selections()
-            .get(&group.tag)
-            .filter(|selected| group.outbounds.iter().any(|item| item == *selected))
-            .cloned()
-            .unwrap_or_else(|| group.selected.clone())
-    });
     let needle = search().trim().to_ascii_lowercase();
     let latency_snapshot = latency_results();
-    let mut members = current_group
-        .as_ref()
+    // The design lists every proxy group as its own section instead of a
+    // master/detail split, so one scroll shows the whole selector tree.
+    let groups_with_members = groups
+        .iter()
         .map(|group| {
-            group
-                .outbounds
-                .iter()
-                .filter_map(|tag| {
-                    let node = nodes.iter().find(|node| node.tag == *tag).cloned();
-                    let nested_kind = groups
-                        .iter()
-                        .find(|candidate| candidate.tag == *tag)
-                        .map(|candidate| candidate.kind);
-                    let display_name = node.as_ref().map(|node| node.name.as_str()).unwrap_or(tag);
-                    (needle.is_empty()
-                        || display_name.to_ascii_lowercase().contains(&needle)
-                        || tag.to_ascii_lowercase().contains(&needle)
-                        || node.as_ref().is_some_and(|node| {
-                            node.server.to_ascii_lowercase().contains(&needle)
-                                || node.protocol.label().to_ascii_lowercase().contains(&needle)
-                        }))
-                    .then(|| ProxyGroupMember {
-                        tag: tag.clone(),
-                        node,
-                        nested_kind,
-                    })
-                })
-                .collect::<Vec<_>>()
+            let mut members = proxy_group_members(group, &groups, &nodes, &needle);
+            sort_proxy_group_members(&mut members, &latency_snapshot);
+            let selected = group_selections()
+                .get(&group.tag)
+                .filter(|selected| group.outbounds.iter().any(|item| item == *selected))
+                .cloned()
+                .unwrap_or_else(|| group.selected.clone());
+            (group.clone(), members, selected)
         })
-        .unwrap_or_default();
-    sort_proxy_group_members(&mut members, &latency_snapshot);
-    let current_selected_label = current_selected
-        .as_deref()
-        .map(|tag| outbound_display_name(tag, &nodes))
-        .unwrap_or_else(|| "未选择".to_string());
+        .filter(|(_, members, _)| !members.is_empty())
+        .collect::<Vec<_>>();
+    let listed_member_count = groups_with_members
+        .iter()
+        .map(|(_, members, _)| members.len())
+        .sum::<usize>();
+    let tested_count = latency_snapshot
+        .values()
+        .filter(|result| result.latency_ms.is_some())
+        .count();
+    let focus = node_focus_details(
+        &groups,
+        &nodes,
+        &subscriptions,
+        &selected_tag(),
+        &latency_snapshot,
+    );
 
     rsx! {
         section { class: "workspace-section glass-surface",
@@ -2251,156 +2965,264 @@ fn NodesView(
                     strong { "配置中没有代理组" }
                 }
             } else {
-                div { class: "proxy-groups-layout",
-                    aside { class: "proxy-group-list", aria_label: "代理组",
-                        div { class: "proxy-group-list-heading",
-                            p { class: "eyebrow", "PROXY GROUPS" }
-                            strong { "{groups.len()} 个分组" }
-                        }
-                        for group in groups.clone() {
-                            ProxyGroupTab {
-                                group,
-                                nodes: nodes.clone(),
-                                active: current_group_tag.clone(),
-                                group_selections,
-                                active_group,
-                            }
+                div { class: "nodes-toolbar",
+                    label { class: "search-field nodes-search",
+                        Icon { icon: LdSearch, width: 17, height: 17 }
+                        input {
+                            value: search,
+                            placeholder: "搜索节点、地址或协议",
+                            oninput: move |event| search.set(event.value()),
                         }
                     }
-                    div { class: "proxy-group-members",
-                        div { class: "workspace-toolbar proxy-group-toolbar",
-                            div {
-                                p { class: "eyebrow", {current_group_kind.map(proxy_group_kind_label).unwrap_or("PROXY GROUP")} }
-                                h2 { "{current_group_tag}" }
-                                span {
-                                    if current_group_kind == Some(ProxyGroupKind::UrlTest) {
-                                        "自动测速 · {members.len()} 个候选"
-                                    } else {
-                                        "当前：{current_selected_label}"
-                                    }
-                                }
-                            }
-                            div { class: "toolbar-controls subscription-actions",
-                                label { class: "search-field",
-                                    Icon { icon: LdSearch, width: 17, height: 17 }
-                                    input {
-                                        value: search,
-                                        placeholder: "搜索当前分组",
-                                        oninput: move |event| search.set(event.value()),
-                                    }
-                                }
-                                button {
-                                    class: "icon-button glass-control",
-                                    title: if latency_busy() { "正在刷新延迟" } else { "刷新延迟" },
-                                    disabled: latency_busy() || nodes.is_empty(),
-                                    onclick: move |_| {
-                                        let probe_nodes = nodes.clone();
-                                        let cache_nodes = nodes.clone();
-                                        let proxy_server_nameservers =
-                                            proxy_server_nameservers.clone();
-                                        async move {
-                                            latency_busy.set(true);
-                                            let mut failures = 0;
-                                            let session_id = match api::start_node_latency(
-                                                probe_nodes,
-                                                proxy_server_nameservers.clone(),
-                                            ).await {
-                                                Ok(session_id) => session_id,
-                                                Err(error) => {
-                                                    toast.error(format!("启动测速失败: {error}"));
-                                                    latency_busy.set(false);
-                                                    return;
-                                                }
-                                            };
-                                            let completed = loop {
-                                                match api::poll_node_latency(session_id).await {
-                                                    Ok(snapshot) => {
-                                                        failures += snapshot
-                                                            .results
-                                                            .iter()
-                                                            .filter(|result| result.latency_ms.is_none())
-                                                            .count();
-                                                        if !snapshot.results.is_empty() {
-                                                            let mut current_results = latency_results.write();
-                                                            for result in snapshot.results {
-                                                                current_results.insert(result.tag.clone(), result);
-                                                            }
-                                                        }
-                                                        if snapshot.done {
-                                                            break snapshot.completed;
-                                                        }
-                                                    }
+                                    button {
+                                        class: "secondary-button compact",
+                                        title: if latency_busy() { "正在刷新延迟" } else { "刷新延迟" },
+                                        disabled: latency_busy() || nodes.is_empty(),
+                                        onclick: move |_| {
+                                            let probe_nodes = nodes.clone();
+                                            let cache_nodes = nodes.clone();
+                                            let proxy_server_nameservers =
+                                                proxy_server_nameservers.clone();
+                                            async move {
+                                                latency_busy.set(true);
+                                                let mut failures = 0;
+                                                let session_id = match api::start_node_latency(
+                                                    probe_nodes,
+                                                    proxy_server_nameservers.clone(),
+                                                ).await {
+                                                    Ok(session_id) => session_id,
                                                     Err(error) => {
-                                                        toast.error(format!("读取测速结果失败: {error}"));
+                                                        toast.error(format!("启动测速失败: {error}"));
                                                         latency_busy.set(false);
                                                         return;
                                                     }
+                                                };
+                                                let completed = loop {
+                                                    match api::poll_node_latency(session_id).await {
+                                                        Ok(snapshot) => {
+                                                            failures += snapshot
+                                                                .results
+                                                                .iter()
+                                                                .filter(|result| result.latency_ms.is_none())
+                                                                .count();
+                                                            if !snapshot.results.is_empty() {
+                                                                let mut current_results = latency_results.write();
+                                                                for result in snapshot.results {
+                                                                    current_results.insert(result.tag.clone(), result);
+                                                                }
+                                                            }
+                                                            if snapshot.done {
+                                                                break snapshot.completed;
+                                                            }
+                                                        }
+                                                        Err(error) => {
+                                                            toast.error(format!("读取测速结果失败: {error}"));
+                                                            latency_busy.set(false);
+                                                            return;
+                                                        }
+                                                    }
+                                                    wait_for_latency_poll().await;
+                                                };
+                                                if failures == 0 {
+                                                    toast.success(format!("已完成 {completed} 个节点测速"));
+                                                } else {
+                                                    toast.info(format!(
+                                                        "延迟刷新完成，{completed} 个节点中 {failures} 个不可用"
+                                                    ));
                                                 }
-                                                wait_for_latency_poll().await;
-                                            };
-                                            if failures == 0 {
-                                                toast.success(format!("已完成 {completed} 个节点测速"));
-                                            } else {
-                                                toast.info(format!(
-                                                    "延迟刷新完成，{completed} 个节点中 {failures} 个不可用"
-                                                ));
+                                                let latency_snapshot = latency_results();
+                                                persist_latency_cache(&cache_nodes, &latency_snapshot)
+                                                    .await;
+                                                latency_busy.set(false);
                                             }
-                                            let latency_snapshot = latency_results();
-                                            persist_latency_cache(&cache_nodes, &latency_snapshot)
-                                                .await;
-                                            latency_busy.set(false);
+                                        },
+                                        if latency_busy() {
+                                            span { class: "spinner" }
+                                        } else {
+                                            Icon { icon: LdRefreshCw, width: 16, height: 16 }
                                         }
-                                    },
-                                    if latency_busy() {
-                                        span { class: "spinner" }
-                                    } else {
-                                        Icon { icon: LdRefreshCw, width: 18, height: 18 }
+                                        span { class: "nodes-refresh-label", "刷新延迟" }
                                     }
-                                }
-                            }
+                    div { class: "nodes-toolbar-meta",
+                        span { class: "nodes-toolbar-count",
+                            "{groups_with_members.len()} 个分组 · {listed_member_count} 个节点"
                         }
-                        if members.is_empty() {
-                            div { class: "large-empty group-empty",
-                                Icon { icon: LdSearch, width: 28, height: 28 }
-                                strong { "当前分组没有匹配项" }
-                            }
-                        } else {
-                            div { class: "node-list proxy-member-list",
-                                for member in members {
-                                    ProxyGroupMemberRow {
-                                        group_tag: current_group_tag.clone(),
-                                        group_kind: current_group_kind.unwrap_or(ProxyGroupKind::Selector),
-                                        member,
-                                        selected: current_selected.clone().unwrap_or_default(),
-                                        connected,
-                                        core_busy,
-                                        core_restarting,
-                                        system_proxy_busy,
-                                        runtime_action_busy,
-                                        core_state,
-                                        core_version,
-                                        core_note,
-                                        nodes: nodes.clone(),
-                                        proxy_server_nameservers: proxy_server_nameservers.clone(),
-                                        selected_tag,
-                                        tunnel_mode,
-                                        tun_enabled,
-                                        allow_lan,
-                                        custom_rules,
-        dns_overrides,
-                                        config_script_enabled,
-                                        config_script,
-                                        group_selections,
-                                        latency_results,
-                                    }
-                                }
+                        small {
+                            if tested_count == 0 {
+                                "尚未测试延迟"
+                            } else {
+                                "已测速 {tested_count} 个节点"
                             }
                         }
                     }
                 }
+                if groups_with_members.is_empty() {
+                    div { class: "large-empty group-empty",
+                        Icon { icon: LdSearch, width: 28, height: 28 }
+                        strong { "没有匹配的节点" }
+                        p { "换个关键词试试，节点名、地址和协议都可以搜索。" }
+                    }
+                } else {
+                    div { class: "proxy-group-sections",
+                        for (group, members, selected) in groups_with_members {
+                            div { class: "proxy-group-section", key: "{group.tag}",
+                                div { class: "proxy-group-section-header",
+                                    span {
+                                        class: if group.kind == ProxyGroupKind::UrlTest {
+                                            "group-kind-mark auto"
+                                        } else {
+                                            "group-kind-mark"
+                                        },
+                                        if group.kind == ProxyGroupKind::UrlTest {
+                                            Icon { icon: LdGauge, width: 17, height: 17 }
+                                        } else {
+                                            Icon { icon: LdLayers, width: 17, height: 17 }
+                                        }
+                                    }
+                                    div { class: "proxy-group-section-copy",
+                                        strong { "{group.tag}" }
+                                        small {
+                                            "{proxy_group_kind_label(group.kind)} · {members.len()} 节点 · 当前 "
+                                            {outbound_display_name(&selected, &nodes)}
+                                        }
+                                    }
+                                }
+                                div { class: "node-table-header",
+                                    span { "协议" }
+                                    span { "节点" }
+                                    span { "类型" }
+                                    span { "延迟" }
+                                    span { "" }
+                                }
+                                div { class: "node-list proxy-member-list",
+                                    for member in members {
+                                        ProxyGroupMemberRow {
+                                            group_tag: group.tag.clone(),
+                                            group_kind: group.kind,
+                                            member,
+                                            selected: selected.clone(),
+                                            connected,
+                                            core_busy,
+                                            core_restarting,
+                                            system_proxy_busy,
+                                            runtime_action_busy,
+                                            core_state,
+                                            core_version,
+                                            core_note,
+                                            nodes: nodes.clone(),
+                                            proxy_server_nameservers: proxy_server_nameservers.clone(),
+                                            selected_tag,
+                                            tunnel_mode,
+                                            tun_enabled,
+                                            allow_lan,
+                                            custom_rules,
+                                            dns_overrides,
+                                            config_script_enabled,
+                                            config_script,
+                                            group_selections,
+                                            latency_results,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                  // The design keeps one detail card under the group tables so the
+                  // focused node stays readable on phones, where rows are compacted.
+                  if let Some(focus) = focus {
+                      div { class: "node-focus",
+                          div { class: "node-focus-header",
+                              Icon { icon: LdInfo, width: 15, height: 15 }
+                              strong { "节点信息" }
+                              small { "· {focus.name}" }
+                          }
+                          div { class: "node-focus-rows",
+                              div { class: "node-focus-row",
+                                  span { "协议" }
+                                  code { "{focus.protocol}" }
+                              }
+                              div { class: "node-focus-row",
+                                  span { "地址" }
+                                  code { "{focus.endpoint}" }
+                              }
+                              div { class: "node-focus-row",
+                                  span { "所属分组" }
+                                  code { "{focus.group_label}" }
+                              }
+                              div { class: "node-focus-row",
+                                  span { "当前状态" }
+                                  code { class: "node-focus-status {focus.status_class}", "{focus.status}" }
+                              }
+                              div { class: "node-focus-row",
+                                  span { "来源" }
+                                  code { "{focus.source}" }
+                              }
+                          }
+                      }
+                  }
+                }
             }
         }
     }
+}
+
+/// Details shown for the node the core is currently using. Every field comes
+/// from the parsed profile: the source is resolved by matching the namespaced
+/// node tag back to its subscription, so nothing is guessed.
+#[derive(Debug, Clone, PartialEq)]
+struct NodeFocusDetails {
+    name: String,
+    protocol: String,
+    endpoint: String,
+    group_label: String,
+    status: String,
+    status_class: &'static str,
+    source: String,
+}
+
+fn node_focus_details(
+    groups: &[ProxyGroup],
+    nodes: &[ProxyNode],
+    subscriptions: &[Subscription],
+    selected_tag: &str,
+    latency_results: &HashMap<String, NodeLatency>,
+) -> Option<NodeFocusDetails> {
+    let node = nodes
+        .iter()
+        .find(|candidate| candidate.tag == selected_tag)?;
+    let owner = groups
+        .iter()
+        .find(|group| group.outbounds.iter().any(|tag| tag == selected_tag))
+        .map(|group| format!("{} · {}", group.tag, proxy_group_kind_label(group.kind)))
+        .unwrap_or_else(|| "未归组".to_string());
+    let source = subscriptions
+        .iter()
+        // Stored nodes are already namespaced by `apply_subscription_report`, so
+        // the tag can be matched directly without re-prefixing it.
+        .find(|subscription| {
+            subscription
+                .nodes
+                .iter()
+                .any(|scoped| scoped.tag == node.tag)
+        })
+        .map(|subscription| source_label(&subscription.source))
+        .unwrap_or_else(|| "本地内容".to_string());
+    let latency = latency_results.get(&node.tag);
+    let (status, status_class) = match latency.map(|entry| entry.latency_ms) {
+        Some(Some(_)) => ("已选中 · 可用", "ready"),
+        Some(None) => ("已选中 · 探测失败", "failed"),
+        None => ("已选中 · 未测试", "pending"),
+    };
+
+    Some(NodeFocusDetails {
+        name: node.name.clone(),
+        protocol: node.protocol.label().to_string(),
+        endpoint: node.endpoint(),
+        group_label: owner,
+        status: status.to_string(),
+        status_class,
+        source,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2410,43 +3232,41 @@ struct ProxyGroupMember {
     nested_kind: Option<ProxyGroupKind>,
 }
 
-#[component]
-fn ProxyGroupTab(
-    group: ProxyGroup,
-    nodes: Vec<ProxyNode>,
-    active: String,
-    group_selections: Signal<HashMap<String, String>>,
-    mut active_group: Signal<String>,
-) -> Element {
-    let tag = group.tag.clone();
-    let selected = group_selections()
-        .get(&group.tag)
-        .filter(|selected| group.outbounds.iter().any(|item| item == *selected))
-        .cloned()
-        .unwrap_or_else(|| group.selected.clone());
-    let detail = if group.kind == ProxyGroupKind::UrlTest {
-        format!("自动测速 · {} 项", group.outbounds.len())
-    } else {
-        format!("当前：{}", outbound_display_name(&selected, &nodes))
-    };
-    rsx! {
-        button {
-            class: if active == group.tag { "proxy-group-tab active" } else { "proxy-group-tab" },
-            onclick: move |_| active_group.set(tag.clone()),
-            span { class: if group.kind == ProxyGroupKind::UrlTest { "group-kind-mark auto" } else { "group-kind-mark" },
-                if group.kind == ProxyGroupKind::UrlTest {
-                    Icon { icon: LdGauge, width: 17, height: 17 }
-                } else {
-                    Icon { icon: LdRoute, width: 17, height: 17 }
-                }
-            }
-            span { class: "proxy-group-tab-copy",
-                strong { "{group.tag}" }
-                small { "{detail}" }
-            }
-            Icon { icon: LdChevronRight, width: 16, height: 16 }
-        }
-    }
+/// Members of one proxy group after the free-text filter. Members can be real
+/// nodes or nested groups, so both are resolved against the shared lists.
+fn proxy_group_members(
+    group: &ProxyGroup,
+    groups: &[ProxyGroup],
+    nodes: &[ProxyNode],
+    needle: &str,
+) -> Vec<ProxyGroupMember> {
+    group
+        .outbounds
+        .iter()
+        .filter_map(|tag| {
+            let node = nodes.iter().find(|node| node.tag == *tag).cloned();
+            let nested_kind = groups
+                .iter()
+                .find(|candidate| candidate.tag == *tag)
+                .map(|candidate| candidate.kind);
+            let display_name = node
+                .as_ref()
+                .map(|node| node.name.as_str())
+                .unwrap_or(tag.as_str());
+            (needle.is_empty()
+                || display_name.to_ascii_lowercase().contains(needle)
+                || tag.to_ascii_lowercase().contains(needle)
+                || node.as_ref().is_some_and(|node| {
+                    node.server.to_ascii_lowercase().contains(needle)
+                        || node.protocol.label().to_ascii_lowercase().contains(needle)
+                }))
+            .then(|| ProxyGroupMember {
+                tag: tag.clone(),
+                node,
+                nested_kind,
+            })
+        })
+        .collect()
 }
 
 #[component]
@@ -2576,14 +3396,19 @@ fn ProxyGroupMemberRow(
                     runtime_action_busy.set(false);
                 }
             },
-            if let Some(node) = member.node {
+            if let Some(ref node) = member.node {
                 span { class: protocol_class(node.protocol), "{protocol_abbreviation(node.protocol)}" }
                 span { class: "node-main",
                     strong { "{node.name}" }
                     small { "{node.endpoint()}" }
                 }
                 span { class: "protocol-label", "{node.protocol.label()}" }
-                span { class: latency_class, title: latency_title, "{latency_label}" }
+                LatencyCell {
+                    result: member.node.as_ref().and_then(|node| latency_results().get(&node.tag).cloned()),
+                    latency_label,
+                    latency_class,
+                    latency_title,
+                }
             } else {
                 span { class: if member.nested_kind == Some(ProxyGroupKind::UrlTest) { "group-kind-mark auto" } else { "group-kind-mark" },
                     if member.tag == "direct" {
@@ -2650,15 +3475,41 @@ fn NodeRow(
             span { class: protocol_class(node.protocol), "{protocol_abbreviation(node.protocol)}" }
             span { class: "node-main",
                 strong { "{node.name}" }
-                small { "{node.endpoint()}" }
+                // The overview preview keeps one mono line: endpoint then protocol.
+                small { "{node.endpoint()} · {node.protocol.label()}" }
             }
-            span { class: "protocol-label", "{node.protocol.label()}" }
-            span { class: latency_class, title: latency_title, "{latency_label}" }
+            span { class: "protocol-label" }
+            LatencyCell {
+                result: latency_results().get(&node.tag).cloned(),
+                latency_label,
+                latency_class,
+                latency_title,
+            }
             if selected {
                 span { class: "selected-check", Icon { icon: LdCircleCheck, width: 19, height: 19 } }
             } else {
                 span { class: "row-chevron", Icon { icon: LdChevronRight, width: 18, height: 18 } }
             }
+        }
+    }
+}
+
+/// Latency column: meter bar plus the monospace millisecond figure from the
+/// design. The meter only fills once a probe really returned a value.
+#[component]
+fn LatencyCell(
+    result: Option<NodeLatency>,
+    latency_label: String,
+    latency_class: &'static str,
+    latency_title: String,
+) -> Element {
+    let (fill, tone) = latency_meter(result.as_ref());
+    rsx! {
+        span { class: "latency-cell", title: latency_title,
+            span { class: "latency-meter", aria_hidden: "true",
+                span { class: "latency-meter-fill {tone}", style: "width: {fill}%" }
+            }
+            span { class: latency_class, "{latency_label}" }
         }
     }
 }
@@ -2740,6 +3591,18 @@ fn format_latency(result: Option<&NodeLatency>) -> (String, &'static str, String
     }
 }
 
+/// Latency meter shown next to the millisecond figure: the bar shrinks as the
+/// probe gets slower, and stays empty until a node is actually measured.
+fn latency_meter(result: Option<&NodeLatency>) -> (u8, &'static str) {
+    match result.and_then(|latency| latency.latency_ms) {
+        Some(ms) if ms < 80 => (100, "fast"),
+        Some(ms) if ms < 180 => (76, "fast"),
+        Some(ms) if ms < 350 => (52, "medium"),
+        Some(_) => (28, "slow"),
+        None => (0, "empty"),
+    }
+}
+
 #[component]
 fn EmptyNodes() -> Element {
     rsx! {
@@ -2787,7 +3650,7 @@ fn SubscriptionsView(
                     h2 { "订阅管理" }
                     span { "{subscriptions().len()} 个订阅" }
                 }
-                div { class: "toolbar-controls",
+                div { class: "toolbar-controls subscription-actions",
                     button {
                         class: "icon-button glass-control",
                         title: "刷新全部订阅",
@@ -2919,7 +3782,6 @@ fn SubscriptionRow(
 
     rsx! {
         div { class: if active { "subscription-row active" } else { "subscription-row" },
-            span { class: "subscription-icon", Icon { icon: LdRadioTower, width: 20, height: 20 } }
             div { class: "subscription-main",
                 strong { "{subscription.name}" }
                 small { "{display_source}" }
@@ -3110,9 +3972,9 @@ fn RulesView(
     tunnel_mode: Signal<TunnelMode>,
     mut rule_sets_busy: Signal<bool>,
     config_script_enabled: Signal<bool>,
+    mut active_tab: Signal<RulesTab>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
-    let mut active_tab = use_signal(|| RulesTab::Routing);
     let mut editor_open = use_signal(|| false);
     let mut editing_id = use_signal(|| None::<u64>);
     let mut draft_match = use_signal(|| CustomRuleMatch::DomainSuffix);
@@ -3251,116 +4113,130 @@ fn RulesView(
             }
 
             if active_tab() == RulesTab::Dns {
-                div { class: "dns-editor",
-                    label { class: "dns-field",
+                div { class: "dns-list",
+                    div { class: "dns-table-header",
+                        span { "序号" }
+                        span { class: "dns-col-action", "解析动作" }
                         span { "域名后缀" }
-                        input {
-                            placeholder: "例如 et.net",
-                            value: "{dns_domain}",
-                            oninput: move |event| dns_domain.set(event.value()),
-                            onkeydown: move |event| {
-                                if event.key() == Key::Enter {
-                                    add_dns_override_rule(
-                                        dns_domain,
-                                        dns_server,
-                                        dns_overrides,
-                                        dns_error,
-                                        connected(),
-                                        toast,
-                                    );
-                                }
-                            },
-                        }
-                    }
-                    label { class: "dns-field",
                         span { "DNS 服务器" }
-                        input {
-                            placeholder: "例如 100.100.100.101",
-                            value: "{dns_server}",
-                            oninput: move |event| dns_server.set(event.value()),
-                            onkeydown: move |event| {
-                                if event.key() == Key::Enter {
-                                    add_dns_override_rule(
-                                        dns_domain,
-                                        dns_server,
-                                        dns_overrides,
-                                        dns_error,
-                                        connected(),
-                                        toast,
-                                    );
-                                }
-                            },
+                        span { "启用" }
+                        span { "操作" }
+                    }
+                    if dns_rules.is_empty() {
+                        div { class: "dns-empty-row",
+                            Icon { icon: LdGlobe, width: 18, height: 18 }
+                            strong { "尚未配置专用 DNS" }
+                            small { "为指定域名后缀固定 DNS，避免公共 DNS 解析到错误地址" }
                         }
                     }
-                    button {
-                        class: "secondary-button dns-add-button",
-                        title: "添加专用 DNS 规则",
-                        onclick: move |_| {
-                            add_dns_override_rule(
-                                dns_domain,
-                                dns_server,
-                                dns_overrides,
-                                dns_error,
-                                connected(),
-                                toast,
-                            );
-                        },
-                        Icon { icon: LdPlus, width: 15, height: 15 }
-                        "添加"
+                    for (index, rule) in dns_rules.into_iter().enumerate() {
+                        div {
+                            class: if rule.enabled { "dns-row" } else { "dns-row disabled" },
+                            key: "{rule.id}",
+                            span { class: "dns-index", "{index + 1:02}" }
+                            span { class: "dns-rule-action",
+                                Icon { icon: LdGlobe, width: 14, height: 14 }
+                                "专用 DNS"
+                            }
+                            span { class: "dns-rule-domain", title: "{rule.domain_suffix}", "{rule.domain_suffix}" }
+                            span { class: "dns-rule-server", title: "{rule.server}", "{rule.server}" }
+                            label {
+                                class: "rule-enabled-toggle",
+                                title: if rule.enabled { "停用这条规则" } else { "启用这条规则" },
+                                input {
+                                    r#type: "checkbox",
+                                    aria_label: if rule.enabled { "停用 {rule.domain_suffix} 的专用 DNS" } else { "启用 {rule.domain_suffix} 的专用 DNS" },
+                                    checked: rule.enabled,
+                                    onchange: move |event| {
+                                        let checked = event.checked();
+                                        dns_overrides.write().iter_mut().for_each(|item| {
+                                            if item.id == rule.id {
+                                                item.enabled = checked;
+                                            }
+                                        });
+                                        notify_rule_change(connected(), toast);
+                                    },
+                                }
+                                span { class: "switch" }
+                            }
+                            button {
+                                class: "icon-button danger",
+                                aria_label: "删除 {rule.domain_suffix} 的专用 DNS",
+                                title: "删除",
+                                onclick: move |_| {
+                                    dns_overrides.write().retain(|item| item.id != rule.id);
+                                    notify_rule_change(connected(), toast);
+                                },
+                                Icon { icon: LdTrash2, width: 16, height: 16 }
+                            }
+                        }
+                    }
+                    // Inline "add row" pinned to the bottom of the list, per design.
+                    div { class: "dns-add-row",
+                        label { class: "dns-add-field",
+                            span { class: "sr-only", "域名后缀" }
+                            input {
+                                placeholder: "添加域名后缀，例如 et.net",
+                                aria_label: "域名后缀",
+                                value: "{dns_domain}",
+                                oninput: move |event| dns_domain.set(event.value()),
+                                onkeydown: move |event| {
+                                    if event.key() == Key::Enter {
+                                        add_dns_override_rule(
+                                            dns_domain,
+                                            dns_server,
+                                            dns_overrides,
+                                            dns_error,
+                                            connected(),
+                                            toast,
+                                        );
+                                    }
+                                },
+                            }
+                        }
+                        label { class: "dns-add-field",
+                            span { class: "sr-only", "DNS 服务器" }
+                            input {
+                                placeholder: "DNS 服务器，例如 100.100.100.101",
+                                aria_label: "DNS 服务器",
+                                value: "{dns_server}",
+                                oninput: move |event| dns_server.set(event.value()),
+                                onkeydown: move |event| {
+                                    if event.key() == Key::Enter {
+                                        add_dns_override_rule(
+                                            dns_domain,
+                                            dns_server,
+                                            dns_overrides,
+                                            dns_error,
+                                            connected(),
+                                            toast,
+                                        );
+                                    }
+                                },
+                            }
+                        }
+                        button {
+                            class: "secondary-button compact dns-add-button",
+                            title: "添加专用 DNS 规则",
+                            onclick: move |_| {
+                                add_dns_override_rule(
+                                    dns_domain,
+                                    dns_server,
+                                    dns_overrides,
+                                    dns_error,
+                                    connected(),
+                                    toast,
+                                );
+                            },
+                            Icon { icon: LdPlus, width: 15, height: 15 }
+                            "添加"
+                        }
                     }
                 }
                 if let Some(message) = dns_error() {
                     div { class: "inline-note", role: "alert",
                         Icon { icon: LdCircleAlert, width: 16, height: 16 }
                         span { "{message}" }
-                    }
-                }
-                if dns_rules.is_empty() {
-                    div { class: "large-empty dns-workspace-empty",
-                        span { class: "empty-icon", Icon { icon: LdGlobe, width: 28, height: 28 } }
-                        strong { "尚未配置专用 DNS" }
-                        small { "为指定域名后缀固定 DNS，避免公共 DNS 解析到错误地址" }
-                    }
-                } else {
-                    div { class: "dns-list",
-                        for rule in dns_rules {
-                            div {
-                                class: if rule.enabled { "dns-row" } else { "dns-row disabled" },
-                                key: "{rule.id}",
-                                span { class: "dns-rule-domain", title: "{rule.domain_suffix}", "{rule.domain_suffix}" }
-                                span { class: "dns-rule-arrow", Icon { icon: LdChevronRight, width: 14, height: 14 } }
-                                span { class: "dns-rule-server", title: "{rule.server}", "{rule.server}" }
-                                label {
-                                    class: "rule-enabled-toggle",
-                                    title: if rule.enabled { "停用这条规则" } else { "启用这条规则" },
-                                    input {
-                                        r#type: "checkbox",
-                                        aria_label: if rule.enabled { "停用 {rule.domain_suffix} 的专用 DNS" } else { "启用 {rule.domain_suffix} 的专用 DNS" },
-                                        checked: rule.enabled,
-                                        onchange: move |event| {
-                                            let checked = event.checked();
-                                            dns_overrides.write().iter_mut().for_each(|item| {
-                                                if item.id == rule.id {
-                                                    item.enabled = checked;
-                                                }
-                                            });
-                                            notify_rule_change(connected(), toast);
-                                        },
-                                    }
-                                    span { class: "switch" }
-                                }
-                                button {
-                                    class: "icon-button danger",
-                                    aria_label: "删除 {rule.domain_suffix} 的专用 DNS",
-                                    title: "删除",
-                                    onclick: move |_| {
-                                        dns_overrides.write().retain(|item| item.id != rule.id);
-                                        notify_rule_change(connected(), toast);
-                                    },
-                                    Icon { icon: LdTrash2, width: 16, height: 16 }
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -3417,7 +4293,7 @@ fn RulesView(
                             && (draft_match() == CustomRuleMatch::ProcessName
                                 || draft_match() == CustomRuleMatch::ProcessPath)
                         {
-                            div { class: "rule-field rule-value-field",
+                            div { class: "rule-field",
                                 span { "匹配内容" }
                                 div { class: "rule-value-row",
                                     input {
@@ -3465,7 +4341,7 @@ fn RulesView(
                                 }
                             }
                         } else {
-                        label { class: "rule-field rule-value-field",
+                        label { class: "rule-field",
                             span { "匹配内容" }
                             input {
                                 value: draft_value,
@@ -3561,6 +4437,13 @@ fn RulesView(
                 }
             } else {
                 div { class: "rule-list",
+                    div { class: "rule-table-header",
+                        span { "序号" }
+                        span { "动作" }
+                        span { "匹配内容 / 类型" }
+                        span { "启用" }
+                        span { "操作" }
+                    }
                     for (index, rule) in stored.into_iter().enumerate() {
                         RuleListItem {
                             key: "{rule.id}",
@@ -4080,9 +4963,11 @@ fn LogsView(
     mut logs: Signal<Vec<CoreLogEntry>>,
     connected: Signal<bool>,
     mut collection_paused: Signal<bool>,
+    core_version: Signal<Option<String>>,
+    mut filter: Signal<LogFilter>,
+    mut search: Signal<String>,
+    on_start: EventHandler<()>,
 ) -> Element {
-    let mut filter = use_signal(|| LogFilter::Routes);
-    let mut search = use_signal(String::new);
     let stored = logs();
     let route_count = stored.iter().filter(|entry| entry.route.is_some()).count();
     let direct_count = stored
@@ -4103,117 +4988,110 @@ fn LogsView(
             entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Block)
         })
         .count();
+    let raw_count = stored.len() - route_count;
     let query = search().trim().to_ascii_lowercase();
-    let visible_logs: Vec<CoreLogEntry> = stored
-        .iter()
-        .rev()
-        .filter(|entry| log_matches_filter(entry, filter()))
-        .filter(|entry| log_matches_search(entry, &query))
-        .cloned()
-        .collect();
+    let visible_logs = visible_log_entries(&stored, filter(), &query);
     let visible_count = visible_logs.len();
+    // The collector only runs while the core is up and this page is open, so the
+    // chip has three real states instead of a fake pause button.
+    let collector_class = if !connected() {
+        "log-collection-toggle stopped"
+    } else if collection_paused() {
+        "log-collection-toggle paused"
+    } else {
+        "log-collection-toggle collecting"
+    };
+    let collector_label = if !connected() {
+        "已停止"
+    } else if collection_paused() {
+        "已暂停"
+    } else {
+        "采集中"
+    };
 
     rsx! {
+        // Count strip doubles as the filter: each chip is one decision tally,
+        // the active one carries the outline, exactly like the design.
+        div { class: "log-stats", aria_label: "日志统计", role: "status",
+            for (label, value, tone, chip_filter) in [
+                ("全部路由", route_count, "total", LogFilter::Routes),
+                ("代理", proxy_count, "proxy", LogFilter::Proxy),
+                ("直连", direct_count, "direct", LogFilter::Direct),
+                ("拦截", block_count, "block", LogFilter::Block),
+                ("内核日志", raw_count, "raw", LogFilter::Raw),
+            ] {
+                button {
+                    class: if filter() == chip_filter { format!("log-stat active {tone}") } else { format!("log-stat {tone}") },
+                    key: "{label}",
+                    aria_pressed: filter() == chip_filter,
+                    onclick: move |_| filter.set(chip_filter),
+                    span { class: "log-stat-bar {tone}", aria_hidden: "true" }
+                    div {
+                        span { class: "log-stat-label", "{label}" }
+                        strong { class: "log-stat-value", "{value}" }
+                    }
+                }
+            }
+        }
+        div { class: "log-controls",
+            label { class: "search-field log-search",
+                Icon { icon: LdSearch, width: 17, height: 17 }
+                input {
+                    value: search,
+                    placeholder: "搜索域名、IP、节点",
+                    oninput: move |event| search.set(event.value()),
+                }
+            }
+            div { class: "log-toolbar-actions",
+                button {
+                    class: collector_class,
+                    title: if connected() {
+                        if collection_paused() { "恢复采集内核日志" } else { "暂停采集内核日志" }
+                    } else {
+                        "内核未运行，日志采集已停止"
+                    },
+                    disabled: !connected(),
+                    onclick: move |_| collection_paused.toggle(),
+                    if connected() && collection_paused() {
+                        Icon { icon: LdPlay, width: 14, height: 14 }
+                    } else if connected() {
+                        Icon { icon: LdPause, width: 14, height: 14 }
+                    } else {
+                        span { class: "status-badge-dot" }
+                    }
+                    span { class: "log-collection-label", "{collector_label}" }
+                }
+                span { class: "log-controls-hint", "缓冲区 {stored.len()} 条记录" }
+            }
+        }
         section { class: "workspace-section log-workspace glass-surface",
-            div { class: "workspace-toolbar log-toolbar",
-                div {
-                    p { class: "eyebrow", "CORE LOGS" }
-                    h2 { "连接日志" }
-                    span { "{route_count} 条路由 · {stored.len()} 条记录" }
-                }
-                div { class: "toolbar-controls log-toolbar-actions",
-                    button {
-                        class: if !connected() {
-                            "log-collection-toggle stopped"
-                        } else if collection_paused() {
-                            "log-collection-toggle paused"
-                        } else {
-                            "log-collection-toggle collecting"
-                        },
-                        title: if !connected() {
-                            "内核未运行"
-                        } else if collection_paused() {
-                            "继续采集日志"
-                        } else {
-                            "暂停采集日志"
-                        },
-                        aria_pressed: collection_paused(),
-                        disabled: !connected(),
-                        onclick: move |_| {
-                            let paused = collection_paused();
-                            collection_paused.set(!paused);
-                        },
-                        if connected() && !collection_paused() {
-                            Icon { icon: LdPause, width: 14, height: 14 }
-                            span { class: "log-collection-label", "实时采集" }
-                        } else if connected() {
-                            Icon { icon: LdPlay, width: 14, height: 14 }
-                            span { class: "log-collection-label", "已暂停" }
-                        } else {
-                            Icon { icon: LdPause, width: 14, height: 14 }
-                            span { class: "log-collection-label", "已停止" }
-                        }
-                    }
-                    button {
-                        class: "icon-button glass-control danger",
-                        title: "清空日志",
-                        disabled: stored.is_empty(),
-                        onclick: move |_| logs.write().clear(),
-                        Icon { icon: LdTrash2, width: 17, height: 17 }
-                    }
-                }
-            }
-            div { class: "log-controls",
-                div { class: "log-segmented-control", aria_label: "日志筛选",
-                    button {
-                        class: if filter() == LogFilter::Routes { "active" } else { "" },
-                        onclick: move |_| filter.set(LogFilter::Routes),
-                        "路由 {route_count}"
-                    }
-                    button {
-                        class: if filter() == LogFilter::All { "active" } else { "" },
-                        onclick: move |_| filter.set(LogFilter::All),
-                        "全部 {stored.len()}"
-                    }
-                    button {
-                        class: if filter() == LogFilter::Direct { "active" } else { "" },
-                        onclick: move |_| filter.set(LogFilter::Direct),
-                        "直连 {direct_count}"
-                    }
-                    button {
-                        class: if filter() == LogFilter::Proxy { "active" } else { "" },
-                        onclick: move |_| filter.set(LogFilter::Proxy),
-                        "代理 {proxy_count}"
-                    }
-                    button {
-                        class: if filter() == LogFilter::Block { "active" } else { "" },
-                        onclick: move |_| filter.set(LogFilter::Block),
-                        "拦截 {block_count}"
-                    }
-                }
-                label { class: "search-field log-search",
-                    Icon { icon: LdSearch, width: 17, height: 17 }
-                    input {
-                        value: search,
-                        placeholder: "搜索域名、IP、节点",
-                        oninput: move |event| search.set(event.value()),
-                    }
-                }
-            }
             if visible_logs.is_empty() {
                 div { class: "large-empty log-empty",
                     span { class: "empty-icon", Icon { icon: LdScrollText, width: 27, height: 27 } }
                     strong {
                         if connected() { "暂无匹配日志" } else { "连接后显示日志" }
                     }
+                    p {
+                        "启动代理后，每条连接的目标域名、命中链路与动作都会实时写入。当前 {route_count} 条路由 · {stored.len()} 条记录。"
+                    }
+                    if !connected() {
+                        button {
+                            class: "primary-button compact log-start-button",
+                            onclick: move |_| on_start.call(()),
+                            Icon { icon: LdPlay, width: 16, height: 16 }
+                            span { "启动代理开始采集" }
+                        }
+                    }
+                    small { class: "log-empty-hint", "{core_build_hint(core_version(), connected())}" }
                 }
             } else {
                 div { class: "log-list", aria_label: "内核日志",
                     div { class: "log-table-header",
-                        span { "时间 / 来源" }
-                        span { "路由" }
+                        span { "时间" }
+                        span { "动作" }
                         span { "目标" }
-                        span { "出口" }
+                        span { class: "log-col-chain", "命中链路" }
+                        span { "出口节点" }
                     }
                     for entry in visible_logs {
                         LogRow { entry }
@@ -4222,6 +5100,168 @@ fn LogsView(
                 div { class: "log-list-footer", "当前显示 {visible_count} 条" }
             }
         }
+    }
+}
+
+/// Flatten the visible log entries into CSV cells, oldest first. Only fields the
+/// core really reports are exported: the design's per-connection byte counts and
+/// timings are not part of the log model, so they stay out of the file.
+fn log_export_rows(entries: &[CoreLogEntry]) -> Vec<Vec<String>> {
+    let mut rows = vec![vec![
+        "时间".to_string(),
+        "级别".to_string(),
+        "动作".to_string(),
+        "目标".to_string(),
+        "类型".to_string(),
+        "端口".to_string(),
+        "出口类型".to_string(),
+        "出口节点".to_string(),
+        "分组链路".to_string(),
+        "来源 IP".to_string(),
+        "原始消息".to_string(),
+    ]];
+    for entry in entries.iter().rev() {
+        match entry.route.as_ref() {
+            Some(route) => rows.push(vec![
+                entry.timestamp.clone(),
+                entry.level.clone(),
+                route_decision_label(route.decision).to_string(),
+                route.host.clone(),
+                route_target_kind_label(route.target_kind).to_string(),
+                route
+                    .port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                route.outbound_type.clone(),
+                route.outbound_tag.clone(),
+                route_group_chain(route),
+                route.source_ip.clone().unwrap_or_else(|| "-".to_string()),
+                entry.message.clone(),
+            ]),
+            None => rows.push(vec![
+                entry.timestamp.clone(),
+                entry.level.clone(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                entry.message.clone(),
+            ]),
+        }
+    }
+    rows
+}
+
+/// Script that turns the received rows into a CSV blob and clicks a temporary
+/// download anchor. The BOM keeps Excel from mangling the Chinese headers.
+fn download_csv_script(file_name: &str) -> String {
+    r#"
+const rows = await dioxus.recv();
+const csv = rows
+    .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
+    .join('\r\n');
+const blob = new Blob([`\ufeff${csv}`], { type: 'text/csv;charset=utf-8' });
+const url = URL.createObjectURL(blob);
+const anchor = document.createElement('a');
+anchor.href = url;
+anchor.download = __FILE_NAME__;
+document.body.appendChild(anchor);
+anchor.click();
+anchor.remove();
+setTimeout(() => URL.revokeObjectURL(url), 1_000);
+await dioxus.send(true);
+"#
+    .replace("__FILE_NAME__", &format!("{file_name:?}"))
+}
+
+async fn download_csv(file_name: &str, rows: Vec<Vec<String>>) -> Result<(), String> {
+    let eval = document::eval(&download_csv_script(file_name));
+    eval.send(rows).map_err(|error| error.to_string())?;
+    eval.await.map(|_| ()).map_err(|error| error.to_string())
+}
+
+/// Subtitle under the Kitty Pro wordmark: which sing-box build is embedded.
+fn about_build_label(core_version: Option<String>, platform: &str) -> String {
+    match core_version {
+        Some(version) => format!("sing-box {version} · {platform}"),
+        None => format!("sing-box 未就绪 · {platform}"),
+    }
+}
+
+/// Plain-text diagnostic blob the user can paste into a bug report. Nothing in
+/// here is invented: every line mirrors a state the UI already shows.
+#[allow(clippy::too_many_arguments)]
+fn build_diagnostic_report(
+    core_state: String,
+    core_version: Option<String>,
+    platform: &str,
+    tunnel_mode: TunnelMode,
+    tun_enabled: bool,
+    allow_lan: bool,
+    node_count: usize,
+    subscription_count: usize,
+    rule_count: usize,
+    dns_count: usize,
+) -> String {
+    format!(
+        "Kitty Pro 诊断信息\n\
+         界面平台: {platform}\n\
+         内核状态: {state_label} ({core_state})\n\
+         内核版本: {core_version}\n\
+         分流模式: {mode}\n\
+         TUN: {tun} · 局域网: {lan} ({endpoint})\n\
+         节点: {node_count} · 订阅: {subscription_count}\n\
+         自定义规则: {rule_count} · 专用 DNS: {dns_count}",
+        state_label = core_state_label(&core_state),
+        core_version = core_version.unwrap_or_else(|| "未检测到版本".to_string()),
+        mode = mode_label(tunnel_mode),
+        tun = if tun_enabled { "开启" } else { "关闭" },
+        lan = if allow_lan { "开启" } else { "关闭" },
+        endpoint = proxy_port_label(allow_lan),
+    )
+}
+
+/// Script that writes the received string to the clipboard. Falls back to a
+/// hidden textarea + execCommand so it still works on non-secure origins.
+fn copy_to_clipboard_script() -> String {
+    r#"
+const text = await dioxus.recv();
+try {
+    await navigator.clipboard.writeText(text);
+} catch (_) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand('copy');
+    area.remove();
+}
+await dioxus.send(true);
+"#
+    .to_string()
+}
+
+async fn copy_to_clipboard(text: String) -> Result<(), String> {
+    let eval = document::eval(&copy_to_clipboard_script());
+    eval.send(text).map_err(|error| error.to_string())?;
+    eval.await.map(|_| ()).map_err(|error| error.to_string())
+}
+
+/// Footer hint of the log empty state: which core is idle, and whether the
+/// collector is waiting for a connection.
+fn core_build_hint(core_version: Option<String>, connected: bool) -> String {
+    let build = core_version.unwrap_or_else(|| "sing-box".to_string());
+    if connected {
+        format!("内核 {build} · 日志采集中")
+    } else {
+        format!("内核 {build} · 日志采集待启动")
     }
 }
 
@@ -4251,17 +5291,6 @@ fn LogRow(entry: CoreLogEntry) -> Element {
                         },
                         {route_decision_label(route.decision)}
                     }
-                    if let Some(group) = route_primary_group(&route) {
-                        small {
-                            class: match route.decision {
-                                RouteDecision::Direct => "route-decision-group direct",
-                                RouteDecision::Proxy => "route-decision-group proxy",
-                                RouteDecision::Block => "route-decision-group block",
-                            },
-                            title: route_group_chain(&route),
-                            "{group}"
-                        }
-                    }
                 }
                 div { class: "log-target", title: route.target.clone(),
                     strong { "{route.host}" }
@@ -4271,6 +5300,11 @@ fn LogRow(entry: CoreLogEntry) -> Element {
                             " · {port}"
                         }
                     }
+                }
+                // The core only reports the outbound chain, never a rule name, so
+                // this column lists the real group hops instead of guessing a rule.
+                div { class: "log-chain",
+                    {route_chain_tags(&route)}
                 }
                 div { class: "log-outbound", title: route.outbound_tag.clone(),
                     strong { "{route.outbound_tag}" }
@@ -4288,7 +5322,7 @@ fn LogRow(entry: CoreLogEntry) -> Element {
 fn log_matches_filter(entry: &CoreLogEntry, filter: LogFilter) -> bool {
     match filter {
         LogFilter::Routes => entry.route.is_some(),
-        LogFilter::All => true,
+        LogFilter::Raw => entry.route.is_none(),
         LogFilter::Direct => {
             entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Direct)
         }
@@ -4299,6 +5333,22 @@ fn log_matches_filter(entry: &CoreLogEntry, filter: LogFilter) -> bool {
             entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Block)
         }
     }
+}
+
+/// Newest first, after the chip filter and the free-text query. Shared with the
+/// topbar export so the CSV always matches what the page shows.
+fn visible_log_entries(
+    stored: &[CoreLogEntry],
+    filter: LogFilter,
+    query: &str,
+) -> Vec<CoreLogEntry> {
+    stored
+        .iter()
+        .rev()
+        .filter(|entry| log_matches_filter(entry, filter))
+        .filter(|entry| log_matches_search(entry, query))
+        .cloned()
+        .collect()
 }
 
 fn log_matches_search(entry: &CoreLogEntry, query: &str) -> bool {
@@ -4320,14 +5370,24 @@ fn log_matches_search(entry: &CoreLogEntry, query: &str) -> bool {
     })
 }
 
-fn route_primary_group(route: &RouteLogDetail) -> Option<&str> {
-    route
+/// Group hops the core really reported for this connection, rendered as tags.
+/// sing-box logs no rule name, so the chain is the closest honest answer to the
+/// design's "匹配规则" column; a direct hop without a chain renders as "-".
+fn route_chain_tags(route: &RouteLogDetail) -> Element {
+    let hops = route
         .outbound_chain
         .iter()
-        .find(|tag| {
-            tag.as_str() != route.outbound_tag && !matches!(tag.as_str(), "direct" | "block")
-        })
-        .map(String::as_str)
+        .filter(|tag| tag.as_str() != route.outbound_tag)
+        .cloned()
+        .collect::<Vec<_>>();
+    if hops.is_empty() {
+        return rsx! { span { class: "log-chain-empty", "-" } };
+    }
+    rsx! {
+        for hop in hops {
+            span { class: "log-chain-tag", key: "{hop}", title: "{hop}", "{hop}" }
+        }
+    }
 }
 
 fn route_group_chain(route: &RouteLogDetail) -> String {
@@ -4814,7 +5874,7 @@ fn DesktopAutostartSettings() -> Element {
         busy.set(false);
     });
     rsx! {
-        section { class: "settings-section glass-surface",
+        section { class: "settings-section autostart-settings glass-surface",
             div { class: "section-heading", h2 { "桌面启动" } }
             label { class: "setting-row toggle-row",
                 div {
@@ -4951,7 +6011,9 @@ fn SettingsView(
     let mut script_check_busy = use_signal(|| false);
     let mut script_editor_open = use_signal(|| false);
     let mut script_draft = use_signal(String::new);
-    let mut tun_busy = use_signal(|| false);
+    let mut copy_busy = use_signal(|| false);
+    let mut copy_env_busy = use_signal(|| false);
+    let tun_busy = use_signal(|| false);
     let toast = use_context::<ToastManager>();
     let tun_proxy_server_nameservers = proxy_server_nameservers.clone();
     let allow_lan_proxy_server_nameservers = proxy_server_nameservers.clone();
@@ -4960,7 +6022,9 @@ fn SettingsView(
 
     rsx! {
         div { class: "settings-grid",
-            section { class: "settings-section glass-surface",
+            // Design row A: the core card (runtime + JS override) sits next to
+            // the routing card, so both fit above the fold on a laptop screen.
+            section { class: "settings-section core-settings glass-surface",
                 div { class: "section-heading",
                     div {
                         p { class: "eyebrow", "CORE" }
@@ -4982,28 +6046,15 @@ fn SettingsView(
                         span { "{note}" }
                     }
                 }
-            }
-
-            section { class: "settings-section script-settings glass-surface",
-                div { class: "section-heading",
-                    div {
-                        p { class: "eyebrow", "CONFIG SCRIPT" }
-                        h2 { "JavaScript 配置覆写" }
-                    }
-                    span {
-                        class: if config_script_enabled() { "status-badge ready" } else { "status-badge" },
-                        if config_script_enabled() { "已启用" } else { "未启用" }
-                    }
-                }
                 div { class: "setting-row script-setting-row",
                     span { class: "setting-icon", Icon { icon: LdScrollText, width: 19, height: 19 } }
                     div {
-                        strong { "main(config)" }
+                        strong { "JavaScript 配置覆写" }
                         small {
                             if config_script().trim().is_empty() {
-                                "尚未配置"
+                                "main(config) · 尚未配置"
                             } else {
-                                "QuickJS · 已配置 {config_script().chars().count()} 个字符"
+                                "main(config) · QuickJS · {config_script().chars().count()} 字符"
                             }
                         }
                     }
@@ -5030,35 +6081,18 @@ fn SettingsView(
                 }
             }
 
-            {autostart_settings}
-
-            SyncSettings {
-                subscriptions,
-                active_subscription_id,
-                nodes,
-                selected_tag,
-                custom_rules,
-                dns_overrides,
-                group_selections,
-                tunnel_mode,
-                tun_enabled,
-                allow_lan,
-                dark_mode,
-                config_script_enabled,
-                config_script,
-            }
-
-            section { class: "settings-section glass-surface",
+            // Design row A pairs routing with the core card.
+            section { class: "settings-section routing-settings glass-surface",
                 div { class: "section-heading",
                     div {
                         p { class: "eyebrow", "ROUTING" }
                         h2 { "路由模式" }
                     }
                 }
-                div { class: "segmented-control wide",
-                    button { class: if tunnel_mode() == TunnelMode::Rule { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Rule), "规则" }
-                    button { class: if tunnel_mode() == TunnelMode::Global { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Global), "全局" }
-                    button { class: if tunnel_mode() == TunnelMode::Direct { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Direct), "直连" }
+                div { class: "segmented-control wide", aria_label: "分流模式",
+                    button { class: if tunnel_mode() == TunnelMode::Rule { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Rule), "规则模式" }
+                    button { class: if tunnel_mode() == TunnelMode::Global { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Global), "全局代理" }
+                    button { class: if tunnel_mode() == TunnelMode::Direct { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Direct), "全局直连" }
                 }
                 if !cfg!(target_os = "android") {
                 label { class: "setting-row toggle-row",
@@ -5083,154 +6117,43 @@ fn SettingsView(
                                 || system_proxy_busy()
                                 || runtime_action_busy(),
                             onclick: move |event| {
-                            event.prevent_default();
-                            let enabled = !tun_enabled();
-                            let proxy_server_nameservers =
-                                tun_proxy_server_nameservers.clone();
-                            let blocked = core_busy()
-                                || core_restarting()
-                                || system_proxy_busy()
-                                || runtime_action_busy();
-                            if !blocked {
-                                runtime_action_busy.set(true);
-                                tun_busy.set(true);
-                                core_restarting.set(true);
-                            }
-                            async move {
-                                if blocked {
-                                    return;
-                                }
-                                let previous_enabled = tun_enabled();
-                                let request = ConnectionRequest {
-                                    nodes: nodes(),
-                                    selected_tag: selected_tag(),
-                                    proxy_server_nameservers,
-                                    mode: tunnel_mode(),
-                                    tun: enabled,
-                                    allow_lan: allow_lan(),
-                                    dns_overrides: dns_overrides(),
-                                    custom_rules: connection_custom_rules(
-                                        config_script_enabled(),
-                                        &config_script(),
-                                        custom_rules(),
-                                    ),
-                                    config_script: if config_script_enabled()
-                                        && !config_script().trim().is_empty()
-                                    {
-                                        Some(config_script())
-                                    } else {
-                                        None
+                                event.prevent_default();
+                                let enabled = !tun_enabled();
+                                let request = build_connection_request(
+                                    nodes(),
+                                    selected_tag(),
+                                    tun_proxy_server_nameservers.clone(),
+                                    RuntimeSettings {
+                                        tunnel_mode,
+                                        tun_enabled,
+                                        allow_lan,
+                                        custom_rules,
+                                        dns_overrides,
+                                        config_script_enabled,
+                                        config_script,
                                     },
-                                    group_selections: group_selections(),
-                                };
-                                if !connected() {
-                                    let result = if enabled {
-                                        api::prepare_tun_mode(request.clone()).await
-                                    } else {
-                                        api::release_tun_mode().await
-                                    };
-                                    match result {
-                                        Ok(()) => {
-                                            tun_enabled.set(enabled);
-                                            toast.success(if enabled {
-                                                "TUN 权限已准备，启动内核时直接生效"
-                                            } else {
-                                                "TUN 模式已关闭"
-                                            });
-                                        }
-                                        Err(error) => {
-                                            tun_enabled.set(previous_enabled);
-                                            if !enabled {
-                                                // The local `connected` state
-                                                // can be stale (page reload,
-                                                // failed status poll), so the
-                                                // core may actually still be
-                                                // running and refuse a bare
-                                                // helper release. Refresh the
-                                                // real state and fall back to
-                                                // restarting the core without
-                                                // TUN when that is the case.
-                                                match api::core_status().await {
-                                                    Ok(status)
-                                                        if status.state == "running" =>
-                                                    {
-                                                        match api::restart_core(request).await {
-                                                            Ok(status) => {
-                                                                let is_running =
-                                                                    status.state == "running";
-                                                                tun_enabled.set(false);
-                                                                connected.set(is_running);
-                                                                core_state.set(status.state);
-                                                                core_version.set(status.version);
-                                                                core_note.set(status.note);
-                                                                toast.success("TUN 模式已关闭");
-                                                            }
-                                                            Err(restart_error) => {
-                                                                toast.error(format!(
-                                                                    "关闭 TUN 失败: {restart_error}"
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    Ok(_) => {
-                                                        toast.error(format!(
-                                                            "关闭 TUN 失败: {error}"
-                                                        ));
-                                                    }
-                                                    Err(status_error) => {
-                                                        toast.error(format!(
-                                                            "关闭 TUN 失败: {error}；刷新内核状态失败: {status_error}"
-                                                        ));
-                                                    }
-                                                }
-                                            } else {
-                                                toast.error(format!(
-                                                    "TUN 权限准备失败: {error}"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    tun_busy.set(false);
-                                    core_restarting.set(false);
-                                    runtime_action_busy.set(false);
-                                    return;
-                                }
-
-                                match api::restart_core(request).await {
-                                    Ok(status) => {
-                                        let is_running = status.state == "running";
-                                        tun_enabled.set(enabled);
-                                        connected.set(is_running);
-                                        core_state.set(status.state);
-                                        core_version.set(status.version);
-                                        core_note.set(status.note);
-                                        toast.success(if enabled {
-                                            "TUN 模式已启用"
-                                        } else {
-                                            "TUN 模式已关闭"
-                                        });
-                                    }
-                                    Err(error) => {
-                                        tun_enabled.set(previous_enabled);
-                                        match api::core_status().await {
-                                            Ok(status) => {
-                                                connected.set(status.state == "running");
-                                                core_state.set(status.state);
-                                                core_version.set(status.version);
-                                                core_note.set(status.note);
-                                            }
-                                            Err(status_error) => {
-                                                core_note.set(Some(status_error.to_string()));
-                                            }
-                                        }
-                                        toast.error(format!("应用 TUN 设置失败: {error}"));
-                                    }
-                                }
-                                tun_busy.set(false);
-                                core_restarting.set(false);
-                                runtime_action_busy.set(false);
-                            }
-                        },
+                                    group_selections(),
+                                );
+                                spawn_tun_toggle(
+                                    enabled,
+                                    request,
+                                    tun_enabled,
+                                    tun_busy,
+                                    RuntimeSignals {
+                                        status: CoreStatusSignals {
+                                            connected,
+                                            core_restarting,
+                                            core_state,
+                                            core_version,
+                                            core_note,
+                                        },
+                                        core_busy,
+                                        system_proxy_busy,
+                                        runtime_action_busy,
+                                    },
+                                    toast,
+                                );
+                            },
                         }
                         span { class: "switch" }
                     }
@@ -5256,95 +6179,64 @@ fn SettingsView(
                             || system_proxy_busy()
                             || runtime_action_busy(),
                         onchange: move |event| {
-                            let proxy_server_nameservers =
-                                allow_lan_proxy_server_nameservers.clone();
-                            let blocked = core_busy()
-                                || core_restarting()
-                                || system_proxy_busy()
-                                || runtime_action_busy();
-                            if !blocked {
-                                runtime_action_busy.set(true);
-                            }
-                            async move {
-                                if blocked {
-                                    return;
-                                }
                                 let enabled = event.checked();
-                                if !connected() {
-                                    allow_lan.set(enabled);
-                                    toast.info(if enabled {
-                                        "局域网连接将在下次启动内核时生效"
-                                    } else {
-                                        "仅本机访问将在下次启动内核时生效"
-                                    });
-                                    runtime_action_busy.set(false);
-                                    return;
-                                }
-
-                                core_restarting.set(true);
-                                let request = ConnectionRequest {
-                                    nodes: nodes(),
-                                    selected_tag: selected_tag(),
-                                    proxy_server_nameservers,
-                                    mode: tunnel_mode(),
-                                    tun: tun_enabled(),
-                                    allow_lan: enabled,
-                                    dns_overrides: dns_overrides(),
-                                    custom_rules: connection_custom_rules(
-                                        config_script_enabled(),
-                                        &config_script(),
-                                        custom_rules(),
-                                    ),
-                                    config_script: if config_script_enabled()
-                                        && !config_script().trim().is_empty()
-                                    {
-                                        Some(config_script())
-                                    } else {
-                                        None
+                                let request = build_connection_request(
+                                    nodes(),
+                                    selected_tag(),
+                                    allow_lan_proxy_server_nameservers.clone(),
+                                    RuntimeSettings {
+                                        tunnel_mode,
+                                        tun_enabled,
+                                        allow_lan,
+                                        custom_rules,
+                                        dns_overrides,
+                                        config_script_enabled,
+                                        config_script,
                                     },
-                                    group_selections: group_selections(),
-                                };
-                                match api::restart_core(request).await {
-                                    Ok(status) => {
-                                        let is_running = status.state == "running";
-                                        allow_lan.set(enabled);
-                                        connected.set(is_running);
-                                        core_state.set(status.state);
-                                        core_version.set(status.version);
-                                        core_note.set(status.note);
-                                        toast.success(if enabled {
-                                            "已允许局域网连接，sing-box 内核已重启"
-                                        } else {
-                                            "已恢复仅本机访问，sing-box 内核已重启"
-                                        });
-                                    }
-                                    Err(error) => {
-                                        match api::core_status().await {
-                                            Ok(status) => {
-                                                connected.set(status.state == "running");
-                                                core_state.set(status.state);
-                                                core_version.set(status.version);
-                                                core_note.set(status.note);
-                                            }
-                                            Err(status_error) => {
-                                                core_note.set(Some(status_error.to_string()));
-                                            }
-                                        }
-                                        toast.error(format!(
-                                            "应用局域网监听设置失败: {error}"
-                                        ));
-                                    }
-                                }
-                                core_restarting.set(false);
-                                runtime_action_busy.set(false);
-                            }
-                        },
+                                    group_selections(),
+                                );
+                                spawn_allow_lan_toggle(
+                                    enabled,
+                                    request,
+                                    allow_lan,
+                                    RuntimeSignals {
+                                        status: CoreStatusSignals {
+                                            connected,
+                                            core_restarting,
+                                            core_state,
+                                            core_version,
+                                            core_note,
+                                        },
+                                        core_busy,
+                                        system_proxy_busy,
+                                        runtime_action_busy,
+                                    },
+                                    toast,
+                                );
+                            },
                     }
                     span { class: "switch" }
                 }
             }
 
-            section { class: "settings-section glass-surface",
+
+            SyncSettings {
+                subscriptions,
+                active_subscription_id,
+                nodes,
+                selected_tag,
+                custom_rules,
+                dns_overrides,
+                group_selections,
+                tunnel_mode,
+                tun_enabled,
+                allow_lan,
+                dark_mode,
+                config_script_enabled,
+                config_script,
+            }
+
+            section { class: "settings-section appearance-settings glass-surface",
                 div { class: "section-heading",
                     div {
                         p { class: "eyebrow", "APPEARANCE" }
@@ -5376,6 +6268,102 @@ fn SettingsView(
                     span { class: "setting-value", "简体中文" }
                 }
             }
+
+            section { class: "settings-section about-settings glass-surface",
+                div { class: "section-heading",
+                    div {
+                        p { class: "eyebrow", "ABOUT" }
+                        h2 { "诊断与关于" }
+                    }
+                }
+                div { class: "about-identity",
+                    span { class: "about-mark", aria_hidden: "true",
+                        dangerous_inner_html: BRAND_ICON_SVG,
+                    }
+                    div {
+                        strong { "Kitty Pro" }
+                        small { {about_build_label(core_version(), &platform)} }
+                    }
+                }
+                div { class: "about-facts",
+                    div { class: "about-fact",
+                        span { "内核状态" }
+                        strong { {core_state_label(&core_state())} }
+                    }
+                    div { class: "about-fact",
+                        span { "节点 / 订阅" }
+                        strong { "{nodes().len()} / {subscriptions().len()}" }
+                    }
+                    div { class: "about-fact",
+                        span { "自定义规则" }
+                        strong { "{custom_rules().len()}" }
+                    }
+                    div { class: "about-fact",
+                        span { "专用 DNS" }
+                        strong { "{dns_overrides().len()}" }
+                    }
+                }
+                div { class: "topbar-actions about-actions",
+                    button {
+                        class: "secondary-button compact",
+                        title: "复制内核与配置诊断信息",
+                        disabled: copy_busy(),
+                        onclick: move |_| {
+                            let payload = build_diagnostic_report(
+                                core_state(),
+                                core_version(),
+                                &platform,
+                                tunnel_mode(),
+                                tun_enabled(),
+                                allow_lan(),
+                                nodes().len(),
+                                subscriptions().len(),
+                                custom_rules().len(),
+                                dns_overrides().len(),
+                            );
+                            copy_busy.set(true);
+                            async move {
+                                match copy_to_clipboard(payload).await {
+                                    Ok(()) => toast.success("诊断信息已复制到剪贴板"),
+                                    Err(error) => toast.error(format!("复制失败: {error}")),
+                                }
+                                copy_busy.set(false);
+                            }
+                        },
+                        if copy_busy() {
+                            span { class: "spinner" }
+                        } else {
+                            Icon { icon: LdClipboardCopy, width: 16, height: 16 }
+                        }
+                        span { "复制诊断信息" }
+                    }
+                    button {
+                        class: "secondary-button compact",
+                        title: "复制代理环境变量",
+                        disabled: copy_env_busy(),
+                        onclick: move |_| {
+                            copy_env_busy.set(true);
+                            async move {
+                                match api::copy_proxy_environment_variables().await {
+                                    Ok(()) => toast.success("代理环境变量已复制"),
+                                    Err(error) => {
+                                        toast.error(format!("复制环境变量失败: {error}"));
+                                    }
+                                }
+                                copy_env_busy.set(false);
+                            }
+                        },
+                        if copy_env_busy() {
+                            span { class: "spinner" }
+                        } else {
+                            Icon { icon: LdTerminal, width: 16, height: 16 }
+                        }
+                        span { "复制环境变量" }
+                    }
+                }
+            }
+
+            {autostart_settings}
         }
 
         if script_editor_open() {
@@ -5536,6 +6524,25 @@ fn status_badge_class(state: &str) -> &'static str {
         "running" => "status-badge online",
         "stopped" => "status-badge ready",
         _ => "status-badge offline",
+    }
+}
+
+/// Topbar chip: the design keeps a connected core and an idle-but-ready core in
+/// the same amber family, and only escalates to coral when the core is gone.
+fn connection_chip_class(connected: bool, state: &str) -> &'static str {
+    match (connected, state) {
+        (true, _) => "status-badge online",
+        (false, "unavailable") => "status-badge offline",
+        _ => "status-badge pending",
+    }
+}
+
+fn connection_chip_label(connected: bool, state: &str) -> &'static str {
+    match (connected, state) {
+        (true, _) => "已连接",
+        (false, "unavailable") => "内核不可用",
+        (false, "checking") => "检测中",
+        _ => "未连接",
     }
 }
 
@@ -5774,6 +6781,64 @@ mod tests {
     }
 
     #[test]
+    fn node_focus_resolves_owner_source_and_status() {
+        let parsed =
+            proxy_core::parse_subscription("trojan://password@edge.example.com:443#Edge").nodes;
+        let subscriptions = vec![Subscription {
+            id: 7,
+            name: "Primary".to_string(),
+            source: "https://sub.example.com/path?token=secret".to_string(),
+            nodes: namespace_nodes(7, parsed.clone()),
+            proxy_server_nameservers: Vec::new(),
+            rejected_count: 0,
+        }];
+        let node = &subscriptions[0].nodes[0];
+        let groups = vec![ProxyGroup {
+            tag: "proxy".to_string(),
+            kind: ProxyGroupKind::Selector,
+            outbounds: vec![node.tag.clone()],
+            selected: node.tag.clone(),
+        }];
+        let mut latencies = HashMap::new();
+        latencies.insert(
+            node.tag.clone(),
+            NodeLatency {
+                tag: node.tag.clone(),
+                latency_ms: Some(42),
+                error: None,
+            },
+        );
+
+        let focus = node_focus_details(
+            &groups,
+            &subscriptions[0].nodes,
+            &subscriptions,
+            &node.tag,
+            &latencies,
+        )
+        .expect("focused node should resolve");
+
+        assert_eq!(focus.name, "Edge");
+        assert_eq!(focus.protocol, "Trojan");
+        assert_eq!(focus.endpoint, "edge.example.com:443");
+        assert_eq!(focus.group_label, "proxy · 手动选择");
+        assert_eq!(focus.status, "已选中 · 可用");
+        assert_eq!(focus.source, "https://sub.example.com");
+
+        let ungrouped = node_focus_details(
+            &[],
+            &subscriptions[0].nodes,
+            &[],
+            &node.tag,
+            &HashMap::new(),
+        )
+        .expect("an ungrouped node still has details");
+        assert_eq!(ungrouped.group_label, "未归组");
+        assert_eq!(ungrouped.status, "已选中 · 未测试");
+        assert_eq!(ungrouped.source, "本地内容");
+    }
+
+    #[test]
     fn empty_refresh_does_not_replace_existing_nodes() {
         let original = proxy_core::parse_subscription(
             "vless://11111111-1111-1111-1111-111111111111@old.example.com:443#Old",
@@ -5979,7 +7044,11 @@ mod tests {
         assert_eq!(format_data_rate(0), "0 B/s");
         assert_eq!(format_data_rate(1_536), "1.5 KiB/s");
         assert_eq!(format_data_amount(2 * 1024 * 1024), "2.0 MiB");
-        assert_eq!(traffic_chart_height(50, 100), "50%");
+        assert_eq!(traffic_bar_height(0, 100), "2px");
+        assert_eq!(traffic_bar_height(100, 100), "88%");
+        assert_eq!(format_uptime(0), "00:00");
+        assert_eq!(format_uptime(75), "01:15");
+        assert_eq!(format_uptime(3_725), "1:02:05");
     }
 
     #[test]
@@ -6144,5 +7213,70 @@ mod tests {
             rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
             vec![3, 2, 1]
         );
+    }
+
+    fn route_entry(sequence: u64) -> CoreLogEntry {
+        CoreLogEntry {
+            sequence,
+            timestamp: "12:00:00".to_string(),
+            level: "info".to_string(),
+            message: "outbound/proxy[AI]: connection to example.com:443".to_string(),
+            route: Some(RouteLogDetail {
+                decision: RouteDecision::Proxy,
+                target: "example.com:443".to_string(),
+                host: "example.com".to_string(),
+                port: Some(443),
+                target_kind: RouteTargetKind::Domain,
+                outbound_type: "proxy".to_string(),
+                outbound_tag: "AI".to_string(),
+                outbound_chain: vec!["proxy".to_string(), "AI".to_string()],
+                source_ip: Some("127.0.0.1".to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn csv_export_keeps_header_and_route_columns() {
+        let rows = log_export_rows(&[
+            route_entry(1),
+            CoreLogEntry {
+                sequence: 2,
+                timestamp: "12:00:01".to_string(),
+                level: "warn".to_string(),
+                message: "unsupported config field".to_string(),
+                route: None,
+            },
+        ]);
+        assert_eq!(rows[0][0], "时间");
+        assert_eq!(rows[0].len(), rows[1].len());
+        // Newest first, mirroring the on-screen order.
+        assert_eq!(rows[1][0], "12:00:01");
+        assert_eq!(rows[1][2], "-");
+        assert_eq!(rows[2][2], "代理");
+        assert_eq!(rows[2][3], "example.com");
+        // The chain column keeps only the group hops; the outbound itself is
+        // exported separately, so "AI" must not be repeated here.
+        assert_eq!(rows[2][8], "proxy");
+        assert_eq!(rows[2][7], "AI");
+    }
+
+    #[test]
+    fn diagnostic_report_lists_only_known_state() {
+        let report = build_diagnostic_report(
+            "running".to_string(),
+            Some("1.13.14".to_string()),
+            "macos",
+            TunnelMode::Rule,
+            true,
+            false,
+            3,
+            2,
+            10,
+            1,
+        );
+        assert!(report.contains("内核版本: 1.13.14"));
+        assert!(report.contains("TUN: 开启 · 局域网: 关闭 (本地代理 7890)"));
+        assert!(report.contains("节点: 3 · 订阅: 2"));
+        assert!(!report.contains("{"));
     }
 }
