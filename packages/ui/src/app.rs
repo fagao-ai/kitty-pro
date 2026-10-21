@@ -4021,7 +4021,17 @@ fn RulesView(
     let dns_enabled_count = dns_rules.iter().filter(|rule| rule.enabled).count();
     let mut dns_domain = use_signal(String::new);
     let mut dns_server = use_signal(String::new);
-    let dns_error = use_signal(|| None::<String>);
+    let mut dns_error = use_signal(|| None::<String>);
+    // The DNS tab adds rules through the same inline dialog as routing so both
+    // tabs keep an identical toolbar and list height when switching.
+    let mut dns_editor_open = use_signal(|| false);
+
+    let mut open_dns_editor = move || {
+        dns_domain.set(String::new());
+        dns_server.set(String::new());
+        dns_error.set(None);
+        dns_editor_open.set(true);
+    };
 
     rsx! {
         section {
@@ -4064,9 +4074,35 @@ fn RulesView(
                         }
                     }
                     if active_tab() == RulesTab::Routing {
-                        p { "{enabled_count} 条启用 · {total} 条规则" }
+                        // The rule-set refresh lives with the subtitle rather than
+                        // the toolbar so the tab control never slides sideways.
+                        div { class: "rules-sub-row",
+                            p { "{enabled_count} 条启用 · {total} 条规则" }
+                            button {
+                                class: "rules-refresh-button",
+                                title: "立即更新分流规则",
+                                aria_busy: rule_sets_busy(),
+                                disabled: rule_sets_busy() || override_active,
+                                onclick: move |_| async move {
+                                    rule_sets_busy.set(true);
+                                    match api::update_rule_sets(true).await {
+                                        Ok(_) => toast.success("分流规则已更新"),
+                                        Err(error) => toast.error(format!("分流规则更新失败: {error}")),
+                                    }
+                                    rule_sets_busy.set(false);
+                                },
+                                if rule_sets_busy() {
+                                    span { class: "spinner" }
+                                } else {
+                                    Icon { icon: LdRefreshCw, width: 13, height: 13 }
+                                }
+                                span { class: "rules-refresh-label", "更新规则" }
+                            }
+                        }
                     } else {
-                        p { "命中域名后缀用专用 DNS 解析并直连，任何分流模式都生效" }
+                        div { class: "rules-sub-row",
+                            p { "命中域名后缀用专用 DNS 解析并直连，任何分流模式都生效" }
+                        }
                     }
                 }
                 div { class: "toolbar-controls rules-toolbar-actions",
@@ -4082,39 +4118,122 @@ fn RulesView(
                             "专用 DNS {dns_total}"
                         }
                     }
-                    if active_tab() == RulesTab::Routing {
-                        button {
-                            class: "secondary-button compact",
-                            title: "立即更新分流规则",
-                            aria_busy: rule_sets_busy(),
-                            disabled: rule_sets_busy() || override_active,
-                            onclick: move |_| async move {
-                                rule_sets_busy.set(true);
-                                match api::update_rule_sets(true).await {
-                                    Ok(_) => toast.success("分流规则已更新"),
-                                    Err(error) => toast.error(format!("分流规则更新失败: {error}")),
-                                }
-                                rule_sets_busy.set(false);
-                            },
-                            if rule_sets_busy() {
-                                span { class: "spinner" }
+                    // Both tabs render exactly this control pair, so switching
+                    // tabs moves nothing: only the label counts change.
+                    button {
+                        class: "primary-button compact",
+                        disabled: if active_tab() == RulesTab::Routing {
+                            override_active || stored_rule_count >= MAX_CUSTOM_RULES
+                        } else {
+                            dns_total >= MAX_CUSTOM_RULES
+                        },
+                        onclick: move |_| {
+                            if active_tab() == RulesTab::Routing {
+                                open_new_editor();
                             } else {
-                                Icon { icon: LdRefreshCw, width: 17, height: 17 }
+                                open_dns_editor();
                             }
-                            span { class: "rules-refresh-label", "更新规则" }
-                        }
-                        button {
-                            class: "primary-button compact",
-                            disabled: override_active || stored_rule_count >= MAX_CUSTOM_RULES,
-                            onclick: move |_| open_new_editor(),
-                            Icon { icon: LdPlus, width: 17, height: 17 }
-                            span { "添加规则" }
-                        }
+                        },
+                        Icon { icon: LdPlus, width: 17, height: 17 }
+                        span { "添加规则" }
                     }
                 }
             }
 
             if active_tab() == RulesTab::Dns {
+                // Same inline dialog as the routing tab: the toolbar and the list
+                // keep identical geometry when the two tabs are switched.
+                if dns_editor_open() {
+                    div { class: "rule-editor",
+                        div { class: "rule-editor-grid dns-editor-grid",
+                            label { class: "rule-field",
+                                span { "域名后缀" }
+                                input {
+                                    value: dns_domain,
+                                    placeholder: "example.com",
+                                    spellcheck: "false",
+                                    oninput: move |event| {
+                                        dns_domain.set(event.value());
+                                        dns_error.set(None);
+                                    },
+                                    onkeydown: move |event| {
+                                        if event.key() == Key::Enter
+                                            && commit_dns_override(
+                                                dns_domain,
+                                                dns_server,
+                                                dns_overrides,
+                                                dns_error,
+                                                connected(),
+                                                toast,
+                                            )
+                                        {
+                                            dns_editor_open.set(false);
+                                        }
+                                    },
+                                }
+                            }
+                            label { class: "rule-field",
+                                span { "DNS 服务器" }
+                                input {
+                                    value: dns_server,
+                                    placeholder: "223.5.5.5",
+                                    spellcheck: "false",
+                                    oninput: move |event| {
+                                        dns_server.set(event.value());
+                                        dns_error.set(None);
+                                    },
+                                    onkeydown: move |event| {
+                                        if event.key() == Key::Enter
+                                            && commit_dns_override(
+                                                dns_domain,
+                                                dns_server,
+                                                dns_overrides,
+                                                dns_error,
+                                                connected(),
+                                                toast,
+                                            )
+                                        {
+                                            dns_editor_open.set(false);
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                        if let Some(error) = dns_error() {
+                            div { class: "field-error",
+                                Icon { icon: LdCircleAlert, width: 15, height: 15 }
+                                span { "{error}" }
+                            }
+                        }
+                        div { class: "rule-editor-actions",
+                            button {
+                                class: "secondary-button",
+                                onclick: move |_| {
+                                    dns_editor_open.set(false);
+                                    dns_error.set(None);
+                                },
+                                "取消"
+                            }
+                            button {
+                                class: "primary-button",
+                                onclick: move |_| {
+                                    if commit_dns_override(
+                                        dns_domain,
+                                        dns_server,
+                                        dns_overrides,
+                                        dns_error,
+                                        connected(),
+                                        toast,
+                                    ) {
+                                        dns_editor_open.set(false);
+                                    }
+                                },
+                                Icon { icon: LdSave, width: 16, height: 16 }
+                                "添加"
+                            }
+                        }
+                    }
+                }
                 div { class: "dns-list",
                     div { class: "dns-table-header",
                         span { "序号" }
@@ -4172,73 +4291,6 @@ fn RulesView(
                                 Icon { icon: LdTrash2, width: 16, height: 16 }
                             }
                         }
-                    }
-                    // Inline "add row" pinned to the bottom of the list, per design.
-                    div { class: "dns-add-row",
-                        label { class: "dns-add-field",
-                            span { class: "sr-only", "域名后缀" }
-                            input {
-                                placeholder: "添加域名后缀，例如 et.net",
-                                aria_label: "域名后缀",
-                                value: "{dns_domain}",
-                                oninput: move |event| dns_domain.set(event.value()),
-                                onkeydown: move |event| {
-                                    if event.key() == Key::Enter {
-                                        add_dns_override_rule(
-                                            dns_domain,
-                                            dns_server,
-                                            dns_overrides,
-                                            dns_error,
-                                            connected(),
-                                            toast,
-                                        );
-                                    }
-                                },
-                            }
-                        }
-                        label { class: "dns-add-field",
-                            span { class: "sr-only", "DNS 服务器" }
-                            input {
-                                placeholder: "DNS 服务器，例如 100.100.100.101",
-                                aria_label: "DNS 服务器",
-                                value: "{dns_server}",
-                                oninput: move |event| dns_server.set(event.value()),
-                                onkeydown: move |event| {
-                                    if event.key() == Key::Enter {
-                                        add_dns_override_rule(
-                                            dns_domain,
-                                            dns_server,
-                                            dns_overrides,
-                                            dns_error,
-                                            connected(),
-                                            toast,
-                                        );
-                                    }
-                                },
-                            }
-                        }
-                        button {
-                            class: "secondary-button compact dns-add-button",
-                            title: "添加专用 DNS 规则",
-                            onclick: move |_| {
-                                add_dns_override_rule(
-                                    dns_domain,
-                                    dns_server,
-                                    dns_overrides,
-                                    dns_error,
-                                    connected(),
-                                    toast,
-                                );
-                            },
-                            Icon { icon: LdPlus, width: 15, height: 15 }
-                            "添加"
-                        }
-                    }
-                }
-                if let Some(message) = dns_error() {
-                    div { class: "inline-note", role: "alert",
-                        Icon { icon: LdCircleAlert, width: 16, height: 16 }
-                        span { "{message}" }
                     }
                 }
             }
@@ -5967,20 +6019,26 @@ fn DesktopAutostartSettings() -> Element {
     }
 }
 
-fn add_dns_override_rule(
+/// Validate and append one DNS override. Returns whether the dialog may close;
+/// failures stay open and surface their message inside the dialog.
+fn commit_dns_override(
     mut domain: Signal<String>,
     mut server: Signal<String>,
     mut dns_overrides: Signal<Vec<DnsOverride>>,
     mut error: Signal<Option<String>>,
     connected: bool,
     toast: ToastManager,
-) {
+) -> bool {
     match proxy_core::normalize_dns_override(&domain(), &server()) {
         Ok((domain_suffix, dns_server)) => {
             let mut rules = dns_overrides.write();
             if rules.iter().any(|item| item.domain_suffix == domain_suffix) {
                 error.set(Some(format!("已存在 {domain_suffix} 的专用 DNS")));
-                return;
+                return false;
+            }
+            if rules.len() >= MAX_CUSTOM_RULES {
+                error.set(Some(format!("最多添加 {MAX_CUSTOM_RULES} 条规则")));
+                return false;
             }
             let id = rules.iter().map(|item| item.id).max().unwrap_or(0) + 1;
             rules.push(DnsOverride {
@@ -5994,8 +6052,12 @@ fn add_dns_override_rule(
             error.set(None);
             drop(rules);
             notify_rule_change(connected, toast);
+            true
         }
-        Err(message) => error.set(Some(message)),
+        Err(message) => {
+            error.set(Some(message));
+            false
+        }
     }
 }
 

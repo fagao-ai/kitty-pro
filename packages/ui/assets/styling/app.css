@@ -1948,13 +1948,79 @@ body {
 }
 
 .rules-toolbar p {
-  margin: 5px 0 0;
   color: var(--text-faint);
   font-size: 11px;
+  /* One line only: the two tabs carry different-length subtitles, and a wrap
+     here would make the header taller on one tab than the other. */
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Allow that subtitle to shrink instead of pushing the toolbar actions out. */
+.rules-toolbar > div:first-child {
+  min-width: 0;
 }
 
 .rules-toolbar-actions {
   flex-wrap: nowrap;
+  /* The group holds only the tab switch and 添加规则, and both tabs render the
+     same two controls, so it never needs to give up width. Shrinking it instead
+     made 添加规则 wrap onto a second line at the desktop's default 800px window,
+     which also misaligned it against the pills. The subtitle takes the squeeze. */
+  flex-shrink: 0;
+}
+
+.rules-toolbar-actions > .primary-button {
+  white-space: nowrap;
+}
+
+/* Shared subtitle row. The routing tab adds its refresh button here, so both
+   tabs reserve the same height and the header never grows on switch. */
+.rules-sub-row {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 5px;
+}
+
+.rules-sub-row p {
+  margin: 0;
+  /* Let the nowrap subtitle truncate instead of pushing the chip aside. */
+  min-width: 0;
+}
+
+/* Quiet text-scale action: rule-set refresh belongs to the subtitle, not the
+   primary toolbar, so it stays out of the tab control's alignment line. */
+.rules-refresh-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  color: var(--text-soft);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color 150ms ease,
+    border-color 150ms ease,
+    background 150ms ease;
+}
+
+.rules-refresh-button:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+  background: var(--accent-soft);
+}
+
+.rules-refresh-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* While a config script owns routing, the stored rules are inert. */
@@ -2011,6 +2077,11 @@ body {
   display: grid;
   grid-template-columns: 130px 170px minmax(180px, 1fr);
   gap: 12px;
+}
+
+/* The DNS dialog has no action/match selects, so its two fields stretch. */
+.dns-editor-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .rule-field {
@@ -3028,9 +3099,27 @@ body {
   font-weight: 400;
 }
 
-.rules-tab-control {
+/* The rules toolbar keeps the tab switch and 添加规则 on one alignment line.
+   The base `.segmented-control` sets `margin-top: 16px` and would win over a
+   plain `.rules-tab-control` rule declared before it, and its box would be 42px
+   (32px button + 2x4px padding + 2x1px border) against the buttons' 38px. These
+   two-class selectors beat it: 0 margin, and 30 + 2x3 + 2x1 = 38px tall, so the
+   pills are neither offset nor taller than their neighbours. */
+.rules-toolbar-actions .rules-tab-control {
   margin-top: 0;
-  gap: 6px;
+  padding: 3px;
+  /* `.segmented-control` uses minmax(0, 1fr) so its options fill equal width.
+     A zero minimum lets the flex toolbar shrink these two pills until their
+     labels clip at the desktop's default 800px window, so the tracks hug their
+     labels here; the toolbar's own wrapping takes over when space runs out. */
+  grid-auto-columns: max-content;
+}
+
+.rules-toolbar-actions .rules-tab-control button {
+  min-height: 30px;
+  /* A wrapped label grows the pill box past the neighbouring 38px buttons and
+     knocks the whole toolbar row out of alignment, so the labels never wrap. */
+  white-space: nowrap;
 }
 
 .dns-list {
@@ -3153,64 +3242,6 @@ body {
 .dns-empty-row small {
   color: var(--text-faint);
   font-size: 11px;
-}
-
-/* Inline add row: the design keeps the DNS editor at the bottom of the list. */
-.dns-add-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) max-content;
-  gap: 10px;
-  align-items: center;
-  padding: 12px 20px;
-  border-top: 1px solid var(--border);
-}
-
-.dns-add-field {
-  min-width: 0;
-}
-
-.dns-add-field input {
-  width: 100%;
-  height: 38px;
-  min-width: 0;
-  padding: 0 11px;
-  color: var(--text);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-sm);
-  outline: 0;
-  background: transparent;
-  font-family: var(--f-mono);
-  font-size: 12px;
-  transition:
-    border-color 150ms ease,
-    box-shadow 150ms ease;
-}
-
-.dns-add-field input::placeholder {
-  color: var(--text-faint);
-  opacity: 1;
-}
-
-.dns-add-field input:focus {
-  border-style: solid;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-
-.dns-add-button {
-  height: 38px;
-  min-height: 38px;
-  white-space: nowrap;
-}
-
-/* Screen-reader-only label; the visible affordance is the input placeholder. */
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
 }
 
 .nav-group-label {
@@ -3420,24 +3451,10 @@ body {
     display: none;
   }
 
-  .dns-add-row {
-    grid-template-columns: 1fr;
-    padding: 14px 16px;
-  }
-
-  /* 16px keeps iOS Safari from auto-zooming the add-DNS inputs. */
-  .dns-add-field input {
+  /* 16px keeps iOS Safari from auto-zooming the rule dialog inputs. */
+  .rule-field input {
     height: 42px;
     font-size: 16px;
-  }
-
-  .dns-add-button {
-    display: flex;
-    width: max-content;
-    margin-top: 12px;
-    margin-left: auto;
-    justify-self: end;
-    min-width: 108px;
   }
 
 }
@@ -4357,12 +4374,15 @@ body {
     gap: 6px;
   }
 
-  .rules-toolbar-actions .secondary-button.compact {
-    width: 38px;
-    padding: 0;
+  /* The refresh chip keeps only its icon; the toolbar button keeps its label. */
+  .rules-refresh-label {
+    display: none;
   }
 
-  .rules-refresh-label,
+  .rules-refresh-button {
+    padding: 2px 6px;
+  }
+
   .nodes-refresh-label {
     display: none;
   }
