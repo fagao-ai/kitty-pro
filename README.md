@@ -140,6 +140,8 @@ system proxy, LAN exposure, and appearance settings remain device-local.
   creates missing collections in the configured remote path.
 - S3 uses AWS Signature Version 4. Leave the endpoint empty for AWS S3; custom
   MinIO, R2, NAS, and other compatible endpoints use path-style object URLs.
+- Each provider keeps its own address field, so switching between WebDAV and S3
+  never reuses or overwrites the address saved for the other provider.
 - Normal uploads use the remote ETag with conditional writes, so another
   device cannot overwrite the object between the version check and upload.
   Changing the provider, endpoint, bucket/account, or object path resets the

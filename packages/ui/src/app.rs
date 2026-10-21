@@ -5503,14 +5503,29 @@ fn SyncSettings(
             }
 
             div { class: "sync-form-grid",
-                label { class: "sync-field sync-endpoint-field",
-                    span { if provider == SyncProviderKind::WebDav { "WebDAV 地址" } else { "S3 Endpoint" } }
-                    input {
-                        value: current.endpoint,
-                        disabled: sync_busy,
-                        placeholder: if provider == SyncProviderKind::WebDav { "https://dav.example.com/remote.php/dav/files/user" } else { "留空使用 AWS，或填写 https://minio.example.com" },
-                        spellcheck: "false",
-                        oninput: move |event| config.write().endpoint = event.value(),
+                // Each provider owns its own address field so switching tabs can
+                // never show or save an address typed for the other provider.
+                if provider == SyncProviderKind::WebDav {
+                    label { class: "sync-field sync-endpoint-field",
+                        span { "WebDAV 地址" }
+                        input {
+                            value: current.webdav_endpoint,
+                            disabled: sync_busy,
+                            placeholder: "https://dav.example.com/dav/files/user",
+                            spellcheck: "false",
+                            oninput: move |event| config.write().webdav_endpoint = event.value(),
+                        }
+                    }
+                } else {
+                    label { class: "sync-field sync-endpoint-field",
+                        span { "S3 Endpoint" }
+                        input {
+                            value: current.s3_endpoint,
+                            disabled: sync_busy,
+                            placeholder: "留空使用 AWS，或填写 https://s3.example.com",
+                            spellcheck: "false",
+                            oninput: move |event| config.write().s3_endpoint = event.value(),
+                        }
                     }
                 }
                 label { class: "sync-field",

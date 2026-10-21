@@ -42,10 +42,40 @@ pub(super) const SECRET_PLACEHOLDER: &str = "••••••••";
 pub(super) fn load_native_sync_config() -> Result<SyncConfig, ServerFnError> {
     let path = sync_config_path()?;
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| ServerFnError::new(format!("同步配置损坏: {error}"))),
+        Ok(bytes) => {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| ServerFnError::new(format!("同步配置损坏: {error}")))?;
+            migrate_legacy_endpoint(&mut value);
+            serde_json::from_value(value)
+                .map_err(|error| ServerFnError::new(format!("同步配置损坏: {error}")))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SyncConfig::default()),
         Err(error) => Err(ServerFnError::new(format!("读取同步配置失败: {error}"))),
+    }
+}
+
+/// Older builds stored one shared `endpoint` for both providers. Route it to the
+/// field belonging to the saved provider so the other provider starts blank and
+/// an address never leaks into a form the user has not filled in.
+fn migrate_legacy_endpoint(value: &mut serde_json::Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    let Some(legacy) = map.remove("endpoint") else {
+        return;
+    };
+    let endpoint = legacy.as_str().unwrap_or_default().trim().to_string();
+    if endpoint.is_empty() {
+        return;
+    }
+    // The stored provider is still in `map`; WebDAV is the serde default.
+    let key = if map.get("provider").and_then(|v| v.as_str()) == Some("s3") {
+        "s3_endpoint"
+    } else {
+        "webdav_endpoint"
+    };
+    if map.get(key).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+        map.insert(key.to_string(), serde_json::Value::String(endpoint));
     }
 }
 
@@ -195,15 +225,18 @@ pub(super) async fn pull(config: &SyncConfig) -> Result<DownloadedSnapshot, Serv
 
 fn same_remote_target(left: &SyncConfig, right: &SyncConfig) -> bool {
     if left.provider != right.provider
-        || left.endpoint.trim() != right.endpoint.trim()
         || left.path.trim_matches('/') != right.path.trim_matches('/')
     {
         return false;
     }
     match left.provider {
-        SyncProviderKind::WebDav => left.username.trim() == right.username.trim(),
+        SyncProviderKind::WebDav => {
+            left.webdav_endpoint.trim() == right.webdav_endpoint.trim()
+                && left.username.trim() == right.username.trim()
+        }
         SyncProviderKind::S3 => {
-            left.bucket.trim() == right.bucket.trim()
+            left.s3_endpoint.trim() == right.s3_endpoint.trim()
+                && left.bucket.trim() == right.bucket.trim()
                 && left.region.trim() == right.region.trim()
                 && left.access_key.trim() == right.access_key.trim()
         }
@@ -218,7 +251,7 @@ fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
 
     match config.provider {
         SyncProviderKind::WebDav => {
-            parse_http_endpoint(&config.endpoint, false)?;
+            parse_http_endpoint(&config.webdav_endpoint, false)?;
             if config.username.trim().is_empty() && !config.password.is_empty() {
                 return Err(ServerFnError::new("WebDAV 密码已填写，但用户名为空"));
             }
@@ -249,8 +282,8 @@ fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
             if config.access_key.trim().is_empty() || config.secret_key.is_empty() {
                 return Err(ServerFnError::new("S3 Access Key 和 Secret Key 不能为空"));
             }
-            if !config.endpoint.trim().is_empty() {
-                parse_http_endpoint(&config.endpoint, true)?;
+            if !config.s3_endpoint.trim().is_empty() {
+                parse_http_endpoint(&config.s3_endpoint, true)?;
             }
         }
     }
@@ -475,7 +508,7 @@ async fn send_webdav_with_condition(
     body: Option<Vec<u8>>,
     condition: &UploadCondition,
 ) -> Result<Response, ServerFnError> {
-    let url = build_remote_url(&config.endpoint, None, &config.path)?;
+    let url = build_remote_url(&config.webdav_endpoint, None, &config.path)?;
     let mut request = http_client()?.request(method, url);
     if !config.username.trim().is_empty() {
         request = request.basic_auth(&config.username, Some(&config.password));
@@ -501,7 +534,7 @@ async fn ensure_webdav_collections(config: &SyncConfig) -> Result<(), ServerFnEr
     let mkcol = Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method");
     for index in 1..segments.len() {
         let path = segments[..index].join("/");
-        let url = build_remote_url(&config.endpoint, None, &path)?;
+        let url = build_remote_url(&config.webdav_endpoint, None, &path)?;
         let mut request = client.request(mkcol.clone(), url);
         if !config.username.trim().is_empty() {
             request = request.basic_auth(&config.username, Some(&config.password));
@@ -635,7 +668,7 @@ fn build_remote_url(
 }
 
 fn build_s3_url(config: &SyncConfig) -> Result<reqwest::Url, ServerFnError> {
-    let endpoint = config.endpoint.trim();
+    let endpoint = config.s3_endpoint.trim();
     if endpoint.is_empty() || endpoint.contains("amazonaws.com") {
         if config.bucket.contains('.') {
             let base = format!("https://s3.{}.amazonaws.com", config.region.trim());
@@ -867,7 +900,8 @@ mod tests {
         assert_eq!(masked.password, SECRET_PLACEHOLDER);
         assert_eq!(masked.secret_key, SECRET_PLACEHOLDER);
         // 非密字段原样保留（前端回显需要）。
-        assert_eq!(masked.endpoint, config.endpoint);
+        assert_eq!(masked.webdav_endpoint, config.webdav_endpoint);
+        assert_eq!(masked.s3_endpoint, config.s3_endpoint);
         assert_eq!(masked.username, config.username);
         assert_eq!(masked.access_key, config.access_key);
     }
@@ -879,6 +913,77 @@ mod tests {
             hex_encode(&hmac_sha256(&key, b"Hi There")),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+
+    #[test]
+    fn legacy_shared_endpoint_migrates_to_saved_provider() {
+        let mut s3: serde_json::Value = serde_json::json!({
+            "provider": "s3",
+            "endpoint": "https://account.r2.cloudflarestorage.com",
+        });
+        migrate_legacy_endpoint(&mut s3);
+        assert!(s3.get("endpoint").is_none());
+        assert_eq!(
+            s3["s3_endpoint"],
+            serde_json::json!("https://account.r2.cloudflarestorage.com")
+        );
+        assert!(s3.get("webdav_endpoint").is_none());
+
+        let mut webdav: serde_json::Value = serde_json::json!({
+            "provider": "webdav",
+            "endpoint": "https://dav.example.com/user",
+        });
+        migrate_legacy_endpoint(&mut webdav);
+        assert_eq!(
+            webdav["webdav_endpoint"],
+            serde_json::json!("https://dav.example.com/user")
+        );
+        assert!(webdav.get("s3_endpoint").is_none());
+
+        // A split config that already carries the new field wins; the legacy
+        // value is dropped instead of resurrecting an old address.
+        let mut split: serde_json::Value = serde_json::json!({
+            "provider": "webdav",
+            "endpoint": "https://old.example.com/user",
+            "webdav_endpoint": "https://new.example.com/user",
+        });
+        migrate_legacy_endpoint(&mut split);
+        assert_eq!(
+            split["webdav_endpoint"],
+            serde_json::json!("https://new.example.com/user")
+        );
+
+        let mut blank: serde_json::Value = serde_json::json!({ "endpoint": "  " });
+        migrate_legacy_endpoint(&mut blank);
+        assert!(blank.get("webdav_endpoint").is_none());
+    }
+
+    #[test]
+    fn provider_switch_keeps_each_address_separate() {
+        let saved = SyncConfig {
+            enabled: true,
+            provider: SyncProviderKind::S3,
+            s3_endpoint: "https://account.r2.cloudflarestorage.com".to_string(),
+            bucket: "backup".to_string(),
+            region: "auto".to_string(),
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            last_sync_at: 42,
+            last_remote_revision: "\"revision-1\"".to_string(),
+            ..SyncConfig::default()
+        };
+        // The user only clicked the WebDAV tab: no address, no shared target.
+        let switched = SyncConfig {
+            provider: SyncProviderKind::WebDav,
+            ..saved.clone()
+        };
+        assert!(switched.webdav_endpoint.is_empty());
+        assert!(!same_remote_target(&saved, &switched));
+        let merged = merge_sync_metadata(&saved, &switched);
+        assert_eq!(merged.last_sync_at, 0);
+        assert!(merged.last_remote_revision.is_empty());
+        // Saving that switch must not validate the S3 address as a WebDAV URL.
+        assert!(validate_config(&switched).is_err());
     }
 
     #[test]
@@ -900,7 +1005,7 @@ mod tests {
         let mut config = SyncConfig {
             enabled: true,
             provider: SyncProviderKind::S3,
-            endpoint: String::new(),
+            s3_endpoint: String::new(),
             path: "folder/profile.json".to_string(),
             bucket: "kitty-backup".to_string(),
             region: "ap-east-1".to_string(),
@@ -924,7 +1029,7 @@ mod tests {
         );
 
         config.bucket = "kitty-backup".to_string();
-        config.endpoint = "http://minio.local:9000".to_string();
+        config.s3_endpoint = "http://minio.local:9000".to_string();
         assert_eq!(
             build_s3_url(&config)
                 .expect("custom endpoint URL should build")
@@ -1020,7 +1125,7 @@ mod tests {
     fn changing_remote_target_resets_sync_metadata() {
         let existing = SyncConfig {
             enabled: true,
-            endpoint: "https://dav.example.com/user".to_string(),
+            webdav_endpoint: "https://dav.example.com/user".to_string(),
             username: "alice".to_string(),
             password: "old-password".to_string(),
             last_sync_at: 42,
@@ -1083,7 +1188,7 @@ mod tests {
         let config = SyncConfig {
             enabled: true,
             provider: SyncProviderKind::WebDav,
-            endpoint,
+            webdav_endpoint: endpoint,
             path: "kitty-profile.json".to_string(),
             username: "demo".to_string(),
             password: "secret".to_string(),
@@ -1135,7 +1240,7 @@ mod tests {
         });
         let config = SyncConfig {
             enabled: true,
-            endpoint,
+            webdav_endpoint: endpoint,
             path: "kitty-profile.json".to_string(),
             last_sync_at: 42,
             last_remote_revision: "\"revision-1\"".to_string(),
@@ -1176,7 +1281,7 @@ mod tests {
         let config = SyncConfig {
             enabled: true,
             provider: SyncProviderKind::S3,
-            endpoint,
+            s3_endpoint: endpoint,
             path: "sync/profile.json".to_string(),
             bucket: "kitty-backup".to_string(),
             region: "us-east-1".to_string(),

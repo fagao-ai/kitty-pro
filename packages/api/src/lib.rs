@@ -162,9 +162,13 @@ pub struct SyncConfig {
     #[serde(default)]
     pub enabled: bool,
     pub provider: SyncProviderKind,
-    /// WebDAV base URL or S3-compatible endpoint.
+    /// WebDAV base URL. Kept apart from `s3_endpoint` so switching the provider
+    /// in the UI never reinterprets an address saved for the other provider.
     #[serde(default)]
-    pub endpoint: String,
+    pub webdav_endpoint: String,
+    /// S3-compatible endpoint. Empty selects AWS S3.
+    #[serde(default)]
+    pub s3_endpoint: String,
     /// Remote object path. For S3 this is the object key.
     #[serde(default = "default_sync_path")]
     pub path: String,
@@ -193,7 +197,8 @@ impl Default for SyncConfig {
         Self {
             enabled: false,
             provider: SyncProviderKind::WebDav,
-            endpoint: String::new(),
+            webdav_endpoint: String::new(),
+            s3_endpoint: String::new(),
             path: default_sync_path(),
             username: String::new(),
             password: String::new(),
