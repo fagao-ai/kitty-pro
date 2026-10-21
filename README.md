@@ -80,6 +80,13 @@ inside the local fullstack server. A browser cannot load a Go/C archive or
 create a system TUN interface directly, so its role is intentionally control
 plane only.
 
+Keep both web flags: `dx serve --package web` without them fails right after
+asset finalization with "Failed to re-sign the binary with codesign ...
+server-dev/web: No such file or directory". Re-run with both flags before
+suspecting a signing identity or keychain problem. The dev server also binds
+loopback by default and its payload is far too large for another device; see
+"Viewing the Web UI from a phone" before serving it anywhere else.
+
 ### Released Web server
 
 Run these commands from the extracted release directory (keep `public/` next
@@ -94,8 +101,9 @@ PORT=9000 ./kitty-pro-web-server                # environment variable also supp
 ./kitty-pro-web-server --help
 ```
 
-Port priority is `--port` > `PORT` > `7897`. `IP` defaults to `127.0.0.1`
-and must be a loopback address because this is a local control surface.
+Port priority is `--port` > `PORT` > `7897`. `IP` defaults to `127.0.0.1`; a
+non-loopback address is rejected unless `--allow-lan` (or `KITTY_PRO_ALLOW_LAN=1`)
+is also given, because this is a local control surface.
 `--daemon` detaches from the terminal on macOS/Linux and Windows, appends
 stdout/stderr to `kitty-pro-web.log` (or `--log-file`), and prints the PID
 only after the new server is ready. A failed startup returns a nonzero exit
@@ -104,6 +112,51 @@ code. Stop the background process with `kill <PID>` on macOS/Linux or
 crash-restart supervisor; use the OS service manager for those requirements.
 Do not use `--daemon` with `dx serve`; the development server still runs in
 the foreground and owns its listener configuration.
+
+### Viewing the Web UI from a phone
+
+Never point a phone or a remote machine at `dx serve`. The dev server ships a
+debug WebAssembly binary: ~84 MB in
+`target/dx/web/debug/web/public/wasm/web_bg.wasm`, against ~2 MB for the same
+file from a `--release` build. Dioxus fullstack still server-renders the first
+frame, so the page *looks* alive and then freezes - the overview stays on
+"checking sing-box" / "reading" with a permanent spinner and the bottom tabs stop
+responding, because no `onclick` handler exists until the wasm finishes
+downloading and hydrates. On a VPN or remote link that never completes. Two
+symptoms confirm it: the payload size, and a server log full of `[200] /` with no
+`/api/...` lines at all, which means the app never booted while the API is fine.
+
+Build for release and run the standalone server instead (keep `public/` next to
+the executable):
+
+```sh
+dx build --package web --web --fullstack true --release --debug-symbols false
+
+stage=target/dx/web/release/web
+mkdir -p /tmp/kitty-web && cp "$stage/server" /tmp/kitty-web/kitty-pro-web-server \
+  && cp -R "$stage/public" /tmp/kitty-web/public
+
+cd /tmp/kitty-web
+IP=0.0.0.0 KITTY_PRO_ALLOW_LAN=1 KITTY_PRO_ALLOWED_HOSTS=phone.example.net \
+  ./kitty-pro-web-server --port 8123 --daemon --log-file ./web.log
+```
+
+The Go toolchain note above applies to this build too: pass `SINGBOX_GO` when
+Homebrew's `go@1.24` is not the default `go`.
+
+Prefer a tunnel address (Tailscale, etc.) over a hostname for phone access. An
+overlay-network name may resolve correctly on the server while its public DNS
+record points somewhere else, so a phone whose overlay virtual DNS is not active
+connects to the wrong host. A literal IP needs no allow-list entry and cannot be
+misresolved.
+
+`KITTY_PRO_ALLOWED_HOSTS` only takes effect on a listener that sees the browser's
+real `Host`. `kitty-pro-web-server` does, so unlisted hosts get `421` and
+cross-site writes get `403`. The `dx serve` proxy rewrites `Host` to its own
+internal upstream address before the guard runs, and an IP literal is always
+allowed, so the allow-list is inert behind the dev server and only the
+`SameSite=Strict` session cookie still blocks cross-site calls. That is another
+reason not to expose a dev server.
 
 Run the macOS desktop shell:
 
