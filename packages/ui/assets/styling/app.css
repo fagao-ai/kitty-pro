@@ -160,6 +160,16 @@ body {
   border-bottom: none;
 }
 
+/* Short windows: only the nav list may shrink and scroll inside the fixed
+   sidebar, so the brand and the core-status footer stay reachable instead of
+   being pushed below the fold (invisible once the viewport dropped under
+   ~430px, because the sidebar itself cannot scroll). */
+.brand,
+.nav-group-label,
+.sidebar-footer {
+  flex: 0 0 auto;
+}
+
 .brand-mark {
   display: grid;
   width: 40px;
@@ -203,10 +213,14 @@ body {
 
 .primary-nav {
   display: flex;
+  min-height: 0;
   flex: 1;
   flex-direction: column;
   gap: 4px;
   padding-top: 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 
 .nav-item {
@@ -321,6 +335,8 @@ body {
 
 .main-content {
   z-index: 1;
+  display: flex;
+  flex-direction: column;
   width: calc(100% - 264px);
   min-height: 100vh;
   margin-left: 264px;
@@ -340,11 +356,20 @@ body {
 
 .topbar {
   display: flex;
+  flex: 0 0 auto;
   min-height: 56px;
   align-items: center;
   justify-content: space-between;
   gap: 20px;
   margin-bottom: 22px;
+}
+
+/* .main-content is a column flexbox so the console card can absorb the
+   viewport (see .workspace-section). Everything else - the log stats strip,
+   the control row, the overview stacks - keeps its natural height instead of
+   being squeezed by the growing sibling. */
+.main-content > :not(.workspace-section) {
+  flex: 0 0 auto;
 }
 
 .eyebrow {
@@ -1284,7 +1309,16 @@ body {
 }
 
 .workspace-section {
-  min-height: calc(100vh - 126px);
+  /* The console card fills the space the header row leaves instead of guessing
+     it with a `100vh` magic number. The old calc assumed exactly 126px of
+     chrome above it, so every other window height either added phantom page
+     scroll (27px on 1440x900, 183px on the logs page) or left the card short
+     of the fold. Because .main-content is now a column flexbox, the card can
+     simply take the remainder and stop the page scroll at the viewport edge.
+     flex-shrink stays 0: on phones .main-content is a definite-height scroll
+     container, and a shrinkable child would be squeezed down to its container
+     and clip the tail of a long node/rule list out of reach. */
+  flex: 1 0 auto;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -1536,8 +1570,53 @@ body {
 }
 
 .log-workspace {
+  /* Console layout: the stats strip and the control row keep their height, the
+     card takes exactly the space the viewport leaves, and the rows scroll
+     inside it. `flex-basis: 0` is what makes the internal scroller engage -
+     with `auto` the card would size itself to the whole row count. The floor
+     keeps the empty state intact on very short windows, where the page scrolls
+     instead. The old `height: calc(100vh - 132px)` assumed a magic chrome
+     height and, combined with `overflow: hidden` plus no scroll container,
+     made every row past the fold unreachable (1.8k px of live log lost). */
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-height: 340px;
+  height: auto;
   overflow: hidden;
-  height: calc(100vh - 132px);
+}
+
+.log-workspace > .log-list,
+.log-workspace > .log-list-footer,
+.log-workspace > .large-empty {
+  min-width: 0;
+}
+
+.log-workspace > .log-list-footer {
+  flex: 0 0 auto;
+}
+
+.log-workspace > .large-empty {
+  flex: 1 1 auto;
+}
+
+/* Rows scroll here, so the column captions stay pinned while they scroll. */
+.log-workspace .log-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Captions stay pinned over the rows. The glass tokens are translucent, so the
+   header composites them over the page base: a plain translucent background
+   let the row text underneath bleed through the sticky bar. */
+.log-workspace .log-table-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background-color: var(--bg);
+  background-image: linear-gradient(var(--surface-strong), var(--surface-strong));
 }
 
 .log-collection-toggle {
@@ -3313,6 +3392,13 @@ body {
   line-height: 1;
 }
 
+/* `small` is 0.833em by UA default, which on top of the 10px strip rendered
+   the byte counter at ~8.3px - illegible, and the only place where iOS Safari
+   auto text inflation kicked in and reflowed the foot row. */
+.chart-foot small {
+  font-size: inherit;
+}
+
 .chart-foot .traffic-status {
   position: static;
   font: inherit;
@@ -4047,9 +4133,11 @@ body {
     border-radius: var(--radius-md);
   }
 
-  .workspace-section {
-    min-height: calc(100vh - 122px);
-  }
+  /* The phone scroller is .main-content itself, so the console card only needs
+     to grow (`flex: 1 0 auto` above); a `100vh` floor here is what used to push
+     ~180px of dead background under the logs console. It must not be replaced
+     with `min-height: 0` either: that rule carries the same specificity as
+     `.log-workspace` and would win by order, clipping the empty state. */
 
   .nodes-toolbar {
     align-items: stretch;
