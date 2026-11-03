@@ -3032,6 +3032,18 @@ body {
   letter-spacing: 0.1em;
 }
 
+/* The derived bundle prefix. Mono because it names a path, but lighter and
+   un-capitalised so it cannot be mistaken for the field's own label, which
+   `.sync-field > span` renders in caps at the same size. */
+.sync-field-hint {
+  margin-top: -3px;
+  color: var(--text-faint);
+  font-family: var(--f-mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .sync-field input {
   width: 100%;
   height: 40px;

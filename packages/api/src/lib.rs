@@ -225,6 +225,12 @@ pub struct SyncResult {
     pub updated_at: u64,
     pub subscription_count: usize,
     pub rule_count: usize,
+    /// How many DNS rules travelled. `None` means the remote document carried no
+    /// DNS section at all - every object uploaded before the feature shipped -
+    /// which the settings page has to word differently from "zero rules": the
+    /// local list is kept in that case, not emptied.
+    #[serde(default)]
+    pub dns_rule_count: Option<usize>,
     #[serde(default)]
     pub remote_revision: String,
     #[serde(default)]
@@ -401,6 +407,7 @@ pub async fn commit_sync_pull(
             updated_at: snapshot.updated_at,
             subscription_count: snapshot.subscriptions.len(),
             rule_count: snapshot.custom_rules.len(),
+            dns_rule_count: snapshot.dns_overrides.as_ref().map(Vec::len),
             remote_revision,
             checkpoint_saved: false,
             warning: None,

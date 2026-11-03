@@ -6,6 +6,21 @@ use thiserror::Error;
 pub const MAX_CUSTOM_RULES: usize = 256;
 pub const SYNC_SNAPSHOT_FORMAT: &str = "kitty-pro-sync";
 pub const SYNC_SNAPSHOT_VERSION: u32 = 2;
+
+/// The folder a configured sync path maps to, e.g. `kitty-pro-sync.json` becomes
+/// `kitty-pro-sync`. Remote sync stores a bundle of objects under this prefix,
+/// derived so an existing single-file setting needs no edit and the legacy
+/// object stays readable. Lives here because it is wire-format knowledge and
+/// the settings page renders it on every target, web included.
+pub fn sync_bundle_directory(path: &str) -> String {
+    let trimmed = path.trim_matches('/');
+    match trimmed.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("json") && !stem.is_empty() => {
+            stem.to_string()
+        }
+        _ => trimmed.to_string(),
+    }
+}
 const MAX_CUSTOM_RULE_VALUE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

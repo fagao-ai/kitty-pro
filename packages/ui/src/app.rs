@@ -5809,7 +5809,7 @@ fn SyncSettings(
 
             div { class: "inline-note sync-security-note",
                 Icon { icon: LdInfo, width: 16, height: 16 }
-                span { "远端文件包含订阅来源（含令牌）、自定义规则、专用 DNS 与配置脚本" }
+                span { "远端内容包含订阅来源（含令牌）、自定义规则、专用 DNS 与配置脚本" }
             }
 
             div { class: "sync-form-grid",
@@ -5839,13 +5839,19 @@ fn SyncSettings(
                     }
                 }
                 label { class: "sync-field",
-                    span { "远程文件" }
+                    span { "远程路径" }
                     input {
                         value: current.path,
                         disabled: sync_busy,
                         placeholder: "kitty-pro-sync.json",
                         spellcheck: "false",
                         oninput: move |event| config.write().path = event.value(),
+                    }
+                    // The field no longer names one file: the content lands in a
+                    // folder beside it, so show the derived prefix instead of
+                    // leaving the user to wonder where the objects went.
+                    small { class: "sync-field-hint",
+                        "内容写入同级目录 /{proxy_core::sync_bundle_directory(&current.path)}/"
                     }
                 }
 
@@ -6005,9 +6011,10 @@ fn SyncSettings(
                                     current.last_remote_revision = result.remote_revision.clone();
                                 }
                                 toast.success(format!(
-                                    "已下载 {} 个订阅和 {} 条分流规则{}",
+                                    "已下载 {} 个订阅、{} 条分流规则、{}{}",
                                     result.subscription_count,
                                     result.rule_count,
+                                    dns_sync_clause(result.dns_rule_count),
                                     if result.subscription_count > 0 {
                                         "，订阅需刷新后使用"
                                     } else {
@@ -6051,8 +6058,10 @@ fn SyncSettings(
                                         current.last_remote_revision = result.remote_revision.clone();
                                     }
                                     toast.success(format!(
-                                        "已上传 {} 个订阅和 {} 条规则",
-                                        result.subscription_count, result.rule_count
+                                        "已上传 {} 个订阅、{} 条分流规则、{}",
+                                        result.subscription_count,
+                                        result.rule_count,
+                                        dns_sync_clause(result.dns_rule_count)
                                     ));
                                     if let Some(warning) = result.warning {
                                         toast.info(warning);
@@ -7028,6 +7037,19 @@ fn select_available_tag(nodes: &[ProxyNode], requested_tag: &str) -> String {
     }
 }
 
+/// The DNS clause for a sync summary.
+///
+/// `None` means the remote document carried no DNS section, which is every
+/// object uploaded before the feature shipped. That must not read as "0 条":
+/// applying such a document *keeps* the local rules, and a user who just
+/// downloaded would otherwise conclude their rules were wiped.
+fn dns_sync_clause(dns_rule_count: Option<usize>) -> String {
+    match dns_rule_count {
+        Some(count) => format!("{count} 条专用 DNS"),
+        None => "远端未含专用 DNS（保留本机）".to_string(),
+    }
+}
+
 fn source_label(source: &str) -> String {
     let trimmed = source.trim();
     if let Some((scheme, remainder)) = trimmed.split_once("://") {
@@ -7626,6 +7648,18 @@ mod tests {
         assert!(report.contains("TUN: 开启 · 局域网: 关闭 (本地代理 7890)"));
         assert!(report.contains("节点: 3 · 订阅: 2"));
         assert!(!report.contains("{"));
+    }
+
+    /// A remote written before DNS overrides existed carries no section, and a
+    /// pull keeps the local rules. The summary must not claim "0 条专用 DNS",
+    /// which reads as if the download had deleted them.
+    #[test]
+    fn dns_clause_distinguishes_absent_from_empty() {
+        assert_eq!(dns_sync_clause(Some(3)), "3 条专用 DNS");
+        assert_eq!(dns_sync_clause(Some(0)), "0 条专用 DNS");
+        let absent = dns_sync_clause(None);
+        assert!(!absent.starts_with('0'), "{absent}");
+        assert!(absent.contains("保留本机"), "{absent}");
     }
 
     #[test]

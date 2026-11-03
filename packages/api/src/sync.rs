@@ -1,14 +1,15 @@
 use super::{profile_path, SyncConfig, SyncProviderKind, SyncResult};
 use dioxus::prelude::ServerFnError;
 use proxy_core::{
-    normalize_dns_override, validate_custom_rules, SyncSnapshot, SYNC_SNAPSHOT_FORMAT,
-    SYNC_SNAPSHOT_VERSION,
+    normalize_dns_override, sync_bundle_directory as bundle_directory, validate_custom_rules,
+    CustomRule, DnsOverride, SyncConfigScript, SyncSnapshot, SyncSubscription,
+    SYNC_SNAPSHOT_FORMAT, SYNC_SNAPSHOT_VERSION,
 };
 use reqwest::header::{ETAG, IF_MATCH, IF_NONE_MATCH};
 use reqwest::{Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -145,6 +146,76 @@ pub(super) fn operation_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// What a sync target currently holds, read without pulling the content itself.
+enum RemoteState {
+    Absent,
+    /// The pre-bundle single document at exactly `config.path`.
+    Legacy {
+        updated_at: u64,
+        revision: String,
+    },
+    Bundle {
+        updated_at: u64,
+        revision: String,
+        /// Section object names the remote already stores. Content addressing
+        /// means a matching name is a matching body, so those can be skipped.
+        objects: HashSet<String>,
+    },
+}
+
+/// The three conditions that make a remote safe to write over: this device owns
+/// a baseline for it, the store hands out revisions to compare, and that revision
+/// has not moved since. Anything else needs an explicit overwrite.
+fn require_baseline(config: &SyncConfig, revision: &str) -> Result<(), ServerFnError> {
+    if config.last_sync_at == 0 && config.last_remote_revision.is_empty() {
+        return Err(ServerFnError::new(
+            "远程同步文件已存在，但本机没有该目标的同步基线，请先下载或明确选择覆盖上传",
+        ));
+    }
+    if revision.is_empty() {
+        return Err(ServerFnError::new(
+            "远端存储未提供 ETag，无法保证安全上传，请使用明确覆盖上传",
+        ));
+    }
+    if !config.last_remote_revision.is_empty() && revision != config.last_remote_revision {
+        return Err(ServerFnError::new(
+            "远程同步文件已被其他设备修改，请先下载或明确选择覆盖上传",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to overwrite a remote that another device has updated since this
+/// device last synced, whether it now holds a bundle or a legacy document.
+fn require_not_newer(config: &SyncConfig, updated_at: u64) -> Result<(), ServerFnError> {
+    if updated_at > config.last_sync_at {
+        return Err(ServerFnError::new(format!(
+            "远程配置更新于本机上次同步之后（远程版本 {updated_at}），请先下载或明确选择覆盖上传",
+        )));
+    }
+    Ok(())
+}
+
+/// Read enough about the remote to decide a conditional write. Deliberately
+/// fetches only the manifest: `push` needs freshness, not another copy of data
+/// it already holds, and a bundle can be several objects.
+async fn remote_state(config: &SyncConfig) -> Result<RemoteState, ServerFnError> {
+    if let Some((manifest, revision)) = download_manifest(config).await? {
+        return Ok(RemoteState::Bundle {
+            updated_at: manifest.updated_at,
+            revision,
+            objects: manifest.files.into_iter().map(|file| file.name).collect(),
+        });
+    }
+    if let Some(legacy) = download_legacy_snapshot(config).await? {
+        return Ok(RemoteState::Legacy {
+            updated_at: legacy.snapshot.updated_at,
+            revision: legacy.remote_revision,
+        });
+    }
+    Ok(RemoteState::Absent)
+}
+
 pub(super) async fn push(
     config: &SyncConfig,
     mut snapshot: SyncSnapshot,
@@ -154,57 +225,54 @@ pub(super) async fn push(
     validate_snapshot(&snapshot)?;
     snapshot.version = SYNC_SNAPSHOT_VERSION;
 
-    let condition = if force {
-        UploadCondition::Unconditional
-    } else {
-        match download_snapshot(config).await? {
-            Some(remote) => {
-                if config.last_sync_at == 0 && config.last_remote_revision.is_empty() {
-                    return Err(ServerFnError::new(
-                        "远程同步文件已存在，但本机没有该目标的同步基线，请先下载或明确选择覆盖上传",
-                    ));
-                }
-                if remote.remote_revision.is_empty() {
-                    return Err(ServerFnError::new(
-                        "远端存储未提供 ETag，无法保证安全上传，请使用明确覆盖上传",
-                    ));
-                }
-                if !config.last_remote_revision.is_empty()
-                    && remote.remote_revision != config.last_remote_revision
-                {
-                    return Err(ServerFnError::new(
-                        "远程同步文件已被其他设备修改，请先下载或明确选择覆盖上传",
-                    ));
-                }
-                if remote.snapshot.updated_at > config.last_sync_at {
-                    return Err(ServerFnError::new(format!(
-                        "远程配置更新于本机上次同步之后（远程版本 {}），请先下载或明确选择覆盖上传",
-                        remote.snapshot.updated_at
-                    )));
-                }
-                UploadCondition::Match(remote.remote_revision)
-            }
-            None if config.last_sync_at > 0 || !config.last_remote_revision.is_empty() => {
+    let mut condition = UploadCondition::Unconditional;
+    let mut known_objects = HashSet::new();
+    if !force {
+        match remote_state(config).await? {
+            RemoteState::Absent
+                if config.last_sync_at > 0 || !config.last_remote_revision.is_empty() =>
+            {
                 return Err(ServerFnError::new(
                     "远程同步文件已在本机上次同步后被删除，请明确选择覆盖上传以重新创建",
                 ));
             }
-            None => UploadCondition::Missing,
+            RemoteState::Absent => condition = UploadCondition::Missing,
+            RemoteState::Legacy {
+                updated_at,
+                revision,
+            } => {
+                require_baseline(config, &revision)?;
+                require_not_newer(config, updated_at)?;
+                // A legacy target has no manifest object to guard with an ETag,
+                // so the first bundle write asserts the manifest is absent: if an
+                // old build re-published the single document in the meantime, this
+                // create fails instead of silently shadowing it.
+                condition = UploadCondition::Missing;
+            }
+            RemoteState::Bundle {
+                updated_at,
+                revision,
+                objects,
+            } => {
+                require_baseline(config, &revision)?;
+                require_not_newer(config, updated_at)?;
+                condition = UploadCondition::Match(revision);
+                known_objects = objects;
+            }
         }
-    };
+    }
 
     let now = unix_timestamp()?;
     snapshot.updated_at = now.max(config.last_sync_at.saturating_add(1));
-    let payload = serde_json::to_vec_pretty(&snapshot)
-        .map_err(|error| ServerFnError::new(format!("序列化同步快照失败: {error}")))?;
-    if payload.len() > MAX_SYNC_BYTES {
-        return Err(ServerFnError::new("同步快照超过 20 MiB 限制"));
-    }
-    let mut remote_revision = upload(config, payload, condition).await?;
+    let mut remote_revision = upload_bundle(config, &snapshot, &condition, &known_objects).await?;
     if remote_revision.is_empty() {
-        if let Ok(Some(downloaded)) = download_snapshot(config).await {
-            if downloaded.snapshot == snapshot {
-                remote_revision = downloaded.remote_revision;
+        // Some stores answer a PUT without an ETag. Re-read the manifest to see
+        // whether the revision we just wrote is actually there; the manifest is
+        // byte-identical when the store preserved our payload, and only the
+        // manifest is fetched, never the sections.
+        if let Ok(Some((manifest, revision))) = download_manifest(config).await {
+            if manifest.updated_at == snapshot.updated_at {
+                remote_revision = revision;
             }
         }
     }
@@ -216,6 +284,7 @@ pub(super) async fn push(
         updated_at: snapshot.updated_at,
         subscription_count: snapshot.subscriptions.len(),
         rule_count: snapshot.custom_rules.len(),
+        dns_rule_count: snapshot.dns_overrides.as_ref().map(Vec::len),
         remote_revision,
         checkpoint_saved: false,
         warning,
@@ -448,14 +517,330 @@ pub(super) fn validate_remote_revision(revision: &str) -> Result<(), ServerFnErr
     Ok(())
 }
 
+/// A sync target is a folder of small documents plus a manifest that names them.
+///
+/// One JSON blob per device was the original layout and it has two problems: any
+/// new section rewrites the whole object, and a half-finished upload leaves a
+/// corrupt file that every device then downloads. Here each section is its own
+/// object, and `manifest.json` is written last, so a bundle is visible to other
+/// devices exactly when it is complete. Objects are content-addressed
+/// (`dns-overrides-<hash>.json`), so publishing a new revision never overwrites
+/// files an older manifest still points at.
+const SYNC_BUNDLE_FORMAT: &str = "kitty-pro-sync-bundle";
+const SYNC_BUNDLE_VERSION: u32 = 1;
+const MANIFEST_NAME: &str = "manifest.json";
+/// Sections this build knows how to place in a snapshot. A manifest naming
+/// anything else is rejected rather than ignored: silently dropping a section
+/// this version does not understand would delete it on the next push.
+const BUNDLE_SECTIONS: [&str; 4] = [
+    "subscriptions",
+    "custom-rules",
+    "dns-overrides",
+    "config-script",
+];
+/// Far above the four sections that exist, but finite: the manifest is remote
+/// input, and each entry it names is a request this client would make.
+const MAX_BUNDLE_FILES: usize = 16;
+
+#[derive(Serialize, Deserialize)]
+struct BundleManifest {
+    format: String,
+    version: u32,
+    updated_at: u64,
+    #[serde(default)]
+    files: Vec<BundleFile>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+struct BundleFile {
+    section: String,
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+fn bundle_path(config: &SyncConfig, name: &str) -> String {
+    format!("{}/{}", bundle_directory(&config.path), name)
+}
+
+/// Section name plus a content hash, so identical content across pushes reuses
+/// one object and different content never collides.
+fn bundle_object_name(section: &str, payload: &[u8]) -> String {
+    format!("{section}-{}.json", &sha256_hex(payload)[..16])
+}
+
+/// The sections a snapshot carries, in a fixed order. A `None` section writes no
+/// object at all, which is how "this device never had the feature" stays
+/// distinguishable from "this device has zero rules".
+fn bundle_sections(snapshot: &SyncSnapshot) -> Result<Vec<(String, Vec<u8>)>, ServerFnError> {
+    let mut sections = Vec::new();
+    sections.push((
+        "subscriptions".to_string(),
+        json_payload(&snapshot.subscriptions)?,
+    ));
+    sections.push((
+        "custom-rules".to_string(),
+        json_payload(&snapshot.custom_rules)?,
+    ));
+    if let Some(dns_overrides) = &snapshot.dns_overrides {
+        sections.push(("dns-overrides".to_string(), json_payload(dns_overrides)?));
+    }
+    if let Some(config_script) = &snapshot.config_script {
+        sections.push(("config-script".to_string(), json_payload(config_script)?));
+    }
+    Ok(sections)
+}
+
+fn json_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, ServerFnError> {
+    serde_json::to_vec_pretty(value)
+        .map_err(|error| ServerFnError::new(format!("序列化同步内容失败: {error}")))
+}
+
+/// Pull a bundle, falling back to the legacy single document.
 async fn download_snapshot(
     config: &SyncConfig,
 ) -> Result<Option<DownloadedSnapshot>, ServerFnError> {
+    match download_manifest(config).await? {
+        Some(manifest) => download_bundle(config, manifest).await.map(Some),
+        None => download_legacy_snapshot(config).await,
+    }
+}
+
+async fn download_manifest(
+    config: &SyncConfig,
+) -> Result<Option<(BundleManifest, String)>, ServerFnError> {
+    let path = bundle_path(config, MANIFEST_NAME);
     let response = match config.provider {
-        SyncProviderKind::WebDav => send_webdav(config, Method::GET, None).await?,
+        SyncProviderKind::WebDav => {
+            send_webdav(
+                config,
+                &path,
+                Method::GET,
+                None,
+                &UploadCondition::Unconditional,
+            )
+            .await?
+        }
         SyncProviderKind::S3 => {
             send_s3(
                 config,
+                &path,
+                Method::GET,
+                Vec::new(),
+                &UploadCondition::Unconditional,
+            )
+            .await?
+        }
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let response = require_success(response, "读取远程同步清单").await?;
+    let revision = response_revision(&response);
+    let bytes = read_limited_body(response, MAX_SYNC_BYTES, "读取远程同步清单").await?;
+    let manifest: BundleManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| ServerFnError::new(format!("远程同步清单无效: {error}")))?;
+    if manifest.format != SYNC_BUNDLE_FORMAT || manifest.version != SYNC_BUNDLE_VERSION {
+        return Err(ServerFnError::new(format!(
+            "不支持的远程同步清单: {} v{}",
+            manifest.format, manifest.version
+        )));
+    }
+    validate_manifest_shape(&manifest)?;
+    Ok(Some((manifest, revision)))
+}
+
+/// Structural checks on a manifest, run before anything it names is fetched.
+///
+/// The manifest is the only trusted index in a bundle: every object it points at
+/// is verified by size and hash afterwards, but the list itself has to hold up
+/// on its own, or a corrupt or hostile one turns a pull into an unbounded loop of
+/// requests and lets two entries claim the same section.
+fn validate_manifest_shape(manifest: &BundleManifest) -> Result<(), ServerFnError> {
+    if manifest.files.len() > MAX_BUNDLE_FILES {
+        return Err(ServerFnError::new(format!(
+            "远程同步清单条目过多（{} 项）",
+            manifest.files.len()
+        )));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for file in &manifest.files {
+        if !BUNDLE_SECTIONS.contains(&file.section.as_str()) {
+            return Err(ServerFnError::new(format!(
+                "远程同步清单包含未知内容: {}",
+                file.section
+            )));
+        }
+        if !seen.insert(file.section.as_str()) {
+            return Err(ServerFnError::new(format!(
+                "远程同步清单内容重复: {}",
+                file.section
+            )));
+        }
+        validate_bundle_file_name(&file.name)?;
+        // The object name embeds the digest this client would verify against, so
+        // a mismatch is a corrupt manifest rather than a renamed object.
+        if !file.name.starts_with(&file.section)
+            || file.sha256.len() != 64
+            || !file.sha256.chars().all(|char| char.is_ascii_hexdigit())
+        {
+            return Err(ServerFnError::new(format!(
+                "远程同步清单文件 {} 与内容 {section} 不匹配",
+                file.name,
+                section = file.section
+            )));
+        }
+    }
+    Ok(())
+}
+async fn download_bundle(
+    config: &SyncConfig,
+    manifest: (BundleManifest, String),
+) -> Result<DownloadedSnapshot, ServerFnError> {
+    let (manifest, revision) = manifest;
+    let mut payloads: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut total = 0_usize;
+    for file in &manifest.files {
+        let bytes = download_object(config, &bundle_path(config, &file.name)).await?;
+        total = total.saturating_add(bytes.len());
+        if total > MAX_SYNC_BYTES {
+            return Err(ServerFnError::new("远程同步内容超过 20 MiB 限制"));
+        }
+        if bytes.len() as u64 != file.size {
+            return Err(ServerFnError::new(format!(
+                "远程同步文件 {} 大小不符（清单 {}，实际 {}）",
+                file.section,
+                file.size,
+                bytes.len()
+            )));
+        }
+        let digest = sha256_hex(&bytes);
+        if digest != file.sha256 {
+            return Err(ServerFnError::new(format!(
+                "远程同步文件 {} 校验失败，请重新上传",
+                file.section
+            )));
+        }
+        payloads.insert(file.section.clone(), bytes);
+    }
+
+    let snapshot = SyncSnapshot {
+        format: SYNC_SNAPSHOT_FORMAT.to_string(),
+        version: SYNC_SNAPSHOT_VERSION,
+        updated_at: manifest.updated_at,
+        subscriptions: take_section(&mut payloads, "subscriptions")?
+            .map(deserialize_section::<Vec<SyncSubscription>>)
+            .transpose()?
+            .unwrap_or_default(),
+        custom_rules: take_section(&mut payloads, "custom-rules")?
+            .map(deserialize_section::<Vec<CustomRule>>)
+            .transpose()?
+            .unwrap_or_default(),
+        dns_overrides: take_section(&mut payloads, "dns-overrides")?
+            .map(deserialize_section::<Vec<DnsOverride>>)
+            .transpose()?,
+        config_script: take_section(&mut payloads, "config-script")?
+            .map(deserialize_section::<SyncConfigScript>)
+            .transpose()?,
+    };
+    validate_snapshot(&snapshot)?;
+    Ok(DownloadedSnapshot {
+        snapshot,
+        remote_revision: revision,
+    })
+}
+
+fn take_section(
+    payloads: &mut HashMap<String, Vec<u8>>,
+    section: &str,
+) -> Result<Option<Vec<u8>>, ServerFnError> {
+    payloads
+        .remove(section)
+        .map(|payload| {
+            if payload.len() > MAX_SYNC_BYTES {
+                return Err(ServerFnError::new(format!("远程同步文件 {section} 过大")));
+            }
+            Ok(payload)
+        })
+        .transpose()
+}
+
+fn deserialize_section<T: serde::de::DeserializeOwned>(bytes: Vec<u8>) -> Result<T, ServerFnError> {
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ServerFnError::new(format!("远程同步文件无效: {error}")))
+}
+
+fn validate_bundle_file_name(name: &str) -> Result<(), ServerFnError> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name.ends_with(".json")
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || "-_.".contains(character)
+        })
+        && !name.starts_with('.')
+        && !name.contains("..");
+    if ok {
+        Ok(())
+    } else {
+        Err(ServerFnError::new(format!("远程同步文件名无效: {name}")))
+    }
+}
+
+async fn download_object(config: &SyncConfig, path: &str) -> Result<Vec<u8>, ServerFnError> {
+    let response = match config.provider {
+        SyncProviderKind::WebDav => {
+            send_webdav(
+                config,
+                path,
+                Method::GET,
+                None,
+                &UploadCondition::Unconditional,
+            )
+            .await?
+        }
+        SyncProviderKind::S3 => {
+            send_s3(
+                config,
+                path,
+                Method::GET,
+                Vec::new(),
+                &UploadCondition::Unconditional,
+            )
+            .await?
+        }
+    };
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(ServerFnError::new(format!(
+            "远程同步文件缺失: {path}，请重新上传"
+        )));
+    }
+    let response = require_success(response, "下载远程同步文件").await?;
+    read_limited_body(response, MAX_SYNC_BYTES, "下载远程同步文件").await
+}
+
+/// The pre-bundle layout: one JSON document at exactly the configured path.
+/// Still read so a remote nobody has re-uploaded since keeps working; pushes
+/// always write a bundle.
+async fn download_legacy_snapshot(
+    config: &SyncConfig,
+) -> Result<Option<DownloadedSnapshot>, ServerFnError> {
+    let response = match config.provider {
+        SyncProviderKind::WebDav => {
+            send_webdav(
+                config,
+                &config.path,
+                Method::GET,
+                None,
+                &UploadCondition::Unconditional,
+            )
+            .await?
+        }
+        SyncProviderKind::S3 => {
+            send_s3(
+                config,
+                &config.path,
                 Method::GET,
                 Vec::new(),
                 &UploadCondition::Unconditional,
@@ -482,17 +867,18 @@ async fn download_snapshot(
     }))
 }
 
-async fn upload(
+async fn upload_object(
     config: &SyncConfig,
+    path: &str,
     payload: Vec<u8>,
-    condition: UploadCondition,
+    condition: &UploadCondition,
 ) -> Result<String, ServerFnError> {
     let response = match config.provider {
         SyncProviderKind::WebDav => {
-            ensure_webdav_collections(config).await?;
-            send_webdav_with_condition(config, Method::PUT, Some(payload), &condition).await?
+            ensure_webdav_collections(config, path).await?;
+            send_webdav(config, path, Method::PUT, Some(payload), condition).await?
         }
-        SyncProviderKind::S3 => send_s3(config, Method::PUT, payload, &condition).await?,
+        SyncProviderKind::S3 => send_s3(config, path, Method::PUT, payload, condition).await?,
     };
     if response.status() == StatusCode::PRECONDITION_FAILED {
         return Err(ServerFnError::new(
@@ -501,6 +887,69 @@ async fn upload(
     }
     let response = require_success(response, "上传远程同步文件").await?;
     Ok(response_revision(&response))
+}
+
+/// Write a bundle: every section object first, the manifest last.
+///
+/// Section names carry a content hash, so a push never rewrites a file an older
+/// manifest still points at, and a reader can only ever see a complete set: the
+/// manifest it validates against appears after all of its objects. Objects a
+/// previous revision owned are left in place rather than deleted, because
+/// another device may be downloading exactly that revision; expire them with a
+/// bucket lifecycle rule.
+///
+/// `known_objects` names the section objects the remote already stores, so an
+/// unchanged section costs no request: editing one DNS rule re-uploads that one
+/// object and the manifest, not the whole profile.
+async fn upload_bundle(
+    config: &SyncConfig,
+    snapshot: &SyncSnapshot,
+    condition: &UploadCondition,
+    known_objects: &HashSet<String>,
+) -> Result<String, ServerFnError> {
+    let sections = bundle_sections(snapshot)?;
+    let mut files = Vec::with_capacity(sections.len());
+    let mut total = 0_usize;
+    for (section, payload) in sections {
+        total = total.saturating_add(payload.len());
+        if total > MAX_SYNC_BYTES {
+            return Err(ServerFnError::new("同步内容超过 20 MiB 限制"));
+        }
+        let name = bundle_object_name(&section, &payload);
+        // Content-addressed name, so "already stored under this name" means
+        // "already stores exactly these bytes".
+        if !known_objects.contains(&name) {
+            let path = bundle_path(config, &name);
+            upload_object(
+                config,
+                &path,
+                payload.clone(),
+                &UploadCondition::Unconditional,
+            )
+            .await?;
+        }
+        files.push(BundleFile {
+            section,
+            size: payload.len() as u64,
+            sha256: sha256_hex(&payload),
+            name,
+        });
+    }
+
+    let manifest = BundleManifest {
+        format: SYNC_BUNDLE_FORMAT.to_string(),
+        version: SYNC_BUNDLE_VERSION,
+        updated_at: snapshot.updated_at,
+        files,
+    };
+    let payload = json_payload(&manifest)?;
+    upload_object(
+        config,
+        &bundle_path(config, MANIFEST_NAME),
+        payload,
+        condition,
+    )
+    .await
 }
 
 fn http_client() -> Result<reqwest::Client, ServerFnError> {
@@ -515,19 +964,12 @@ fn http_client() -> Result<reqwest::Client, ServerFnError> {
 
 async fn send_webdav(
     config: &SyncConfig,
-    method: Method,
-    body: Option<Vec<u8>>,
-) -> Result<Response, ServerFnError> {
-    send_webdav_with_condition(config, method, body, &UploadCondition::Unconditional).await
-}
-
-async fn send_webdav_with_condition(
-    config: &SyncConfig,
+    path: &str,
     method: Method,
     body: Option<Vec<u8>>,
     condition: &UploadCondition,
 ) -> Result<Response, ServerFnError> {
-    let url = build_remote_url(&config.webdav_endpoint, None, &config.path)?;
+    let url = build_remote_url(&config.webdav_endpoint, None, path)?;
     let mut request = http_client()?.request(method, url);
     if !config.username.trim().is_empty() {
         request = request.basic_auth(&config.username, Some(&config.password));
@@ -544,16 +986,19 @@ async fn send_webdav_with_condition(
         .map_err(|error| ServerFnError::new(format!("WebDAV 请求失败: {error}")))
 }
 
-async fn ensure_webdav_collections(config: &SyncConfig) -> Result<(), ServerFnError> {
-    let segments = config.path.trim_matches('/').split('/').collect::<Vec<_>>();
+/// Create the directories above an object. A single-file path needs its
+/// parents; a bundle also needs its own directory, which is why the object name
+/// is excluded rather than every segment but the last two.
+async fn ensure_webdav_collections(config: &SyncConfig, path: &str) -> Result<(), ServerFnError> {
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
     if segments.len() < 2 {
         return Ok(());
     }
     let client = http_client()?;
     let mkcol = Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method");
     for index in 1..segments.len() {
-        let path = segments[..index].join("/");
-        let url = build_remote_url(&config.webdav_endpoint, None, &path)?;
+        let collection = segments[..index].join("/");
+        let url = build_remote_url(&config.webdav_endpoint, None, &collection)?;
         let mut request = client.request(mkcol.clone(), url);
         if !config.username.trim().is_empty() {
             request = request.basic_auth(&config.username, Some(&config.password));
@@ -577,11 +1022,12 @@ async fn ensure_webdav_collections(config: &SyncConfig) -> Result<(), ServerFnEr
 
 async fn send_s3(
     config: &SyncConfig,
+    path: &str,
     method: Method,
     body: Vec<u8>,
     condition: &UploadCondition,
 ) -> Result<Response, ServerFnError> {
-    let url = build_s3_url(config)?;
+    let url = build_s3_url(config, path)?;
     let payload_hash = sha256_hex(&body);
     let (amz_date, date_stamp) = aws_timestamp()?;
     let host = request_host(&url)?;
@@ -686,22 +1132,22 @@ fn build_remote_url(
     Ok(url)
 }
 
-fn build_s3_url(config: &SyncConfig) -> Result<reqwest::Url, ServerFnError> {
+fn build_s3_url(config: &SyncConfig, path: &str) -> Result<reqwest::Url, ServerFnError> {
     let endpoint = config.s3_endpoint.trim();
     if endpoint.is_empty() || endpoint.contains("amazonaws.com") {
         if config.bucket.contains('.') {
             let base = format!("https://s3.{}.amazonaws.com", config.region.trim());
-            return build_remote_url(&base, Some(&config.bucket), &config.path);
+            return build_remote_url(&base, Some(&config.bucket), path);
         }
         let base = format!(
             "https://{}.s3.{}.amazonaws.com",
             config.bucket.trim(),
             config.region.trim()
         );
-        return build_remote_url(&base, None, &config.path);
+        return build_remote_url(&base, None, path);
     }
     let endpoint = parse_http_endpoint(endpoint, true)?;
-    build_remote_url(endpoint.as_str(), Some(&config.bucket), &config.path)
+    build_remote_url(endpoint.as_str(), Some(&config.bucket), path)
 }
 
 fn request_host(url: &reqwest::Url) -> Result<String, ServerFnError> {
@@ -899,12 +1345,341 @@ mod tests {
     use proxy_core::AppProfile;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// A tiny path-keyed HTTP store. The bundle layout issues several requests per
+    /// push, which the earlier "expect exactly N requests" servers cannot express,
+    /// so this serves GET/PUT/MKCOL on any path, honours `If-Match` and
+    /// `If-None-Match: *`, and records the order writes arrived in.
+    /// One stored object: its ETag and body, keyed by request target. Spelled
+    /// once because the fake remote threads it through four signatures.
+    type StoredFile = (String, Vec<u8>);
+
+    struct FakeRemote {
+        endpoint: String,
+        files: Arc<Mutex<HashMap<String, StoredFile>>>,
+        writes: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<String>>>,
+        reject_next_put: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl FakeRemote {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("fake remote should bind");
+            let address = listener.local_addr().expect("fake remote address");
+            listener
+                .set_nonblocking(true)
+                .expect("fake remote should be nonblocking");
+            let files = Arc::new(Mutex::new(HashMap::new()));
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let reject_next_put = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (server_files, server_writes, server_requests, server_reject, server_stop) = (
+                Arc::clone(&files),
+                Arc::clone(&writes),
+                Arc::clone(&requests),
+                Arc::clone(&reject_next_put),
+                Arc::clone(&stop),
+            );
+
+            std::thread::spawn(move || {
+                while !server_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let (files, writes, requests, reject) = (
+                                Arc::clone(&server_files),
+                                Arc::clone(&server_writes),
+                                Arc::clone(&server_requests),
+                                Arc::clone(&server_reject),
+                            );
+                            std::thread::spawn(move || {
+                                let (request, mut stream) = read_http_request(stream);
+                                // Only the request head is kept; bodies are stored
+                                // in `files`, and nothing here needs both.
+                                let head = request
+                                    .split_once("\r\n\r\n")
+                                    .map_or_else(|| request.clone(), |(head, _)| head.to_string());
+                                lock_shared(&requests).push(head);
+                                serve_fake_request(&request, &files, &writes, &reject, &mut stream);
+                            });
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            Self {
+                endpoint: format!("http://{address}"),
+                files,
+                writes,
+                requests,
+                reject_next_put,
+                stop,
+            }
+        }
+
+        /// Make the next PUT fail with 412, to exercise the window between the
+        /// precondition check in `push` and the write itself.
+        fn reject_next_put(&self) {
+            self.reject_next_put.store(true, Ordering::SeqCst);
+        }
+
+        /// Seed an object, bypassing the wire, to stage a remote revision.
+        fn put(&self, path: &str, body: Vec<u8>) {
+            lock_shared(&self.files).insert(
+                format!("/{path}"),
+                ("\"revision-remote\"".to_string(), body),
+            );
+        }
+
+        fn paths(&self) -> Vec<String> {
+            let mut keys = lock_shared(&self.files).keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys
+        }
+
+        fn writes(&self) -> Vec<String> {
+            lock_shared(&self.writes).clone()
+        }
+
+        /// Every request head the server saw, in arrival order.
+        fn requests(&self) -> Vec<String> {
+            lock_shared(&self.requests).clone()
+        }
+
+        fn body(&self, path: &str) -> Option<Vec<u8>> {
+            lock_shared(&self.files)
+                .get(path)
+                .map(|entry| entry.1.clone())
+        }
+    }
+
+    impl Drop for FakeRemote {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// `Mutex::lock` across the helper methods: a poisoned test lock is fine to
+    /// read, since the test itself is the only writer and it cannot be mid-write.
+    fn lock_shared<T>(value: &Arc<Mutex<T>>) -> std::sync::MutexGuard<'_, T> {
+        value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn serve_fake_request(
+        request: &str,
+        files: &Arc<Mutex<HashMap<String, StoredFile>>>,
+        writes: &Arc<Mutex<Vec<String>>>,
+        reject_next_put: &Arc<AtomicBool>,
+        stream: &mut TcpStream,
+    ) {
+        let mut words = request.split_whitespace();
+        let (Some(method), Some(target)) = (words.next(), words.next()) else {
+            return;
+        };
+        let lowered = request.to_ascii_lowercase();
+        let existing = files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(target)
+            .cloned();
+
+        match method {
+            "MKCOL" => write_fake_response(stream, "201 Created\r\n", b""),
+            "GET" | "HEAD" => match existing {
+                Some((etag, body)) => write_fake_response(
+                    stream,
+                    &format!("200 OK\r\nETag: {etag}\r\nContent-Type: application/json\r\n"),
+                    &body,
+                ),
+                None => write_fake_response(stream, "404 Not Found\r\n", b""),
+            },
+            "PUT" => {
+                if reject_next_put.swap(false, Ordering::SeqCst) {
+                    write_fake_response(stream, "412 Precondition Failed\r\n", b"");
+                    return;
+                }
+                if lowered.contains("if-none-match: *") && existing.is_some() {
+                    write_fake_response(stream, "412 Precondition Failed\r\n", b"");
+                    return;
+                }
+                if let Some(expected) = header_value(&lowered, "if-match") {
+                    match &existing {
+                        Some((etag, _)) if *etag == expected => {}
+                        _ => {
+                            write_fake_response(stream, "412 Precondition Failed\r\n", b"");
+                            return;
+                        }
+                    }
+                }
+                let body = request_body(request).to_vec();
+                writes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(target.to_string());
+                files
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        target.to_string(),
+                        ("\"revision-remote\"".to_string(), body),
+                    );
+                write_fake_response(stream, "201 Created\r\nETag: \"revision-remote\"\r\n", b"");
+            }
+            other => write_fake_response(stream, &format!("405 {other} Not Allowed\r\n"), b""),
+        }
+    }
+
+    fn header_value(lowered_request: &str, name: &str) -> Option<String> {
+        lowered_request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    /// Every reply closes the connection, so a client that pipelines or reuses
+    /// keeps working against a one-request-per-connection server.
+    fn write_fake_response(stream: &mut TcpStream, status_and_headers: &str, body: &[u8]) {
+        let response = format!(
+            "HTTP/1.1 {status_and_headers}Connection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+    }
 
     #[test]
     fn aws_timestamp_uses_utc_calendar_date() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+    }
+
+    #[test]
+    fn a_configured_file_path_maps_to_a_sibling_folder() {
+        assert_eq!(bundle_directory("kitty-pro-sync.json"), "kitty-pro-sync");
+        assert_eq!(
+            bundle_directory("sync/kitty-profile.JSON"),
+            "sync/kitty-profile"
+        );
+        // A path that already names a folder stays one.
+        assert_eq!(bundle_directory("sync/kitty"), "sync/kitty");
+        assert_eq!(bundle_directory("/a/b.json"), "a/b");
+    }
+
+    #[test]
+    fn object_names_are_content_addresses() {
+        let payload = br#"[{"id":1}]"#;
+        let name = bundle_object_name("dns-overrides", payload);
+        assert_eq!(name, bundle_object_name("dns-overrides", payload));
+        assert!(name.starts_with("dns-overrides-"));
+        assert!(name.ends_with(".json"));
+        assert_ne!(name, bundle_object_name("dns-overrides", b"[{\"id\":2}]"));
+        assert_ne!(name, bundle_object_name("custom-rules", payload));
+    }
+
+    /// Sections a snapshot does not carry write no object at all. That is what
+    /// keeps "this build never had the feature" distinct from "zero rules", and
+    /// it is the shape a reader needs in order to preserve local DNS on a pull.
+    #[test]
+    fn absent_sections_write_no_objects() {
+        let mut legacy = SyncSnapshot::from_profile(&AppProfile::default(), 1);
+        legacy.dns_overrides = None;
+        legacy.config_script = None;
+        let legacy_sections = bundle_sections(&legacy).expect("legacy sections should build");
+        assert_eq!(
+            section_names(&legacy_sections),
+            vec!["subscriptions", "custom-rules"]
+        );
+
+        let modern = SyncSnapshot::from_profile(&AppProfile::default(), 1);
+        let modern_sections = bundle_sections(&modern).expect("modern sections should build");
+        assert_eq!(
+            section_names(&modern_sections),
+            vec![
+                "subscriptions",
+                "custom-rules",
+                "dns-overrides",
+                "config-script"
+            ]
+        );
+    }
+
+    fn section_names(sections: &[(String, Vec<u8>)]) -> Vec<&str> {
+        sections.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// Manifest names become request paths, so they cannot be allowed to walk
+    /// out of the bundle folder.
+    #[test]
+    fn manifest_names_are_confined_to_the_bundle() {
+        assert!(validate_bundle_file_name("dns-overrides-abcd.json").is_ok());
+        assert!(validate_bundle_file_name("../manifest.json").is_err());
+        assert!(validate_bundle_file_name("a/b.json").is_err());
+        assert!(validate_bundle_file_name("/etc/passwd.json").is_err());
+        assert!(validate_bundle_file_name(".hidden.json").is_err());
+        assert!(validate_bundle_file_name("UPPER.json").is_err());
+        assert!(validate_bundle_file_name("no-extension").is_err());
+    }
+
+    /// The manifest is the one index in a bundle that is not itself hashed, and
+    /// every entry it names is a request. It has to hold up before any of that
+    /// is fetched.
+    #[test]
+    fn manifest_shape_is_checked_before_anything_is_downloaded() {
+        let file = |section: &str| BundleFile {
+            section: section.to_string(),
+            name: format!("{section}-aaaaaaaaaaaaaaaa.json"),
+            size: 2,
+            sha256: "a".repeat(64),
+        };
+        let manifest = |files: Vec<BundleFile>| BundleManifest {
+            format: SYNC_BUNDLE_FORMAT.to_string(),
+            version: SYNC_BUNDLE_VERSION,
+            updated_at: 1,
+            files,
+        };
+
+        assert!(validate_manifest_shape(&manifest(vec![
+            file("subscriptions"),
+            file("dns-overrides"),
+        ]))
+        .is_ok());
+
+        // A section this build cannot place must fail rather than be dropped:
+        // dropping would delete it on the next push.
+        assert!(validate_manifest_shape(&manifest(vec![file("future-things")])).is_err());
+        // Two entries for one section would otherwise resolve last-one-wins.
+        assert!(validate_manifest_shape(&manifest(vec![
+            file("custom-rules"),
+            file("custom-rules"),
+        ]))
+        .is_err());
+        // Names must belong to the section they claim, and digests be digests.
+        let mut mismatched = file("subscriptions");
+        mismatched.name = "custom-rules-aaaaaaaaaaaaaaaa.json".to_string();
+        assert!(validate_manifest_shape(&manifest(vec![mismatched])).is_err());
+        let mut short_digest = file("subscriptions");
+        short_digest.sha256 = "deadbeef".to_string();
+        assert!(validate_manifest_shape(&manifest(vec![short_digest])).is_err());
+        // Bounded, so a huge list cannot turn one pull into thousands of GETs.
+        let many = manifest(vec![file("subscriptions"); MAX_BUNDLE_FILES + 1]);
+        assert!(validate_manifest_shape(&many).is_err());
     }
 
     #[test]
@@ -1033,7 +1808,7 @@ mod tests {
             ..SyncConfig::default()
         };
         assert_eq!(
-            build_s3_url(&config)
+            build_s3_url(&config, &config.path.clone())
                 .expect("AWS URL should build")
                 .as_str(),
             "https://kitty-backup.s3.ap-east-1.amazonaws.com/folder/profile.json"
@@ -1041,7 +1816,7 @@ mod tests {
 
         config.bucket = "kitty.backup".to_string();
         assert_eq!(
-            build_s3_url(&config)
+            build_s3_url(&config, &config.path.clone())
                 .expect("dotted AWS bucket URL should build")
                 .as_str(),
             "https://s3.ap-east-1.amazonaws.com/kitty.backup/folder/profile.json"
@@ -1050,7 +1825,7 @@ mod tests {
         config.bucket = "kitty-backup".to_string();
         config.s3_endpoint = "http://minio.local:9000".to_string();
         assert_eq!(
-            build_s3_url(&config)
+            build_s3_url(&config, &config.path.clone())
                 .expect("custom endpoint URL should build")
                 .as_str(),
             "http://minio.local:9000/kitty-backup/folder/profile.json"
@@ -1165,66 +1940,245 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webdav_push_and_pull_round_trip() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let endpoint = format!(
-            "http://{}",
-            listener.local_addr().expect("listener should have address")
-        );
-        let stored = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let server_stored = Arc::clone(&stored);
-        let server = std::thread::spawn(move || {
-            for _ in 0..3 {
-                let (stream, _) = listener.accept().expect("request should arrive");
-                let (request, mut stream) = read_http_request(stream);
-                assert!(request
-                    .to_ascii_lowercase()
-                    .contains("authorization: basic "));
-                if request.starts_with("PUT ") {
-                    assert!(request.to_ascii_lowercase().contains("if-none-match: *"));
-                    let body = request_body(&request);
-                    *server_stored.lock().expect("stored body lock") = body.to_vec();
-                    write_http_response_with_headers(
-                        &mut stream,
-                        "201 Created",
-                        "ETag: \"revision-1\"\r\n",
-                        b"",
-                    );
-                } else if server_stored.lock().expect("stored body lock").is_empty() {
-                    write_http_response(&mut stream, "404 Not Found", b"");
-                } else {
-                    let body = server_stored.lock().expect("stored body lock").clone();
-                    write_http_response_with_headers(
-                        &mut stream,
-                        "200 OK",
-                        "ETag: \"revision-1\"\r\n",
-                        &body,
-                    );
-                }
-            }
-        });
-
+    async fn webdav_push_and_pull_round_trips_a_bundle() {
+        let remote = FakeRemote::start();
         let config = SyncConfig {
             enabled: true,
             provider: SyncProviderKind::WebDav,
-            webdav_endpoint: endpoint,
+            webdav_endpoint: remote.endpoint.clone(),
             path: "kitty-profile.json".to_string(),
             username: "demo".to_string(),
             password: "secret".to_string(),
             ..SyncConfig::default()
         };
-        let snapshot = SyncSnapshot::from_profile(&AppProfile::default(), 0);
-        let result = push(&config, snapshot, false)
+        let profile = AppProfile {
+            subscriptions: vec![proxy_core::Subscription {
+                id: 3,
+                name: "Primary".to_string(),
+                source: "https://example.com/sub?token=secret".to_string(),
+                nodes: Vec::new(),
+                proxy_server_nameservers: Vec::new(),
+                rejected_count: 0,
+            }],
+            dns_overrides: vec![proxy_core::DnsOverride {
+                id: 1,
+                enabled: true,
+                domain_suffix: "example.net".to_string(),
+                server: "192.0.2.53".to_string(),
+            }],
+            config_script_enabled: true,
+            config_script: "function main(c) { return c; }".to_string(),
+            ..AppProfile::default()
+        };
+
+        let result = push(&config, SyncSnapshot::from_profile(&profile, 0), false)
             .await
             .expect("WebDAV push should succeed");
         let pulled = pull(&config).await.expect("WebDAV pull should succeed");
 
-        server.join().expect("server should exit");
         assert_eq!(pulled.snapshot.updated_at, result.updated_at);
-        assert_eq!(pulled.snapshot.format, SYNC_SNAPSHOT_FORMAT);
-        assert_eq!(result.remote_revision, "\"revision-1\"");
-        assert_eq!(pulled.remote_revision, "\"revision-1\"");
-        assert!(!stored.lock().expect("stored body lock").is_empty());
+        assert_eq!(pulled.remote_revision, "\"revision-remote\"");
+        // Every section survives, not just the two the single-document layout
+        // could carry.
+        let expected = SyncSnapshot::from_profile(&profile, pulled.snapshot.updated_at);
+        assert_eq!(pulled.snapshot, expected);
+
+        // Stored as a folder: a manifest plus one object per section.
+        let paths = remote.paths();
+        assert!(
+            paths.contains(&"/kitty-profile/manifest.json".to_string()),
+            "manifest missing from {paths:?}"
+        );
+        assert!(paths
+            .iter()
+            .any(|path| path.starts_with("/kitty-profile/dns-overrides-")));
+        assert!(paths
+            .iter()
+            .any(|path| path.starts_with("/kitty-profile/config-script-")));
+        assert!(paths
+            .iter()
+            .any(|path| path.starts_with("/kitty-profile/subscriptions-")));
+    }
+
+    /// The manifest is what makes a bundle atomic: a reader only ever sees it
+    /// once every object it names is already uploaded.
+    #[tokio::test]
+    async fn bundle_manifest_is_uploaded_last() {
+        let remote = FakeRemote::start();
+        let config = SyncConfig {
+            enabled: true,
+            provider: SyncProviderKind::WebDav,
+            webdav_endpoint: remote.endpoint.clone(),
+            path: "sync/profile.json".to_string(),
+            ..SyncConfig::default()
+        };
+
+        push(
+            &config,
+            SyncSnapshot::from_profile(&AppProfile::default(), 0),
+            true,
+        )
+        .await
+        .expect("bundle push should succeed");
+
+        let writes = remote.writes();
+        assert!(
+            writes.len() >= 2,
+            "expected section writes plus a manifest: {writes:?}"
+        );
+        assert_eq!(
+            writes.last().expect("at least one write").as_str(),
+            "/sync/profile/manifest.json",
+            "the manifest must be the final write"
+        );
+        assert!(writes[..writes.len() - 1]
+            .iter()
+            .all(|path| !path.ends_with("manifest.json")));
+    }
+
+    /// The payoff of splitting the blob into objects: a second push that changes
+    /// one section re-uploads that section and the manifest, and nothing else.
+    #[tokio::test]
+    async fn push_reuploads_only_the_changed_section() {
+        let remote = FakeRemote::start();
+        let config = SyncConfig {
+            enabled: true,
+            provider: SyncProviderKind::WebDav,
+            webdav_endpoint: remote.endpoint.clone(),
+            path: "profile.json".to_string(),
+            ..SyncConfig::default()
+        };
+
+        let first = push(
+            &config,
+            SyncSnapshot::from_profile(
+                &AppProfile {
+                    dns_overrides: vec![proxy_core::DnsOverride {
+                        id: 1,
+                        enabled: true,
+                        domain_suffix: "example.net".to_string(),
+                        server: "192.0.2.1".to_string(),
+                    }],
+                    ..AppProfile::default()
+                },
+                0,
+            ),
+            true,
+        )
+        .await
+        .expect("first push should succeed");
+        let seen = remote.writes().len();
+
+        // Carry the checkpoint forward so the second push runs its preflight and
+        // learns which objects the remote already holds.
+        let second_config = SyncConfig {
+            last_sync_at: first.updated_at,
+            last_remote_revision: first.remote_revision.clone(),
+            ..config.clone()
+        };
+        push(
+            &second_config,
+            SyncSnapshot::from_profile(
+                &AppProfile {
+                    dns_overrides: vec![proxy_core::DnsOverride {
+                        id: 1,
+                        enabled: true,
+                        domain_suffix: "example.net".to_string(),
+                        server: "192.0.2.2".to_string(),
+                    }],
+                    ..AppProfile::default()
+                },
+                0,
+            ),
+            false,
+        )
+        .await
+        .expect("second push should succeed");
+
+        let new_writes = &remote.writes()[seen..];
+        assert!(
+            new_writes
+                .iter()
+                .any(|path| path.starts_with("/profile/dns-overrides-")),
+            "the changed section should re-upload: {new_writes:?}"
+        );
+        assert!(
+            !new_writes.iter().any(|path| path.contains("subscriptions")),
+            "unchanged subscriptions must not re-upload: {new_writes:?}"
+        );
+        assert!(
+            !new_writes.iter().any(|path| path.contains("custom-rules")),
+            "unchanged rules must not re-upload: {new_writes:?}"
+        );
+        assert_eq!(
+            new_writes.last().map(String::as_str),
+            Some("/profile/manifest.json"),
+            "the manifest stays the commit point"
+        );
+    }
+
+    /// A remote written by an older build is a single document at exactly
+    /// `config.path`. It must still download, and the first push must create a
+    /// manifest rather than clobber it blind.
+    #[tokio::test]
+    async fn legacy_single_document_still_downloads_and_upgrades() {
+        let remote = FakeRemote::start();
+        // Verbatim shape of an object written by a pre-DNS build: v1, and no
+        // `dns_overrides` key at all. Serializing a modern snapshot would not
+        // reproduce it, because a modern snapshot always carries the section.
+        let legacy = br#"{
+            "format": "kitty-pro-sync",
+            "version": 1,
+            "updated_at": 42,
+            "subscriptions": [],
+            "custom_rules": [],
+            "active_subscription_id": null,
+            "selected_tag": "",
+            "group_selections": {}
+        }"#
+        .to_vec();
+        remote.put("kitty-profile.json", legacy.clone());
+
+        let config = SyncConfig {
+            enabled: true,
+            provider: SyncProviderKind::WebDav,
+            webdav_endpoint: remote.endpoint.clone(),
+            path: "kitty-profile.json".to_string(),
+            last_sync_at: 42,
+            last_remote_revision: "\"revision-remote\"".to_string(),
+            ..SyncConfig::default()
+        };
+
+        let pulled = pull(&config)
+            .await
+            .expect("legacy document should still download");
+        assert_eq!(pulled.snapshot.updated_at, 42);
+        // A v1 document carries no DNS section, which is precisely the case the
+        // pull guard has to survive.
+        assert!(pulled.snapshot.dns_overrides.is_none());
+
+        push(
+            &config,
+            SyncSnapshot::from_profile(&AppProfile::default(), 0),
+            false,
+        )
+        .await
+        .expect("pushing over a legacy target should succeed");
+        assert!(remote
+            .paths()
+            .contains(&"/kitty-profile/manifest.json".to_string()));
+        // The legacy object is left in place so a device still on an older build
+        // can read it until it upgrades too.
+        assert_eq!(
+            remote.body("/kitty-profile.json").as_deref(),
+            Some(&legacy[..])
+        );
+
+        // A reader now gets the bundle, whose manifest always lists the modern
+        // sections, so the same pull returns a snapshot that carries them.
+        let upgraded = pull(&config).await.expect("bundle should download");
+        assert!(upgraded.snapshot.dns_overrides.is_some());
+        assert!(upgraded.snapshot.updated_at > 42);
     }
 
     /// The exact failure this guard exists for: a remote object written before
@@ -1292,45 +2246,33 @@ mod tests {
         assert_eq!(target.config_script, source.config_script);
     }
 
+    /// `push` reads the remote, then writes guarded by its revision. If another
+    /// device publishes in between, the write must fail rather than stomp it.
     #[tokio::test]
-    async fn conditional_upload_rejects_a_remote_change_after_get() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let endpoint = format!(
-            "http://{}",
-            listener.local_addr().expect("listener should have address")
-        );
-        let remote = serde_json::to_vec(&SyncSnapshot::from_profile(&AppProfile::default(), 42))
-            .expect("remote snapshot should serialize");
-        let server = std::thread::spawn(move || {
-            for request_index in 0..2 {
-                let (stream, _) = listener.accept().expect("request should arrive");
-                let (request, mut stream) = read_http_request(stream);
-                if request_index == 0 {
-                    assert!(request.starts_with("GET "));
-                    write_http_response_with_headers(
-                        &mut stream,
-                        "200 OK",
-                        "ETag: \"revision-1\"\r\n",
-                        &remote,
-                    );
-                } else {
-                    assert!(request.starts_with("PUT "));
-                    assert!(request
-                        .to_ascii_lowercase()
-                        .contains("if-match: \"revision-1\""));
-                    write_http_response(&mut stream, "412 Precondition Failed", b"");
-                }
-            }
-        });
+    async fn bundle_upload_rejects_a_remote_change_after_the_check() {
+        let remote = FakeRemote::start();
+        let manifest = serde_json::to_vec(&BundleManifest {
+            format: SYNC_BUNDLE_FORMAT.to_string(),
+            version: SYNC_BUNDLE_VERSION,
+            updated_at: 42,
+            files: Vec::new(),
+        })
+        .expect("manifest should serialize");
+        remote.put("kitty-profile/manifest.json", manifest);
+
         let config = SyncConfig {
             enabled: true,
-            webdav_endpoint: endpoint,
+            provider: SyncProviderKind::WebDav,
+            webdav_endpoint: remote.endpoint.clone(),
             path: "kitty-profile.json".to_string(),
             last_sync_at: 42,
-            last_remote_revision: "\"revision-1\"".to_string(),
+            last_remote_revision: "\"revision-remote\"".to_string(),
             ..SyncConfig::default()
         };
 
+        // The preflight GET sees the revision we match; the manifest PUT that
+        // follows is rejected, exactly as a real conditional write would be.
+        remote.reject_next_put();
         let error = push(
             &config,
             SyncSnapshot::from_profile(&AppProfile::default(), 42),
@@ -1338,34 +2280,16 @@ mod tests {
         )
         .await
         .expect_err("changed remote must reject conditional upload");
-
-        server.join().expect("server should exit");
-        assert!(error.to_string().contains("检查后发生变化"));
+        assert!(error.to_string().contains("检查后发生变化"), "{error}");
     }
 
     #[tokio::test]
-    async fn s3_upload_uses_path_style_and_signed_headers_for_custom_endpoint() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let endpoint = format!(
-            "http://{}",
-            listener.local_addr().expect("listener should have address")
-        );
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("request should arrive");
-            let (request, mut stream) = read_http_request(stream);
-            sender.send(request).expect("request should be captured");
-            write_http_response_with_headers(
-                &mut stream,
-                "200 OK",
-                "ETag: \"revision-1\"\r\n",
-                b"",
-            );
-        });
+    async fn s3_bundle_uses_path_style_and_signed_headers_for_custom_endpoint() {
+        let remote = FakeRemote::start();
         let config = SyncConfig {
             enabled: true,
             provider: SyncProviderKind::S3,
-            s3_endpoint: endpoint,
+            s3_endpoint: remote.endpoint.clone(),
             path: "sync/profile.json".to_string(),
             bucket: "kitty-backup".to_string(),
             region: "us-east-1".to_string(),
@@ -1382,10 +2306,18 @@ mod tests {
         .await
         .expect("S3 upload should succeed");
 
-        server.join().expect("server should exit");
-        let request = receiver.recv().expect("request should be available");
-        let lower = request.to_ascii_lowercase();
-        assert!(request.starts_with("PUT /kitty-backup/sync/profile.json "));
+        let requests = remote.requests();
+        assert!(!requests.is_empty(), "expected signed requests");
+        // Path style: bucket first, then the bundle folder.
+        assert!(
+            requests
+                .iter()
+                .any(|head| head.starts_with("PUT /kitty-backup/sync/profile/")),
+            "unexpected request line: {:?}",
+            requests.first()
+        );
+        let first = requests.first().expect("request should exist");
+        let lower = first.to_ascii_lowercase();
         assert!(lower.contains("authorization: aws4-hmac-sha256"));
         assert!(lower.contains("signedheaders=content-type;host;x-amz-content-sha256;x-amz-date"));
         assert!(lower.contains("x-amz-content-sha256:"));
@@ -1440,25 +2372,5 @@ mod tests {
 
     fn find_header_end(bytes: &[u8]) -> Option<usize> {
         bytes.windows(4).position(|window| window == b"\r\n\r\n")
-    }
-
-    fn write_http_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
-        write_http_response_with_headers(stream, status, "", body);
-    }
-
-    fn write_http_response_with_headers(
-        stream: &mut TcpStream,
-        status: &str,
-        extra_headers: &str,
-        body: &[u8],
-    ) {
-        let headers = format!(
-            "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream
-            .write_all(headers.as_bytes())
-            .and_then(|_| stream.write_all(body))
-            .expect("response should write");
     }
 }

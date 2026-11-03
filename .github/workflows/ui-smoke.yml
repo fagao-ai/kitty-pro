@@ -125,7 +125,9 @@ jobs:
         working-directory: tests/ui-smoke
         env:
           KITTY_WEB_URL: http://127.0.0.1:7897
-        run: npx playwright test layout.spec.js console.spec.js dialog.spec.js
+        # `npm test` rather than a file list: the spec list lives in
+        # package.json, and a hardcoded copy here silently skips new suites.
+        run: npm test
 
       # Proves the budgets above are able to fail; a guard that cannot is worse
       # than none. Separate step so a broken assertion names itself.

@@ -49,6 +49,9 @@ the app booted.
   *reachable* control; panels stay centred in the viewport; the script editor
   keeps its 880px; the nested process picker lands on screen instead of inside
   the rule card's containing block.
+- `sync.spec.js` - the remote-path field names a folder and its hint echoes the
+  configured path's stem (not a hard-coded name), and that hint cannot create
+  horizontal overflow on a phone.
 - `negcheck.spec.js` - opt-in proof that the budgets above can fail (see below).
 
 ## The negative control
