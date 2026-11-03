@@ -963,7 +963,9 @@ socks5://bob:pass@127.0.0.1:1080#Socks",
 
     #[test]
     fn distinguishes_http_proxy_links_from_subscription_urls() {
-        assert!(is_http_proxy_share_link("http://198.51.100.20:11080#Company"));
+        assert!(is_http_proxy_share_link(
+            "http://198.51.100.20:11080#Company"
+        ));
         assert!(is_http_proxy_share_link(
             "https://user:pass@proxy.example.com"
         ));

@@ -962,10 +962,9 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
 
     #[test]
     fn direct_domain_rules_use_local_dns_before_secure_dns_fallback() {
-        let nodes = parse_subscription(
-            "hysteria2://secret@203.0.113.66:10086?sni=bing.com&insecure=1#HY2",
-        )
-        .nodes;
+        let nodes =
+            parse_subscription("hysteria2://secret@203.0.113.66:10086?sni=bing.com&insecure=1#HY2")
+                .nodes;
         let request = ConnectionRequest {
             selected_tag: nodes[0].tag.clone(),
             nodes,
