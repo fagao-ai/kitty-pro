@@ -526,10 +526,23 @@ pub struct SyncSnapshot {
     pub subscriptions: Vec<SyncSubscription>,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
-    /// Optional since version 2: older snapshots decode to an empty list, so
-    /// the additive field keeps wire compatibility without a version bump.
-    #[serde(default)]
-    pub dns_overrides: Vec<DnsOverride>,
+    /// `None` means the remote document carries no DNS section at all, which is
+    /// every snapshot uploaded before the feature shipped. Applying one must
+    /// leave the local list alone: reading "absent" as "empty" silently deletes
+    /// rules the remote never had a chance to send. `Some(vec![])` stays the
+    /// different, deliberate case - the remote really has none, so clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_overrides: Option<Vec<DnsOverride>>,
+    /// Config script, with the same absent-versus-empty rule. Device-local
+    /// preferences (theme, TUN, LAN, mode) still deliberately never travel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_script: Option<SyncConfigScript>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncConfigScript {
+    pub enabled: bool,
+    pub script: String,
 }
 
 impl SyncSnapshot {
@@ -544,7 +557,11 @@ impl SyncSnapshot {
                 .map(SyncSubscription::from)
                 .collect(),
             custom_rules: profile.custom_rules.clone(),
-            dns_overrides: profile.dns_overrides.clone(),
+            dns_overrides: Some(profile.dns_overrides.clone()),
+            config_script: Some(SyncConfigScript {
+                enabled: profile.config_script_enabled,
+                script: profile.config_script.clone(),
+            }),
         }
     }
 
@@ -558,7 +575,14 @@ impl SyncSnapshot {
         profile.active_subscription_id = None;
         profile.selected_tag.clear();
         profile.custom_rules = self.custom_rules.clone();
-        profile.dns_overrides = self.dns_overrides.clone();
+        // Only overwrite sections the document actually carries.
+        if let Some(dns_overrides) = &self.dns_overrides {
+            profile.dns_overrides = dns_overrides.clone();
+        }
+        if let Some(config_script) = &self.config_script {
+            profile.config_script_enabled = config_script.enabled;
+            profile.config_script = config_script.script.clone();
+        }
         profile.group_selections.clear();
     }
 }
@@ -715,9 +739,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_snapshot_without_dns_overrides_decodes_empty() {
-        // Version-2 snapshots uploaded before dns_overrides existed must keep
-        // decoding, syncing to an empty override list.
+    fn snapshot_without_a_dns_section_preserves_local_rules() {
+        // Every remote document uploaded before DNS overrides shipped looks like
+        // this. It must decode, and applying it must leave the local rules alone:
+        // treating "absent" as "empty" deleted the user's rules on pull.
         let legacy = r#"{
             "format": "kitty-pro-sync",
             "version": 2,
@@ -727,7 +752,8 @@ mod tests {
         }"#;
         let snapshot: SyncSnapshot =
             serde_json::from_str(legacy).expect("legacy snapshot should decode");
-        assert!(snapshot.dns_overrides.is_empty());
+        assert!(snapshot.dns_overrides.is_none());
+        assert!(snapshot.config_script.is_none());
 
         let mut profile = AppProfile::default();
         profile.dns_overrides.push(DnsOverride {
@@ -736,8 +762,73 @@ mod tests {
             domain_suffix: "example.net".to_string(),
             server: "192.0.2.53".to_string(),
         });
+        profile.config_script = "function main(c) { return c; }".to_string();
+        profile.config_script_enabled = true;
+        snapshot.apply_to_profile(&mut profile);
+        assert_eq!(profile.dns_overrides.len(), 1);
+        assert!(profile.config_script_enabled);
+        assert_eq!(profile.config_script, "function main(c) { return c; }");
+    }
+
+    #[test]
+    fn explicit_empty_dns_section_clears_local_rules() {
+        // The opposite case: a modern remote that really has no rules must clear
+        // them locally, otherwise a deletion could never sync down.
+        let modern = r#"{
+            "format": "kitty-pro-sync",
+            "version": 2,
+            "updated_at": 7,
+            "subscriptions": [],
+            "custom_rules": [],
+            "dns_overrides": [],
+            "config_script": { "enabled": false, "script": "" }
+        }"#;
+        let snapshot: SyncSnapshot = serde_json::from_str(modern).expect("modern snapshot");
+        let mut profile = AppProfile {
+            dns_overrides: vec![DnsOverride {
+                id: 1,
+                enabled: true,
+                domain_suffix: "example.net".to_string(),
+                server: "192.0.2.53".to_string(),
+            }],
+            config_script_enabled: true,
+            config_script: "stale".to_string(),
+            ..AppProfile::default()
+        };
         snapshot.apply_to_profile(&mut profile);
         assert!(profile.dns_overrides.is_empty());
+        assert!(!profile.config_script_enabled);
+        assert!(profile.config_script.is_empty());
+    }
+
+    #[test]
+    fn snapshot_carries_dns_rules_and_the_config_script() {
+        let source = AppProfile {
+            dns_overrides: vec![DnsOverride {
+                id: 4,
+                enabled: false,
+                domain_suffix: "example.net".to_string(),
+                server: "192.0.2.53".to_string(),
+            }],
+            config_script_enabled: true,
+            config_script: "function main(c) { return c; }".to_string(),
+            ..AppProfile::default()
+        };
+        let snapshot = SyncSnapshot::from_profile(&source, 3);
+        assert_eq!(snapshot.dns_overrides, Some(source.dns_overrides.clone()));
+        assert_eq!(
+            snapshot.config_script,
+            Some(SyncConfigScript {
+                enabled: true,
+                script: "function main(c) { return c; }".to_string(),
+            })
+        );
+
+        let mut target = AppProfile::default();
+        snapshot.apply_to_profile(&mut target);
+        assert_eq!(target.dns_overrides, source.dns_overrides);
+        assert!(target.config_script_enabled);
+        assert_eq!(target.config_script, source.config_script);
     }
 
     #[test]

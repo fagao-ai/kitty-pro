@@ -16,8 +16,8 @@ use dioxus_free_icons::Icon;
 use proxy_core::{
     validate_custom_rules, AppProfile, ConnectionRequest, CustomRule, CustomRuleAction,
     CustomRuleMatch, DnsOverride, ParseReport, ProxyGroup, ProxyGroupKind, ProxyNode,
-    ProxyProtocol, Subscription, SyncSnapshot, SyncSubscription, TunnelMode, MAX_CUSTOM_RULES,
-    SYNC_SNAPSHOT_VERSION,
+    ProxyProtocol, Subscription, SyncConfigScript, SyncSnapshot, SyncSubscription, TunnelMode,
+    MAX_CUSTOM_RULES, SYNC_SNAPSHOT_VERSION,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -5809,7 +5809,7 @@ fn SyncSettings(
 
             div { class: "inline-note sync-security-note",
                 Icon { icon: LdInfo, width: 16, height: 16 }
-                span { "远端文件包含订阅来源和自定义规则" }
+                span { "远端文件包含订阅来源（含令牌）、自定义规则、专用 DNS 与配置脚本" }
             }
 
             div { class: "sync-form-grid",
@@ -5950,6 +5950,11 @@ fn SyncSettings(
                         match api::sync_pull(value.clone()).await {
                             Ok(downloaded) => {
                                 let snapshot = downloaded.snapshot;
+                                // Every field the snapshot is allowed to keep must
+                                // be handed over explicitly: `..Default::default()`
+                                // quietly drops anything not listed, and the drop is
+                                // then persisted - which is how a pull erased the
+                                // local DNS rules.
                                 let profile = AppProfile {
                                     subscriptions: subscriptions(),
                                     active_subscription_id: active_subscription_id(),
@@ -5959,6 +5964,7 @@ fn SyncSettings(
                                     allow_lan: allow_lan(),
                                     dark_mode: dark_mode(),
                                     custom_rules: custom_rules(),
+                                    dns_overrides: dns_overrides(),
                                     config_script_enabled: config_script_enabled(),
                                     config_script: config_script(),
                                     group_selections: group_selections(),
@@ -5999,7 +6005,7 @@ fn SyncSettings(
                                     current.last_remote_revision = result.remote_revision.clone();
                                 }
                                 toast.success(format!(
-                                    "已下载 {} 个订阅和 {} 条规则{}",
+                                    "已下载 {} 个订阅和 {} 条分流规则{}",
                                     result.subscription_count,
                                     result.rule_count,
                                     if result.subscription_count > 0 {
@@ -6030,6 +6036,8 @@ fn SyncSettings(
                             &subscriptions(),
                             &custom_rules(),
                             &dns_overrides(),
+                            config_script_enabled(),
+                            &config_script(),
                             value.last_sync_at,
                         );
                         async move {
@@ -6074,6 +6082,8 @@ fn SyncSettings(
                             &subscriptions(),
                             &custom_rules(),
                             &dns_overrides(),
+                            config_script_enabled(),
+                            &config_script(),
                             value.last_sync_at,
                         );
                         busy.set(Some(SyncAction::ForcePush));
@@ -6107,6 +6117,8 @@ fn build_sync_snapshot(
     subscriptions: &[Subscription],
     custom_rules: &[CustomRule],
     dns_overrides: &[DnsOverride],
+    config_script_enabled: bool,
+    config_script: &str,
     updated_at: u64,
 ) -> SyncSnapshot {
     SyncSnapshot {
@@ -6115,7 +6127,11 @@ fn build_sync_snapshot(
         updated_at,
         subscriptions: subscriptions.iter().map(SyncSubscription::from).collect(),
         custom_rules: custom_rules.to_vec(),
-        dns_overrides: dns_overrides.to_vec(),
+        dns_overrides: Some(dns_overrides.to_vec()),
+        config_script: Some(SyncConfigScript {
+            enabled: config_script_enabled,
+            script: config_script.to_string(),
+        }),
     }
 }
 
@@ -6153,7 +6169,11 @@ fn apply_sync_snapshot(snapshot: SyncSnapshot, targets: SyncTargetSignals) {
     nodes.set(Vec::new());
     selected_tag.set(String::new());
     custom_rules.set(snapshot.custom_rules);
-    dns_overrides.set(snapshot.dns_overrides);
+    // A remote written before DNS overrides existed carries no section; keep the
+    // local rules rather than deleting them.
+    if let Some(overrides) = snapshot.dns_overrides {
+        dns_overrides.set(overrides);
+    }
     group_selections.set(HashMap::new());
 }
 

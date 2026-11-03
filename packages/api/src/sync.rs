@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_SYNC_BYTES: usize = 20 * 1024 * 1024;
 const LEGACY_SYNC_SNAPSHOT_VERSION: u32 = 1;
+const MAX_CONFIG_SCRIPT_BYTES: usize = 512 * 1024;
 
 #[derive(Deserialize)]
 struct SyncSnapshotEnvelope {
@@ -74,7 +75,12 @@ fn migrate_legacy_endpoint(value: &mut serde_json::Value) {
     } else {
         "webdav_endpoint"
     };
-    if map.get(key).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+    if map
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
         map.insert(key.to_string(), serde_json::Value::String(endpoint));
     }
 }
@@ -353,11 +359,14 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
     }
     validate_custom_rules(&snapshot.custom_rules)
         .map_err(|error| ServerFnError::new(format!("远程自定义规则无效: {error}")))?;
-    if snapshot.dns_overrides.len() > 256 {
+    // Absent sections are not validated: nothing to check, and applying such a
+    // document leaves the matching local state untouched.
+    let dns_overrides = snapshot.dns_overrides.clone().unwrap_or_default();
+    if dns_overrides.len() > 256 {
         return Err(ServerFnError::new("远程专用 DNS 规则数量超过 256 条限制"));
     }
-    let mut dns_rule_suffixes = HashSet::with_capacity(snapshot.dns_overrides.len());
-    for rule in &snapshot.dns_overrides {
+    let mut dns_rule_suffixes = HashSet::with_capacity(dns_overrides.len());
+    for rule in &dns_overrides {
         let (domain_suffix, server) = normalize_dns_override(&rule.domain_suffix, &rule.server)
             .map_err(|error| ServerFnError::new(format!("远程专用 DNS 规则无效: {error}")))?;
         if !dns_rule_suffixes.insert(domain_suffix.clone()) {
@@ -368,6 +377,16 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
         if rule.server != server {
             return Err(ServerFnError::new("远程专用 DNS 服务器与规范化结果不一致"));
         }
+    }
+    if snapshot
+        .config_script
+        .as_ref()
+        .is_some_and(|script| script.script.len() > MAX_CONFIG_SCRIPT_BYTES)
+    {
+        return Err(ServerFnError::new(format!(
+            "远程配置脚本超过 {} KiB 限制",
+            MAX_CONFIG_SCRIPT_BYTES / 1024
+        )));
     }
     if snapshot.subscriptions.len() > 1024 {
         return Err(ServerFnError::new("远程订阅数量超过 1024 个限制"));
@@ -1206,6 +1225,71 @@ mod tests {
         assert_eq!(result.remote_revision, "\"revision-1\"");
         assert_eq!(pulled.remote_revision, "\"revision-1\"");
         assert!(!stored.lock().expect("stored body lock").is_empty());
+    }
+
+    /// The exact failure this guard exists for: a remote object written before
+    /// DNS overrides shipped carries no `dns_overrides` key at all (this shape is
+    /// verbatim from a real R2 bucket, v1). Pulling it used to clear the local
+    /// rules, and the autosave then persisted the loss.
+    #[test]
+    fn legacy_remote_document_keeps_local_dns_rules_on_pull() {
+        let legacy = br#"{
+            "format": "kitty-pro-sync",
+            "version": 1,
+            "updated_at": 1786457924,
+            "subscriptions": [],
+            "custom_rules": [],
+            "active_subscription_id": null,
+            "selected_tag": "",
+            "group_selections": {}
+        }"#;
+
+        let snapshot = decode_snapshot(legacy).expect("legacy document should decode");
+        assert!(snapshot.dns_overrides.is_none());
+        validate_snapshot(&snapshot).expect("legacy document should validate");
+
+        let mut profile = AppProfile {
+            dns_overrides: vec![proxy_core::DnsOverride {
+                id: 1,
+                enabled: true,
+                domain_suffix: "et.net".to_string(),
+                server: "100.100.100.101".to_string(),
+            }],
+            ..AppProfile::default()
+        };
+        snapshot.apply_to_profile(&mut profile);
+        assert_eq!(
+            profile.dns_overrides.len(),
+            1,
+            "a legacy pull must not delete locally configured DNS rules"
+        );
+    }
+
+    /// A modern round-trip must still carry both sections, so deleting a rule on
+    /// one device does reach the other.
+    #[test]
+    fn modern_round_trip_still_propagates_dns_rules() {
+        let source = AppProfile {
+            dns_overrides: vec![proxy_core::DnsOverride {
+                id: 2,
+                enabled: true,
+                domain_suffix: "example.net".to_string(),
+                server: "192.0.2.53".to_string(),
+            }],
+            config_script_enabled: true,
+            config_script: "function main(c) { return c; }".to_string(),
+            ..AppProfile::default()
+        };
+        let snapshot = SyncSnapshot::from_profile(&source, 5);
+        let bytes = serde_json::to_vec(&snapshot).expect("snapshot should serialize");
+        let decoded = decode_snapshot(&bytes).expect("modern document should decode");
+        validate_snapshot(&decoded).expect("modern document should validate");
+
+        let mut target = AppProfile::default();
+        decoded.apply_to_profile(&mut target);
+        assert_eq!(target.dns_overrides, source.dns_overrides);
+        assert!(target.config_script_enabled);
+        assert_eq!(target.config_script, source.config_script);
     }
 
     #[tokio::test]
