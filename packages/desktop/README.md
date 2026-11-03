@@ -12,6 +12,20 @@ Linux 直接使用 crates.io 上的 **`auto-launch = 0.6.0`**（XDG Autostart）
 
 **限制**：Linux 只判断 desktop 文件是否存在，不解析 `Hidden`、桌面环境或系统目录里的同名项。关闭会删除用户项，系统目录里的同名项可能重新生效。Windows 只看当前用户的 Run 和 StartupApproved。未覆盖系统设置或第三方工具的所有禁用方式。尚需在各平台人工验证真实登录行为。
 
+## macOS 菜单栏与剪贴板快捷键
+
+macOS 的 WKWebView 自己不响应 `Cmd+C`/`Cmd+V`/`Cmd+A`：只有当某个菜单项占用这个键位、并把 `copy:`/`paste:` 等 selector 发给 first responder 时，输入框才能复制粘贴。`Cmd+Q` 同理，它靠 `terminate:` 生效。此前桌面端用 `.with_menu(None)` 启动，安装后没有任何菜单栏，这些快捷键全部失效，`Cmd+Q` 也无处可去。
+
+现在 macOS 装一条最小菜单栏：应用菜单（关于/服务/隐藏/最小化/退出）、编辑菜单（撤销/重做/剪切/拷贝/粘贴/全选）、窗口菜单。编辑菜单是剪贴板能用起来的唯一原因，不能删。Windows 和 Linux 保持 `with_menu(None)`：WebView2 与 WebKitGTK 在页面内自己处理这些键位，不需要菜单。
+
+`Cmd+Q` 绑到“最小化”而不是退出：窗口关闭本来只是隐藏到托盘，`terminate:` 会直接杀掉正在运行的 sing-box 内核，绕过清理。真正的退出放在 `Opt+Cmd+Q`，复用托盘“退出”的同一个 id，先 `shutdown_native_runtime()` 再结束进程。窗口已经隐藏时再按 `Cmd+Q` 会把窗口显示出来，避免按键静默无效。
+
+所有原生平台都会注入一段捕获阶段的 `contextmenu` 监听：Dioxus 在 release 构建里用初始化脚本注册了全局 `preventDefault()` 来藏调试菜单，顺带也移除了 WebView 自带的编辑菜单——输入框右键没有剪切/拷贝/粘贴，日志里选中文本右键也拷不出来。脚本只对“有选区”或“落在可编辑元素上”的右键 `stopPropagation()`，页面其它位置仍然没有右键菜单。
+
+必须是捕获阶段。Dioxus 的抑制脚本在 document start 执行（早于任何页面脚本），但它是冒泡阶段监听；同一个节点上捕获先于冒泡，所以这里靠阶段取胜，而不是靠注册顺序。
+
+`Submenu::set_as_windows_menu_for_nsapp()` 必须在 `NSApp.mainMenu` 装好之后调用，而 Dioxus 是在建窗时才装菜单（晚于 `Config` 组装），所以窗口菜单先存进 thread local，由根组件第一次 `use_effect` 收养。muda 的菜单项只能在主线程创建，键位绑定因此抽成 `quit_key_bindings()` 供单元测试固定。
+
 The desktop crate defines the entrypoint for the desktop app along with any assets, components and dependencies that are specific to desktop builds. The desktop crate starts out something like this:
 
 ```
