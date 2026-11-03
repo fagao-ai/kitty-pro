@@ -274,6 +274,20 @@ cargo test -p singbox --features embedded-core
 The embedded-core test starts a VLESS configuration through the static bridge
 and proves that no external executable is required.
 
+Resize and dialog behaviour needs a real layout engine, so it is covered
+separately by a headless Chromium suite in `tests/ui-smoke`. It runs on a
+release web bundle (the debug wasm is ~84 MB and never finishes hydrating) and
+checks horizontal overflow across 320-1620px, that card pages never scroll onto
+background, that no content falls past the scroll height, and that Escape, the
+Tab ring and focus return hold in every dialog. See
+[`tests/ui-smoke/README.md`](tests/ui-smoke/README.md).
+
+```sh
+cd tests/ui-smoke
+npm ci && npx playwright install chromium
+KITTY_WEB_URL=http://127.0.0.1:7897 npm test
+```
+
 ## Platform boundary
 
 The native C archive bridge is validated on macOS and is structured for Linux
