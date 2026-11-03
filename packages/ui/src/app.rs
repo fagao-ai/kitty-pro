@@ -2,14 +2,15 @@ use api::{
     CoreLogEntry, CoreTraffic, NodeLatency, RouteDecision, RouteLogDetail, RouteTargetKind,
     SyncConfig, SyncProviderKind, SystemProxyStatus,
 };
+use dioxus::html::geometry::PixelsVector2D;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
-    LdArrowDown, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight, LdCircleAlert,
-    LdCircleCheck, LdClipboardCopy, LdCloud, LdCloudDownload, LdCloudUpload, LdDownload, LdGauge,
-    LdGitFork, LdGlobe, LdInfo, LdLanguages, LdLayers, LdLayoutDashboard, LdListFilter, LdMoon,
-    LdNetwork, LdPause, LdPencil, LdPlay, LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRoute,
-    LdRss, LdSave, LdScrollText, LdSearch, LdShieldCheck, LdSlidersHorizontal, LdSplit, LdSun,
-    LdTerminal, LdTimer, LdTrash2, LdWifi, LdX,
+    LdArrowDown, LdArrowDownFromLine, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight,
+    LdCircleAlert, LdCircleCheck, LdClipboardCopy, LdCloud, LdCloudDownload, LdCloudUpload,
+    LdDownload, LdGauge, LdGitFork, LdGlobe, LdInfo, LdLanguages, LdLayers, LdLayoutDashboard,
+    LdListFilter, LdMoon, LdNetwork, LdPause, LdPencil, LdPlay, LdPlus, LdPower, LdRadioTower,
+    LdRefreshCw, LdRoute, LdRss, LdSave, LdScrollText, LdSearch, LdShieldCheck,
+    LdSlidersHorizontal, LdSplit, LdSun, LdTerminal, LdTimer, LdTrash2, LdWifi, LdX,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
@@ -19,6 +20,7 @@ use proxy_core::{
     SYNC_SNAPSHOT_VERSION,
 };
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::APP_CSS;
 
@@ -28,6 +30,10 @@ const RULE_SET_UPDATE_CHECK_SECS: u64 = 6 * 60 * 60;
 const TOAST_DISMISS_MILLIS: u64 = 4_500;
 const TOAST_SWEEP_MILLIS: u64 = 250;
 const TOAST_DISMISS_TICKS: u32 = (TOAST_DISMISS_MILLIS / TOAST_SWEEP_MILLIS) as u32;
+/// A reader counts as "following" while the newest row is this close to the top
+/// of the console. Rows are 46px tall on desktop, so 8px only ever absorbs the
+/// fractional offset a wheel/touch fling leaves behind.
+const LOG_FOLLOW_THRESHOLD_PX: f64 = 8.0;
 const LATENCY_CACHE_KEY: &str = "kitty-pro.node-latency.v1";
 /// Bars in the live traffic chart: one per second over the last minute.
 const TRAFFIC_HISTORY_LEN: usize = 60;
@@ -1796,143 +1802,134 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
             }
 
             if import_open() {
-                div {
-                    class: "modal-backdrop",
-                    role: "presentation",
-                    onclick: move |_| {
-                        if !import_busy() {
-                            import_open.set(false);
+                DialogShell {
+                    panel_id: "import-dialog".to_string(),
+                    class: "modal glass-modal",
+                    label: "添加订阅".to_string(),
+                    dismissible: !import_busy(),
+                    on_close: move |_| import_open.set(false),
+                    div { class: "modal-header",
+                        div {
+                            p { class: "eyebrow", "SUBSCRIPTION" }
+                            h2 { "添加订阅" }
                         }
-                    },
-                    div {
-                        class: "modal glass-modal",
-                        role: "dialog",
-                        aria_modal: "true",
-                        aria_label: "添加订阅",
-                        onclick: move |event| event.stop_propagation(),
-                        div { class: "modal-header",
-                            div {
-                                p { class: "eyebrow", "SUBSCRIPTION" }
-                                h2 { "添加订阅" }
-                            }
-                            button {
-                                class: "icon-button",
-                                title: "关闭",
-                                disabled: import_busy(),
-                                onclick: move |_| import_open.set(false),
-                                Icon { icon: LdX, width: 19, height: 19 }
-                            }
+                        button {
+                            class: "icon-button",
+                            title: "关闭",
+                            disabled: import_busy(),
+                            onclick: move |_| import_open.set(false),
+                            Icon { icon: LdX, width: 19, height: 19 }
                         }
-                        div { class: "form-stack",
-                            label {
-                                span { "名称" }
-                                input {
-                                    value: import_name,
-                                    placeholder: "例如：日常线路",
-                                    oninput: move |event| import_name.set(event.value()),
-                                }
-                            }
-                            label {
-                                span { "订阅地址或内容" }
-                                textarea {
-                                    value: import_source,
-                                    placeholder: "订阅地址，或代理 URL（HTTP/HTTPS/SOCKS5）",
-                                    rows: 5,
-                                    oninput: move |event| import_source.set(event.value()),
-                                }
-                            }
-                            if let Some(error) = import_error() {
-                                div { class: "form-error",
-                                    Icon { icon: LdCircleAlert, width: 16, height: 16 }
-                                    span { "{error}" }
-                                }
+                    }
+                    div { class: "form-stack",
+                        label {
+                            span { "名称" }
+                            input {
+                                value: import_name,
+                                placeholder: "例如：日常线路",
+                                oninput: move |event| import_name.set(event.value()),
                             }
                         }
-                        div { class: "modal-actions",
-                            button {
-                                class: "secondary-button",
-                                disabled: import_busy(),
-                                onclick: move |_| import_open.set(false),
-                                "取消"
+                        label {
+                            span { "订阅地址或内容" }
+                            textarea {
+                                value: import_source,
+                                placeholder: "订阅地址，或代理 URL（HTTP/HTTPS/SOCKS5）",
+                                rows: 5,
+                                oninput: move |event| import_source.set(event.value()),
                             }
-                            button {
-                                class: "primary-button",
-                                disabled: import_busy()
-                                    || core_busy()
-                                    || core_restarting()
-                                    || import_source().trim().is_empty(),
-                                onclick: move |_| async move {
-                                    import_busy.set(true);
-                                    import_error.set(None);
-                                    let source = import_source();
-                                    match api::preview_subscription(source.clone()).await {
-                                        Ok(report) if !report.nodes.is_empty() => {
-                                            let ParseReport {
-                                                nodes: report_nodes,
-                                                rejected,
-                                                proxy_server_nameservers,
-                                            } = report;
-                                            let count = report_nodes.len();
-                                            let rejected = rejected.len();
-                                            let id = next_subscription_id(&subscriptions());
-                                            let parsed_nodes = namespace_nodes(id, report_nodes);
-                                            let name = if import_name().trim().is_empty() {
-                                                source_label(&source)
+                        }
+                        if let Some(error) = import_error() {
+                            div { class: "form-error",
+                                Icon { icon: LdCircleAlert, width: 16, height: 16 }
+                                span { "{error}" }
+                            }
+                        }
+                    }
+                    div { class: "modal-actions",
+                        button {
+                            class: "secondary-button",
+                            disabled: import_busy(),
+                            onclick: move |_| import_open.set(false),
+                            "取消"
+                        }
+                        button {
+                            class: "primary-button",
+                            disabled: import_busy()
+                                || core_busy()
+                                || core_restarting()
+                                || import_source().trim().is_empty(),
+                            onclick: move |_| async move {
+                                import_busy.set(true);
+                                import_error.set(None);
+                                let source = import_source();
+                                match api::preview_subscription(source.clone()).await {
+                                    Ok(report) if !report.nodes.is_empty() => {
+                                        let ParseReport {
+                                            nodes: report_nodes,
+                                            rejected,
+                                            proxy_server_nameservers,
+                                        } = report;
+                                        let count = report_nodes.len();
+                                        let rejected = rejected.len();
+                                        let id = next_subscription_id(&subscriptions());
+                                        let parsed_nodes = namespace_nodes(id, report_nodes);
+                                        let name = if import_name().trim().is_empty() {
+                                            source_label(&source)
+                                        } else {
+                                            import_name().trim().to_string()
+                                        };
+                                        subscriptions.write().push(Subscription {
+                                            id,
+                                            name: name.clone(),
+                                            source,
+                                            nodes: parsed_nodes,
+                                            proxy_server_nameservers,
+                                            rejected_count: rejected,
+                                        });
+                                        if connected() {
+                                            toast.success(format!("已导入 {name}，共 {count} 个节点"));
+                                        } else {
+                                            active_subscription_id.set(Some(id));
+                                            let active_nodes = collect_subscription_nodes(
+                                                &subscriptions(),
+                                                Some(id),
+                                            );
+                                            let next_tag = select_available_tag(&active_nodes, "");
+                                            let mut next_selections = group_selections();
+                                            if next_tag.is_empty() {
+                                                next_selections.remove("proxy");
                                             } else {
-                                                import_name().trim().to_string()
-                                            };
-                                            subscriptions.write().push(Subscription {
-                                                id,
-                                                name: name.clone(),
-                                                source,
-                                                nodes: parsed_nodes,
-                                                proxy_server_nameservers,
-                                                rejected_count: rejected,
-                                            });
-                                            if connected() {
-                                                toast.success(format!("已导入 {name}，共 {count} 个节点"));
-                                            } else {
-                                                active_subscription_id.set(Some(id));
-                                                let active_nodes = collect_subscription_nodes(
-                                                    &subscriptions(),
-                                                    Some(id),
-                                                );
-                                                let next_tag = select_available_tag(&active_nodes, "");
-                                                let mut next_selections = group_selections();
-                                                if next_tag.is_empty() {
-                                                    next_selections.remove("proxy");
-                                                } else {
-                                                    next_selections
-                                                        .insert("proxy".to_string(), next_tag.clone());
-                                                }
-                                                nodes.set(active_nodes);
-                                                selected_tag.set(next_tag);
-                                                group_selections.set(next_selections);
-                                                toast.success(format!("已导入并切换到 {name}，共 {count} 个节点"));
+                                                next_selections
+                                                    .insert("proxy".to_string(), next_tag.clone());
                                             }
-                                            import_source.set(String::new());
-                                            import_name.set(String::new());
-                                            import_open.set(false);
+                                            nodes.set(active_nodes);
+                                            selected_tag.set(next_tag);
+                                            group_selections.set(next_selections);
+                                            toast.success(format!("已导入并切换到 {name}，共 {count} 个节点"));
                                         }
-                                        Ok(report) => {
-                                            let reason = report
-                                                .rejected
-                                                .first()
-                                                .map(|issue| issue.reason.clone())
-                                                .unwrap_or_else(|| "没有找到可用节点".to_string());
-                                            import_error.set(Some(reason));
-                                        }
-                                        Err(error) => import_error.set(Some(error.to_string())),
+                                        import_source.set(String::new());
+                                        import_name.set(String::new());
+                                        import_open.set(false);
                                     }
-                                    import_busy.set(false);
-                                },
-                                if import_busy() {
-                                    span { class: "spinner" }
-                                    "解析中"
-                                } else {
-                                    Icon { icon: LdPlus, width: 17, height: 17 }
-                                    "导入"
+                                    Ok(report) => {
+                                        let reason = report
+                                            .rejected
+                                            .first()
+                                            .map(|issue| issue.reason.clone())
+                                            .unwrap_or_else(|| "没有找到可用节点".to_string());
+                                        import_error.set(Some(reason));
+                                    }
+                                    Err(error) => import_error.set(Some(error.to_string())),
                                 }
+                                import_busy.set(false);
+                            },
+                            if import_busy() {
+                                span { class: "spinner" }
+                                "解析中"
+                            } else {
+                                Icon { icon: LdPlus, width: 17, height: 17 }
+                                "导入"
                             }
                         }
                     }
@@ -2040,7 +2037,149 @@ fn ToastViewport() -> Element {
     }
 }
 
+/// JS source shared by enter/teardown. A stack is required because dialogs
+/// nest here (the process picker opens on top of the rule editor): only the
+/// topmost panel may own the Tab ring, and each layer restores focus to the
+/// layer beneath it rather than to the page.
+const DIALOG_STACK_JS: &str = r#"
+const state = (window.__kittyDialogs ||= { stack: [] });
+if (!state.trap) {
+    const focusable = (root) => Array.from(
+        root.querySelectorAll('a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])')
+    ).filter((el) => el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    state.focusable = focusable;
+    // Capture phase: a listener on the page cannot break the ring by calling
+    // stopPropagation first, and the ring still sees keys while focus sits on
+    // the panel itself.
+    state.trap = (event) => {
+        const top = state.stack[state.stack.length - 1];
+        if (!top || event.key !== 'Tab') return;
+        const items = focusable(top.panel);
+        if (items.length === 0) {
+            event.preventDefault();
+            top.panel.focus({ preventScroll: true });
+            return;
+        }
+        const first = items[0];
+        const last = items[items.length - 1];
+        const active = document.activeElement;
+        if (!top.panel.contains(active)) { event.preventDefault(); first.focus(); return; }
+        if (event.shiftKey && active === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && active === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    };
+    document.addEventListener('keydown', state.trap, true);
+}
+"#;
+
+/// Script that arms one dialog instance: remembers what had focus, moves focus
+/// into the panel, and pushes it onto the Tab-ring stack.
+fn dialog_enter_script(panel_id: &str) -> String {
+    format!(
+        r#"
+{DIALOG_STACK_JS}
+const panel = document.getElementById({panel_id:?});
+if (panel) {{
+    state.stack.push({{ panel, returnFocus: document.activeElement }});
+    const target = panel.querySelector('[data-autofocus]') || state.focusable(panel)[0];
+    if (target) {{
+        target.focus({{ preventScroll: true }});
+    }} else {{
+        panel.tabIndex = -1;
+        panel.focus({{ preventScroll: true }});
+    }}
+}}
+"#
+    )
+}
+
+/// Teardown of `dialog_enter_script`: pop this layer and hand focus back to
+/// whatever was focused before it opened, so the keyboard never lands on
+/// `document.body` after Escape.
+fn dialog_leave_script() -> &'static str {
+    r#"
+const state = window.__kittyDialogs;
+if (state && state.stack.length > 0) {
+    const closed = state.stack.pop();
+    if (state.stack.length === 0) {
+        document.removeEventListener('keydown', state.trap, true);
+        state.trap = null;
+    }
+    // Each layer records what had focus when it opened, which for a nested
+    // dialog is the trigger inside the outer one. A trigger that no longer
+    // exists is skipped by the contains() guard rather than throwing.
+    if (closed.returnFocus && document.contains(closed.returnFocus)) {
+        closed.returnFocus.focus({ preventScroll: true });
+    }
+}
+"#
+}
+
 #[component]
+/// Backdrop + panel used by every dialog in the app.
+///
+/// Owning the shell is what makes the keyboard behaviour uniform: Escape
+/// dismisses (when the dialog is idle), Tab cannot escape the panel, and focus
+/// returns to the trigger on close. It also keeps the panel a genuine viewport
+/// overlay - the rule card's `backdrop-filter` makes it a containing block for
+/// `position: fixed` descendants, which used to fling the process picker off
+/// screen once the rule list was long enough to scroll.
+fn DialogShell(
+    /// DOM id for the panel; the focus scripts find the panel through it.
+    panel_id: String,
+    /// Panel classes, so each dialog keeps its own width and padding.
+    class: String,
+    /// Accessible name of the dialog.
+    label: String,
+    /// False while a submit is in flight: Escape must not throw work away.
+    dismissible: bool,
+    on_close: EventHandler<()>,
+    children: Element,
+) -> Element {
+    let dismiss_on_key = move |event: Event<KeyboardData>| {
+        if event.key() != Key::Escape || !dismissible {
+            return;
+        }
+        event.prevent_default();
+        event.stop_propagation();
+        on_close.call(());
+    };
+    let dismiss_on_click = move |_| {
+        if dismissible {
+            on_close.call(());
+        }
+    };
+    let enter_id = panel_id.clone();
+    use_effect(move || {
+        document::eval(&dialog_enter_script(&enter_id));
+    });
+    use_drop(move || {
+        document::eval(dialog_leave_script());
+    });
+
+    rsx! {
+        div {
+            class: "modal-backdrop",
+            role: "presentation",
+            onclick: dismiss_on_click,
+            div {
+                class,
+                id: panel_id,
+                role: "dialog",
+                aria_modal: "true",
+                aria_label: label,
+                onclick: move |event| event.stop_propagation(),
+                onkeydown: dismiss_on_key,
+                {children}
+            }
+        }
+    }
+}
+
 /// Sidebar identity. The kicker is the real build (`EMBEDDED · 1.13.14`), not a
 /// fixed tag, so the shell the user is driving is readable at a glance.
 #[component]
@@ -4465,25 +4604,6 @@ fn RulesView(
                 }
             }
 
-            if process_picker_open() {
-                ProcessPicker {
-                    list: process_picker_list,
-                    loaded: process_picker_loaded,
-                    error: process_picker_error,
-                    on_close: move |_| process_picker_open.set(false),
-                    on_pick: move |process: api::RunningProcess| {
-                        let value = if draft_match() == CustomRuleMatch::ProcessPath {
-                            process.exe_path.clone().unwrap_or_else(|| process.name.clone())
-                        } else {
-                            process.name.clone()
-                        };
-                        draft_value.set(value);
-                        editor_error.set(None);
-                        process_picker_open.set(false);
-                    },
-                }
-            }
-
             if stored.is_empty() {
                 div { class: "large-empty rules-empty",
                     span { class: "empty-icon", Icon { icon: LdListFilter, width: 28, height: 28 } }
@@ -4513,6 +4633,30 @@ fn RulesView(
                     }
                 }
             }
+            }
+        }
+
+        // The picker has to live outside the card: `.glass-surface` gives the
+        // rule card a `backdrop-filter`, which makes it the containing block for
+        // every `position: fixed` descendant, so a picker rendered inside it was
+        // centred on the card instead of the viewport - and with a long rule list
+        // the card scrolls, which flung the dialog out of reach entirely.
+        if process_picker_open() {
+            ProcessPicker {
+                list: process_picker_list,
+                loaded: process_picker_loaded,
+                error: process_picker_error,
+                on_close: move |_| process_picker_open.set(false),
+                on_pick: move |process: api::RunningProcess| {
+                    let value = if draft_match() == CustomRuleMatch::ProcessPath {
+                        process.exe_path.clone().unwrap_or_else(|| process.name.clone())
+                    } else {
+                        process.name.clone()
+                    };
+                    draft_value.set(value);
+                    editor_error.set(None);
+                    process_picker_open.set(false);
+                },
             }
         }
     }
@@ -4560,8 +4704,12 @@ fn ProcessPicker(
         .collect::<Vec<_>>();
 
     rsx! {
-        div { class: "process-picker-backdrop", aria_hidden: "true", onclick: move |_| on_close.call(()) }
-        div { class: "process-picker", role: "dialog", aria_label: "选择进程",
+        DialogShell {
+            panel_id: "process-picker-dialog".to_string(),
+            class: "process-picker glass-modal",
+            label: "选择进程".to_string(),
+            dismissible: true,
+            on_close,
             div { class: "process-picker-header",
                 h3 { "选择进程" }
                 button {
@@ -4653,6 +4801,10 @@ fn RuleSelect(
                         }
                         Key::Escape => {
                             event.prevent_default();
+                            // Only the menu may close: without this the dialog
+                            // shell above also sees Escape and takes the whole
+                            // editor with it.
+                            event.stop_propagation();
                             open.set(false);
                         }
                         _ => {}
@@ -5046,6 +5198,76 @@ fn LogsView(
     let query = search().trim().to_ascii_lowercase();
     let visible_logs = visible_log_entries(&stored, filter(), &query);
     let visible_count = visible_logs.len();
+
+    // The console is newest-first, so "following" simply means being parked at the
+    // top: prepending a row never moves the viewport (the browser anchors the
+    // scroll to the row the reader is looking at), so new entries appear without
+    // ever yanking the page. Scroll away and the reader keeps their place, but
+    // then rows only ever arrive above the fold - the chip below is what makes
+    // them reachable again.
+    let mut following = use_signal(|| true);
+    let mut unseen = use_signal(|| 0_u32);
+    let mut newest_seen = use_signal(|| None::<u64>);
+    let mut list_element = use_signal(|| None::<Rc<MountedData>>);
+
+    use_effect(move || {
+        // Read the buffer through the signal so every poll batch reruns this.
+        let entries = logs.read();
+        let Some(&newest) = entries.last().map(|entry| &entry.sequence) else {
+            // Buffer emptied (the clear button, or the page being reopened): the
+            // console has no scroll position left to be "away" from.
+            if *unseen.peek() != 0 {
+                unseen.set(0);
+            }
+            if !*following.peek() {
+                following.set(true);
+            }
+            return;
+        };
+        let previous = *newest_seen.peek();
+        newest_seen.set(Some(newest));
+        // First batch since the page opened has nothing "missed", and a sequence
+        // that goes backwards means the buffer was cleared or the core restarted.
+        let Some(previous) = previous else {
+            return;
+        };
+        if newest <= previous {
+            return;
+        }
+        if *following.peek() {
+            if *unseen.peek() != 0 {
+                unseen.set(0);
+            }
+            return;
+        }
+        let added = log_entries_newer_than(&entries, previous);
+        let pending = *unseen.peek();
+        unseen.set(pending.saturating_add(added));
+    });
+
+    let track_follow = move |event: Event<ScrollData>| {
+        let at_latest = event.scroll_top().abs() <= LOG_FOLLOW_THRESHOLD_PX;
+        if *following.peek() != at_latest {
+            following.set(at_latest);
+        }
+        if at_latest && *unseen.peek() != 0 {
+            unseen.set(0);
+        }
+    };
+    let jump_to_latest = move |_| {
+        following.set(true);
+        unseen.set(0);
+        let Some(element) = list_element.cloned() else {
+            return;
+        };
+        spawn(async move {
+            let _ = element
+                .scroll(PixelsVector2D::new(0.0, 0.0), ScrollBehavior::Instant)
+                .await;
+        });
+    };
+    let unseen_count = unseen();
+
     // The collector only runs while the core is up and this page is open, so the
     // chip has three real states instead of a fake pause button.
     let collector_class = if !connected() {
@@ -5140,6 +5362,15 @@ fn LogsView(
                 }
             } else {
                 div { class: "log-list", aria_label: "内核日志",
+                    onscroll: track_follow,
+                    onmounted: move |event| {
+                        // The list mounts at the top, so it mounts following: the
+                        // reader is looking at the newest row whatever state the
+                        // page was left in when the console emptied and refilled.
+                        following.set(true);
+                        unseen.set(0);
+                        list_element.set(Some(event.data()));
+                    },
                     div { class: "log-table-header",
                         span { "时间" }
                         span { "动作" }
@@ -5151,7 +5382,21 @@ fn LogsView(
                         LogRow { entry }
                     }
                 }
-                div { class: "log-list-footer", "当前显示 {visible_count} 条" }
+                div { class: "log-list-footer",
+                    div { class: "log-follow-state", role: "status", aria_live: "polite",
+                        if unseen_count > 0 {
+                            button {
+                                r#type: "button",
+                                class: "log-follow-button",
+                                title: "滚到最新一条",
+                                onclick: jump_to_latest,
+                                Icon { icon: LdArrowDownFromLine, width: 14, height: 14 }
+                                "{unseen_count} 条新日志"
+                            }
+                        }
+                    }
+                    span { class: "log-list-count", "当前显示 {visible_count} 条" }
+                }
             }
         }
     }
@@ -5387,6 +5632,17 @@ fn log_matches_filter(entry: &CoreLogEntry, filter: LogFilter) -> bool {
             entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Block)
         }
     }
+}
+
+/// How many buffered rows arrived after `previous`, i.e. what a reader who
+/// scrolled away from the newest entry has missed. Counting sequences instead of
+/// `entries.len()` keeps a trimmed buffer (the poll drops the oldest rows past
+/// 500) from under-reporting.
+fn log_entries_newer_than(entries: &[CoreLogEntry], previous: u64) -> u32 {
+    entries
+        .iter()
+        .filter(|entry| entry.sequence > previous)
+        .count() as u32
 }
 
 /// Newest first, after the chip filter and the free-text query. Shared with the
@@ -6446,100 +6702,93 @@ fn SettingsView(
         }
 
         if script_editor_open() {
-            div {
-                class: "modal-backdrop",
-                role: "presentation",
-                onclick: move |_| {
-                    if !script_check_busy() {
-                        script_editor_open.set(false);
+            DialogShell {
+                panel_id: "script-editor-dialog".to_string(),
+                class: "modal script-modal glass-modal",
+                label: "编辑 JavaScript 配置覆写".to_string(),
+                // A validation round-trip owns the draft: closing mid-flight would
+                // drop the answer the user is waiting for.
+                dismissible: !script_check_busy(),
+                on_close: move |_| script_editor_open.set(false),
+                div { class: "modal-header",
+                    div {
+                        p { class: "eyebrow", "CONFIG SCRIPT" }
+                        h2 { "JavaScript 配置覆写" }
                     }
-                },
-                div {
-                    class: "modal script-modal glass-modal",
-                    role: "dialog",
-                    aria_modal: "true",
-                    aria_label: "编辑 JavaScript 配置覆写",
-                    onclick: move |event| event.stop_propagation(),
-                    div { class: "modal-header",
-                        div {
-                            p { class: "eyebrow", "CONFIG SCRIPT" }
-                            h2 { "JavaScript 配置覆写" }
-                        }
-                        button {
-                            class: "icon-button",
-                            title: "关闭",
-                            aria_label: "关闭脚本编辑器",
-                            disabled: script_check_busy(),
-                            onclick: move |_| script_editor_open.set(false),
-                            Icon { icon: LdX, width: 19, height: 19 }
-                        }
+                    button {
+                        class: "icon-button",
+                        title: "关闭",
+                        aria_label: "关闭脚本编辑器",
+                        disabled: script_check_busy(),
+                        onclick: move |_| script_editor_open.set(false),
+                        Icon { icon: LdX, width: 19, height: 19 }
                     }
-                    textarea {
-                        class: "script-editor",
-                        aria_label: "JavaScript 配置覆写脚本",
-                        spellcheck: "false",
-                        placeholder: "function main(config) {{\n  return config;\n}}",
-                        value: script_draft,
-                        oninput: move |event| script_draft.set(event.value()),
+                }
+                textarea {
+                    class: "script-editor",
+                    aria_label: "JavaScript 配置覆写脚本",
+                    spellcheck: "false",
+                    placeholder: "function main(config) {{\n  return config;\n}}",
+                    value: script_draft,
+                    oninput: move |event| script_draft.set(event.value()),
+                }
+                div { class: "modal-actions",
+                    button {
+                        class: "secondary-button",
+                        disabled: script_check_busy(),
+                        onclick: move |_| script_editor_open.set(false),
+                        "取消"
                     }
-                    div { class: "modal-actions",
-                        button {
-                            class: "secondary-button",
-                            disabled: script_check_busy(),
-                            onclick: move |_| script_editor_open.set(false),
-                            "取消"
-                        }
-                        button {
-                            class: "secondary-button",
-                            disabled: script_check_busy() || script_draft().trim().is_empty(),
-                            onclick: move |_| {
-                                let proxy_server_nameservers =
-                                    script_proxy_server_nameservers.clone();
-                                async move {
-                                script_check_busy.set(true);
-                                let request = ConnectionRequest {
-                                    nodes: nodes(),
-                                    selected_tag: selected_tag(),
-                                    proxy_server_nameservers: proxy_server_nameservers.clone(),
-                                    mode: tunnel_mode(),
-                                    tun: tun_enabled(),
-                                    allow_lan: allow_lan(),
-                                    custom_rules: Vec::new(),
-                                    dns_overrides: dns_overrides(),
-                                    config_script: Some(script_draft()),
-                                    group_selections: group_selections(),
-                                };
-                                match api::validate_config_script(request).await {
-                                    Ok(()) => toast.success("配置脚本校验通过"),
-                                    Err(error) => {
-                                        toast.error(format!("配置脚本校验失败: {error}"));
-                                    }
+                    button {
+                        class: "secondary-button",
+                        disabled: script_check_busy() || script_draft().trim().is_empty(),
+                        onclick: move |_| {
+                            let proxy_server_nameservers =
+                                script_proxy_server_nameservers.clone();
+                            async move {
+                            script_check_busy.set(true);
+                            let request = ConnectionRequest {
+                                nodes: nodes(),
+                                selected_tag: selected_tag(),
+                                proxy_server_nameservers: proxy_server_nameservers.clone(),
+                                mode: tunnel_mode(),
+                                tun: tun_enabled(),
+                                allow_lan: allow_lan(),
+                                custom_rules: Vec::new(),
+                                dns_overrides: dns_overrides(),
+                                config_script: Some(script_draft()),
+                                group_selections: group_selections(),
+                            };
+                            match api::validate_config_script(request).await {
+                                Ok(()) => toast.success("配置脚本校验通过"),
+                                Err(error) => {
+                                    toast.error(format!("配置脚本校验失败: {error}"));
                                 }
-                                script_check_busy.set(false);
-                                }
-                            },
-                            if script_check_busy() {
-                                span { class: "spinner" }
-                            } else {
-                                Icon { icon: LdCircleCheck, width: 17, height: 17 }
                             }
-                            "校验"
+                            script_check_busy.set(false);
+                            }
+                        },
+                        if script_check_busy() {
+                            span { class: "spinner" }
+                        } else {
+                            Icon { icon: LdCircleCheck, width: 17, height: 17 }
                         }
-                        button {
-                            class: "primary-button",
-                            disabled: script_check_busy(),
-                            onclick: move |_| {
-                                let value = script_draft();
-                                if value.trim().is_empty() {
-                                    config_script_enabled.set(false);
-                                }
-                                config_script.set(value);
-                                script_editor_open.set(false);
-                                toast.success("配置脚本已保存");
-                            },
-                            Icon { icon: LdSave, width: 16, height: 16 }
-                            "保存"
-                        }
+                        "校验"
+                    }
+                    button {
+                        class: "primary-button",
+                        disabled: script_check_busy(),
+                        onclick: move |_| {
+                            let value = script_draft();
+                            if value.trim().is_empty() {
+                                config_script_enabled.set(false);
+                            }
+                            config_script.set(value);
+                            script_editor_open.set(false);
+                            toast.success("配置脚本已保存");
+                        },
+                        Icon { icon: LdSave, width: 16, height: 16 }
+                        "保存"
                     }
                 }
             }
@@ -7357,5 +7606,174 @@ mod tests {
         assert!(report.contains("TUN: 开启 · 局域网: 关闭 (本地代理 7890)"));
         assert!(report.contains("节点: 3 · 订阅: 2"));
         assert!(!report.contains("{"));
+    }
+
+    #[test]
+    fn missed_log_count_ignores_rows_the_reader_already_saw() {
+        let entry = |sequence: u64| CoreLogEntry {
+            sequence,
+            timestamp: String::new(),
+            level: "info".to_string(),
+            message: String::new(),
+            route: None,
+        };
+        let entries = [entry(7), entry(8), entry(9)];
+
+        assert_eq!(log_entries_newer_than(&entries, 9), 0);
+        assert_eq!(log_entries_newer_than(&entries, 8), 1);
+        assert_eq!(log_entries_newer_than(&entries, 6), 3);
+        // A buffer trimmed at the tail still reports what arrived, because the
+        // count walks sequences rather than the buffer length.
+        assert_eq!(log_entries_newer_than(&entries, 0), 3);
+    }
+
+    /// Every dialog in the app renders through `DialogShell`, which is what owns
+    /// Escape, the Tab ring and focus restore. A hand-rolled backdrop re-introduces
+    /// the bug where Escape did nothing and focus fell through to `document.body`.
+    #[test]
+    fn dialogs_all_use_the_shared_shell() {
+        // Scan only the component source: this test quotes the very patterns it
+        // counts, so reading itself back would inflate every total.
+        let source = APP_SOURCE
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module has to be the last block");
+
+        assert_eq!(
+            source.matches(r#"class: "modal-backdrop""#).count(),
+            1,
+            "only DialogShell may render a backdrop"
+        );
+        assert_eq!(
+            source.matches(r#"role: "dialog""#).count(),
+            1,
+            "only DialogShell may declare a dialog role"
+        );
+        assert_eq!(
+            source.matches("DialogShell {").count(),
+            3,
+            "import dialog, process picker and script editor all need the shell"
+        );
+        assert!(
+            source.contains("Key::Escape"),
+            "the shell must dismiss on Escape"
+        );
+    }
+
+    /// `100vh` minus a hand-picked chrome height is the root cause of the resize
+    /// bugs: the moment the window is a different height the card is either short
+    /// of the fold or adds phantom page scroll. Only a dialog's `max-height` may
+    /// reference the viewport, and then as a cap rather than a target.
+    #[test]
+    fn layout_does_not_guess_the_viewport_chrome_height() {
+        for (number, line) in css_lines() {
+            let trimmed = line.trim();
+            if !trimmed.contains("calc(100vh")
+                || trimmed.starts_with("/*")
+                || trimmed.contains(" `")
+            {
+                continue;
+            }
+            assert!(
+                trimmed.starts_with("max-height:"),
+                "line {number} sizes layout off the viewport height: {trimmed}"
+            );
+        }
+    }
+
+    /// The console card must be the flex child that absorbs the viewport, and the
+    /// row list must be the scroller inside it. Without both, rows past the card's
+    /// bottom are clipped by `overflow: hidden` and no wheel or touch gesture can
+    /// reach them.
+    #[test]
+    fn log_console_scrolls_its_rows_internally() {
+        let workspace = css_rule(".log-workspace");
+        assert!(
+            workspace.contains("display: flex"),
+            ".log-workspace must be a column"
+        );
+        assert!(
+            workspace.contains("flex: 1 1 0"),
+            ".log-workspace must absorb the remainder"
+        );
+        assert!(
+            workspace.contains("overflow: hidden"),
+            "the card clips its own scroller"
+        );
+
+        let list = css_rule(".log-workspace .log-list");
+        assert!(
+            list.contains("overflow-y: auto"),
+            "the row list must scroll"
+        );
+        assert!(
+            list.contains("min-height: 0"),
+            "a flex scroller needs a zero floor"
+        );
+
+        let header = css_rule(".log-workspace .log-table-header");
+        assert!(
+            header.contains("position: sticky"),
+            "captions stay pinned over the rows"
+        );
+        assert!(
+            header.contains("var(--bg)"),
+            "a translucent sticky header lets scrolled rows bleed through"
+        );
+    }
+
+    /// `.script-modal` and `.modal` share one specificity, so declaration order
+    /// decides the width: the script editor silently shrank to the import dialog's
+    /// 510px when `.script-modal` sat earlier in the file.
+    #[test]
+    fn script_modal_widens_the_shared_modal() {
+        let modal = SHEET
+            .find("\n.modal {")
+            .expect("the shared modal rule must exist");
+        let script = SHEET
+            .find("\n.script-modal {")
+            .expect("the script modal width override must exist");
+        assert!(
+            script > modal,
+            ".script-modal has to follow .modal or the 880px width loses"
+        );
+    }
+
+    /// The console footer reserves the chip slot so a batch cannot jump the
+    /// layout, and the `<small>` in the chart footnote has to opt out of the
+    /// browser default (0.833em of a 10px parent measured 8.33px).
+    #[test]
+    fn small_text_and_follow_slot_stay_legible() {
+        assert!(
+            css_rule(".chart-foot small").contains("font-size: inherit"),
+            "UA-default <small> shrinks below 9px inside .chart-foot"
+        );
+        assert!(css_rule(".log-follow-state").contains("min-height"));
+    }
+
+    /// The stylesheet as authored, so the line numbers in failures match the file
+    /// on disk (`APP_CSS` prefixes it with the inlined fonts).
+    const SHEET: &str = include_str!("../assets/styling/app.css");
+    /// The dialogs are declared in RSX, so the guard reads the component source.
+    const APP_SOURCE: &str = include_str!("app.rs");
+
+    fn css_lines() -> impl Iterator<Item = (usize, &'static str)> {
+        SHEET
+            .lines()
+            .enumerate()
+            .map(|(index, line)| (index + 1, line))
+    }
+
+    /// Body of the first rule whose selector appears at the start of a line.
+    fn css_rule(selector: &str) -> &'static str {
+        let needle = format!("{selector} {{");
+        let start = SHEET
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing CSS rule: {selector}"));
+        let body = &SHEET[start + needle.len()..];
+        let end = body
+            .find("\n}")
+            .unwrap_or_else(|| panic!("unterminated CSS rule: {selector}"));
+        &body[..end]
     }
 }

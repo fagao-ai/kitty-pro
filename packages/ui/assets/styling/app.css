@@ -1965,10 +1965,46 @@ body {
 }
 
 .log-list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding-top: 12px;
   color: var(--text-faint);
   font-size: 11px;
-  text-align: right;
+}
+
+/* Reserve the chip's height even while following, so the footer never jumps
+   when a batch turns the indicator into a button. */
+.log-follow-state {
+  display: flex;
+  min-height: 26px;
+  align-items: center;
+}
+
+.log-follow-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--accent-ink);
+  background: var(--accent-strong);
+  box-shadow: 0 6px 16px var(--accent-glow);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.log-follow-button:hover {
+  border-color: transparent;
+  color: var(--accent-ink);
+  background: var(--accent);
+}
+
+.log-follow-button svg {
+  flex: 0 0 auto;
 }
 
 .log-empty {
@@ -2370,20 +2406,7 @@ body {
   color: var(--accent);
 }
 
-.process-picker-backdrop {
-  position: fixed;
-  z-index: 100;
-  inset: 0;
-  background: rgba(13, 12, 17, 0.42);
-  backdrop-filter: blur(8px);
-}
-
 .process-picker {
-  position: fixed;
-  z-index: 101;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
   display: grid;
   grid-template-rows: auto auto auto 1fr;
   width: min(460px, 92vw);
@@ -3094,15 +3117,6 @@ body {
   outline-offset: 2px;
 }
 
-.script-modal {
-  width: min(880px, 100%);
-}
-
-.script-modal .script-editor {
-  height: min(54vh, 560px);
-  min-height: 320px;
-}
-
 .script-editor {
   width: 100%;
   min-height: 280px;
@@ -3697,6 +3711,18 @@ body {
   border-radius: var(--radius-lg);
   background: var(--surface-strong);
   animation: modal-in 170ms ease-out;
+}
+
+/* Must stay after `.modal`: both selectors have the same specificity, so a
+   `.script-modal` declared earlier would lose the `width` race and the script
+   editor would render at the 510px import-dialog width. */
+.script-modal {
+  width: min(880px, 100%);
+}
+
+.script-modal .script-editor {
+  height: min(54vh, 560px);
+  min-height: 320px;
 }
 
 .form-stack {
