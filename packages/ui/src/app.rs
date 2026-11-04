@@ -234,29 +234,26 @@ fn apply_core_status(status: api::ApiCoreStatus, signals: CoreStatusSignals) -> 
     is_running
 }
 
-/// A runtime switch whose new value has to be written onto a request by hand.
-#[derive(Clone, Copy)]
-enum RuntimeSetting {
-    Tun,
-    AllowLan,
+/// The saved request with the TUN switch moved to `enabled`.
+///
+/// Requests are built from the `tun_enabled`/`allow_lan` signals, and those only
+/// change once the backend has accepted the toggle, so the request a click builds
+/// still carries the position being switched away from. Stamping the new value
+/// here - the one place both switches route through - means no call site has to
+/// remember to do it.
+///
+/// Skipping it is not merely a wrong config: with the core stopped,
+/// `prepare_tun_mode` rejects a request whose `tun` is false, and while running
+/// the core restarts on the old value yet the UI still reports the new one.
+fn request_with_tun(mut request: ConnectionRequest, enabled: bool) -> ConnectionRequest {
+    request.tun = enabled;
+    request
 }
 
-/// Stamp the value a toggle is about to apply onto a request that was built from
-/// the signals, which still hold the *previous* value: `tun_enabled`/`allow_lan`
-/// are only written after the backend accepts the change. Without this the
-/// request always carries the opposite of what the user just clicked -
-/// `prepare_tun_mode` rejects a request whose `tun` is false outright, and a
-/// running core restarts with the switch in the position it was left, not the one
-/// it was moved to.
-fn request_with_setting(
-    mut request: ConnectionRequest,
-    setting: RuntimeSetting,
-    enabled: bool,
-) -> ConnectionRequest {
-    match setting {
-        RuntimeSetting::Tun => request.tun = enabled,
-        RuntimeSetting::AllowLan => request.allow_lan = enabled,
-    }
+/// `request_with_tun` for the LAN switch. Same trap, quieter failure: the core
+/// restarts on the old bind address and the toast still claims it changed.
+fn request_with_allow_lan(mut request: ConnectionRequest, enabled: bool) -> ConnectionRequest {
+    request.allow_lan = enabled;
     request
 }
 
@@ -271,7 +268,7 @@ fn spawn_tun_toggle(
     if runtime.busy() {
         return;
     }
-    let request = request_with_setting(request, RuntimeSetting::Tun, enabled);
+    let request = request_with_tun(request, enabled);
     let CoreStatusSignals {
         connected,
         mut core_restarting,
@@ -381,7 +378,7 @@ fn spawn_allow_lan_toggle(
     if runtime.busy() {
         return;
     }
-    let request = request_with_setting(request, RuntimeSetting::AllowLan, enabled);
+    let request = request_with_allow_lan(request, enabled);
     let CoreStatusSignals {
         connected,
         mut core_restarting,
@@ -8029,7 +8026,7 @@ mod tests {
         );
     }
 
-    fn request_with_tun(tun: bool, allow_lan: bool) -> ConnectionRequest {
+    fn saved_request(tun: bool, allow_lan: bool) -> ConnectionRequest {
         let nodes =
             proxy_core::parse_subscription("trojan://password@edge.example.com:443#Edge").nodes;
         ConnectionRequest {
@@ -8054,24 +8051,20 @@ mod tests {
     #[test]
     fn toggles_stamp_their_new_value_onto_the_request() {
         // Off -> on: the saved request still says false.
-        let request = request_with_tun(false, false);
-        let request = request_with_setting(request, RuntimeSetting::Tun, true);
+        let request = request_with_tun(saved_request(false, false), true);
         assert!(request.tun);
         assert!(!request.allow_lan, "TUN must not disturb LAN");
 
         // On -> off: the saved request still says true.
-        let request = request_with_tun(true, true);
-        let request = request_with_setting(request, RuntimeSetting::Tun, false);
+        let request = request_with_tun(saved_request(true, true), false);
         assert!(!request.tun);
         assert!(request.allow_lan);
 
-        let request = request_with_tun(true, false);
-        let request = request_with_setting(request, RuntimeSetting::AllowLan, true);
+        let request = request_with_allow_lan(saved_request(true, false), true);
         assert!(request.allow_lan);
         assert!(request.tun, "LAN must not disturb TUN");
 
-        let request = request_with_tun(true, true);
-        let request = request_with_setting(request, RuntimeSetting::AllowLan, false);
+        let request = request_with_allow_lan(saved_request(true, true), false);
         assert!(!request.allow_lan);
         assert!(request.tun);
     }
