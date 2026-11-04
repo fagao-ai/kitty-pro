@@ -16,11 +16,11 @@ Linux 直接使用 crates.io 上的 **`auto-launch = 0.6.0`**（XDG Autostart）
 
 macOS 的 WKWebView 自己不响应 `Cmd+C`/`Cmd+V`/`Cmd+A`：只有当某个菜单项占用这个键位、并把 `copy:`/`paste:` 等 selector 发给 first responder 时，输入框才能复制粘贴。`Cmd+Q` 同理，它靠 `terminate:` 生效。此前桌面端用 `.with_menu(None)` 启动，安装后没有任何菜单栏，这些快捷键全部失效，`Cmd+Q` 也无处可去。
 
-配置里三个平台统一 `.with_menu(None)`（这同时挡住 Dioxus 默认菜单栏——它的 `Cmd+Q` 是裸 `terminate:`）。macOS 在根组件第一次 `use_effect` 里自己装一条最小菜单栏：应用菜单（关于/服务/隐藏/最小化/退出）、编辑菜单（撤销/重做/剪切/拷贝/粘贴/全选）、窗口菜单。编辑菜单是剪贴板能用起来的唯一原因，不能删。Windows 和 Linux 到此为止：WebView2 与 WebKitGTK 在页面内自己处理这些键位，不需要菜单。
+配置里三个平台统一 `.with_menu(None)`（这同时挡住 Dioxus 默认菜单栏——它的 `Cmd+Q` 是裸 `terminate:`）。macOS 在根组件第一次 `use_effect` 里自己装一条最小菜单栏：应用菜单（关于/服务/隐藏/隐藏到托盘/退出）、编辑菜单（撤销/重做/剪切/拷贝/粘贴/全选）、窗口菜单。编辑菜单是剪贴板能用起来的唯一原因，不能删。Windows 和 Linux 到此为止：WebView2 与 WebKitGTK 在页面内自己处理这些键位，不需要菜单。
 
 **菜单栏不能在 `main()` 组装 `Config` 时建。** `PredefinedMenuItem::services` 在 append 的瞬间就发 `+[NSApplication sharedApplication]`，而 tao 要求自己是第一个发这个消息的人（见 `tao::platform_impl::macos::event_loop`），否则 AppKit 会实例化原生 `NSApplication`，tao 那个重写 `sendEvent:` 的子类就永远装不上——`Cmd` 组合键的 `keyUp` 不再送达 WebView。effect 在事件循环内运行，既晚于 `EventLoop::new()`，也晚于 `NSApp.mainMenu` 就位，所以是唯一安全的时机；`MenuEvent` 接收器在这之前已经接好，菜单点击照常作为 muda 事件送达。
 
-`Cmd+Q` 绑到“最小化”而不是退出：窗口关闭本来只是隐藏到托盘，`terminate:` 会直接杀掉正在运行的 sing-box 内核，绕过清理。真正的退出放在 `Opt+Cmd+Q`，复用托盘“退出”的同一个 id，先 `shutdown_native_runtime()` 再结束进程。窗口已经隐藏时再按 `Cmd+Q` 会把窗口显示出来，避免按键静默无效。
+`Cmd+Q` 绑到“隐藏到托盘”，走的是 `orderOut:`——和点红色关闭按钮完全同一条路径（`WindowCloseBehaviour::WindowHides`），因为窗口关闭本来就只是隐藏；`terminate:` 会直接杀掉正在运行的 sing-box 内核，绕过清理。注意它不是应用级 `hide:`（那会整个切走），也不是 `Cmd+M` 的最小化（那会把窗口留在 Dock 里，托盘和 Dock 两处找同一个窗口）。真正的退出放在 `Opt+Cmd+Q`，复用托盘“退出”的同一个 id，先 `shutdown_native_runtime()` 再结束进程。窗口已隐藏时再按 `Cmd+Q` 会把窗口显示出来，避免按键静默无效；点 Dock 图标会触发 `Event::Reopen`，同样能唤回。
 
 所有原生平台都会注入一段捕获阶段的 `contextmenu` 监听：Dioxus 在 release 构建里用初始化脚本注册了全局 `preventDefault()` 来藏调试菜单，顺带也移除了 WebView 自带的编辑菜单——输入框右键没有剪切/拷贝/粘贴，日志里选中文本右键也拷不出来。脚本只对“有选区”或“落在可编辑元素上”的右键 `stopPropagation()`，页面其它位置仍然没有右键菜单。
 

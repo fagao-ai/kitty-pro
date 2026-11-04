@@ -43,7 +43,7 @@ const TRAY_QUIT_ID: &str = "kitty-quit";
 /// Menu-bar-only item. macOS hands `Cmd+Q` to `terminate:`, which would kill
 /// the embedded core mid-flight, so this item takes the key instead.
 #[cfg(feature = "desktop")]
-const MENU_MINIMIZE_ID: &str = "kitty-minimize";
+const MENU_HIDE_ID: &str = "kitty-hide";
 #[cfg(feature = "desktop")]
 const TRAY_SUBSCRIPTION_PREFIX: &str = "kitty-subscription:";
 #[cfg(feature = "desktop")]
@@ -58,7 +58,7 @@ const TRAY_COPY_ENV_ID: &str = "kitty-copy-environment";
 enum TrayCommand {
     Show,
     /// Put the window away without stopping the core. This is macOS `Cmd+Q`.
-    Minimize,
+    Hide,
     App(DesktopTrayCommand),
     Quit,
 }
@@ -67,7 +67,7 @@ enum TrayCommand {
 fn tray_command(id: &str) -> Option<TrayCommand> {
     match id {
         TRAY_SHOW_ID => Some(TrayCommand::Show),
-        MENU_MINIMIZE_ID => Some(TrayCommand::Minimize),
+        MENU_HIDE_ID => Some(TrayCommand::Hide),
         TRAY_QUIT_ID => Some(TrayCommand::Quit),
         TRAY_SYSTEM_PROXY_ID => Some(TrayCommand::App(DesktopTrayCommand::ToggleSystemProxy)),
         TRAY_COPY_ENV_ID => Some(TrayCommand::App(
@@ -90,14 +90,14 @@ fn tray_command(id: &str) -> Option<TrayCommand> {
 fn execute_tray_command(
     command: TrayCommand,
     show_window: impl FnOnce(),
-    minimize_window: impl FnOnce(),
+    hide_window: impl FnOnce(),
     dispatch_app_command: impl FnOnce(DesktopTrayCommand),
     shutdown_runtime: impl FnOnce(),
     exit_process: impl FnOnce(),
 ) {
     match command {
         TrayCommand::Show => show_window(),
-        TrayCommand::Minimize => minimize_window(),
+        TrayCommand::Hide => hide_window(),
         TrayCommand::App(command) => dispatch_app_command(command),
         TrayCommand::Quit => {
             shutdown_runtime();
@@ -109,8 +109,8 @@ fn execute_tray_command(
 #[cfg(feature = "desktop")]
 fn show_desktop_window(window: &DesktopContext) {
     // A window in the Dock stays in the Dock: ordering it front does not
-    // deminiaturize it. `Cmd+Q` puts the window there, so the tray's Show has to
-    // undo that or it looks like the menu item stopped working.
+    // deminiaturize it. `Cmd+M` and the yellow button put it there, so the tray's
+    // Show has to undo that or it looks like the menu item stopped working.
     if window.is_minimized() {
         window.set_minimized(false);
     }
@@ -118,20 +118,18 @@ fn show_desktop_window(window: &DesktopContext) {
     window.set_focus();
 }
 
-/// `Cmd+Q`. Closing the window only hides it (tray behaviour), so the key never
-/// means "destroy the only window": a visible or miniaturized window goes to the
-/// Dock, a window already in the Dock comes back, and a window hidden in the tray
-/// is revealed - every press does something instead of nothing.
+/// `Cmd+Q` - hide to the tray, exactly what the red close button already does
+/// (`WindowCloseBehaviour::WindowHides`), so the app has one way to step aside.
+/// Miniaturizing instead would leave the window in the Dock as well as the tray,
+/// which is two places to look for the same window.
 ///
-/// The proxy is untouched either way. Quitting stays on `Opt+Cmd+Q` and the
-/// tray's 退出, both of which shut the core down first.
+/// Pressing it again while hidden brings the window back, so the key is never a
+/// silent no-op. The proxy keeps running either way: quitting stays on
+/// `Opt+Cmd+Q` and the tray's 退出, both of which shut the core down first.
 #[cfg(feature = "desktop")]
-fn minimize_desktop_window(window: &DesktopContext) {
-    // Only a plain on-screen window gets miniaturized. Whether AppKit reports a
-    // miniaturized window as visible is not something to depend on, so the
-    // "already in the Dock" case is handled by the branch below either way.
-    if window.is_visible() && !window.is_minimized() {
-        window.set_minimized(true);
+fn hide_desktop_window(window: &DesktopContext) {
+    if window.is_visible() {
+        window.set_visible(false);
         return;
     }
     show_desktop_window(window);
@@ -325,7 +323,7 @@ fn quit_key_bindings() -> Vec<(&'static str, Accelerator)> {
     vec![
         // `Cmd+Q` puts the window away; the core keeps running.
         (
-            MENU_MINIMIZE_ID,
+            MENU_HIDE_ID,
             Accelerator::new(Some(Modifiers::SUPER), Code::KeyQ),
         ),
         // The binding that really stops everything, and it goes through the same
@@ -352,16 +350,16 @@ fn edit_menu_labels() -> [&'static str; 6] {
 /// `Cmd+C`/`Cmd+V` at all, and `Cmd+Q` went nowhere because nothing bound it to
 /// `terminate:`. The Edit menu is what brings the clipboard back.
 ///
-/// The application menu claims `Cmd+Q` for [`TrayCommand::Minimize`] - the
+/// The application menu claims `Cmd+Q` for [`TrayCommand::Hide`] - the
 /// window only ever hides to the tray, and letting `terminate:` fire would kill
 /// a running core mid-flight - so real quit moves to `Opt+Cmd+Q` and shares the
 /// tray's quit id, keeping one cleanup path.
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 fn app_menu_bar() -> AppMenuBar {
     let bindings = quit_key_bindings();
-    let (minimize_id, minimize_accel) = bindings
+    let (hide_id, hide_accel) = bindings
         .first()
-        .expect("the minimize key binding must be present");
+        .expect("the hide key binding must be present");
     let (quit_id, quit_accel) = bindings
         .get(1)
         .expect("the quit key binding must be present");
@@ -376,9 +374,11 @@ fn app_menu_bar() -> AppMenuBar {
             ..Default::default()
         }),
     );
-    // Same action as the Window menu's "最小化" (`Cmd+M`) under a different key:
-    // `Cmd+Q` must land on an item we own, or AppKit routes it to `terminate:`.
-    let minimize = MenuItem::with_id(*minimize_id, "最小化", true, Some(*minimize_accel));
+    // "隐藏到托盘" is the window-level hide the red close button already does. It
+    // is deliberately not the app-level `hide:` above: that deactivates Kitty Pro
+    // entirely, while this leaves the app running with only the tray left behind.
+    // `Cmd+Q` has to land on an item we own, or AppKit routes it to `terminate:`.
+    let hide = MenuItem::with_id(*hide_id, "隐藏到托盘", true, Some(*hide_accel));
     // The quit id is the tray item's id, so quitting from either place runs the
     // same cleanup before the process exits.
     let quit = MenuItem::with_id(*quit_id, "退出 Kitty Pro", true, Some(*quit_accel));
@@ -392,7 +392,7 @@ fn app_menu_bar() -> AppMenuBar {
             &PredefinedMenuItem::hide_others(Some("隐藏其他")),
             &PredefinedMenuItem::show_all(Some("全部显示")),
             &PredefinedMenuItem::separator(),
-            &minimize,
+            &hide,
             &quit,
         ])
         .expect("application menu must be valid");
@@ -601,7 +601,7 @@ fn use_desktop_tray(bridge: DesktopTrayBridge) {
         execute_tray_command(
             command,
             || show_desktop_window(&window),
-            || minimize_desktop_window(&window),
+            || hide_desktop_window(&window),
             |command| app_command.set(Some(command)),
             || {
                 if let Err(error) = api::shutdown_native_runtime() {
@@ -622,7 +622,7 @@ mod tests {
     fn tray_ids_map_to_expected_commands() {
         assert_eq!(tray_command(TRAY_SHOW_ID), Some(TrayCommand::Show));
         assert_eq!(tray_command(TRAY_QUIT_ID), Some(TrayCommand::Quit));
-        assert_eq!(tray_command(MENU_MINIMIZE_ID), Some(TrayCommand::Minimize));
+        assert_eq!(tray_command(MENU_HIDE_ID), Some(TrayCommand::Hide));
         assert_eq!(
             tray_command(TRAY_SYSTEM_PROXY_ID),
             Some(TrayCommand::App(DesktopTrayCommand::ToggleSystemProxy))
@@ -643,7 +643,7 @@ mod tests {
         execute_tray_command(
             TrayCommand::Quit,
             || panic!("quit must not show the window"),
-            || panic!("quit must not minimize the window"),
+            || panic!("quit must not hide the window"),
             |_| panic!("quit must not dispatch an app command"),
             || {
                 assert_eq!(sequence.get(), 0);
@@ -665,7 +665,7 @@ mod tests {
         execute_tray_command(
             TrayCommand::Show,
             || shown.set(true),
-            || panic!("show must not minimize the window"),
+            || panic!("show must not hide the window"),
             |_| panic!("show must not dispatch an app command"),
             || panic!("show must not shut down the runtime"),
             || panic!("show must not exit the process"),
@@ -678,19 +678,19 @@ mod tests {
     /// that stops a running core: it puts the window away and leaves the proxy
     /// alive, which is what the tray-based close behaviour already promises.
     #[test]
-    fn minimize_command_keeps_the_runtime_alive() {
-        let minimized = Cell::new(false);
+    fn hide_command_keeps_the_runtime_alive() {
+        let hidden = Cell::new(false);
 
         execute_tray_command(
-            TrayCommand::Minimize,
-            || panic!("minimize must not show the window"),
-            || minimized.set(true),
-            |_| panic!("minimize must not dispatch an app command"),
-            || panic!("minimize must not shut down the runtime"),
-            || panic!("minimize must not exit the process"),
+            TrayCommand::Hide,
+            || panic!("hide must not show the window"),
+            || hidden.set(true),
+            |_| panic!("hide must not dispatch an app command"),
+            || panic!("hide must not shut down the runtime"),
+            || panic!("hide must not exit the process"),
         );
 
-        assert!(minimized.get());
+        assert!(hidden.get());
     }
 
     /// The command reaches `use_muda_event_handler` through an id, so a menu bar
@@ -701,16 +701,16 @@ mod tests {
     fn menu_bar_binds_quit_keys_to_the_shared_ids() {
         let bindings = quit_key_bindings();
         let ids: Vec<&str> = bindings.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec![MENU_MINIMIZE_ID, TRAY_QUIT_ID]);
+        assert_eq!(ids, vec![MENU_HIDE_ID, TRAY_QUIT_ID]);
         // Every bound id must map back to a command, or the key would be a no-op.
         for (id, _) in &bindings {
             assert!(tray_command(id).is_some(), "{id} has no command");
         }
         // `Cmd+Q` may never reach the item that stops the core.
-        let (minimize_id, minimize) = &bindings[0];
-        assert_eq!(tray_command(minimize_id), Some(TrayCommand::Minimize));
-        assert_eq!(minimize.modifiers(), Modifiers::SUPER);
-        assert_eq!(minimize.key(), Code::KeyQ);
+        let (hide_id, hide) = &bindings[0];
+        assert_eq!(tray_command(hide_id), Some(TrayCommand::Hide));
+        assert_eq!(hide.modifiers(), Modifiers::SUPER);
+        assert_eq!(hide.key(), Code::KeyQ);
         let (quit_id, quit) = &bindings[1];
         assert_eq!(tray_command(quit_id), Some(TrayCommand::Quit));
         assert_eq!(quit.modifiers(), Modifiers::SUPER | Modifiers::ALT);
