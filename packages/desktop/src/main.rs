@@ -296,7 +296,11 @@ fn App() -> Element {
 
     rsx! {
         document::Style { "{MAIN_CSS}" }
-        ProxyApp { platform: "Desktop".to_string(), desktop_tray }
+        ProxyApp {
+            platform: "Desktop".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            desktop_tray,
+        }
     }
 }
 

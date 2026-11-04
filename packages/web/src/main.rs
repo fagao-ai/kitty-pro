@@ -408,7 +408,11 @@ fn App() -> Element {
     rsx! {
         document::Link { rel: "icon", href: FAVICON }
         document::Link { rel: "stylesheet", href: MAIN_CSS }
-        ProxyApp { platform: "Web Control".to_string(), desktop_tray: None }
+        ProxyApp {
+            platform: "Web Control".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            desktop_tray: None,
+        }
     }
 }
 

@@ -1,0 +1,5 @@
+# The release workflow runs scripts/set-package-version.sh on the Windows runner,
+# whose images set core.autocrlf=true. A shell script checked out with CRLF fails
+# before its first line runs - the shebang resolves to `bash\r` and exec dies with
+# 127 - so line endings here are pinned rather than left to each runner's config.
+*.sh text eol=lf

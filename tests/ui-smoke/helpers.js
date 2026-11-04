@@ -166,6 +166,104 @@ async function stopStubs(page) {
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 }
 
+/// A release document in the exact shape `check_app_update` answers with.
+///
+/// Field names and the snake_case state strings are the serialized shape of
+/// `api::update::AppUpdateStatus`/`AppRelease`, so this has to move with those
+/// types - which is a feature: a renamed field breaks the card here rather than
+/// silently in front of a user.
+const releaseStatus = (overrides = {}) => ({
+  state: 'available',
+  current_version: '1.0.9',
+  latest: {
+    version: '1.1.0',
+    title: 'v1.1.0',
+    url: 'https://github.example/releases/tag/v1.1.0',
+    notes: '- fixed something\n\n**Full Changelog**: https://github.example/compare',
+    published_at: '2026-11-01T00:00:00Z',
+    prerelease: false,
+    asset: 'KittyPro_1.1.0_aarch64.dmg',
+    asset_size: 23351810,
+  },
+  last_check_at: 1_793_704_246,
+  snoozed: false,
+  target: '桌面版 · macos · aarch64',
+  error: null,
+  // Ages are measured against this, so it sits a whole three days past
+  // `published_at` for the labels to read sanely.
+  server_time: 1_793_704_246 + 3 * 86_400,
+  ...overrides,
+});
+
+const baseRelease = releaseStatus().latest;
+
+const UPDATE_VARIANTS = {
+  available: releaseStatus(),
+  up_to_date: releaseStatus({ state: 'up_to_date', latest: null }),
+  // Newer release, nothing published for this OS/CPU pair.
+  no_asset: releaseStatus({ latest: { ...baseRelease, asset: null, asset_size: 0 } }),
+  // A check that reached the server and failed there: an answer with a reason.
+  failed: releaseStatus({
+    state: 'failed',
+    latest: null,
+    error: '检查更新失败: dns failure',
+    server_time: 1_793_704_246,
+  }),
+};
+
+/// Answer the update endpoints from the browser instead of GitHub.
+///
+/// Two reasons this is not optional for the update card:
+///
+/// 1. The real endpoint contacts `api.github.com`, whose anonymous limit is 60
+///    requests per hour per IP. CI runners share egress IPs, so a suite that
+///    reaches the network several times per run is a flaky suite.
+/// 2. Whatever the newest published release happens to be decides what renders,
+///    so an unstubbed suite can only ever assert the one case the repository is
+///    currently in. Stubbing lets each card state - available, current, no asset
+///    for this machine, failed - be pinned on purpose.
+///
+/// `variant` picks one of `UPDATE_VARIANTS`; `transportError` answers 500
+/// instead, which is the branch with no `AppUpdateStatus` at all.
+async function stubUpdateCheck(page, { variant = 'available', transportError = false } = {}) {
+  const document = UPDATE_VARIANTS[variant];
+  if (!document) throw new Error(`unknown update fixture ${variant}`);
+
+  await page.route('**/api/update/settings', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ auto_check: true, last_check_at: 1_793_704_246 }),
+    }),
+  );
+
+  await page.route('**/api/update/check', (route) =>
+    route.fulfill(
+      transportError
+        ? {
+            status: 500,
+            contentType: 'application/json',
+            // The shape `ServerFnError::into_response` actually produces. The
+            // client falls back to "HTTP 500: <text>" when it cannot read this
+            // as its own payload, so what matters is the status: either way the
+            // call resolves to `Err` and no `AppUpdateStatus` exists at all.
+            body: JSON.stringify({ error: '读取更新状态失败' }),
+          }
+        : { status: 200, contentType: 'application/json', body: JSON.stringify(document) },
+    ),
+  );
+
+  await page.route('**/api/update/dismiss', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ auto_check: true, last_check_at: 1_793_704_246 }),
+    }),
+  );
+
+  return document;
+}
+
 /// Wait until a freshly opened panel stops moving, and return its box.
 ///
 /// `.modal` runs a 170ms entry animation (translateY + scale), so a box read
@@ -212,5 +310,7 @@ module.exports = {
   settlePanel,
   measureScroller,
   stubCoreLogStream,
+  stubUpdateCheck,
+  UPDATE_VARIANTS,
   stopStubs,
 };

@@ -106,39 +106,7 @@ jobs:
           release_version="$(
             jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
           )"
-          if ! jq -en --arg version "$release_version" \
-              '$version | test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$")' \
-              >/dev/null; then
-            echo "Release tag $GITHUB_REF_NAME is not a supported package version" >&2
-            exit 1
-          fi
-
-          desktop_manifest="$(
-            cargo metadata --locked --no-deps --format-version 1 \
-              | jq -er '.packages[] | select(.name == "desktop") | .manifest_path'
-          )"
-          updated_manifest="$RUNNER_TEMP/desktop-Cargo.toml"
-          jq -Rrsj --arg version "$release_version" '
-            sub(
-              "(?<prefix>\\[package\\]\\s+name\\s*=\\s*\"desktop\"\\s+version\\s*=\\s*\")[^\"]+(?<suffix>\")";
-              "\(.prefix)\($version)\(.suffix)"
-            )
-          ' "$desktop_manifest" > "$updated_manifest"
-          mv "$updated_manifest" "$desktop_manifest"
-
-          # Cargo.lock records workspace package versions. Update exactly this
-          # package entry after the manifest edit without upgrading dependencies.
-          cargo update --package desktop --precise "$release_version"
-
-          # Confirm that all later --locked builds see the tag-derived version.
-          package_version="$(
-            cargo metadata --locked --no-deps --format-version 1 \
-              | jq -er '.packages[] | select(.name == "desktop") | .version'
-          )"
-          if [[ "$package_version" != "$release_version" ]]; then
-            echo "desktop package version $package_version does not match tag $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
+          ./scripts/set-package-version.sh desktop "$release_version"
 
       - name: Cache Rust builds
         if: matrix.id != 'windows'
@@ -476,6 +444,19 @@ jobs:
         with:
           tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
 
+      # The Web server answers the in-app update check with its own package
+      # version, so a tagged build has to carry the tag. Without this the shipped
+      # server reports `0.1.0` forever and every user is told to update on every
+      # launch, to a version no install of theirs can ever reach.
+      - name: Set tagged Web version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          release_version="$(
+            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
+          )"
+          ./scripts/set-package-version.sh web "$release_version"
+
       - name: Build fullstack Web package
         shell: bash
         run: |
@@ -608,6 +589,18 @@ jobs:
           echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
           echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
           echo "ANDROID_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+
+      # Same reason as the Web job: the APK answers the update check with its own
+      # package version. `versionCode` is already monotonic, but it is not a
+      # version a human or this comparison reads.
+      - name: Set tagged Android version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          release_version="$(
+            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
+          )"
+          ./scripts/set-package-version.sh kitty-pro "$release_version"
 
       - name: Build Android APK
         shell: bash

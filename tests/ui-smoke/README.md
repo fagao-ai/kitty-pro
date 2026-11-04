@@ -49,6 +49,22 @@ the app booted.
   *reachable* control; panels stay centred in the viewport; the script editor
   keeps its 880px; the nested process picker lands on screen instead of inside
   the rule card's containing block.
+- `update.spec.js` - mounting the settings page cannot trap the wasm client. A
+  `wasm32` build has no platform clock (`SystemTime::now()` compiles, then traps as
+  `RuntimeError: unreachable` and takes the whole app down), so the ages the update
+  card prints have to come from the machine that ran the check. This is the only
+  guard that can see that class of bug: the native test target does have a clock.
+  The update endpoints are stubbed (`stubUpdateCheck`), which matters twice over:
+  the live check spends GitHub's 60-requests-per-hour anonymous limit from a shared
+  CI egress IP, and unstubbed the suite can only assert whatever release the
+  repository happens to have published. Stubbing pins each card state on purpose -
+  an available release naming one asset, a release with no package for this
+  machine, a current build offering nothing to download, a check that failed, and
+  a transport failure that produced no answer at all (the badge must not sit on
+  "尚未检查", since a background check does not raise a toast). Also pins the
+  settings nav dot and its accessible name, and that the card cannot create
+  horizontal overflow on a phone. The fixtures are the serialized shape of
+  `api::update::AppUpdateStatus`, so renaming a field breaks them deliberately.
 - `sync.spec.js` - the remote-path field names a folder and its hint echoes the
   configured path's stem (not a hard-coded name), and that hint cannot create
   horizontal overflow on a phone.

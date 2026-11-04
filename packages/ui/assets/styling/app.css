@@ -2889,7 +2889,8 @@ body {
   grid-column: 1 / -1;
 }
 
-.sync-settings {
+.sync-settings,
+.update-settings {
   grid-column: 1 / -1;
 }
 
@@ -2997,6 +2998,124 @@ body {
   grid-template-columns: minmax(220px, 0.8fr) minmax(280px, 1.2fr);
   align-items: center;
   gap: 14px;
+}
+
+/* Update card. The card sits in the same two-column grid as appearance and
+   diagnostics, so it has to survive being ~300px wide without the release row
+   or the action row ever creating scroll. */
+.update-release {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.update-release-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.update-release-head > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.update-release-head small {
+  color: var(--text-faint);
+  font-family: var(--f-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.update-asset {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  color: var(--text-soft);
+  font-family: var(--f-mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.update-asset small {
+  color: var(--text-faint);
+}
+
+/* Release notes arrive verbatim from GitHub as Markdown. Monospace and a scroll
+   box keep them honest without letting a long changelog stretch the card. */
+.update-notes {
+  max-height: 190px;
+  margin: 0;
+  padding: 10px 11px;
+  overflow: auto;
+  color: var(--text-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  font-family: var(--f-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.update-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* Full-width card: hold the release block and its notes to a readable measure
+   instead of stretching one line of mono text across both columns. */
+.update-release,
+.update-actions {
+  max-width: 760px;
+}
+
+/* An anchor styled as a button still brings its own underline and colour. */
+.update-actions a.primary-button,
+.update-actions a.primary-button:hover {
+  color: var(--accent-ink);
+  text-decoration: none;
+}
+
+.text-button {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  color: var(--accent);
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.text-button:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+/* Attention dot on the settings nav item while an update is waiting. The count
+   chip it shares a slot with is absent there, so nothing shifts. */
+.nav-item .nav-dot {
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-soft);
 }
 
 .sync-provider-control {
@@ -3894,7 +4013,8 @@ body {
   }
 
   .settings-section:first-child,
-  .sync-settings {
+  .sync-settings,
+  .update-settings {
     grid-column: auto;
   }
 
@@ -4261,7 +4381,8 @@ body {
     grid-column: auto;
   }
 
-  .sync-settings {
+  .sync-settings,
+  .update-settings {
     grid-column: auto;
   }
 

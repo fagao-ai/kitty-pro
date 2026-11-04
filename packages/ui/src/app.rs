@@ -5,12 +5,13 @@ use api::{
 use dioxus::html::geometry::PixelsVector2D;
 use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
-    LdArrowDown, LdArrowDownFromLine, LdArrowUp, LdBan, LdCheck, LdChevronDown, LdChevronRight,
-    LdCircleAlert, LdCircleCheck, LdClipboardCopy, LdCloud, LdCloudDownload, LdCloudUpload,
-    LdDownload, LdGauge, LdGitFork, LdGlobe, LdInfo, LdLanguages, LdLayers, LdLayoutDashboard,
-    LdListFilter, LdMoon, LdNetwork, LdPause, LdPencil, LdPlay, LdPlus, LdPower, LdRadioTower,
-    LdRefreshCw, LdRoute, LdRss, LdSave, LdScrollText, LdSearch, LdShieldCheck,
-    LdSlidersHorizontal, LdSplit, LdSun, LdTerminal, LdTimer, LdTrash2, LdWifi, LdX,
+    LdArrowDown, LdArrowDownFromLine, LdArrowUp, LdArrowUpRight, LdBan, LdBellOff, LdBellRing,
+    LdCheck, LdChevronDown, LdChevronRight, LdCircleAlert, LdCircleCheck, LdClipboardCopy, LdCloud,
+    LdCloudDownload, LdCloudUpload, LdDownload, LdGauge, LdGitFork, LdGlobe, LdInfo, LdLanguages,
+    LdLayers, LdLayoutDashboard, LdListFilter, LdMoon, LdNetwork, LdPackage, LdPause, LdPencil,
+    LdPlay, LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRocket, LdRoute, LdRss, LdSave,
+    LdScrollText, LdSearch, LdShieldCheck, LdSlidersHorizontal, LdSplit, LdSun, LdTerminal,
+    LdTimer, LdTrash2, LdWifi, LdX,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
@@ -824,8 +825,28 @@ impl AppView {
 struct DesktopAutostartCapability(bool);
 
 #[component]
-pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> Element {
+pub fn ProxyApp(
+    platform: String,
+    /// Package version of the shell that mounted this UI (`CARGO_PKG_VERSION`).
+    /// The update card compares it against the newest published release, so each
+    /// shell reports its own build rather than the version of the shared `ui`
+    /// crate it links.
+    app_version: String,
+    desktop_tray: Option<DesktopTrayBridge>,
+) -> Element {
     use_context_provider(|| DesktopAutostartCapability(desktop_tray.is_some()));
+    // One update check per app run, shared so the launch toast, the settings nav
+    // dot, and the settings card all read the same answer.
+    let mut update = use_context_provider(|| UpdateMonitor {
+        status: Signal::new(None),
+        saved: Signal::new(api::update::UpdateSettings::default()),
+        busy: Signal::new(None),
+        ready: Signal::new(false),
+        announced: Signal::new(None),
+        error: Signal::new(None),
+        platform: Signal::new(platform.clone()),
+        version: Signal::new(app_version.clone()),
+    });
     let active_view = use_signal(|| AppView::Overview);
     let mut dark_mode = use_signal(|| false);
     let mut connected = use_signal(|| false);
@@ -1205,6 +1226,21 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
         });
     });
 
+    // Update check on launch: read what the last run remembered, then let the
+    // server decide whether the day is up. A check the user did not ask for only
+    // ever speaks up about a release worth installing - "already latest" is the
+    // card's business, and a failure is the card's business too - so an offline
+    // start costs the user nothing but a request they enabled.
+    use_effect(move || {
+        spawn(async move {
+            if let Ok(saved) = api::update::load_update_settings().await {
+                update.saved.set(saved);
+            }
+            update.ready.set(true);
+            update.refresh(false, toast, true).await;
+        });
+    });
+
     use_effect(move || {
         spawn(async move {
             match api::load_profile().await {
@@ -1487,7 +1523,11 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                         active_view,
                         count: core_logs().len().to_string(),
                     }
-                    NavItem { view: AppView::Settings, active_view }
+                    NavItem {
+                        view: AppView::Settings,
+                        active_view,
+                        dot: update.has_actionable_update(),
+                    }
                 }
                 div { class: "sidebar-footer",
                     div { class: "core-chip",
@@ -1761,6 +1801,7 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                     AppView::Settings => rsx! {
                         SettingsView {
                             platform: platform.clone(),
+                            app_version: app_version.clone(),
                             core_state,
                             core_version,
                             core_note,
@@ -1798,7 +1839,12 @@ pub fn ProxyApp(platform: String, desktop_tray: Option<DesktopTrayBridge>) -> El
                 NavItem { view: AppView::Subscriptions, active_view, count: None::<String> }
                 NavItem { view: AppView::Rules, active_view, count: None::<String> }
                 NavItem { view: AppView::Logs, active_view, count: None::<String> }
-                NavItem { view: AppView::Settings, active_view, count: None::<String> }
+                NavItem {
+                    view: AppView::Settings,
+                    active_view,
+                    count: None::<String>,
+                    dot: update.has_actionable_update(),
+                }
             }
 
             if import_open() {
@@ -2218,12 +2264,25 @@ fn NavItem(
     mut active_view: Signal<AppView>,
     /// Trailing count chip (nodes, subscriptions, rules, log entries).
     count: Option<String>,
+    /// Small attention dot. Used by Settings while an update is waiting; the
+    /// count chip is absent there, so the two never compete for the same slot.
+    #[props(default)]
+    dot: bool,
 ) -> Element {
     let active = active_view() == view;
     rsx! {
         button {
             class: if active { "nav-item active" } else { "nav-item" },
             aria_current: if active { "page" },
+            // The dot itself is a 7px circle: colour carries the whole message,
+            // which no screen reader reads. Naming the button is the one place
+            // that is guaranteed to be announced, and `aria_label` on a bare
+            // `span` is not - so the dot stays decorative and the label says what
+            // the dot means. Only while the dot is up, so every other item keeps
+            // the name its visible text already gives it.
+            aria_label: if dot {
+                format!("{}（有新版本可更新）", view.title())
+            },
             onclick: move |_| active_view.set(view),
             match view {
                 AppView::Overview => rsx! { Icon { icon: LdLayoutDashboard, width: 20, height: 20 } },
@@ -2236,6 +2295,9 @@ fn NavItem(
             span { "{view.title()}" }
             if let Some(count) = count {
                 span { class: "nav-count", "{count}" }
+            } else if dot {
+                // Tooltip for a pointer; assistive tech reads the button's name.
+                span { class: "nav-dot", title: "有新版本可更新", aria_hidden: "true" }
             }
         }
     }
@@ -5484,11 +5546,12 @@ async fn download_csv(file_name: &str, rows: Vec<Vec<String>>) -> Result<(), Str
 }
 
 /// Subtitle under the Kitty Pro wordmark: which sing-box build is embedded.
-fn about_build_label(core_version: Option<String>, platform: &str) -> String {
-    match core_version {
-        Some(version) => format!("sing-box {version} · {platform}"),
-        None => format!("sing-box 未就绪 · {platform}"),
-    }
+fn about_build_label(app_version: &str, core_version: Option<String>, platform: &str) -> String {
+    let core = match core_version {
+        Some(version) => format!("sing-box {version}"),
+        None => "sing-box 未就绪".to_string(),
+    };
+    format!("v{app_version} · {core} · {platform}")
 }
 
 /// Plain-text diagnostic blob the user can paste into a bug report. Nothing in
@@ -6186,6 +6249,596 @@ fn apply_sync_snapshot(snapshot: SyncSnapshot, targets: SyncTargetSignals) {
     group_selections.set(HashMap::new());
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum UpdateAction {
+    Check,
+    Dismiss,
+    Toggle,
+}
+
+/// The app's one owner of update state, provided as context.
+///
+/// `ProxyApp` drives it so a check happens on launch whether or not the user ever
+/// opens the settings page - the shape Magpie's `UpdateService` has, with the
+/// service living beside the window instead of inside an about page. The settings
+/// card is a view over these signals, which is what lets the sidebar dot, the
+/// card, and the launch toast agree without three reads of one endpoint.
+///
+/// Every field is a signal, including the two strings, so the monitor is `Copy`
+/// and any event handler can take it by value.
+#[derive(Clone, Copy)]
+struct UpdateMonitor {
+    status: Signal<Option<api::update::AppUpdateStatus>>,
+    saved: Signal<api::update::UpdateSettings>,
+    busy: Signal<Option<UpdateAction>>,
+    ready: Signal<bool>,
+    /// Version the launch toast already announced, so a re-check that finds the
+    /// same release cannot stack a second toast.
+    announced: Signal<Option<String>>,
+    /// Why the last check never reached the answer stage, if it did not.
+    ///
+    /// Kept apart from `status`, which only ever holds a real answer: the
+    /// transport error has to survive long enough for the card to show it, and a
+    /// toast is the wrong place for a failure the user did not ask about.
+    error: Signal<Option<String>>,
+    platform: Signal<String>,
+    version: Signal<String>,
+}
+
+impl UpdateMonitor {
+    fn view(self) -> Option<api::update::AppUpdateStatus> {
+        (self.status)().clone()
+    }
+
+    fn state(self) -> api::update::AppUpdateState {
+        self.view()
+            .map(|value| value.state)
+            .unwrap_or(api::update::AppUpdateState::Idle)
+    }
+
+    fn latest(self) -> Option<api::update::AppRelease> {
+        self.view().and_then(|value| value.latest.clone())
+    }
+
+    /// A newer release the user has not dismissed.
+    fn has_actionable_update(self) -> bool {
+        self.state() == api::update::AppUpdateState::Available
+            && !self.view().is_some_and(|value| value.snoozed)
+    }
+
+    fn is_checking(self) -> bool {
+        (self.busy)() == Some(UpdateAction::Check)
+    }
+
+    /// Reason the last check failed to produce an answer, if it did.
+    fn failure(self) -> Option<String> {
+        (self.error)().clone()
+    }
+
+    /// What the badge reports. See [`resolve_display_state`].
+    fn display_state(self) -> api::update::AppUpdateState {
+        resolve_display_state(self.view().as_ref(), (self.error)().as_deref())
+    }
+
+    fn is_idle(self) -> bool {
+        (self.busy)().is_none()
+    }
+
+    /// Whether the remembered settings have been read at least once. Until then
+    /// every action is disabled, because "no answer yet" and "no update" would
+    /// otherwise render identically.
+    fn has_loaded(self) -> bool {
+        (self.ready)()
+    }
+
+    fn platform_text(self) -> String {
+        (self.platform)()
+    }
+
+    fn version_text(self) -> String {
+        (self.version)()
+    }
+
+    fn settings(self) -> api::update::UpdateSettings {
+        (self.saved)()
+    }
+
+    /// Ask the server for an answer. `force` ignores the daily throttle.
+    async fn refresh(mut self, force: bool, toast: ToastManager, announce: bool) {
+        self.busy.set(Some(UpdateAction::Check));
+        let request = api::update::AppUpdateRequest {
+            platform: self.platform_text(),
+            current_version: self.version_text(),
+            force,
+        };
+        match api::update::check_app_update(request).await {
+            Ok(answer) => {
+                let release = answer.latest.clone();
+                let available =
+                    answer.state == api::update::AppUpdateState::Available && !answer.snoozed;
+                // The answer replaces any transport error from an earlier attempt.
+                self.error.set(None);
+                self.status.set(Some(answer));
+                if announce {
+                    self.announce(available, release, toast);
+                }
+            }
+            Err(error) => {
+                // Kept for the card to render as "检查失败" plus the reason, which
+                // is where a failure belongs whether or not anybody is watching.
+                self.error.set(Some(error.to_string()));
+                // Only a check the user started gets interrupted by a toast.
+                //
+                // This branch is the transport, not the network: an unreachable
+                // GitHub comes back as `Ok` with `state: Failed` and a reason the
+                // card already prints. What lands here instead is a state file
+                // that cannot be read or written, or a server that cannot be
+                // reached at all - which a launch would surface as a red banner
+                // over an app the user was busy opening, on every launch, for a
+                // fault the card already reports in its own row.
+                if force {
+                    toast.error(format!("检查更新失败: {error}"));
+                }
+            }
+        }
+        self.busy.set(None);
+    }
+
+    /// Report a check to the user, at most once per release.
+    ///
+    /// A launch check stays quiet unless there is something to act on: the card
+    /// saying "already latest" is enough, and a toast for it would be noise on
+    /// every start.
+    fn announce(
+        mut self,
+        available: bool,
+        release: Option<api::update::AppRelease>,
+        toast: ToastManager,
+    ) {
+        let Some(release) = release.filter(|_| available) else {
+            return;
+        };
+        if (self.announced)().as_deref() == Some(release.version.as_str()) {
+            return;
+        }
+        self.announced.set(Some(release.version.clone()));
+        toast.info(format!("发现新版本 v{}", release.version));
+    }
+}
+
+/// Update card: the GitHub release check, and the only place in the app that
+/// offers to leave it.
+///
+/// Everything it renders comes from the [`UpdateMonitor`] in context, which
+/// `ProxyApp` mounted at startup. Nothing here downloads or installs: the release
+/// page owns the installers and their checksums, and every package this project
+/// ships needs privileges the app does not have (a signed `.dmg`, an MSI,
+/// Android's own installer), so the last step is a link the user can read first.
+#[component]
+fn UpdateSettings() -> Element {
+    let toast = use_context::<ToastManager>();
+    let mut monitor = use_context::<UpdateMonitor>();
+    let mut confirm_dismiss = use_signal(|| false);
+    let mut notes_open = use_signal(|| false);
+
+    let view = monitor.view();
+    let state = monitor.display_state();
+    let latest = monitor.latest();
+    let update_ready = monitor.has_actionable_update();
+    let settings = monitor.settings();
+    // A check can fail two ways: it reached GitHub and has an answer to keep
+    // beside the reason, or it never got that far and only the monitor remembers.
+    // The card shows either, which is what makes not toasting a background
+    // failure an honest trade rather than a swallowed one.
+    let error = view
+        .as_ref()
+        .and_then(|value| value.error.clone())
+        .or_else(|| monitor.failure());
+    let platform = monitor.platform_text();
+    let app_version = monitor.version_text();
+    // Clock the age labels are measured against, read together with the stamp it
+    // is compared to so the age cannot drift between two reads. A browser client
+    // has no clock of its own and must not read one: that traps in `wasm32`.
+    let server_time = view.as_ref().map_or(0, |value| value.server_time);
+    // A release with nothing published for this machine still gets a card: the
+    // version and the reason are the useful part, and the download link would be
+    // a dead end.
+    let show_asset_note = latest.is_some()
+        && latest
+            .as_ref()
+            .is_some_and(|release| release.asset.is_none());
+
+    rsx! {
+        section { class: "settings-section update-settings glass-surface",
+            div { class: "section-heading",
+                div {
+                    p { class: "eyebrow", "UPDATES" }
+                    h2 { "检查更新" }
+                }
+                span { class: update_badge_class(state, update_ready),
+                    {update_badge_label(
+                        state,
+                        monitor.is_checking(),
+                        monitor.has_loaded(),
+                        view.as_ref().is_some_and(|value| value.snoozed),
+                    )}
+                }
+            }
+
+            div { class: "setting-row",
+                span { class: "setting-icon", Icon { icon: LdRocket, width: 19, height: 19 } }
+                div {
+                    strong { {format!("当前版本 v{app_version}")} }
+                    small {
+                        if let Some(answer) = view.as_ref() {
+                            {format!("检查目标 {}", answer.target)}
+                        } else {
+                            {platform.clone()}
+                        }
+                    }
+                }
+                if let Some(release) = latest.as_ref() {
+                    span { class: "setting-value", {format!("最新 v{}", release.version)} }
+                }
+            }
+
+            label { class: "setting-row toggle-row",
+                span { class: "setting-icon",
+                    if settings.auto_check {
+                        Icon { icon: LdBellRing, width: 19, height: 19 }
+                    } else {
+                        Icon { icon: LdBellOff, width: 19, height: 19 }
+                    }
+                }
+                div {
+                    strong { "自动检查更新" }
+                    small {
+                        {auto_check_label(
+                            settings.auto_check,
+                            view.as_ref().map_or(0, |value| value.last_check_at),
+                            server_time,
+                        )}
+                    }
+                }
+                input {
+                    r#type: "checkbox",
+                    aria_label: "自动检查更新",
+                    checked: settings.auto_check,
+                    disabled: !monitor.is_idle(),
+                    onchange: move |event| {
+                        let enabled = event.checked();
+                        spawn(async move {
+                            monitor.busy.set(Some(UpdateAction::Toggle));
+                            let mut next = monitor.settings();
+                            next.auto_check = enabled;
+                            match api::update::save_update_settings(next).await {
+                                Ok(saved) => {
+                                    monitor.saved.set(saved);
+                                    if enabled {
+                                        // Turning the switch back on should say
+                                        // whether anything is waiting, right now.
+                                        monitor.refresh(false, toast, true).await;
+                                    } else {
+                                        toast.success("已关闭自动检查，仍可手动检查");
+                                    }
+                                }
+                                Err(error) => {
+                                    toast.error(format!("更新设置保存失败: {error}"));
+                                }
+                            }
+                            monitor.busy.set(None);
+                        });
+                    },
+                }
+                span { class: "switch" }
+            }
+
+            if state == api::update::AppUpdateState::Unsupported {
+                div { class: "inline-note",
+                    Icon { icon: LdInfo, width: 16, height: 16 }
+                    span { "此客户端不通过 GitHub 发布安装包，请从分发它的渠道更新" }
+                }
+            }
+
+            if let Some(release) = latest.as_ref() {
+                div { class: "update-release",
+                    div { class: "update-release-head",
+                        div {
+                            strong { {release.title.clone()} }
+                            small {
+                                {release_subtitle(
+                                    &release.title,
+                                    &release.version,
+                                    release_age_label(
+                                        release.published_at.as_deref(),
+                                        server_time,
+                                    ),
+                                )}
+                                if release.prerelease { " · 预览版" }
+                            }
+                        }
+                        if update_ready {
+                            span { class: "status-badge pending", "可更新" }
+                        } else if view.as_ref().is_some_and(|value| value.snoozed) {
+                            span { class: "status-badge", "已忽略" }
+                        }
+                    }
+                    if let Some(asset) = release.asset.as_ref() {
+                        p { class: "update-asset",
+                            Icon { icon: LdPackage, width: 14, height: 14 }
+                            span { "{asset}" }
+                            if release.asset_size > 0 {
+                                small { {format_data_amount(release.asset_size)} }
+                            }
+                        }
+                    } else {
+                        // Newer, but nothing published for this OS/CPU pair: an
+                        // exact answer beats a download button that cannot work.
+                        p { class: "update-asset",
+                            Icon { icon: LdCircleAlert, width: 14, height: 14 }
+                            span { "此发布未包含适配本机的安装包" }
+                        }
+                    }
+                    if release.notes.is_some() {
+                        button {
+                            class: "text-button",
+                            aria_expanded: "{notes_open()}",
+                            onclick: move |_| notes_open.toggle(),
+                            {if notes_open() { "收起更新说明" } else { "查看更新说明" }}
+                        }
+                        if let Some(notes) = release.notes.as_ref() {
+                            if notes_open() {
+                                pre { class: "update-notes", "{notes}" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(message) = error.clone() {
+                div { class: "inline-note", role: "alert",
+                    Icon { icon: LdCircleAlert, width: 16, height: 16 }
+                    span { "{message}" }
+                }
+            }
+
+            div { class: "update-actions",
+                button {
+                    class: "secondary-button compact",
+                    disabled: !monitor.is_idle() || !monitor.has_loaded(),
+                    onclick: move |_| {
+                        spawn(async move {
+                            // A manual check answers whatever it finds, including
+                            // "nothing newer".
+                            monitor.refresh(true, toast, true).await;
+                        });
+                    },
+                    if monitor.is_checking() { span { class: "spinner" } }
+                    else { Icon { icon: LdRefreshCw, width: 16, height: 16 } }
+                    "检查更新"
+                }
+                if let Some(url) = latest.as_ref().map(|release| release.url.clone()) {
+                    // A real anchor rather than a button that evals an opener.
+                    //
+                    // In a browser this is a plain link, and `target="_blank"` is
+                    // what sends the release page to a background tab instead of
+                    // navigating away from the console.
+                    //
+                    // On desktop and Android the same markup reaches the system
+                    // browser by a different route: the native interpreter
+                    // (`dioxus-interpreter-js`'s `handleClickNavigate`) calls
+                    // `preventDefault` on any click that lands on an `<a>` and
+                    // sends the href over IPC as `browser_open`, which
+                    // `dioxus-desktop` hands to `webbrowser::open` - an Android
+                    // `ACTION_VIEW` intent there. So `target` is inert on those
+                    // shells. The one thing that must not be added here is an
+                    // `onclick` that returns `prevent_default`: that suppression
+                    // is what skips the interception, and the navigation is
+                    // already cancelled - so the click would simply do nothing.
+                    a {
+                        class: "primary-button compact",
+                        href: "{url}",
+                        target: "_blank",
+                        rel: "noreferrer",
+                        Icon { icon: LdArrowUpRight, width: 16, height: 16 }
+                        {if update_ready { "前往下载" } else { "发布页" }}
+                    }
+                }
+                if update_ready {
+                    if confirm_dismiss() {
+                        button {
+                            class: "secondary-button compact danger-text-button",
+                            disabled: !monitor.is_idle(),
+                            onclick: move |_| {
+                                let Some(release) = latest.clone() else { return };
+                                spawn(async move {
+                                    monitor.busy.set(Some(UpdateAction::Dismiss));
+                                    let result =
+                                        api::update::dismiss_app_update(release.version.clone()).await;
+                                    match result {
+                                        Ok(_) => {
+                                            confirm_dismiss.set(false);
+                                            if let Some(mut answer) = (monitor.status)() {
+                                                answer.snoozed = true;
+                                                monitor.status.set(Some(answer));
+                                            }
+                                            toast.success(format!("已忽略 v{}", release.version));
+                                        }
+                                        Err(error) => toast.error(format!("忽略失败: {error}")),
+                                    }
+                                    monitor.busy.set(None);
+                                });
+                            },
+                            Icon { icon: LdX, width: 16, height: 16 }
+                            "确认忽略此版本"
+                        }
+                        button {
+                            class: "secondary-button compact",
+                            disabled: !monitor.is_idle(),
+                            onclick: move |_| confirm_dismiss.set(false),
+                            "取消"
+                        }
+                    } else {
+                        button {
+                            class: "secondary-button compact",
+                            title: "直到出现更新的版本前不再提示",
+                            disabled: !monitor.is_idle(),
+                            onclick: move |_| confirm_dismiss.set(true),
+                            Icon { icon: LdBellOff, width: 16, height: 16 }
+                            "忽略此版本"
+                        }
+                    }
+                }
+            }
+
+            if show_asset_note {
+                div { class: "inline-note sync-security-note",
+                    Icon { icon: LdInfo, width: 16, height: 16 }
+                    span {
+                        {format!("已按 {platform} 的操作系统与 CPU 匹配安装包；发布页仍可查看其他平台的包")}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The state the badge shows, given whatever the monitor holds.
+///
+/// A check that never produced an answer - a state file that could not be read, a
+/// server that could not be reached - has no `AppUpdateStatus` to read a state
+/// out of. That must not render as "尚未检查", which is what it said a moment
+/// before: since a background failure no longer raises a toast, the badge is the
+/// only place it can appear, and this is the mapping that keeps it visible.
+fn resolve_display_state(
+    answer: Option<&api::update::AppUpdateStatus>,
+    failure: Option<&str>,
+) -> api::update::AppUpdateState {
+    match answer {
+        Some(answer) => answer.state,
+        None if failure.is_some() => api::update::AppUpdateState::Failed,
+        None => api::update::AppUpdateState::Idle,
+    }
+}
+
+fn update_badge_class(state: api::update::AppUpdateState, update_ready: bool) -> &'static str {
+    if update_ready {
+        "status-badge pending"
+    } else {
+        match state {
+            api::update::AppUpdateState::UpToDate => "status-badge ready",
+            api::update::AppUpdateState::Failed => "status-badge offline",
+            _ => "status-badge",
+        }
+    }
+}
+
+fn update_badge_label(
+    state: api::update::AppUpdateState,
+    checking: bool,
+    loaded: bool,
+    snoozed: bool,
+) -> &'static str {
+    if checking {
+        "检查中"
+    } else if !loaded {
+        "读取中"
+    } else if snoozed {
+        // The header would otherwise read "有更新" over a card that says "已忽略".
+        "已忽略"
+    } else {
+        match state {
+            api::update::AppUpdateState::Available => "有更新",
+            api::update::AppUpdateState::UpToDate => "已是最新",
+            api::update::AppUpdateState::Unsupported => "不支持",
+            api::update::AppUpdateState::Failed => "检查失败",
+            api::update::AppUpdateState::Idle => "尚未检查",
+        }
+    }
+}
+
+/// Release line of the card: the title, then the version and age unless the
+/// title already is the version.
+///
+/// GitHub lets a release be named anything, and this project titles them exactly
+/// like their tags, so printing both lines would read "v1.0.9 / v1.0.9 · 13 天前".
+/// The version only earns its own place when it adds something.
+fn release_subtitle(title: &str, version: &str, age: String) -> String {
+    let names_version = {
+        let trimmed = title.trim().trim_start_matches(['v', 'V']);
+        trimmed.eq_ignore_ascii_case(version.trim())
+    };
+    if names_version {
+        age
+    } else {
+        format!("v{version} · {age}")
+    }
+}
+
+/// Elapsed time in the largest unit that still reads as "recent".
+fn relative_age(seconds_ago: u64) -> String {
+    if seconds_ago == 0 {
+        return "刚刚".to_string();
+    }
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if seconds_ago < MINUTE {
+        format!("{seconds_ago} 秒前")
+    } else if seconds_ago < HOUR {
+        format!("{} 分钟前", seconds_ago / MINUTE)
+    } else if seconds_ago < DAY {
+        format!("{} 小时前", seconds_ago / HOUR)
+    } else {
+        format!("{} 天前", seconds_ago / DAY)
+    }
+}
+
+/// The auto-check row's subtitle: how often it runs, and when it last ran.
+///
+/// The age is omitted while no check has answered yet, because the only usable
+/// "now" is the one that came back with an answer.
+fn auto_check_label(auto_check: bool, last_check_at: u64, server_time: u64) -> String {
+    if !auto_check {
+        return "仅手动检查，启动时不再联网".to_string();
+    }
+    match age_label(last_check_at, server_time) {
+        Some(age) => format!("每天一次 · {age}"),
+        None => "每天一次 · 启动时检查".to_string(),
+    }
+}
+
+/// Age of an event stamped `then`, measured against `now`.
+///
+/// `None` when the answering clock is unknown. Both numbers arrive from the
+/// server: a browser client compiled to `wasm32` has no platform clock, and
+/// reading one there traps (see the uptime note in `ProxyApp`), so every age the
+/// card prints is measured by the machine that checked GitHub. Zero for `then`
+/// means "never", not "the epoch".
+fn age_label(then: u64, now: u64) -> Option<String> {
+    if now == 0 {
+        return None;
+    }
+    Some(if then == 0 {
+        "从未检查".to_string()
+    } else {
+        relative_age(now.saturating_sub(then))
+    })
+}
+
+/// Age of a release from the RFC 3339 stamp GitHub sends, measured against `now`.
+/// An unparseable stamp or an unknown clock says "发布时间未知" rather than a
+/// wrong date.
+fn release_age_label(published_at: Option<&str>, now: u64) -> String {
+    match (now > 0)
+        .then(|| published_at.and_then(proxy_core::unix_from_rfc3339))
+        .flatten()
+    {
+        Some(unix) => relative_age(now.saturating_sub(unix)),
+        None => "发布时间未知".to_string(),
+    }
+}
+
 #[cfg(all(
     feature = "native-desktop",
     any(target_os = "macos", target_os = "windows", target_os = "linux")
@@ -6349,6 +7002,7 @@ fn commit_dns_override(
 #[component]
 fn SettingsView(
     platform: String,
+    app_version: String,
     mut core_state: Signal<String>,
     mut core_version: Signal<Option<String>>,
     mut core_note: Signal<Option<String>>,
@@ -6600,6 +7254,8 @@ fn SettingsView(
                 config_script,
             }
 
+            UpdateSettings {}
+
             section { class: "settings-section appearance-settings glass-surface",
                 div { class: "section-heading",
                     div {
@@ -6646,7 +7302,7 @@ fn SettingsView(
                     }
                     div {
                         strong { "Kitty Pro" }
-                        small { {about_build_label(core_version(), &platform)} }
+                        small { {about_build_label(&app_version, core_version(), &platform)} }
                     }
                 }
                 div { class: "about-facts",
@@ -7065,6 +7721,201 @@ fn source_label(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn age_labels_measure_against_the_supplied_clock() {
+        // The card runs in the browser, where there is no clock to read, so an
+        // age is always "then" subtracted from the "now" the check came back with.
+        assert_eq!(age_label(1_000, 1_000).as_deref(), Some("刚刚"));
+        assert_eq!(age_label(1_000, 1_900).as_deref(), Some("15 分钟前"));
+        assert_eq!(age_label(1_000, 200_000).as_deref(), Some("2 天前"));
+        // A timestamp ahead of the answering clock must not underflow.
+        assert_eq!(age_label(5_000, 1_000).as_deref(), Some("刚刚"));
+        // "Never checked" must not read as "a moment ago".
+        assert_eq!(age_label(0, 1_000).as_deref(), Some("从未检查"));
+        // No answering clock means no age at all, rather than a wrong one.
+        assert_eq!(age_label(1_000, 0), None);
+    }
+
+    #[test]
+    fn the_auto_check_row_names_its_schedule_without_inventing_a_time() {
+        assert_eq!(
+            auto_check_label(true, 1_000, 1_000 + 3 * 86_400),
+            "每天一次 · 3 天前"
+        );
+        assert_eq!(auto_check_label(true, 0, 1_000), "每天一次 · 从未检查");
+        // Before the first answer there is no clock, so the row promises only
+        // what it can keep.
+        assert_eq!(auto_check_label(true, 0, 0), "每天一次 · 启动时检查");
+        assert_eq!(
+            auto_check_label(false, 1_000, 1_000),
+            "仅手动检查，启动时不再联网"
+        );
+    }
+
+    #[test]
+    fn release_ages_read_the_formats_github_sends() {
+        let now = 1_793_704_246 + 3 * 86_400;
+        assert_eq!(
+            release_age_label(Some("2026-11-03T11:10:46Z"), now),
+            "3 天前"
+        );
+        // An unparseable stamp says so instead of inventing a date.
+        for value in [None, Some(""), Some("yesterday"), Some("2026-11-03")] {
+            assert_eq!(
+                release_age_label(value, now),
+                "发布时间未知",
+                "{value:?} should not produce a date"
+            );
+        }
+        // So does a stamp with no clock to measure it against.
+        assert_eq!(
+            release_age_label(Some("2026-11-03T11:10:46Z"), 0),
+            "发布时间未知"
+        );
+    }
+
+    #[test]
+    fn a_release_named_after_its_tag_does_not_repeat_it() {
+        // This project titles releases exactly like their tags, so the version
+        // line would otherwise read "v1.0.9 / v1.0.9 · 13 天前".
+        assert_eq!(
+            release_subtitle("v1.0.9", "1.0.9", "13 天前".into()),
+            "13 天前"
+        );
+        assert_eq!(
+            release_subtitle("V1.0.9", "1.0.9", "13 天前".into()),
+            "13 天前"
+        );
+        // A human title carries information the version does not, so both stay.
+        assert_eq!(
+            release_subtitle("Hotfix release", "1.0.9", "13 天前".into()),
+            "v1.0.9 · 13 天前"
+        );
+    }
+
+    #[test]
+    fn elapsed_time_uses_the_largest_recent_unit() {
+        assert_eq!(relative_age(0), "刚刚");
+        assert_eq!(relative_age(45), "45 秒前");
+        assert_eq!(relative_age(59), "59 秒前");
+        assert_eq!(relative_age(60), "1 分钟前");
+        assert_eq!(relative_age(3_600), "1 小时前");
+        assert_eq!(relative_age(86_400), "1 天前");
+        assert_eq!(relative_age(200_000), "2 天前");
+    }
+
+    #[test]
+    fn asset_sizes_read_in_the_units_a_download_is_judged_in() {
+        // The card prints a size the user weighs a download against, so it uses
+        // the same formatter the traffic stats use rather than a second one with
+        // its own rounding - `2 KiB` in one place and `2.0 KiB` in another is how
+        // two helpers start disagreeing about the same byte count.
+        assert_eq!(format_data_amount(0), "0 B");
+        assert_eq!(format_data_amount(1_023), "1023 B");
+        // The real .dmg, .msi and .apk sizes all land on one decimal of MiB.
+        assert_eq!(format_data_amount(23_351_810), "22.3 MiB");
+        assert_eq!(format_data_amount(30_306_304), "28.9 MiB");
+        assert_eq!(format_data_amount(2 * 1024 * 1024), "2.0 MiB");
+        assert_eq!(format_data_amount(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn the_badge_wording_follows_the_check_state() {
+        assert_eq!(
+            update_badge_label(api::update::AppUpdateState::Available, false, true, false),
+            "有更新"
+        );
+        assert_eq!(
+            update_badge_label(api::update::AppUpdateState::UpToDate, false, true, false),
+            "已是最新"
+        );
+        // While a check is in flight the badge says so, whatever it last found.
+        assert_eq!(
+            update_badge_label(api::update::AppUpdateState::UpToDate, true, true, false),
+            "检查中"
+        );
+        assert_eq!(
+            update_badge_label(api::update::AppUpdateState::Idle, false, false, false),
+            "读取中"
+        );
+        assert_eq!(
+            update_badge_label(api::update::AppUpdateState::Failed, false, true, false),
+            "检查失败"
+        );
+        assert_eq!(
+            update_badge_label(api::update::AppUpdateState::Unsupported, false, true, false),
+            "不支持"
+        );
+        // A dismissed release: the header must not keep advertising an update the
+        // card already said it would leave alone.
+        assert_eq!(
+            update_badge_label(api::update::AppUpdateState::Available, false, true, true),
+            "已忽略"
+        );
+    }
+
+    #[test]
+    fn only_an_actionable_update_colours_the_badge() {
+        assert_eq!(
+            update_badge_class(api::update::AppUpdateState::Available, true),
+            "status-badge pending"
+        );
+        // A dismissed release keeps the neutral badge: the colour is the nag.
+        assert_eq!(
+            update_badge_class(api::update::AppUpdateState::Available, false),
+            "status-badge"
+        );
+        assert_eq!(
+            update_badge_class(api::update::AppUpdateState::UpToDate, false),
+            "status-badge ready"
+        );
+        assert_eq!(
+            update_badge_class(api::update::AppUpdateState::Failed, false),
+            "status-badge offline"
+        );
+    }
+
+    #[test]
+    fn a_check_that_never_answered_still_shows_the_failure() {
+        // Suppressing the background toast is only honest while the card reports
+        // the failure. Without this mapping a check that died before producing an
+        // `AppUpdateStatus` - unreadable state file, server unreachable - would
+        // keep saying "尚未检查" and the error would exist nowhere at all.
+        use api::update::{AppUpdateState, AppUpdateStatus};
+        let answer = |state: AppUpdateState| AppUpdateStatus {
+            state,
+            current_version: "1.0.0".to_string(),
+            latest: None,
+            last_check_at: 0,
+            snoozed: false,
+            target: "桌面版 · macos · aarch64".to_string(),
+            error: None,
+            server_time: 0,
+        };
+
+        assert_eq!(
+            resolve_display_state(None, Some("state file unreadable")),
+            AppUpdateState::Failed
+        );
+        // Whatever the badge said before the check is not what it says after a
+        // failure, and a real answer still wins over a stale error.
+        assert_eq!(resolve_display_state(None, None), AppUpdateState::Idle);
+        assert_eq!(
+            resolve_display_state(Some(&answer(AppUpdateState::UpToDate)), Some("late")),
+            AppUpdateState::UpToDate
+        );
+        assert_eq!(
+            resolve_display_state(Some(&answer(AppUpdateState::Available)), None),
+            AppUpdateState::Available
+        );
+
+        // And the failed badge reads as a failure rather than a placeholder.
+        assert_eq!(
+            update_badge_label(AppUpdateState::Failed, false, true, false),
+            "检查失败"
+        );
+    }
 
     #[test]
     fn separate_subscriptions_get_distinct_node_tags() {

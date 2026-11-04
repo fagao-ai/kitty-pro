@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 mod sync;
 #[cfg(not(target_arch = "wasm32"))]
 use sync::{load_native_sync_config, save_native_sync_config, save_native_sync_state};
+pub mod update;
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]

@@ -264,6 +264,43 @@ Apple notarization and Windows Authenticode signing require developer
 certificates and should be added before public distribution. iOS packaging is
 intentionally deferred until its NetworkExtension and signing setup are ready.
 
+## Checking for updates
+
+The Settings page asks GitHub for the newest release of the repository, compares
+it against the running shell's package version, and offers the release page when
+something newer exists. Checks run at startup and at most once a day, remembered
+in `<data dir>/update.json` beside `profile.json`, and can be switched off; the
+button on the card ignores the throttle.
+
+The check reads only GitHub's own API and never downloads or installs anything.
+Each platform ships a signed installer with its own privilege requirements - a
+`.dmg`, an MSI, Android's installer - so the last step is a link, which is also
+where the `.sha256` files published next to every asset stay useful.
+
+Which asset belongs to which install is decided from the file names the release
+workflow produces, so a renamed package breaks the match and shows up in the
+ignored live test rather than as a silent wrong download:
+
+```sh
+cargo test -p api --lib live_release -- --ignored
+```
+
+Anything the check cannot classify - a malformed tag, an asset that names no
+operating system, a CPU with no published build - is reported as "nothing to
+install", never as an invitation to fetch a binary that cannot run. The card
+shows the target it matched against (`桌面版 · macos · aarch64`) so "no package
+for you" is a specific answer.
+
+A check the user did not start only ever announces a release worth installing.
+Failure belongs to the card, which reads "检查失败" with the reason, and to the
+manual button's toast; a startup check that cannot reach GitHub stays quiet,
+because a red banner over an app the user is busy opening, on every launch, is
+nagging about a fault that is already written on the card.
+
+A fork checks its own releases by building with
+`KITTY_UPDATE_REPO=acme/kitty-pro`, which stops it from prompting users to
+install someone else's binaries.
+
 ## Verification
 
 ```sh
