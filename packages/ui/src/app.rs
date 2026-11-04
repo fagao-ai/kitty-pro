@@ -7,11 +7,11 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::ld_icons::{
     LdArrowDown, LdArrowDownFromLine, LdArrowUp, LdArrowUpRight, LdBan, LdBellOff, LdBellRing,
     LdCheck, LdChevronDown, LdChevronRight, LdCircleAlert, LdCircleCheck, LdClipboardCopy, LdCloud,
-    LdCloudDownload, LdCloudUpload, LdDownload, LdGauge, LdGitFork, LdGlobe, LdInfo, LdLanguages,
-    LdLayers, LdLayoutDashboard, LdListFilter, LdMoon, LdNetwork, LdPackage, LdPause, LdPencil,
-    LdPlay, LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRocket, LdRoute, LdRss, LdSave,
-    LdScrollText, LdSearch, LdShieldCheck, LdSlidersHorizontal, LdSplit, LdSun, LdTerminal,
-    LdTimer, LdTrash2, LdWifi, LdX,
+    LdCloudDownload, LdCloudUpload, LdGauge, LdGitFork, LdGlobe, LdInfo, LdLanguages, LdLayers,
+    LdLayoutDashboard, LdListFilter, LdMoon, LdNetwork, LdPackage, LdPause, LdPencil, LdPlay,
+    LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRocket, LdRoute, LdRss, LdSave, LdScrollText,
+    LdSearch, LdShieldCheck, LdSlidersHorizontal, LdSplit, LdSun, LdTerminal, LdTimer, LdTrash2,
+    LdWifi, LdX,
 };
 use dioxus_free_icons::Icon;
 use proxy_core::{
@@ -925,11 +925,10 @@ pub fn ProxyApp(
     let mut profile_loaded = use_signal(|| false);
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
     let mut system_proxy_busy = use_signal(|| false);
-    // Log page state lives here so the export action can hand the exact rows on
-    // screen to the CSV writer, and the rules tab drives the topbar eyebrow.
+    // Log page state lives here so the chip filter and the search box stay in
+    // sync with the topbar eyebrow that the rules tab also drives.
     let log_filter = use_signal(|| LogFilter::Routes);
     let log_search = use_signal(String::new);
-    let mut log_export_busy = use_signal(|| false);
     let rules_tab = use_signal(|| RulesTab::Routing);
 
     use_effect(move || {
@@ -1623,45 +1622,16 @@ pub fn ProxyApp(
                                 span { "添加订阅" }
                             }
                         }
-                        // The design keeps the destructive/export pair in the page
-                        // header so they are reachable without scrolling the log list.
+                        // The design keeps the destructive action in the page header
+                        // so it is reachable without scrolling the log list.
                         if current_view == AppView::Logs {
                             button {
                                 class: "secondary-button log-clear-button",
                                 title: "清空当前缓冲区中的日志",
-                                disabled: core_logs().is_empty() || log_export_busy(),
+                                disabled: core_logs().is_empty(),
                                 onclick: move |_| core_logs.write().clear(),
                                 Icon { icon: LdTrash2, width: 15, height: 15 }
                                 span { "清空日志" }
-                            }
-                            button {
-                                class: "primary-button compact log-export-button",
-                                title: "导出当前筛选结果为 CSV",
-                                aria_busy: log_export_busy(),
-                                disabled: core_logs().is_empty() || log_export_busy(),
-                                onclick: move |_| {
-                                    let rows = log_export_rows(&visible_log_entries(
-                                        &core_logs(),
-                                        log_filter(),
-                                        log_search().trim().to_lowercase().as_str(),
-                                    ));
-                                    log_export_busy.set(true);
-                                    spawn(async move {
-                                        match download_csv("kitty-pro-logs.csv", rows).await {
-                                            Ok(()) => toast.success("日志已导出为 CSV"),
-                                            Err(error) => {
-                                                toast.error(format!("日志导出失败: {error}"));
-                                            }
-                                        }
-                                        log_export_busy.set(false);
-                                    });
-                                },
-                                if log_export_busy() {
-                                    span { class: "spinner" }
-                                } else {
-                                    Icon { icon: LdDownload, width: 15, height: 15 }
-                                }
-                                span { "导出 CSV" }
                             }
                         }
                     }
@@ -5489,87 +5459,6 @@ fn LogsView(
     }
 }
 
-/// Flatten the visible log entries into CSV cells, oldest first. Only fields the
-/// core really reports are exported: the design's per-connection byte counts and
-/// timings are not part of the log model, so they stay out of the file.
-fn log_export_rows(entries: &[CoreLogEntry]) -> Vec<Vec<String>> {
-    let mut rows = vec![vec![
-        "时间".to_string(),
-        "级别".to_string(),
-        "动作".to_string(),
-        "目标".to_string(),
-        "类型".to_string(),
-        "端口".to_string(),
-        "出口类型".to_string(),
-        "出口节点".to_string(),
-        "分组链路".to_string(),
-        "来源 IP".to_string(),
-        "原始消息".to_string(),
-    ]];
-    for entry in entries.iter().rev() {
-        match entry.route.as_ref() {
-            Some(route) => rows.push(vec![
-                entry.timestamp.clone(),
-                entry.level.clone(),
-                route_decision_label(route.decision).to_string(),
-                route.host.clone(),
-                route_target_kind_label(route.target_kind).to_string(),
-                route
-                    .port
-                    .map(|port| port.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                route.outbound_type.clone(),
-                route.outbound_tag.clone(),
-                route_group_chain(route),
-                route.source_ip.clone().unwrap_or_else(|| "-".to_string()),
-                entry.message.clone(),
-            ]),
-            None => rows.push(vec![
-                entry.timestamp.clone(),
-                entry.level.clone(),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-                entry.message.clone(),
-            ]),
-        }
-    }
-    rows
-}
-
-/// Script that turns the received rows into a CSV blob and clicks a temporary
-/// download anchor. The BOM keeps Excel from mangling the Chinese headers.
-fn download_csv_script(file_name: &str) -> String {
-    r#"
-const rows = await dioxus.recv();
-const csv = rows
-    .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(','))
-    .join('\r\n');
-const blob = new Blob([`\ufeff${csv}`], { type: 'text/csv;charset=utf-8' });
-const url = URL.createObjectURL(blob);
-const anchor = document.createElement('a');
-anchor.href = url;
-anchor.download = __FILE_NAME__;
-document.body.appendChild(anchor);
-anchor.click();
-anchor.remove();
-setTimeout(() => URL.revokeObjectURL(url), 1_000);
-await dioxus.send(true);
-"#
-    .replace("__FILE_NAME__", &format!("{file_name:?}"))
-}
-
-async fn download_csv(file_name: &str, rows: Vec<Vec<String>>) -> Result<(), String> {
-    let eval = document::eval(&download_csv_script(file_name));
-    eval.send(rows).map_err(|error| error.to_string())?;
-    eval.await.map(|_| ()).map_err(|error| error.to_string())
-}
-
 /// Subtitle under the Kitty Pro wordmark: which sing-box build is embedded.
 fn about_build_label(app_version: &str, core_version: Option<String>, platform: &str) -> String {
     let core = match core_version {
@@ -5733,8 +5622,8 @@ fn log_entries_newer_than(entries: &[CoreLogEntry], previous: u64) -> u32 {
         .count() as u32
 }
 
-/// Newest first, after the chip filter and the free-text query. Shared with the
-/// topbar export so the CSV always matches what the page shows.
+/// Newest first, after the chip filter and the free-text query: this is the one
+/// list the page renders, so the counts beside the chips cannot drift from it.
 fn visible_log_entries(
     stored: &[CoreLogEntry],
     filter: LogFilter,
@@ -5786,16 +5675,6 @@ fn route_chain_tags(route: &RouteLogDetail) -> Element {
             span { class: "log-chain-tag", key: "{hop}", title: "{hop}", "{hop}" }
         }
     }
-}
-
-fn route_group_chain(route: &RouteLogDetail) -> String {
-    route
-        .outbound_chain
-        .iter()
-        .filter(|tag| tag.as_str() != route.outbound_tag)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" → ")
 }
 
 fn route_decision_label(decision: RouteDecision) -> &'static str {
@@ -8502,51 +8381,6 @@ mod tests {
             rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
             vec![3, 2, 1]
         );
-    }
-
-    fn route_entry(sequence: u64) -> CoreLogEntry {
-        CoreLogEntry {
-            sequence,
-            timestamp: "12:00:00".to_string(),
-            level: "info".to_string(),
-            message: "outbound/proxy[AI]: connection to example.com:443".to_string(),
-            route: Some(RouteLogDetail {
-                decision: RouteDecision::Proxy,
-                target: "example.com:443".to_string(),
-                host: "example.com".to_string(),
-                port: Some(443),
-                target_kind: RouteTargetKind::Domain,
-                outbound_type: "proxy".to_string(),
-                outbound_tag: "AI".to_string(),
-                outbound_chain: vec!["proxy".to_string(), "AI".to_string()],
-                source_ip: Some("127.0.0.1".to_string()),
-            }),
-        }
-    }
-
-    #[test]
-    fn csv_export_keeps_header_and_route_columns() {
-        let rows = log_export_rows(&[
-            route_entry(1),
-            CoreLogEntry {
-                sequence: 2,
-                timestamp: "12:00:01".to_string(),
-                level: "warn".to_string(),
-                message: "unsupported config field".to_string(),
-                route: None,
-            },
-        ]);
-        assert_eq!(rows[0][0], "时间");
-        assert_eq!(rows[0].len(), rows[1].len());
-        // Newest first, mirroring the on-screen order.
-        assert_eq!(rows[1][0], "12:00:01");
-        assert_eq!(rows[1][2], "-");
-        assert_eq!(rows[2][2], "代理");
-        assert_eq!(rows[2][3], "example.com");
-        // The chain column keeps only the group hops; the outbound itself is
-        // exported separately, so "AI" must not be repeated here.
-        assert_eq!(rows[2][8], "proxy");
-        assert_eq!(rows[2][7], "AI");
     }
 
     #[test]

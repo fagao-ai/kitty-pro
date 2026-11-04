@@ -1750,10 +1750,6 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.log-export-button svg {
-  flex: 0 0 16px;
-}
-
 .log-controls {
   display: flex;
   align-items: center;
