@@ -306,10 +306,15 @@ install someone else's binaries.
 ```sh
 cargo test --workspace
 cargo test -p singbox --features embedded-core
+cargo test -p desktop --features desktop
 ```
 
 The embedded-core test starts a VLESS configuration through the static bridge
 and proves that no external executable is required.
+
+`desktop` needs its feature enabled: without it the shell compiles down to
+`dioxus::launch` and every tray and menu-bar test compiles away, so
+`cargo test --workspace` reports those 0 tests as a pass.
 
 Resize and dialog behaviour needs a real layout engine, so it is covered
 separately by a headless Chromium suite in `tests/ui-smoke`. It runs on a

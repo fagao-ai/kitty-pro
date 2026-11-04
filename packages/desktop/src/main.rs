@@ -108,25 +108,29 @@ fn execute_tray_command(
 
 #[cfg(feature = "desktop")]
 fn show_desktop_window(window: &DesktopContext) {
+    // A window in the Dock stays in the Dock: ordering it front does not
+    // deminiaturize it. `Cmd+Q` puts the window there, so the tray's Show has to
+    // undo that or it looks like the menu item stopped working.
+    if window.is_minimized() {
+        window.set_minimized(false);
+    }
     window.set_visible(true);
     window.set_focus();
 }
 
-/// `Cmd+Q`. Closing the window only hides it (tray behaviour), so the key can
-/// never mean "destroy the only window": a visible window goes to the Dock, a
-/// window already in the Dock comes back, and a window hidden in the tray is
-/// revealed - every press does something instead of nothing.
+/// `Cmd+Q`. Closing the window only hides it (tray behaviour), so the key never
+/// means "destroy the only window": a visible or miniaturized window goes to the
+/// Dock, a window already in the Dock comes back, and a window hidden in the tray
+/// is revealed - every press does something instead of nothing.
 ///
 /// The proxy is untouched either way. Quitting stays on `Opt+Cmd+Q` and the
 /// tray's 退出, both of which shut the core down first.
 #[cfg(feature = "desktop")]
 fn minimize_desktop_window(window: &DesktopContext) {
-    if window.is_minimized() {
-        window.set_minimized(false);
-        window.set_focus();
-        return;
-    }
-    if window.is_visible() {
+    // Only a plain on-screen window gets miniaturized. Whether AppKit reports a
+    // miniaturized window as visible is not something to depend on, so the
+    // "already in the Dock" case is handled by the branch below either way.
+    if window.is_visible() && !window.is_minimized() {
         window.set_minimized(true);
         return;
     }
@@ -372,6 +376,8 @@ fn app_menu_bar() -> AppMenuBar {
             ..Default::default()
         }),
     );
+    // Same action as the Window menu's "最小化" (`Cmd+M`) under a different key:
+    // `Cmd+Q` must land on an item we own, or AppKit routes it to `terminate:`.
     let minimize = MenuItem::with_id(*minimize_id, "最小化", true, Some(*minimize_accel));
     // The quit id is the tray item's id, so quitting from either place runs the
     // same cleanup before the process exits.
@@ -425,7 +431,8 @@ fn app_menu_bar() -> AppMenuBar {
     AppMenuBar { menu, window_menu }
 }
 
-/// The menu bar plus the part macOS can only adopt after it is installed.
+/// The menu bar, kept alive for the process: dropping a muda `Menu` tears the
+/// native menu down, and there is no reason for this one to ever go away.
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 struct AppMenuBar {
     menu: Menu,
@@ -434,36 +441,38 @@ struct AppMenuBar {
 
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 thread_local! {
-    static WINDOW_MENU: RefCell<Option<Submenu>> = const { RefCell::new(None) };
+    static MENU_BAR: RefCell<Option<AppMenuBar>> = const { RefCell::new(None) };
 }
 
-/// Hand the menu bar to Dioxus. macOS turns a submenu into the real windows
-/// menu only once `NSApp.mainMenu` exists, which Dioxus does while building the
-/// window - after this `Config` is assembled - so the submenu is parked here and
-/// adopted by [`adopt_window_menu`] once the first frame is up.
+/// Install the menu bar and adopt the windows menu, from the first effect.
+///
+/// Not from `main()` while assembling `Config`: `PredefinedMenuItem::services`
+/// sends `+[NSApplication sharedApplication]` the moment it is appended, and tao
+/// has to be the first to send it (see its `platform_impl::macos::event_loop`) or
+/// AppKit keeps its own plain `NSApplication` and tao's subclass - which is what
+/// makes `Cmd` key-up reach the web view - never gets installed. Two later hooks
+/// are past that point: `Config::with_on_window` runs once the window exists, and
+/// effects run after that. Only effects are late enough for both halves here,
+/// because `set_as_windows_menu_for_nsapp` resolves its submenu through the
+/// delegate of the *current* `NSApp.mainMenu`, which Dioxus sets while building
+/// the window. One hook, one ordering to reason about; effects also run on the
+/// main thread every muda call needs.
+///
+/// Dioxus is told about no menu at all (`.with_menu(None)`), so it installs none
+/// and this bar owns `NSApp.mainMenu`. The muda receiver is already wired by the
+/// time the first effect runs, so these items arrive as ordinary muda events.
 #[cfg(all(feature = "desktop", target_os = "macos"))]
-fn with_platform_menu(config: Config) -> Config {
-    let bar = app_menu_bar();
-    WINDOW_MENU.with(|slot| *slot.borrow_mut() = Some(bar.window_menu.clone()));
-    config.with_menu(bar.menu)
-}
-
-/// Windows and Linux keep the previous behaviour: WebView2 and WebKitGTK handle
-/// the clipboard keys in the page themselves, and both already show their own
-/// accelerator labels, so no bar is needed.
-#[cfg(all(feature = "desktop", not(target_os = "macos")))]
-fn with_platform_menu(config: Config) -> Config {
-    config.with_menu(None)
-}
-
-/// Adopt the windows menu. Runs on the main thread that muda requires, and
-/// after Dioxus installed the menu bar.
-#[cfg(all(feature = "desktop", target_os = "macos"))]
-fn adopt_window_menu() {
-    WINDOW_MENU.with(|slot| {
-        if let Some(window_menu) = slot.borrow().as_ref() {
-            window_menu.set_as_windows_menu_for_nsapp();
+fn install_menu_bar() {
+    MENU_BAR.with(|slot| {
+        // Hot reload re-runs the root effect; installing twice would just rebuild
+        // the same bar, and the guard also keeps the first bar alive.
+        if slot.borrow().is_some() {
+            return;
         }
+        let bar = app_menu_bar();
+        bar.menu.init_for_nsapp();
+        bar.window_menu.set_as_windows_menu_for_nsapp();
+        *slot.borrow_mut() = Some(bar);
     });
 }
 
@@ -489,6 +498,10 @@ fn main() {
     api::cleanup_stale_system_proxy_sentinel();
     let config = Config::new()
         .with_window(WindowBuilder::new().with_title("Kitty Pro"))
+        // macOS installs its own bar later, on purpose - see `install_menu_bar`.
+        // `with_menu(None)` is what stops Dioxus from installing its default bar,
+        // whose `Cmd+Q` would be a bare `terminate:`.
+        .with_menu(None)
         .with_icon(window_icon)
         .with_custom_head(format!(
             "<style>{MAIN_CSS}\n{APP_CSS}</style>{}",
@@ -500,9 +513,6 @@ fn main() {
                 let _ = api::shutdown_native_runtime();
             }
         });
-    // `with_menu` is a no-op unless the window still has decorations, so it has
-    // to run after `with_window`.
-    let config = with_platform_menu(config);
 
     dioxus::LaunchBuilder::desktop()
         .with_cfg(config)
@@ -528,7 +538,7 @@ fn App() -> Element {
     #[cfg(not(feature = "desktop"))]
     let desktop_tray = None;
     #[cfg(all(feature = "desktop", target_os = "macos"))]
-    use_effect(adopt_window_menu);
+    use_effect(install_menu_bar);
 
     rsx! {
         document::Style { "{MAIN_CSS}" }
@@ -713,10 +723,13 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn edit_menu_covers_every_clipboard_key() {
-        let items = edit_menu_labels();
-        for expected in ["撤销", "重做", "剪切", "拷贝", "粘贴", "全选"] {
-            assert!(items.contains(&expected), "{expected} is missing");
-        }
+        // Exact order, not membership: the labels are zipped positionally onto
+        // undo/redo/cut/copy/paste/select-all, so a swap would mislabel the
+        // clipboard items while still passing a set check.
+        assert_eq!(
+            edit_menu_labels(),
+            ["撤销", "重做", "剪切", "拷贝", "粘贴", "全选"]
+        );
     }
 
     #[test]

@@ -16,7 +16,9 @@ Linux 直接使用 crates.io 上的 **`auto-launch = 0.6.0`**（XDG Autostart）
 
 macOS 的 WKWebView 自己不响应 `Cmd+C`/`Cmd+V`/`Cmd+A`：只有当某个菜单项占用这个键位、并把 `copy:`/`paste:` 等 selector 发给 first responder 时，输入框才能复制粘贴。`Cmd+Q` 同理，它靠 `terminate:` 生效。此前桌面端用 `.with_menu(None)` 启动，安装后没有任何菜单栏，这些快捷键全部失效，`Cmd+Q` 也无处可去。
 
-现在 macOS 装一条最小菜单栏：应用菜单（关于/服务/隐藏/最小化/退出）、编辑菜单（撤销/重做/剪切/拷贝/粘贴/全选）、窗口菜单。编辑菜单是剪贴板能用起来的唯一原因，不能删。Windows 和 Linux 保持 `with_menu(None)`：WebView2 与 WebKitGTK 在页面内自己处理这些键位，不需要菜单。
+配置里三个平台统一 `.with_menu(None)`（这同时挡住 Dioxus 默认菜单栏——它的 `Cmd+Q` 是裸 `terminate:`）。macOS 在根组件第一次 `use_effect` 里自己装一条最小菜单栏：应用菜单（关于/服务/隐藏/最小化/退出）、编辑菜单（撤销/重做/剪切/拷贝/粘贴/全选）、窗口菜单。编辑菜单是剪贴板能用起来的唯一原因，不能删。Windows 和 Linux 到此为止：WebView2 与 WebKitGTK 在页面内自己处理这些键位，不需要菜单。
+
+**菜单栏不能在 `main()` 组装 `Config` 时建。** `PredefinedMenuItem::services` 在 append 的瞬间就发 `+[NSApplication sharedApplication]`，而 tao 要求自己是第一个发这个消息的人（见 `tao::platform_impl::macos::event_loop`），否则 AppKit 会实例化原生 `NSApplication`，tao 那个重写 `sendEvent:` 的子类就永远装不上——`Cmd` 组合键的 `keyUp` 不再送达 WebView。effect 在事件循环内运行，既晚于 `EventLoop::new()`，也晚于 `NSApp.mainMenu` 就位，所以是唯一安全的时机；`MenuEvent` 接收器在这之前已经接好，菜单点击照常作为 muda 事件送达。
 
 `Cmd+Q` 绑到“最小化”而不是退出：窗口关闭本来只是隐藏到托盘，`terminate:` 会直接杀掉正在运行的 sing-box 内核，绕过清理。真正的退出放在 `Opt+Cmd+Q`，复用托盘“退出”的同一个 id，先 `shutdown_native_runtime()` 再结束进程。窗口已经隐藏时再按 `Cmd+Q` 会把窗口显示出来，避免按键静默无效。
 
@@ -24,7 +26,7 @@ macOS 的 WKWebView 自己不响应 `Cmd+C`/`Cmd+V`/`Cmd+A`：只有当某个菜
 
 必须是捕获阶段。Dioxus 的抑制脚本在 document start 执行（早于任何页面脚本），但它是冒泡阶段监听；同一个节点上捕获先于冒泡，所以这里靠阶段取胜，而不是靠注册顺序。
 
-`Submenu::set_as_windows_menu_for_nsapp()` 必须在 `NSApp.mainMenu` 装好之后调用，而 Dioxus 是在建窗时才装菜单（晚于 `Config` 组装），所以窗口菜单先存进 thread local，由根组件第一次 `use_effect` 收养。muda 的菜单项只能在主线程创建，键位绑定因此抽成 `quit_key_bindings()` 供单元测试固定。
+muda 的菜单项只能在主线程创建，所以整条菜单栏、包括 `set_as_windows_menu_for_nsapp()`，都在这一个 effect 里一次做完；菜单栏本身存进 thread local 保持存活（muda 的 `Menu` 一 drop 原生菜单就没了）。键位绑定抽成 `quit_key_bindings()` 数据形式，单元测试才能在不动 muda 的前提下钉住它。
 
 The desktop crate defines the entrypoint for the desktop app along with any assets, components and dependencies that are specific to desktop builds. The desktop crate starts out something like this:
 
