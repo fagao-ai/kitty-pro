@@ -234,6 +234,32 @@ fn apply_core_status(status: api::ApiCoreStatus, signals: CoreStatusSignals) -> 
     is_running
 }
 
+/// A runtime switch whose new value has to be written onto a request by hand.
+#[derive(Clone, Copy)]
+enum RuntimeSetting {
+    Tun,
+    AllowLan,
+}
+
+/// Stamp the value a toggle is about to apply onto a request that was built from
+/// the signals, which still hold the *previous* value: `tun_enabled`/`allow_lan`
+/// are only written after the backend accepts the change. Without this the
+/// request always carries the opposite of what the user just clicked -
+/// `prepare_tun_mode` rejects a request whose `tun` is false outright, and a
+/// running core restarts with the switch in the position it was left, not the one
+/// it was moved to.
+fn request_with_setting(
+    mut request: ConnectionRequest,
+    setting: RuntimeSetting,
+    enabled: bool,
+) -> ConnectionRequest {
+    match setting {
+        RuntimeSetting::Tun => request.tun = enabled,
+        RuntimeSetting::AllowLan => request.allow_lan = enabled,
+    }
+    request
+}
+
 fn spawn_tun_toggle(
     enabled: bool,
     request: ConnectionRequest,
@@ -245,6 +271,7 @@ fn spawn_tun_toggle(
     if runtime.busy() {
         return;
     }
+    let request = request_with_setting(request, RuntimeSetting::Tun, enabled);
     let CoreStatusSignals {
         connected,
         mut core_restarting,
@@ -354,6 +381,7 @@ fn spawn_allow_lan_toggle(
     if runtime.busy() {
         return;
     }
+    let request = request_with_setting(request, RuntimeSetting::AllowLan, enabled);
     let CoreStatusSignals {
         connected,
         mut core_restarting,
@@ -7999,6 +8027,53 @@ mod tests {
             source_label("https://user:pass@sub.example.com/path?token=secret"),
             "https://sub.example.com"
         );
+    }
+
+    fn request_with_tun(tun: bool, allow_lan: bool) -> ConnectionRequest {
+        let nodes =
+            proxy_core::parse_subscription("trojan://password@edge.example.com:443#Edge").nodes;
+        ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun,
+            allow_lan,
+            custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
+        }
+    }
+
+    /// Both toggles build their request from signals that still hold the value
+    /// being switched away from, so the request has to be stamped with the new
+    /// one. Getting this wrong reads as "TUN 权限预检需要启用 TUN 的连接配置"
+    /// with the core stopped, and as a core restarted with the switch unmoved
+    /// while running.
+    #[test]
+    fn toggles_stamp_their_new_value_onto_the_request() {
+        // Off -> on: the saved request still says false.
+        let request = request_with_tun(false, false);
+        let request = request_with_setting(request, RuntimeSetting::Tun, true);
+        assert!(request.tun);
+        assert!(!request.allow_lan, "TUN must not disturb LAN");
+
+        // On -> off: the saved request still says true.
+        let request = request_with_tun(true, true);
+        let request = request_with_setting(request, RuntimeSetting::Tun, false);
+        assert!(!request.tun);
+        assert!(request.allow_lan);
+
+        let request = request_with_tun(true, false);
+        let request = request_with_setting(request, RuntimeSetting::AllowLan, true);
+        assert!(request.allow_lan);
+        assert!(request.tun, "LAN must not disturb TUN");
+
+        let request = request_with_tun(true, true);
+        let request = request_with_setting(request, RuntimeSetting::AllowLan, false);
+        assert!(!request.allow_lan);
+        assert!(request.tun);
     }
 
     #[test]
