@@ -1141,6 +1141,53 @@ fn latency_sessions(
     > = std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
+
+/// Redact credentials a dependency may have echoed into an error string.
+/// reqwest renders request URLs (including `?token=` query strings and
+/// `user:pass@` userinfo) into transport errors, and the UI shows those
+/// strings verbatim in toasts and `role=alert` panels — a subscription URL
+/// is a credential (README: snapshots contain proxy credentials).
+/// Must stay available for every target: the wasm client surfaces the same
+/// server errors.
+pub(crate) fn redact_secrets(text: &str) -> String {
+    let mut out = text.to_string();
+    for scheme in ["https://", "http://"] {
+        let mut rest = out.as_str();
+        let mut replacement_start = 0usize;
+        while let Some(pos) = rest.find(scheme) {
+            let abs = replacement_start + pos;
+            let after = &out[abs + scheme.len()..];
+            let end = after
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '>')
+                .unwrap_or(after.len());
+            let url = &after[..end];
+            let authority = url.split('/').next().unwrap_or("");
+            let mut redacted = (*scheme).to_string();
+            if let Some(at) = authority.rfind('@') {
+                redacted.push_str("[credential-redacted]@");
+                redacted.push_str(&authority[at + 1..]);
+            } else {
+                redacted.push_str(authority);
+            }
+            if let Some(path) = url.get(authority.len()..) {
+                let (path_part, _query) = match path.split_once('?') {
+                    Some((p, _)) => (p, ""),
+                    None => (path, ""),
+                };
+                let _ = _query;
+                redacted.push_str(path_part);
+                if path.contains('?') {
+                    redacted.push_str("?…");
+                }
+            }
+            out.replace_range(abs..abs + scheme.len() + url.len(), &redacted);
+            replacement_start = abs + redacted.len();
+            rest = &out[replacement_start..];
+        }
+    }
+    out
+}
+
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
 async fn download_subscription(url: &str) -> Result<String, ServerFnError> {
@@ -1163,9 +1210,19 @@ async fn download_subscription(url: &str) -> Result<String, ServerFnError> {
         .get(parsed)
         .send()
         .await
-        .map_err(|error| ServerFnError::new(format!("订阅下载失败: {error}")))?
+        .map_err(|error| {
+            ServerFnError::new(format!(
+                "订阅下载失败: {}",
+                redact_secrets(&error.to_string())
+            ))
+        })?
         .error_for_status()
-        .map_err(|error| ServerFnError::new(format!("订阅服务返回错误: {error}")))?;
+        .map_err(|error| {
+            ServerFnError::new(format!(
+                "订阅服务返回错误: {}",
+                redact_secrets(&error.to_string())
+            ))
+        })?;
 
     if response
         .content_length()
@@ -1173,10 +1230,12 @@ async fn download_subscription(url: &str) -> Result<String, ServerFnError> {
     {
         return Err(ServerFnError::new("订阅内容超过 10 MiB 限制"));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| ServerFnError::new(format!("读取订阅失败: {error}")))?;
+    let bytes = response.bytes().await.map_err(|error| {
+        ServerFnError::new(format!(
+            "读取订阅失败: {}",
+            redact_secrets(&error.to_string())
+        ))
+    })?;
     if bytes.len() > MAX_SUBSCRIPTION_BYTES {
         return Err(ServerFnError::new("订阅内容超过 10 MiB 限制"));
     }
@@ -1777,8 +1836,16 @@ fn load_native_profile() -> Result<AppProfile, ServerFnError> {
 
     let path = profile_path()?;
     match fs::read(&path) {
-        Ok(contents) => serde_json::from_slice(&contents)
-            .map_err(|error| ServerFnError::new(format!("本地配置损坏: {error}"))),
+        Ok(contents) => serde_json::from_slice(&contents).map_err(|error| {
+            // Keep the unreadable file around. The UI starts from an empty
+            // profile after a parse failure and saves over the path, so
+            // without this copy one bad write would cost every subscription.
+            let backup = path.with_extension("corrupt.json");
+            if !backup.exists() {
+                let _ = fs::copy(&path, &backup);
+            }
+            ServerFnError::new(format!("本地配置损坏: {error}"))
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AppProfile::default()),
         Err(error) => Err(ServerFnError::new(format!("读取本地配置失败: {error}"))),
     }
@@ -3474,6 +3541,37 @@ impl NativeCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_credentials_from_error_strings() {
+        // reqwest echoes the full request URL (token query + userinfo) into
+        // transport errors; none of it may reach the toast.
+        let raw =
+            "builder error: https://user:pa***@sub.example.com:8443/get?token=***&flag=1 timed out";
+        let red = redact_secrets(raw);
+        assert!(!red.contains("topsecret"), "{red}");
+        assert!(!red.contains("hunter2"), "{red}");
+        assert!(!red.contains("flag=1"), "{red}");
+        assert!(
+            red.contains("[credential-redacted]@sub.example.com:8443"),
+            "{red}"
+        );
+        assert!(red.contains("/get?…"), "{red}");
+        assert!(red.ends_with("timed out"), "{red}");
+    }
+
+    #[test]
+    fn leaves_non_url_text_and_host_only_urls_untouched() {
+        assert_eq!(
+            redact_secrets("connection refused (os error 61)"),
+            "connection refused (os error 61)"
+        );
+        // no credential, no query: the readable host stays.
+        assert_eq!(
+            redact_secrets("https://sub.example.com/link/abc"),
+            "https://sub.example.com/link/abc"
+        );
+    }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     #[test]

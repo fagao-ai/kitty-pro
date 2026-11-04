@@ -142,6 +142,56 @@ struct CoreStatusSignals {
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
+    /// The OS proxy can change underneath the UI whenever the core goes down:
+    /// a failed restart transaction disables it server-side before reporting
+    /// `CoreOffline`. Every failure path re-reads it through
+    /// `refresh_runtime_state`, so this lives with the other status signals
+    /// rather than at the handful of call sites that used to remember it.
+    system_proxy: Signal<SystemProxyLoadState>,
+    /// Set while the running core lags behind local edits (refreshed
+    /// subscriptions, imported sources, edited rules). Cleared by the
+    /// restart/start that applies the current config - every path that
+    /// accepts a freshly-built `ConnectionRequest` runs through
+    /// `apply_core_status` or `restart_core_from_ui`, so clearing lives here
+    /// once instead of at each call site.
+    config_pending: Signal<bool>,
+}
+
+/// Re-read the core (and, on request, the OS proxy) after a failed operation
+/// so the UI converges on what the backend actually did. Without the proxy
+/// re-read the switch kept showing "已启用" after a failed restart had already
+/// turned the system proxy off, and the next click then toggled from a lie.
+async fn refresh_runtime_state(status: CoreStatusSignals, include_system_proxy: bool) {
+    let CoreStatusSignals {
+        mut connected,
+        core_restarting: _,
+        mut core_state,
+        mut core_version,
+        mut core_note,
+        mut system_proxy,
+        // A failed-status refresh does not apply any pending config, so it
+        // must leave the "待生效" flag standing.
+        config_pending: _,
+    } = status;
+    match api::core_status().await {
+        Ok(core) => {
+            connected.set(core.state == "running");
+            core_state.set(core.state);
+            core_version.set(core.version);
+            core_note.set(core.note);
+        }
+        Err(status_error) => {
+            connected.set(false);
+            core_state.set("unavailable".to_string());
+            core_note.set(Some(status_error.to_string()));
+        }
+    }
+    if include_system_proxy {
+        match api::system_proxy_status().await {
+            Ok(proxy_status) => system_proxy.set(SystemProxyLoadState::Ready(proxy_status)),
+            Err(error) => system_proxy.set(SystemProxyLoadState::Failed(error.to_string())),
+        }
+    }
 }
 
 async fn restart_core_from_ui(
@@ -156,8 +206,16 @@ async fn restart_core_from_ui(
         mut core_state,
         mut core_version,
         mut core_note,
+        mut config_pending,
+        ..
     } = status;
     let success_message = success_message.into();
+    // Re-entry guard for every caller, including buttons whose busy check runs
+    // inside the event future (after a render tick, too late for a double
+    // click). Callers no longer have to remember this signal in their guards.
+    if *core_restarting.peek() {
+        return false;
+    }
     core_restarting.set(true);
     let success = match api::restart_core(request).await {
         Ok(status) => {
@@ -166,28 +224,23 @@ async fn restart_core_from_ui(
             core_state.set(status.state);
             core_version.set(status.version);
             core_note.set(status.note);
+            config_pending.set(false);
             if is_running {
                 toast.success(success_message);
             } else {
+                // Accepted but not up yet (Android VPN consent pending). The
+                // backend DID apply the new config and is starting against it,
+                // so this stays a success: rolling the caller's optimistic
+                // switch back here would show the old node while the core comes
+                // up on the new one. `connected` is truthfully false meanwhile,
+                // and the waiting notice explains the gap.
                 toast.info(ANDROID_VPN_WAITING_NOTICE);
             }
             true
         }
         Err(error) => {
             toast.error(format!("内核重启失败: {error}"));
-            match api::core_status().await {
-                Ok(status) => {
-                    connected.set(status.state == "running");
-                    core_state.set(status.state);
-                    core_version.set(status.version);
-                    core_note.set(status.note);
-                }
-                Err(status_error) => {
-                    connected.set(false);
-                    core_state.set("unavailable".to_string());
-                    core_note.set(Some(status_error.to_string()));
-                }
-            }
+            refresh_runtime_state(status, true).await;
             false
         }
     };
@@ -225,12 +278,19 @@ fn apply_core_status(status: api::ApiCoreStatus, signals: CoreStatusSignals) -> 
         mut core_state,
         mut core_version,
         mut core_note,
+        mut config_pending,
+        ..
     } = signals;
     let is_running = status.state == "running";
     connected.set(is_running);
     core_state.set(status.state);
     core_version.set(status.version);
     core_note.set(status.note);
+    // This helper only ever runs on an accepted (re)start built from the
+    // current local config, so the core now matches the UI.
+    if is_running {
+        config_pending.set(false);
+    }
     is_running
 }
 
@@ -272,15 +332,16 @@ fn spawn_tun_toggle(
     let CoreStatusSignals {
         connected,
         mut core_restarting,
-        core_state: _,
-        core_version: _,
-        mut core_note,
+        ..
     } = runtime.status;
     let mut runtime_action_busy = runtime.runtime_action_busy;
     let previous_enabled = tun_enabled();
     tun_busy.set(true);
     runtime_action_busy.set(true);
-    core_restarting.set(true);
+    // `core_restarting` drives the "正在重启 sing-box 内核" banner and locks the
+    // power button. Setting it for the permission-only path told the user the
+    // core was restarting while the OS was actually waiting on an elevation
+    // prompt, so it is armed just before the real restart below instead.
     spawn(async move {
         if !connected() {
             let result = if enabled {
@@ -306,16 +367,26 @@ fn spawn_tun_toggle(
                         // real state and fall back to restarting without TUN.
                         match api::core_status().await {
                             Ok(status) if status.state == "running" => {
+                                core_restarting.set(true);
                                 match api::restart_core(request).await {
-                                    Ok(status) => {
+                                    Ok(status) if status.state == "running" => {
                                         apply_core_status(status, runtime.status);
                                         tun_enabled.set(false);
                                         toast.success("TUN 模式已关闭");
                                     }
+                                    Ok(status) => {
+                                        let state = status.state.clone();
+                                        apply_core_status(status, runtime.status);
+                                        toast.error(format!(
+                                            "关闭 TUN 失败: 内核未以新配置运行（当前状态 {state}），请重试"
+                                        ));
+                                    }
                                     Err(restart_error) => {
                                         toast.error(format!("关闭 TUN 失败: {restart_error}"));
+                                        refresh_runtime_state(runtime.status, true).await;
                                     }
                                 }
+                                core_restarting.set(false);
                             }
                             Ok(_) => {
                                 toast.error(format!("关闭 TUN 失败: {error}"));
@@ -332,13 +403,13 @@ fn spawn_tun_toggle(
                 }
             }
             tun_busy.set(false);
-            core_restarting.set(false);
             runtime_action_busy.set(false);
             return;
         }
 
+        core_restarting.set(true);
         match api::restart_core(request).await {
-            Ok(status) => {
+            Ok(status) if status.state == "running" => {
                 apply_core_status(status, runtime.status);
                 tun_enabled.set(enabled);
                 toast.success(if enabled {
@@ -347,16 +418,18 @@ fn spawn_tun_toggle(
                     "TUN 模式已关闭"
                 });
             }
+            Ok(status) => {
+                // Ok, but not up yet (Android VPN consent pending). The backend
+                // accepted and applied the new config, so the switch keeps the
+                // clicked position; `apply_core_status` records that the core
+                // itself is still starting.
+                apply_core_status(status, runtime.status);
+                tun_enabled.set(enabled);
+                toast.info(ANDROID_VPN_WAITING_NOTICE);
+            }
             Err(error) => {
                 tun_enabled.set(previous_enabled);
-                match api::core_status().await {
-                    Ok(status) => {
-                        apply_core_status(status, runtime.status);
-                    }
-                    Err(status_error) => {
-                        core_note.set(Some(status_error.to_string()));
-                    }
-                }
+                refresh_runtime_state(runtime.status, true).await;
                 toast.error(format!("应用 TUN 设置失败: {error}"));
             }
         }
@@ -372,6 +445,7 @@ fn spawn_allow_lan_toggle(
     enabled: bool,
     request: ConnectionRequest,
     mut allow_lan: Signal<bool>,
+    mut lan_busy: Signal<bool>,
     runtime: RuntimeSignals,
     toast: ToastManager,
 ) {
@@ -382,12 +456,16 @@ fn spawn_allow_lan_toggle(
     let CoreStatusSignals {
         connected,
         mut core_restarting,
-        core_state: _,
-        core_version: _,
-        mut core_note,
+        ..
     } = runtime.status;
     let mut runtime_action_busy = runtime.runtime_action_busy;
+    let previous_enabled = allow_lan();
+    // Both busy signals are armed synchronously, before the spawn: arming
+    // `core_restarting` inside the task left a window where a second knob
+    // (the power button) passed its guard and fired a concurrent restart.
+    lan_busy.set(true);
     runtime_action_busy.set(true);
+    core_restarting.set(true);
     spawn(async move {
         if !connected() {
             allow_lan.set(enabled);
@@ -396,12 +474,13 @@ fn spawn_allow_lan_toggle(
             } else {
                 "仅本机访问将在下次启动内核时生效"
             });
+            core_restarting.set(false);
+            lan_busy.set(false);
             runtime_action_busy.set(false);
             return;
         }
-        core_restarting.set(true);
         match api::restart_core(request).await {
-            Ok(status) => {
+            Ok(status) if status.state == "running" => {
                 apply_core_status(status, runtime.status);
                 allow_lan.set(enabled);
                 toast.success(if enabled {
@@ -410,19 +489,19 @@ fn spawn_allow_lan_toggle(
                     "已恢复仅本机访问，sing-box 内核已重启"
                 });
             }
+            Ok(status) => {
+                apply_core_status(status, runtime.status);
+                allow_lan.set(enabled);
+                toast.info(ANDROID_VPN_WAITING_NOTICE);
+            }
             Err(error) => {
-                match api::core_status().await {
-                    Ok(status) => {
-                        apply_core_status(status, runtime.status);
-                    }
-                    Err(status_error) => {
-                        core_note.set(Some(status_error.to_string()));
-                    }
-                }
+                allow_lan.set(previous_enabled);
+                refresh_runtime_state(runtime.status, true).await;
                 toast.error(format!("应用局域网监听设置失败: {error}"));
             }
         }
         core_restarting.set(false);
+        lan_busy.set(false);
         runtime_action_busy.set(false);
     });
 }
@@ -434,7 +513,8 @@ fn spawn_allow_lan_toggle(
 struct CoreToggleSignals {
     status: CoreStatusSignals,
     core_busy: Signal<bool>,
-    system_proxy: Signal<SystemProxyLoadState>,
+    system_proxy_busy: Signal<bool>,
+    runtime_action_busy: Signal<bool>,
 }
 
 fn spawn_core_toggle(
@@ -443,22 +523,20 @@ fn spawn_core_toggle(
     toast: ToastManager,
 ) {
     let CoreToggleSignals {
-        status,
+        mut status,
         mut core_busy,
-        mut system_proxy,
+        system_proxy_busy,
+        runtime_action_busy,
     } = signals;
-    let CoreStatusSignals {
-        mut connected,
-        core_restarting,
-        mut core_state,
-        mut core_note,
-        ..
-    } = status;
-    if core_busy() || core_restarting() {
+    // Same guard set as every other runtime knob (`RuntimeSignals::busy`): the
+    // power button used to ignore in-flight TUN/LAN restarts and system-proxy
+    // writes, so starting while either was pending fired a concurrent call.
+    if core_busy() || (status.core_restarting)() || (system_proxy_busy)() || (runtime_action_busy)()
+    {
         return;
     }
     core_busy.set(true);
-    let target = !connected();
+    let target = !(status.connected)();
     spawn(async move {
         // With TUN toggled on but the core stopped, the privileged helper is
         // gone and starting would fail with "TUN 权限尚未准备". Re-acquire the
@@ -501,25 +579,19 @@ fn spawn_core_toggle(
             }
             Err(error) => {
                 toast.error(error.to_string());
-                match api::core_status().await {
-                    Ok(core_status) => {
-                        apply_core_status(core_status, status);
-                    }
-                    Err(status_error) => {
-                        connected.set(false);
-                        core_state.set("unavailable".to_string());
-                        core_note.set(Some(status_error.to_string()));
-                    }
-                }
+                refresh_runtime_state(status, false).await;
             }
         }
-        if !target {
+        // Stopping the core (successfully or not) can leave the OS proxy
+        // pointing at a dead port; a failed start may also have torn it down.
+        // Re-read after any stop and after any failed start.
+        if !target || !(status.connected)() {
             match api::system_proxy_status().await {
                 Ok(proxy_status) => {
-                    system_proxy.set(SystemProxyLoadState::Ready(proxy_status));
+                    (status.system_proxy).set(SystemProxyLoadState::Ready(proxy_status));
                 }
                 Err(error) => {
-                    system_proxy.set(SystemProxyLoadState::Failed(error.to_string()));
+                    (status.system_proxy).set(SystemProxyLoadState::Failed(error.to_string()));
                 }
             }
         }
@@ -636,15 +708,25 @@ impl ToastManager {
     }
 
     fn push(self, kind: ToastKind, message: String) {
-        let id = {
-            let mut next_id = self.next_id;
-            let mut value = next_id.write();
-            *value = value.wrapping_add(1);
-            *value
-        };
         let mut messages = self.messages;
         {
             let mut stored = messages.write();
+            // Same text arriving again (Android start taps, repeated poll
+            // failures) refreshes the existing toast's lifetime instead of
+            // stacking duplicates of one notice.
+            if let Some(existing) = stored
+                .iter_mut()
+                .find(|toast| toast.kind == kind && toast.message == message)
+            {
+                existing.born_tick = *self.tick.peek();
+                return;
+            }
+            let id = {
+                let mut next_id = self.next_id;
+                let mut value = next_id.write();
+                *value = value.wrapping_add(1);
+                *value
+            };
             if stored.len() >= 4 {
                 stored.remove(0);
             }
@@ -708,6 +790,12 @@ impl ToastManager {
         messages.write().retain(|toast| toast.message != message);
     }
 }
+
+/// Copy handle for "the running core lags behind local config edits".
+/// Provided as context by `ProxyApp` so every page can flag edits without
+/// prop-drilling, and so `CoreStatusSignals` can clear it on apply.
+#[derive(Clone, Copy, PartialEq)]
+struct ConfigPending(Signal<bool>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppView {
@@ -890,6 +978,11 @@ pub fn ProxyApp(
     use_effect(move || {
         toast.start_sweeper();
     });
+    // "Local config drifted from what the running core applied." Set by
+    // refreshes/imports/deletes/rule edits while connected; cleared by the
+    // restart or start that ships the current config to the core.
+    let mut config_pending = use_signal(|| false);
+    use_context_provider(|| ConfigPending(config_pending));
     let mut nodes = use_signal(Vec::<ProxyNode>::new);
     let mut selected_tag = use_signal(String::new);
     let mut subscriptions = use_signal(Vec::<Subscription>::new);
@@ -921,8 +1014,13 @@ pub fn ProxyApp(
     let mut uptime_generation = use_signal(|| 0_u32);
     let mut core_log_cursor = use_signal(|| 0_u64);
     let mut log_poll_generation = use_signal(|| 0_u64);
-    let log_collection_paused = use_signal(|| false);
+    let mut log_collection_paused = use_signal(|| false);
     let mut profile_loaded = use_signal(|| false);
+    // Per-switch busy flags live at the root so the "处理中" spinner follows
+    // the operation across pages: a local `use_signal` reset when the view
+    // remounted, leaving a disabled switch with no explanation.
+    let tun_busy = use_signal(|| false);
+    let lan_busy = use_signal(|| false);
     let mut system_proxy = use_signal(|| SystemProxyLoadState::Loading);
     let mut system_proxy_busy = use_signal(|| false);
     // Log page state lives here so the chip filter and the search box stay in
@@ -1012,6 +1110,7 @@ pub fn ProxyApp(
                         collect_subscription_nodes(&subscriptions(), Some(subscription_id));
                     let next_tag = select_available_tag(&active_nodes, "");
                     let mut next_selections = previous_selections.clone();
+                    prune_group_selections(&mut next_selections, |_| false);
                     if next_tag.is_empty() {
                         next_selections.remove("proxy");
                     } else {
@@ -1050,6 +1149,8 @@ pub fn ProxyApp(
                                 core_state,
                                 core_version,
                                 core_note,
+                                system_proxy,
+                                config_pending,
                             },
                             toast,
                             "已从托盘切换订阅，内核已重启",
@@ -1123,6 +1224,8 @@ pub fn ProxyApp(
                                     core_state,
                                     core_version,
                                     core_note,
+                                    system_proxy,
+                                    config_pending,
                                 },
                                 toast,
                                 format!("已从托盘切换到 {outbound}，内核已重启"),
@@ -1199,6 +1302,9 @@ pub fn ProxyApp(
                     core_note.set(status.note);
                 }
                 Err(error) => {
+                    // One truth: a failed first read means "not connected",
+                    // not the half-update that left the chip on 已连接.
+                    connected.set(false);
                     core_state.set("unavailable".to_string());
                     core_note.set(Some(error.to_string()));
                 }
@@ -1223,6 +1329,11 @@ pub fn ProxyApp(
                         core_note.set(status.note);
                     }
                     Err(error) => {
+                        // `connected` and `core_state` are one truth, not two:
+                        // an errored poll must move both, or the topbar chip
+                        // keeps saying 已连接 while the sidebar reads 内核不可用
+                        // and the next power click toggles from a stale value.
+                        connected.set(false);
                         core_state.set("unavailable".to_string());
                         core_note.set(Some(error.to_string()));
                     }
@@ -1292,7 +1403,19 @@ pub fn ProxyApp(
                     group_selections.set(profile.group_selections);
                     profile_loaded.set(true);
                 }
-                Err(error) => toast.error(format!("无法恢复本地配置: {error}")),
+                Err(error) => {
+                    // Start from an empty-but-editable profile. Gating
+                    // `profile_loaded` on success only meant every later edit
+                    // (subscriptions, rules, theme) silently never reached the
+                    // disk and vanished on restart, while the tray ignored
+                    // commands with no feedback. The backend kept a copy of
+                    // the unreadable file beside the profile, so editing from
+                    // empty costs nothing that cannot be recovered.
+                    profile_loaded.set(true);
+                    toast.error(format!(
+                        "无法恢复本地配置，已从空配置开始；原文件已备份为 profile.corrupt.json（{error}）"
+                    ));
+                }
             }
         });
     });
@@ -1427,7 +1550,15 @@ pub fn ProxyApp(
         let enabled =
             core_state() == "running" && active_view() == AppView::Logs && !log_collection_paused();
         spawn(async move {
-            let _ = api::set_core_log_collection(enabled).await;
+            if let Err(error) = api::set_core_log_collection(enabled).await {
+                // The chip reads `log_collection_paused` as the truth; swallowing
+                // the error left it showing 采集中 while the backend refused to
+                // collect. Park the switch on the real outcome and say so.
+                if enabled {
+                    log_collection_paused.set(true);
+                    toast.error(format!("无法开启日志采集: {error}"));
+                }
+            }
         });
     });
 
@@ -1582,6 +1713,8 @@ pub fn ProxyApp(
                                 core_state,
                                 core_version,
                                 core_note,
+                                system_proxy,
+                                config_pending,
                             },
                             settings: RuntimeSettings {
                                 tunnel_mode,
@@ -1670,6 +1803,8 @@ pub fn ProxyApp(
                             system_proxy_busy,
                             runtime_action_busy,
                             dark_mode,
+                            tun_busy,
+                            lan_busy,
                         }
                     },
                     AppView::Nodes => rsx! {
@@ -1693,6 +1828,7 @@ pub fn ProxyApp(
                             core_state,
                             core_version,
                             core_note,
+                            system_proxy,
                             selected_tag,
                             tunnel_mode,
                             tun_enabled,
@@ -1722,6 +1858,7 @@ pub fn ProxyApp(
                             core_state,
                             core_version,
                             core_note,
+                            system_proxy,
                             tunnel_mode,
                             tun_enabled,
                             allow_lan,
@@ -1752,6 +1889,11 @@ pub fn ProxyApp(
                             core_version,
                             filter: log_filter,
                             search: log_search,
+                            start_allowed: connection_allowed,
+                            start_busy: core_busy()
+                                || core_restarting()
+                                || system_proxy_busy()
+                                || runtime_action_busy(),
                             on_start: move |_| {
                                 let target = !connected();
                                 if !target || nodes().is_empty() {
@@ -1784,9 +1926,12 @@ pub fn ProxyApp(
                                             core_state,
                                             core_version,
                                             core_note,
+                                            system_proxy,
+                                            config_pending,
                                         },
                                         core_busy,
-                                        system_proxy,
+                                        system_proxy_busy,
+                                        runtime_action_busy,
                                     },
                                     toast,
                                 );
@@ -1797,9 +1942,12 @@ pub fn ProxyApp(
                         SettingsView {
                             platform: platform.clone(),
                             app_version: app_version.clone(),
+                            tun_busy,
+                            lan_busy,
                             core_state,
                             core_version,
                             core_note,
+                            system_proxy,
                             connected,
                             core_busy,
                             core_restarting,
@@ -1929,7 +2077,14 @@ pub fn ProxyApp(
                                             rejected_count: rejected,
                                         });
                                         if connected() {
-                                            toast.success(format!("已导入 {name}，共 {count} 个节点"));
+                                            // The new subscription is not what
+                                            // the core runs; switching to it (or
+                                            // restarting) is a separate action,
+                                            // so flag the drift like refresh does.
+                                            config_pending.set(true);
+                                            toast.success(format!(
+                                                "已导入 {name}，共 {count} 个节点；当前连接未变化"
+                                            ));
                                         } else {
                                             active_subscription_id.set(Some(id));
                                             let active_nodes = collect_subscription_nodes(
@@ -2051,6 +2206,9 @@ fn ToastViewport() -> Element {
             aria_relevant: "additions",
             for item in (toast.messages)() {
                 div {
+                    // Sweepers remove middle entries; keyed rows keep their
+                    // dismiss buttons bound to the right message.
+                    key: "{item.id}",
                     class: match item.kind {
                         ToastKind::Info => "toast toast-info",
                         ToastKind::Success => "toast toast-success",
@@ -2138,26 +2296,40 @@ if (panel) {{
     )
 }
 
-/// Teardown of `dialog_enter_script`: pop this layer and hand focus back to
-/// whatever was focused before it opened, so the keyboard never lands on
-/// `document.body` after Escape.
-fn dialog_leave_script() -> &'static str {
-    r#"
+/// Teardown of `dialog_enter_script`: remove *this* layer (identified by the
+/// panel still referenced by the stack entry) and hand focus back to whatever
+/// was focused before it opened, so the keyboard never lands on
+/// `document.body` after Escape. Popping by identity rather than unconditionally
+/// matters when two dialogs close in a quick sequence: an async `eval` reorder
+/// would otherwise pop the wrong entry and leave the closed panel on the stack.
+fn dialog_leave_script(panel_id: &str) -> String {
+    format!(
+        r#"
 const state = window.__kittyDialogs;
-if (state && state.stack.length > 0) {
-    const closed = state.stack.pop();
-    if (state.stack.length === 0) {
-        document.removeEventListener('keydown', state.trap, true);
-        state.trap = null;
-    }
-    // Each layer records what had focus when it opened, which for a nested
-    // dialog is the trigger inside the outer one. A trigger that no longer
-    // exists is skipped by the contains() guard rather than throwing.
-    if (closed.returnFocus && document.contains(closed.returnFocus)) {
-        closed.returnFocus.focus({ preventScroll: true });
-    }
-}
+if (state) {{
+    const panel = document.getElementById({panel_id:?});
+    let index = state.stack.length - 1;
+    while (index >= 0 && state.stack[index].panel !== panel) {{ index -= 1; }}
+    // A panel that re-rendered away (id gone from the DOM) still matches its
+    // stack entry by insertion order, so fall back to the top when the node
+    // detached before this teardown ran.
+    if (index < 0 && state.stack.length > 0 && !panel) index = state.stack.length - 1;
+    if (index >= 0) {{
+        const closed = state.stack.splice(index, 1)[0];
+        if (state.stack.length === 0) {{
+            document.removeEventListener('keydown', state.trap, true);
+            state.trap = null;
+        }}
+        // Each layer records what had focus when it opened, which for a nested
+        // dialog is the trigger inside the outer one. A trigger that no longer
+        // exists is skipped by the contains() guard rather than throwing.
+        if (closed.returnFocus && document.contains(closed.returnFocus)) {{
+            closed.returnFocus.focus({{ preventScroll: true }});
+        }}
+    }}
+}}
 "#
+    )
 }
 
 #[component]
@@ -2195,11 +2367,12 @@ fn DialogShell(
         }
     };
     let enter_id = panel_id.clone();
+    let leave_id = panel_id.clone();
     use_effect(move || {
         document::eval(&dialog_enter_script(&enter_id));
     });
     use_drop(move || {
-        document::eval(dialog_leave_script());
+        document::eval(&dialog_leave_script(&leave_id));
     });
 
     rsx! {
@@ -2327,8 +2500,12 @@ fn OverviewView(
     system_proxy_busy: Signal<bool>,
     runtime_action_busy: Signal<bool>,
     mut dark_mode: Signal<bool>,
+    tun_busy: Signal<bool>,
+    lan_busy: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
+    // Read here for the "重新连接" banner; the restart paths clear it centrally.
+    let config_pending = use_context::<ConfigPending>().0;
     let selected_node = nodes().into_iter().find(|node| node.tag == selected_tag());
     let is_connected = connected();
     let is_core_busy = core_busy();
@@ -2426,6 +2603,10 @@ fn OverviewView(
     } else {
         "ms · 未测试"
     };
+    // The pending-reload banner's handler runs after the power button's
+    // closure already moved `proxy_server_nameservers` (both are `move`
+    // closures over the same prop), so it needs its own copy.
+    let banner_nameservers = proxy_server_nameservers.clone();
 
     rsx! {
         div { class: "overview-grid",
@@ -2495,9 +2676,12 @@ fn OverviewView(
                                         core_state,
                                         core_version,
                                         core_note,
+                                        system_proxy,
+                                        config_pending,
                                     },
                                     core_busy,
-                                    system_proxy,
+                                    system_proxy_busy,
+                                    runtime_action_busy,
                                 },
                                 toast,
                             );
@@ -2516,6 +2700,63 @@ fn OverviewView(
                             || is_runtime_action_busy,
                         system_proxy,
                         system_proxy_busy,
+                    }
+                }
+            }
+
+            // Local edits (refresh, import, rule changes) reach the core only
+            // through a restart; keep the restart affordance right here instead
+            // of telling the user to "reconnect" without a way to do it.
+            if config_pending() && is_connected && !is_core_action_busy {
+                div { class: "inline-note action pending-reload-banner", role: "status",
+                    Icon { icon: LdRefreshCw, width: 16, height: 16 }
+                    span { "配置已更改，当前连接仍在使用旧配置。" }
+                    button {
+                        class: "secondary-button compact",
+                        onclick: move |_| {
+                            let nameservers = banner_nameservers.clone();
+                            async move {
+                            let request = ConnectionRequest {
+                                nodes: nodes(),
+                                selected_tag: selected_tag(),
+                                proxy_server_nameservers: nameservers,
+                                mode: tunnel_mode(),
+                                tun: tun_enabled(),
+                                allow_lan: allow_lan(),
+                                dns_overrides: dns_overrides(),
+                                custom_rules: connection_custom_rules(
+                                    config_script_enabled(),
+                                    &config_script(),
+                                    custom_rules(),
+                                ),
+                                config_script: if config_script_enabled()
+                                    && !config_script().trim().is_empty()
+                                {
+                                    Some(config_script())
+                                } else {
+                                    None
+                                },
+                                group_selections: group_selections(),
+                            };
+                            restart_core_from_ui(
+                                request,
+                                CoreStatusSignals {
+                                    connected,
+                                    core_restarting,
+                                    core_state,
+                                    core_version,
+                                    core_note,
+                                    system_proxy,
+                                    config_pending,
+                                },
+                                toast,
+                                "已应用最新配置",
+                            )
+                            .await;
+                            }
+                        },
+                        Icon { icon: LdRefreshCw, width: 15, height: 15 }
+                        span { "重新连接" }
                     }
                 }
             }
@@ -2581,6 +2822,8 @@ fn OverviewView(
                     system_proxy,
                     system_proxy_busy,
                     runtime_action_busy,
+                    tun_busy,
+                    lan_busy,
                 }
         }
 
@@ -2620,7 +2863,12 @@ fn OverviewView(
             } else {
                 div { class: "node-list compact-list",
                     for node in nodes().into_iter().take(4) {
-                        NodeRow { node, selected_tag, latency_results }
+                        NodeRow {
+                            node,
+                            selected_tag,
+                            latency_results,
+                            on_open: move |_| active_view.set(AppView::Nodes),
+                        }
                     }
                 }
             }
@@ -2833,6 +3081,14 @@ fn QuickToggle(
     busy: bool,
     disabled: bool,
     hint: String,
+    /// What applying this switch costs (restarts the core, touches the OS...)
+    /// so four identical-looking tiles do not hide three different impacts.
+    #[props(default)]
+    cost: String,
+    /// Why the switch cannot be used right now. A disabled toggle with a
+    /// static hint reads as broken; the reason makes it a step, not a wall.
+    #[props(default)]
+    disabled_reason: String,
     on_toggle: EventHandler<bool>,
 ) -> Element {
     let control = if busy {
@@ -2856,8 +3112,22 @@ fn QuickToggle(
             span { class: "switch" }
         }
     };
+    let reason_shown = disabled && !busy && !disabled_reason.is_empty();
+    let shown_hint = if reason_shown {
+        disabled_reason.clone()
+    } else {
+        hint.clone()
+    };
     rsx! {
-        label { class: if checked { "quick-toggle active" } else { "quick-toggle" }, title: "{hint}",
+        label {
+            class: if disabled {
+                if checked { "quick-toggle active disabled" } else { "quick-toggle disabled" }
+            } else if checked {
+                "quick-toggle active"
+            } else {
+                "quick-toggle"
+            },
+            title: "{shown_hint}",
             span { class: "quick-toggle-icon",
                 if icon == "network" {
                     Icon { icon: LdNetwork, width: 16, height: 16 }
@@ -2878,8 +3148,23 @@ fn QuickToggle(
             span { class: "quick-toggle-text",
                 strong { "{title}" }
                 small { "{value}" }
+                if !cost.is_empty() {
+                    small { class: "quick-toggle-cost", "{cost}" }
+                }
             }
         }
+    }
+}
+
+/// Why a runtime quick-toggle is currently inert, in one place so TUN and LAN
+/// stop silently refusing the tap while showing an unrelated feature hint.
+fn quick_toggle_disabled_reason(busy: bool, node_count: usize) -> String {
+    if busy {
+        "其它网络操作正在进行".to_string()
+    } else if node_count == 0 {
+        "请先添加订阅".to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -2908,9 +3193,12 @@ fn OverviewQuickToggles(
     system_proxy: Signal<SystemProxyLoadState>,
     system_proxy_busy: Signal<bool>,
     runtime_action_busy: Signal<bool>,
+    tun_busy: Signal<bool>,
+    lan_busy: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
-    let tun_busy = use_signal(|| false);
+    // Provided by ProxyApp; cleared centrally when a restart applies the config.
+    let config_pending = use_context::<ConfigPending>().0;
     let runtime = RuntimeSignals {
         status: CoreStatusSignals {
             connected,
@@ -2918,6 +3206,8 @@ fn OverviewQuickToggles(
             core_state,
             core_version,
             core_note,
+            system_proxy,
+            config_pending,
         },
         core_busy,
         system_proxy_busy,
@@ -2960,6 +3250,8 @@ fn OverviewQuickToggles(
                             "未启用".to_string()
                         },
                         hint: "系统级网络接管".to_string(),
+                        cost: if core_running { "切换会重启内核".to_string() } else { "需要管理员授权".to_string() },
+                        disabled_reason: quick_toggle_disabled_reason(busy, nodes().len()),
                         checked: tun_enabled(),
                         busy: tun_busy(),
                         disabled: busy || nodes().is_empty(),
@@ -2985,7 +3277,7 @@ fn OverviewQuickToggles(
                 QuickToggle {
                     icon: "wifi".to_string(),
                     title: "局域网".to_string(),
-                    value: if busy {
+                    value: if lan_busy() {
                         "处理中".to_string()
                     } else if allow_lan() {
                         "0.0.0.0:7890".to_string()
@@ -2993,8 +3285,10 @@ fn OverviewQuickToggles(
                         "仅本机".to_string()
                     },
                     hint: "允许同一局域网设备使用此代理".to_string(),
+                    cost: if core_running { "切换会重启内核".to_string() } else { "下次启动生效".to_string() },
+                    disabled_reason: quick_toggle_disabled_reason(busy, nodes().len()),
                     checked: allow_lan(),
-                    busy: false,
+                    busy: lan_busy(),
                     disabled: busy || nodes().is_empty(),
                     on_toggle: move |enabled| {
                         let request = build_connection_request(
@@ -3008,6 +3302,7 @@ fn OverviewQuickToggles(
                             enabled,
                             request,
                             allow_lan,
+                            lan_busy,
                             runtime,
                             toast,
                         );
@@ -3028,6 +3323,18 @@ fn OverviewQuickToggles(
                     title: "系统代理".to_string(),
                     value: proxy.label.to_string(),
                     hint: proxy.detail,
+                    cost: "修改操作系统代理设置".to_string(),
+                    disabled_reason: if busy {
+                        "其它网络操作正在进行".to_string()
+                    } else if !proxy.supported {
+                        "当前平台不支持系统代理".to_string()
+                    } else if !proxy.ready {
+                        "系统代理状态读取中或不可用".to_string()
+                    } else if !proxy.enabled && !core_running {
+                        "先启动代理，才能开启系统代理".to_string()
+                    } else {
+                        String::new()
+                    },
                     checked: proxy.enabled,
                     busy: proxy.busy || proxy.loading,
                     disabled: busy
@@ -3086,6 +3393,7 @@ fn NodesView(
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
+    system_proxy: Signal<SystemProxyLoadState>,
     selected_tag: Signal<String>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
@@ -3122,9 +3430,16 @@ fn NodesView(
         .iter()
         .map(|(_, members, _)| members.len())
         .sum::<usize>();
+    // Count only nodes that exist in the current subscription: after a
+    // switch the map still holds the previous provider's results, and the old
+    // count claimed "已测速 30 个节点" above a list of `-- ms` rows.
+    let listed_tags: HashMap<&str, ()> =
+        nodes.iter().map(|node| (node.tag.as_str(), ())).collect();
     let tested_count = latency_snapshot
-        .values()
-        .filter(|result| result.latency_ms.is_some())
+        .iter()
+        .filter(|(tag, result)| {
+            result.latency_ms.is_some() && listed_tags.contains_key(tag.as_str())
+        })
         .count();
     let focus = node_focus_details(
         &groups,
@@ -3214,6 +3529,18 @@ fn NodesView(
                                                             }
                                                         }
                                                         Err(error) => {
+                                                            // Keep what already
+                                                            // arrived: dropping
+                                                            // the batch meant a
+                                                            // late failure threw
+                                                            // away a full run of
+                                                            // measurements.
+                                                            let partial = latency_results();
+                                                            persist_latency_cache(
+                                                                &cache_nodes,
+                                                                &partial,
+                                                            )
+                                                            .await;
                                                             toast.error(format!("读取测速结果失败: {error}"));
                                                             latency_busy.set(false);
                                                             return;
@@ -3257,8 +3584,16 @@ fn NodesView(
                 if groups_with_members.is_empty() {
                     div { class: "large-empty group-empty",
                         Icon { icon: LdSearch, width: 28, height: 28 }
-                        strong { "没有匹配的节点" }
-                        p { "换个关键词试试，节点名、地址和协议都可以搜索。" }
+                        strong {
+                            if needle.is_empty() { "配置中没有代理组" } else { "没有匹配的节点" }
+                        }
+                        p {
+                            if needle.is_empty() {
+                                "这份订阅没有可展示的代理分组。回到订阅页刷新一次；若仍为空，说明来源不含 selector/urltest 分组，请直接使用「切换节点」或检查来源格式。"
+                            } else {
+                                "换个关键词试试，节点名、地址和协议都可以搜索。"
+                            }
+                        }
                     }
                 } else {
                     div { class: "proxy-group-sections",
@@ -3307,6 +3642,7 @@ fn NodesView(
                                             core_state,
                                             core_version,
                                             core_note,
+                                            system_proxy,
                                             nodes: nodes.clone(),
                                             proxy_server_nameservers: proxy_server_nameservers.clone(),
                                             selected_tag,
@@ -3481,6 +3817,7 @@ fn ProxyGroupMemberRow(
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
+    system_proxy: Signal<SystemProxyLoadState>,
     nodes: Vec<ProxyNode>,
     proxy_server_nameservers: Vec<String>,
     mut selected_tag: Signal<String>,
@@ -3495,6 +3832,8 @@ fn ProxyGroupMemberRow(
     latency_results: Signal<HashMap<String, NodeLatency>>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
+    // Provided by ProxyApp; cleared centrally when a restart applies the config.
+    let config_pending = use_context::<ConfigPending>().0;
     let is_selected = group_kind == ProxyGroupKind::Selector && selected == member.tag;
     let selectable = group_kind == ProxyGroupKind::Selector;
     let member_tag = member.tag.clone();
@@ -3575,6 +3914,8 @@ fn ProxyGroupMemberRow(
                                         core_state,
                                         core_version,
                                         core_note,
+                                        system_proxy,
+                                        config_pending,
                                     },
                                     toast,
                                     format!("{group} 已切换到 {outbound}，内核已重启"),
@@ -3656,20 +3997,26 @@ fn outbound_display_name(tag: &str, nodes: &[ProxyNode]) -> String {
         })
 }
 
+/// The overview's four-row node preview. This is a *preview*, not a selector:
+/// writing `selected_tag` here only relabels the header while the core keeps
+/// running the old node (and the next start sends the new `selected_tag` with
+/// the stale `group_selections`), so a tap opens the nodes page where picking
+/// actually applies. The check mark still shows which node is live.
 #[component]
 fn NodeRow(
     node: ProxyNode,
-    mut selected_tag: Signal<String>,
+    selected_tag: Signal<String>,
     latency_results: Signal<HashMap<String, NodeLatency>>,
+    mut on_open: EventHandler<()>,
 ) -> Element {
     let selected = selected_tag() == node.tag;
-    let tag = node.tag.clone();
     let (latency_label, latency_class, latency_title) =
         format_latency(latency_results().get(&node.tag));
     rsx! {
         button {
             class: if selected { "node-row selected" } else { "node-row" },
-            onclick: move |_| selected_tag.set(tag.clone()),
+            title: "在节点页切换",
+            onclick: move |_| on_open.call(()),
             span { class: protocol_class(node.protocol), "{protocol_abbreviation(node.protocol)}" }
             span { class: "node-main",
                 strong { "{node.name}" }
@@ -3720,10 +4067,9 @@ fn restore_cached_latencies(
         .iter()
         .map(|(tag, endpoint, latency_ms)| ((tag.as_str(), endpoint.as_str()), *latency_ms))
         .collect::<HashMap<_, _>>();
-    let cached_by_endpoint = entries
-        .iter()
-        .map(|(_, endpoint, latency_ms)| (endpoint.as_str(), *latency_ms))
-        .collect::<HashMap<_, _>>();
+    // Match on (tag, endpoint) only. The previous endpoint-only fallback
+    // pasted a deleted subscription's number onto any new node sharing that
+    // address - "已测速" values that belonged to a different provider.
 
     nodes
         .iter()
@@ -3731,7 +4077,6 @@ fn restore_cached_latencies(
             let endpoint = node.endpoint();
             cached_by_tag
                 .get(&(node.tag.as_str(), endpoint.as_str()))
-                .or_else(|| cached_by_endpoint.get(endpoint.as_str()))
                 .map(|latency_ms| {
                     (
                         node.tag.clone(),
@@ -3830,6 +4175,7 @@ fn SubscriptionsView(
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
+    system_proxy: Signal<SystemProxyLoadState>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
@@ -3840,6 +4186,8 @@ fn SubscriptionsView(
     group_selections: Signal<HashMap<String, String>>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
+    let mut config_pending = use_context::<ConfigPending>();
+    let mut confirm_delete = use_signal(|| None::<u64>);
     rsx! {
         section { class: "workspace-section glass-surface",
             div { class: "workspace-toolbar",
@@ -3854,6 +4202,7 @@ fn SubscriptionsView(
                         title: "刷新全部订阅",
                         disabled: subscriptions().is_empty() || refresh_busy().is_some(),
                         onclick: move |_| {
+                            confirm_delete.set(None);
                             let sources: Vec<(u64, String)> = subscriptions()
                                 .into_iter()
                                 .map(|subscription| (subscription.id, subscription.source))
@@ -3861,8 +4210,16 @@ fn SubscriptionsView(
                             async move {
                                 refresh_busy.set(Some(RefreshTarget::All));
                                 let mut refreshed = 0;
-                                let mut failed = 0;
+                                // Name the failed subscriptions: "1 个失败" gave
+                                // no idea WHICH provider is down, and a user
+                                // with four subscriptions cannot act on that.
+                                let mut failures: Vec<String> = Vec::new();
                                 for (subscription_id, source) in sources {
+                                    let name = subscriptions()
+                                        .iter()
+                                        .find(|item| item.id == subscription_id)
+                                        .map(|item| item.name.clone())
+                                        .unwrap_or_else(|| format!("#{subscription_id}"));
                                     match api::preview_subscription(source).await {
                                         Ok(report) => {
                                             let result = {
@@ -3870,11 +4227,16 @@ fn SubscriptionsView(
                                                 apply_subscription_report(&mut stored, subscription_id, report)
                                             };
                                             match result {
-                                                Ok(_) => refreshed += 1,
-                                                Err(_) => failed += 1,
+                                                Ok(_) => {
+                                                    refreshed += 1;
+                                                    if connected() {
+                                                        config_pending.0.set(true);
+                                                    }
+                                                }
+                                                Err(reason) => failures.push(format!("{name}: {reason}")),
                                             }
                                         }
-                                        Err(_) => failed += 1,
+                                        Err(error) => failures.push(format!("{name}: {error}")),
                                     }
                                 }
                                 let active_nodes = collect_subscription_nodes(
@@ -3885,10 +4247,14 @@ fn SubscriptionsView(
                                     select_available_tag(&active_nodes, &selected_tag());
                                 nodes.set(active_nodes);
                                 selected_tag.set(next_tag);
-                                if failed == 0 {
+                                if failures.is_empty() {
                                     toast.success(format!("已刷新 {refreshed} 个订阅"));
                                 } else {
-                                    toast.info(format!("已刷新 {refreshed} 个订阅，{failed} 个失败"));
+                                    toast.error(format!(
+                                        "已刷新 {refreshed} 个订阅，{} 个失败：{}",
+                                        failures.len(),
+                                        failures.join("；")
+                                    ));
                                 }
                                 refresh_busy.set(None);
                             }
@@ -3917,6 +4283,7 @@ fn SubscriptionsView(
                     for subscription in subscriptions() {
                         SubscriptionRow {
                             subscription,
+                            confirm_delete,
                             subscriptions,
                             active_subscription_id,
                             nodes,
@@ -3930,6 +4297,7 @@ fn SubscriptionsView(
                             core_state,
                             core_version,
                             core_note,
+                            system_proxy,
                             tunnel_mode,
                             tun_enabled,
                             allow_lan,
@@ -3949,6 +4317,10 @@ fn SubscriptionsView(
 #[component]
 fn SubscriptionRow(
     subscription: Subscription,
+    /// Row id currently armed for delete confirmation (tap trash again to
+    /// confirm). Destructive one-tap deletes with no undo need a second step;
+    /// an inline arm/disarm keeps it lighter than a dialog.
+    mut confirm_delete: Signal<Option<u64>>,
     mut subscriptions: Signal<Vec<Subscription>>,
     mut active_subscription_id: Signal<Option<u64>>,
     mut nodes: Signal<Vec<ProxyNode>>,
@@ -3962,6 +4334,7 @@ fn SubscriptionRow(
     core_state: Signal<String>,
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
+    system_proxy: Signal<SystemProxyLoadState>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
     allow_lan: Signal<bool>,
@@ -3972,6 +4345,8 @@ fn SubscriptionRow(
     group_selections: Signal<HashMap<String, String>>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
+    // Provided by ProxyApp; cleared centrally when a restart applies the config.
+    let mut config_pending = use_context::<ConfigPending>().0;
     let subscription_id = subscription.id;
     let subscription_source = subscription.source.clone();
     let display_source = source_label(&subscription.source);
@@ -4019,7 +4394,10 @@ fn SubscriptionRow(
                         let active_nodes =
                             collect_subscription_nodes(&subscriptions(), Some(subscription_id));
                         let next_tag = select_available_tag(&active_nodes, "");
+                        // Other groups belong to the old subscription's config;
+                        // carrying them over resurrects stale outbounds.
                         let mut next_selections = previous_selections.clone();
+                        prune_group_selections(&mut next_selections, |_| false);
                         if next_tag.is_empty() {
                             next_selections.remove("proxy");
                         } else {
@@ -4055,6 +4433,8 @@ fn SubscriptionRow(
                                     core_state,
                                     core_version,
                                     core_note,
+                                    system_proxy,
+                                    config_pending,
                                 },
                                 toast,
                                 "已切换订阅，内核已重启",
@@ -4095,7 +4475,9 @@ fn SubscriptionRow(
                             };
                             match result {
                                 Ok(count) => {
-                                    if active_subscription_id() == Some(subscription_id) {
+                                    let touched_active = active_subscription_id()
+                                        == Some(subscription_id);
+                                    if touched_active {
                                         let active_nodes = collect_subscription_nodes(
                                             &subscriptions(),
                                             Some(subscription_id),
@@ -4104,10 +4486,36 @@ fn SubscriptionRow(
                                             &active_nodes,
                                             &selected_tag(),
                                         );
+                                        // Outbounds of THIS subscription that the
+                                        // refresh removed would otherwise stay
+                                        // remembered in group_selections and go
+                                        // out with the next start.
+                                        let prefix = format!("subscription-{subscription_id}-");
+                                        let live_tags = active_nodes
+                                            .iter()
+                                            .map(|node| node.tag.clone())
+                                            .collect::<Vec<_>>();
+                                        let mut selections = group_selections();
+                                        prune_group_selections(&mut selections, |outbound| {
+                                            !outbound.starts_with(&prefix)
+                                                || live_tags.iter().any(|tag| tag == outbound)
+                                        });
+                                        group_selections.set(selections);
                                         nodes.set(active_nodes);
                                         selected_tag.set(next_tag);
+                                        // A refresh never restarts the core:
+                                        // while connected, the running config
+                                        // still holds the old node set, so flag
+                                        // the drift instead of pretending.
+                                        if connected() {
+                                            config_pending.set(true);
+                                        }
                                     }
-                                    toast.success(format!("已刷新 {count} 个节点"));
+                                    toast.success(if touched_active && connected() {
+                                        format!("已刷新 {count} 个节点，重新连接后生效")
+                                    } else {
+                                        format!("已刷新 {count} 个节点")
+                                    });
                                 }
                                 Err(reason) => {
                                     toast.error(format!("刷新失败: {reason}"));
@@ -4126,12 +4534,36 @@ fn SubscriptionRow(
                 }
             }
             button {
-                class: "icon-button danger subscription-delete-button",
-                title: "删除订阅",
+                class: if confirm_delete() == Some(subscription_id) {
+                    "icon-button danger armed subscription-delete-button"
+                } else {
+                    "icon-button danger subscription-delete-button"
+                },
+                aria_label: if confirm_delete() == Some(subscription_id) {
+                    "再次点击确认删除订阅"
+                } else {
+                    "删除订阅"
+                },
+                title: if confirm_delete() == Some(subscription_id) {
+                    "再次点击确认删除；点击其它位置取消"
+                } else {
+                    "删除订阅"
+                },
                 disabled: refresh_busy().is_some(),
                 onclick: move |_| {
+                    if confirm_delete() != Some(subscription_id) {
+                        confirm_delete.set(Some(subscription_id));
+                        return;
+                    }
+                    confirm_delete.set(None);
                     let deleting_active = active_subscription_id() == Some(subscription_id);
                     subscriptions.write().retain(|item| item.id != subscription_id);
+                    let prefix = format!("subscription-{subscription_id}-");
+                    let mut selections = group_selections();
+                    prune_group_selections(&mut selections, |outbound| {
+                        !outbound.starts_with(&prefix)
+                    });
+                    group_selections.set(selections);
                     let next_active_id = if deleting_active {
                         subscriptions().first().map(|item| item.id)
                     } else {
@@ -4148,7 +4580,26 @@ fn SubscriptionRow(
                     let next_tag = select_available_tag(&active_nodes, &requested_tag);
                     nodes.set(active_nodes);
                     selected_tag.set(next_tag);
-                    toast.success("订阅已删除");
+                    // The core still runs the deleted subscription's nodes
+                    // until a restart; flag the drift and name the new active
+                    // subscription when the delete silently swapped one.
+                    if connected() {
+                        config_pending.set(true);
+                    }
+                    let swapped_to = deleting_active.then(|| {
+                        subscriptions()
+                            .iter()
+                            .find(|item| Some(item.id) == next_active_id)
+                            .map(|item| item.name.clone())
+                    });
+                    let mut message = "订阅已删除".to_string();
+                    if let Some(Some(name)) = swapped_to {
+                        message.push_str(&format!("，当前订阅已切换到「{name}」"));
+                    }
+                    if connected() {
+                        message.push_str("，重新连接后生效");
+                    }
+                    toast.success(message);
                 },
                 Icon { icon: LdTrash2, width: 17, height: 17 }
             }
@@ -4173,12 +4624,15 @@ fn RulesView(
     mut active_tab: Signal<RulesTab>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
+    let config_pending = use_context::<ConfigPending>();
     let mut editor_open = use_signal(|| false);
     let mut editing_id = use_signal(|| None::<u64>);
     let mut draft_match = use_signal(|| CustomRuleMatch::DomainSuffix);
     let mut draft_action = use_signal(|| CustomRuleAction::Direct);
     let mut draft_value = use_signal(String::new);
     let mut editor_error = use_signal(|| None::<String>);
+    let mut confirm_rule_delete = use_signal(|| None::<u64>);
+    let mut confirm_dns_delete = use_signal(|| None::<u64>);
     let mut process_picker_open = use_signal(|| false);
     let mut process_picker_loaded = use_signal(|| false);
     let mut process_picker_error = use_signal(|| None::<String>);
@@ -4194,8 +4648,11 @@ fn RulesView(
     let total = stored.len();
     let rule_mode_active = tunnel_mode() == TunnelMode::Rule;
     let override_active = config_script_enabled();
+    // Rules stored but not shown on this platform (process rules on Android).
+    let hidden_process_rules = stored_rule_count.saturating_sub(total);
 
     let mut open_new_editor = move || {
+        confirm_rule_delete.set(None);
         editing_id.set(None);
         draft_match.set(CustomRuleMatch::DomainSuffix);
         draft_action.set(CustomRuleAction::Direct);
@@ -4204,6 +4661,7 @@ fn RulesView(
         editor_open.set(true);
     };
     let on_edit = move |rule: CustomRule| {
+        confirm_rule_delete.set(None);
         editing_id.set(Some(rule.id));
         draft_match.set(rule.match_type);
         draft_action.set(rule.action);
@@ -4361,6 +4819,7 @@ fn RulesView(
                                                 dns_error,
                                                 connected(),
                                                 toast,
+                                                config_pending,
                                             )
                                         {
                                             dns_editor_open.set(false);
@@ -4387,6 +4846,7 @@ fn RulesView(
                                                 dns_error,
                                                 connected(),
                                                 toast,
+                                                config_pending,
                                             )
                                         {
                                             dns_editor_open.set(false);
@@ -4407,6 +4867,8 @@ fn RulesView(
                                 onclick: move |_| {
                                     dns_editor_open.set(false);
                                     dns_error.set(None);
+                                    dns_domain.set(String::new());
+                                    dns_server.set(String::new());
                                 },
                                 "取消"
                             }
@@ -4420,6 +4882,7 @@ fn RulesView(
                                         dns_error,
                                         connected(),
                                         toast,
+                                        config_pending,
                                     ) {
                                         dns_editor_open.set(false);
                                     }
@@ -4471,18 +4934,35 @@ fn RulesView(
                                                 item.enabled = checked;
                                             }
                                         });
-                                        notify_rule_change(connected(), toast);
+                                        notify_rule_change(connected(), toast, config_pending);
                                     },
                                 }
                                 span { class: "switch" }
                             }
                             button {
-                                class: "icon-button danger",
-                                aria_label: "删除 {rule.domain_suffix} 的专用 DNS",
-                                title: "删除",
+                                class: if confirm_dns_delete() == Some(rule.id) {
+                                    "icon-button danger armed"
+                                } else {
+                                    "icon-button danger"
+                                },
+                                aria_label: if confirm_dns_delete() == Some(rule.id) {
+                                    "再次点击确认删除该专用 DNS"
+                                } else {
+                                    "删除 {rule.domain_suffix} 的专用 DNS"
+                                },
+                                title: if confirm_dns_delete() == Some(rule.id) {
+                                    "再次点击确认删除"
+                                } else {
+                                    "删除"
+                                },
                                 onclick: move |_| {
+                                    if confirm_dns_delete() != Some(rule.id) {
+                                        confirm_dns_delete.set(Some(rule.id));
+                                        return;
+                                    }
+                                    confirm_dns_delete.set(None);
                                     dns_overrides.write().retain(|item| item.id != rule.id);
-                                    notify_rule_change(connected(), toast);
+                                    notify_rule_change(connected(), toast, config_pending);
                                 },
                                 Icon { icon: LdTrash2, width: 16, height: 16 }
                             }
@@ -4499,6 +4979,16 @@ fn RulesView(
                         strong { "JavaScript 配置覆写已启用" }
                         span { "自定义分流规则暂不可用" }
                     }
+                }
+            }
+
+            if hidden_process_rules > 0 && !override_active {
+                // Process rules saved on a desktop sync to Android where they
+                // are hidden, yet they still count against MAX_CUSTOM_RULES.
+                // Without this the limit hits with a half-empty-looking list.
+                div { class: "inline-note info",
+                    Icon { icon: LdInfo, width: 16, height: 16 }
+                    span { "另有 {hidden_process_rules} 条进程规则在当前平台不可见，但仍计入规则总数并随配置同步。" }
                 }
             }
 
@@ -4565,7 +5055,7 @@ fn RulesView(
                                                 ) {
                                                     Ok(()) => {
                                                         editor_open.set(false);
-                                                        notify_rule_change(connected(), toast);
+                                                        notify_rule_change(connected(), toast, config_pending);
                                                     }
                                                     Err(error) => editor_error.set(Some(error)),
                                                 }
@@ -4612,7 +5102,7 @@ fn RulesView(
                                         ) {
                                             Ok(()) => {
                                                 editor_open.set(false);
-                                                notify_rule_change(connected(), toast);
+                                                notify_rule_change(connected(), toast, config_pending);
                                             }
                                             Err(error) => editor_error.set(Some(error)),
                                         }
@@ -4632,8 +5122,14 @@ fn RulesView(
                         button {
                             class: "secondary-button",
                             onclick: move |_| {
+                                // Drop the draft too: leaving `editing_id` and
+                                // `draft_value` filled made "取消" a hide, not
+                                // an undo - the editor reopened with the
+                                // abandoned edit still loaded.
                                 editor_open.set(false);
                                 editor_error.set(None);
+                                editing_id.set(None);
+                                draft_value.set(String::new());
                             },
                             "取消"
                         }
@@ -4649,7 +5145,7 @@ fn RulesView(
                                 ) {
                                     Ok(()) => {
                                         editor_open.set(false);
-                                        notify_rule_change(connected(), toast);
+                                        notify_rule_change(connected(), toast, config_pending);
                                     }
                                     Err(error) => editor_error.set(Some(error)),
                                 }
@@ -4686,6 +5182,7 @@ fn RulesView(
                             locked: override_active,
                             include_process_rules,
                             on_edit,
+                            confirm_delete: confirm_rule_delete,
                         }
                     }
                 }
@@ -4917,8 +5414,12 @@ fn RuleListItem(
     locked: bool,
     include_process_rules: bool,
     on_edit: EventHandler<CustomRule>,
+    /// Rule id currently armed for delete (see SubscriptionRow's note on the
+    /// inline two-step pattern; rules have no undo either).
+    mut confirm_delete: Signal<Option<u64>>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
+    let config_pending = use_context::<ConfigPending>();
     let rule_id = rule.id;
     let edit_rule = rule.clone();
     let enabled = rule.enabled;
@@ -4956,7 +5457,7 @@ fn RuleListItem(
                     onchange: move |event| {
                         if let Some(stored) = rules.write().iter_mut().find(|item| item.id == rule_id) {
                             stored.enabled = event.checked();
-                            notify_rule_change(connected, toast);
+                            notify_rule_change(connected, toast, config_pending);
                         }
                     },
                 }
@@ -4966,6 +5467,7 @@ fn RuleListItem(
                 button {
                     class: "icon-button",
                     title: "上移",
+                    aria_label: "上移这条规则",
                     disabled: locked || index == 0,
                     onclick: move |_| {
                         move_custom_rule(
@@ -4974,13 +5476,14 @@ fn RuleListItem(
                             -1,
                             include_process_rules,
                         );
-                        notify_rule_change(connected, toast);
+                        notify_rule_change(connected, toast, config_pending);
                     },
                     Icon { icon: LdArrowUp, width: 16, height: 16 }
                 }
                 button {
                     class: "icon-button",
                     title: "下移",
+                    aria_label: "下移这条规则",
                     disabled: locked || index + 1 >= total,
                     onclick: move |_| {
                         move_custom_rule(
@@ -4989,24 +5492,43 @@ fn RuleListItem(
                             1,
                             include_process_rules,
                         );
-                        notify_rule_change(connected, toast);
+                        notify_rule_change(connected, toast, config_pending);
                     },
                     Icon { icon: LdArrowDown, width: 16, height: 16 }
                 }
                 button {
                     class: "icon-button",
                     title: "编辑规则",
+                    aria_label: "编辑这条规则",
                     disabled: locked,
                     onclick: move |_| on_edit.call(edit_rule.clone()),
                     Icon { icon: LdPencil, width: 16, height: 16 }
                 }
                 button {
-                    class: "icon-button danger",
-                    title: "删除规则",
+                    class: if confirm_delete() == Some(rule_id) {
+                        "icon-button danger armed"
+                    } else {
+                        "icon-button danger"
+                    },
+                    aria_label: if confirm_delete() == Some(rule_id) {
+                        "再次点击确认删除规则"
+                    } else {
+                        "删除规则"
+                    },
+                    title: if confirm_delete() == Some(rule_id) {
+                        "再次点击确认删除"
+                    } else {
+                        "删除规则"
+                    },
                     disabled: locked,
                     onclick: move |_| {
+                        if confirm_delete() != Some(rule_id) {
+                            confirm_delete.set(Some(rule_id));
+                            return;
+                        }
+                        confirm_delete.set(None);
                         rules.write().retain(|item| item.id != rule_id);
-                        notify_rule_change(connected, toast);
+                        notify_rule_change(connected, toast, config_pending);
                     },
                     Icon { icon: LdTrash2, width: 16, height: 16 }
                 }
@@ -5111,7 +5633,12 @@ fn move_custom_rule(rules: &mut [CustomRule], id: u64, offset: isize, include_pr
     }
 }
 
-fn notify_rule_change(connected: bool, toast: ToastManager) {
+fn notify_rule_change(connected: bool, toast: ToastManager, mut pending: ConfigPending) {
+    if connected {
+        // Rules/DNS edits only reach the core through a (re)start, so the
+        // overview keeps a 重新连接 affordance up until one happens.
+        pending.0.set(true);
+    }
     toast.success(if connected {
         "规则已保存，重新连接后生效"
     } else {
@@ -5229,6 +5756,11 @@ fn LogsView(
     core_version: Signal<Option<String>>,
     mut filter: Signal<LogFilter>,
     mut search: Signal<String>,
+    /// False when the power button itself is disabled (no nodes, or the core
+    /// is unavailable); the empty-state start affordance must not stay live
+    /// where the overview refuses the same action.
+    start_allowed: bool,
+    start_busy: bool,
     on_start: EventHandler<()>,
 ) -> Element {
     let stored = logs();
@@ -5410,8 +5942,13 @@ fn LogsView(
                     if !connected() {
                         button {
                             class: "primary-button compact log-start-button",
+                            disabled: !start_allowed || start_busy,
                             onclick: move |_| on_start.call(()),
-                            Icon { icon: LdPlay, width: 16, height: 16 }
+                            if start_busy {
+                                span { class: "spinner" }
+                            } else {
+                                Icon { icon: LdPlay, width: 16, height: 16 }
+                            }
                             span { "启动代理开始采集" }
                         }
                     }
@@ -5586,10 +6123,13 @@ fn LogRow(entry: CoreLogEntry) -> Element {
                     strong { "{route.outbound_tag}" }
                     small { "{route.outbound_type}" }
                 }
-                code { class: "log-message", "{entry.message}" }
+                // Rows stay one line on desktop, so carry the whole message in
+                // the tooltip: these strings hold URLs and error details that
+                // are unrecoverable once ellipsised.
+                code { class: "log-message", title: entry.message.clone(), "{entry.message}" }
             } else {
                 span { class: level_class, "{level_label}" }
-                code { class: "log-message raw-message", "{entry.message}" }
+                code { class: "log-message raw-message", title: entry.message.clone(), "{entry.message}" }
             }
         }
     }
@@ -5710,17 +6250,34 @@ fn SyncSettings(
 ) -> Element {
     let toast = use_context::<ToastManager>();
     let mut config = use_signal(SyncConfig::default);
-    let mut loaded = use_signal(|| false);
+    let loaded = use_signal(|| false);
+    let load_error = use_signal(|| None::<String>);
+    let mut load_attempt = use_signal(|| 0_u32);
     let mut busy = use_signal(|| None::<SyncAction>);
     let mut confirm = use_signal(|| None::<SyncAction>);
 
     use_effect(move || {
+        let _ = load_attempt();
+        let mut loaded = loaded;
+        let mut config = config;
+        let mut load_error = load_error;
         spawn(async move {
             match api::load_sync_config().await {
-                Ok(saved) => config.set(saved),
-                Err(error) => toast.error(format!("同步配置读取失败: {error}")),
+                Ok(saved) => {
+                    config.set(saved);
+                    load_error.set(None);
+                    loaded.set(true);
+                }
+                // A failed read must NOT unlock the buttons: the form still
+                // holds SyncConfig::default() and saving it would overwrite the
+                // real sync.json with an empty config. Stay gated, show the
+                // reason, and offer a retry (the effect only re-runs when
+                // `load_attempt` bumps - there is no dependency array here).
+                Err(error) => {
+                    loaded.set(false);
+                    load_error.set(Some(error.to_string()));
+                }
             }
-            loaded.set(true);
         });
     });
 
@@ -5740,6 +6297,25 @@ fn SyncSettings(
                 span {
                     class: if last_sync_at > 0 { "status-badge ready" } else if sync_enabled { "status-badge pending" } else { "status-badge" },
                     if !loaded() { "读取中" } else if last_sync_at > 0 { "已同步" } else if sync_enabled { "待同步" } else { "未启用" }
+                }
+            }
+
+            if let Some(error) = load_error() {
+                div { class: "load-error-panel", role: "alert",
+                    Icon { icon: LdCircleAlert, width: 17, height: 17 }
+                    div { class: "load-error-copy",
+                        strong { "同步配置读取失败" }
+                        small { "为避免用空配置覆盖已保存的设置，所有同步操作已停用。{error}" }
+                    }
+                    button {
+                        class: "secondary-button compact",
+                        onclick: move |_| {
+                            let next = *load_attempt.peek() + 1;
+                            load_attempt.set(next);
+                        },
+                        Icon { icon: LdRefreshCw, width: 15, height: 15 }
+                        "重试"
+                    }
                 }
             }
 
@@ -5970,6 +6546,8 @@ fn SyncSettings(
                                         custom_rules,
                                         dns_overrides,
                                         group_selections,
+                                        config_script_enabled,
+                                        config_script,
                                     },
                                 );
                                 if result.checkpoint_saved {
@@ -6122,6 +6700,8 @@ struct SyncTargetSignals {
     custom_rules: Signal<Vec<CustomRule>>,
     dns_overrides: Signal<Vec<DnsOverride>>,
     group_selections: Signal<HashMap<String, String>>,
+    config_script_enabled: Signal<bool>,
+    config_script: Signal<String>,
 }
 
 fn apply_sync_snapshot(snapshot: SyncSnapshot, targets: SyncTargetSignals) {
@@ -6133,6 +6713,8 @@ fn apply_sync_snapshot(snapshot: SyncSnapshot, targets: SyncTargetSignals) {
         mut custom_rules,
         mut dns_overrides,
         mut group_selections,
+        mut config_script_enabled,
+        mut config_script,
     } = targets;
     subscriptions.set(
         snapshot
@@ -6149,6 +6731,14 @@ fn apply_sync_snapshot(snapshot: SyncSnapshot, targets: SyncTargetSignals) {
     // local rules rather than deleting them.
     if let Some(overrides) = snapshot.dns_overrides {
         dns_overrides.set(overrides);
+    }
+    // Same rule for the JS override: `commit_sync_pull` writes the snapshot's
+    // script into the disk profile, so the signals must follow it too -
+    // otherwise the UI shows the old script, the save effect persists that
+    // stale view over the profile, and the pull quietly rolls itself back.
+    if let Some(script) = snapshot.config_script {
+        config_script_enabled.set(script.enabled);
+        config_script.set(script.script);
     }
     group_selections.set(HashMap::new());
 }
@@ -6870,6 +7460,7 @@ fn commit_dns_override(
     mut error: Signal<Option<String>>,
     connected: bool,
     toast: ToastManager,
+    pending: ConfigPending,
 ) -> bool {
     match proxy_core::normalize_dns_override(&domain(), &server()) {
         Ok((domain_suffix, dns_server)) => {
@@ -6893,7 +7484,7 @@ fn commit_dns_override(
             server.set(String::new());
             error.set(None);
             drop(rules);
-            notify_rule_change(connected, toast);
+            notify_rule_change(connected, toast, pending);
             true
         }
         Err(message) => {
@@ -6907,9 +7498,12 @@ fn commit_dns_override(
 fn SettingsView(
     platform: String,
     app_version: String,
+    tun_busy: Signal<bool>,
+    lan_busy: Signal<bool>,
     mut core_state: Signal<String>,
     mut core_version: Signal<Option<String>>,
     mut core_note: Signal<Option<String>>,
+    system_proxy: Signal<SystemProxyLoadState>,
     mut connected: Signal<bool>,
     core_busy: Signal<bool>,
     mut core_restarting: Signal<bool>,
@@ -6935,8 +7529,9 @@ fn SettingsView(
     let mut script_draft = use_signal(String::new);
     let mut copy_busy = use_signal(|| false);
     let mut copy_env_busy = use_signal(|| false);
-    let tun_busy = use_signal(|| false);
     let toast = use_context::<ToastManager>();
+    // Provided by ProxyApp; cleared centrally when a restart applies the config.
+    let config_pending = use_context::<ConfigPending>().0;
     let tun_proxy_server_nameservers = proxy_server_nameservers.clone();
     let allow_lan_proxy_server_nameservers = proxy_server_nameservers.clone();
     let script_proxy_server_nameservers = proxy_server_nameservers;
@@ -7068,6 +7663,8 @@ fn SettingsView(
                                             core_state,
                                             core_version,
                                             core_note,
+                                            system_proxy,
+                                            config_pending,
                                         },
                                         core_busy,
                                         system_proxy_busy,
@@ -7121,6 +7718,7 @@ fn SettingsView(
                                     enabled,
                                     request,
                                     allow_lan,
+                                    lan_busy,
                                     RuntimeSignals {
                                         status: CoreStatusSignals {
                                             connected,
@@ -7128,6 +7726,8 @@ fn SettingsView(
                                             core_state,
                                             core_version,
                                             core_note,
+                                            system_proxy,
+                                            config_pending,
                                         },
                                         core_busy,
                                         system_proxy_busy,
@@ -7263,12 +7863,19 @@ fn SettingsView(
                     }
                     button {
                         class: "secondary-button compact",
-                        title: "复制代理环境变量",
+                        title: if cfg!(target_arch = "wasm32") {
+                            "复制到运行此服务的主机剪贴板（浏览器内无法直接访问剪贴板）"
+                        } else {
+                            "复制代理环境变量"
+                        },
                         disabled: copy_env_busy(),
                         onclick: move |_| {
                             copy_env_busy.set(true);
                             async move {
                                 match api::copy_proxy_environment_variables().await {
+                                    Ok(()) if cfg!(target_arch = "wasm32") => {
+                                        toast.success("代理环境变量已复制到服务器主机的剪贴板");
+                                    }
                                     Ok(()) => toast.success("代理环境变量已复制"),
                                     Err(error) => {
                                         toast.error(format!("复制环境变量失败: {error}"));
@@ -7349,7 +7956,11 @@ fn SettingsView(
                                 group_selections: group_selections(),
                             };
                             match api::validate_config_script(request).await {
-                                Ok(()) => toast.success("配置脚本校验通过"),
+                                Ok(()) => toast.success(if cfg!(target_arch = "wasm32") {
+                                    "配置脚本已在服务器端校验通过"
+                                } else {
+                                    "配置脚本校验通过"
+                                }),
                                 Err(error) => {
                                     toast.error(format!("配置脚本校验失败: {error}"));
                                 }
@@ -7470,6 +8081,18 @@ fn next_subscription_id(subscriptions: &[Subscription]) -> u64 {
         .max()
         .unwrap_or(0)
         .saturating_add(1)
+}
+
+/// Drop remembered proxy-group selections whose outbound no longer exists.
+/// Switching/refreshing/deleting a subscription rewrites the namespaced node
+/// tags, and the previous map was cloned whole - the stale outbound then went
+/// out in every later `ConnectionRequest.group_selections` while the list
+/// showed a silently different (defaulted) choice.
+fn prune_group_selections(
+    selections: &mut HashMap<String, String>,
+    mut keep: impl FnMut(&str) -> bool,
+) {
+    selections.retain(|_, outbound| keep(outbound));
 }
 
 fn namespace_nodes(subscription_id: u64, mut nodes: Vec<ProxyNode>) -> Vec<ProxyNode> {
@@ -8139,16 +8762,15 @@ mod tests {
             Some(128)
         );
 
+        // A renamed node must NOT inherit the cached number by endpoint
+        // alone: subscriptions from different providers share exit addresses,
+        // and the old endpoint-only fallback pasted one node's latency onto
+        // another provider's node ("已测速" values that were never measured).
         let mut renamed_node = node.clone();
         renamed_node.tag = "renamed-edge".to_string();
         let restored_renamed =
             restore_cached_latencies(std::slice::from_ref(&renamed_node), entries.clone());
-        assert_eq!(
-            restored_renamed
-                .get(&renamed_node.tag)
-                .and_then(|item| item.latency_ms),
-            Some(128)
-        );
+        assert!(restored_renamed.is_empty());
 
         let mut changed_node = node;
         changed_node.server = "new-edge.example.com".to_string();

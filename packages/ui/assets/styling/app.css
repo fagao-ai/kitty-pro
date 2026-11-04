@@ -1,5 +1,11 @@
+/* z-index 层级顺序（低 → 高）：
+   0 内容 · 20 装饰/侧栏 · 50 手机底栏(.mobile-nav) · 55 规则下拉遮罩(.rule-select-backdrop)
+   · 60 规则下拉菜单(.rule-select-menu) · 100 模态(.modal-backdrop) · 120 toast(.toast-viewport) */
 :root {
   color-scheme: light;
+  /* 背景基础变量同时挂在根级，供 body / 根滚动条 / overscroll 取色；
+     暗色由下方 :root:has(.proxy-app.theme-dark) 切换，.proxy-app.theme-dark 的覆盖保持不变。 */
+  --bg: #e9edf4;
   font-family:
     Inter,
     'PingFang SC',
@@ -36,6 +42,7 @@ body {
   min-width: 320px;
   min-height: 100vh;
   overflow-x: hidden;
+  background: var(--bg);
 }
 
 .proxy-app {
@@ -66,10 +73,12 @@ body {
   --blue-soft: rgba(10, 99, 168, 0.1);
   --dns: #5b21b6;
   --dns-soft: rgba(91, 33, 182, 0.1);
-  --amber: #8f4306;
-  --amber-soft: rgba(168, 82, 8, 0.13);
+  --amber: #8a5a00;
+  --amber-soft: rgba(138, 90, 0, 0.13);
   --coral: #a81f45;
   --coral-soft: rgba(168, 31, 69, 0.1);
+  --success: #1c7a4d;
+  --success-soft: rgba(28, 122, 77, 0.12);
   --tint-a: rgba(255, 196, 138, 0.3);
   --tint-b: rgba(143, 199, 245, 0.27);
   --tint-c: rgba(245, 168, 192, 0.24);
@@ -106,14 +115,25 @@ body {
   --blue-soft: rgba(130, 185, 220, 0.11);
   --dns: #a693d8;
   --dns-soft: rgba(166, 147, 216, 0.11);
-  --amber: #b37e45;
-  --amber-soft: rgba(212, 153, 92, 0.14);
+  --amber: #e0b25c;
+  --amber-soft: rgba(224, 178, 92, 0.14);
   --coral: #d97f98;
   --coral-soft: rgba(217, 127, 152, 0.11);
+  --success: #7bd6a4;
+  --success-soft: rgba(123, 214, 164, 0.14);
   --tint-a: rgba(179, 126, 69, 0.18);
   --tint-b: rgba(130, 185, 220, 0.15);
   --tint-c: rgba(217, 127, 152, 0.14);
   --shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+
+/* 暗色变量挂在 .proxy-app.theme-dark 上，根级默认却是 color-scheme:light：
+   body 与 overscroll 会露浅底。用 :has() 把根级同步为暗色；这里必须显式
+   重设 --bg，否则 background: var(--bg) 仍取 :root 的浅色值。 */
+:root:has(.proxy-app.theme-dark) {
+  color-scheme: dark;
+  --bg: #131218;
+  background: var(--bg);
 }
 
 .ambient-grid {
@@ -320,8 +340,8 @@ body {
 
 .status-dot.online,
 .status-dot.ready {
-  background: var(--accent);
-  box-shadow: 0 0 0 4px var(--accent-soft);
+  background: var(--success);
+  box-shadow: 0 0 0 4px var(--success-soft);
 }
 
 .status-dot.online {
@@ -492,20 +512,31 @@ body {
   background: var(--surface-strong);
 }
 
+.secondary-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 统一键盘焦点环 */
+.nav-item:focus-visible,
+.icon-button:focus-visible,
+.primary-button:focus-visible,
+.secondary-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.primary-button:active:not(:disabled),
+.secondary-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
 .primary-button:disabled,
 .secondary-button:disabled,
 .icon-button:disabled,
 .power-button:disabled {
   cursor: not-allowed;
   opacity: 0.48;
-}
-
-.primary-button.compact {
-  min-height: 38px;
-}
-
-.secondary-button.compact {
-  min-height: 38px;
 }
 
 .toast-viewport {
@@ -541,7 +572,7 @@ body {
 }
 
 .toast-success {
-  border-left-color: var(--accent);
+  border-left-color: var(--success);
 }
 
 .toast-error {
@@ -1267,7 +1298,7 @@ body {
 }
 
 .latency.success {
-  color: var(--accent);
+  color: var(--success);
 }
 
 .latency.error {
@@ -1655,9 +1686,9 @@ body {
 }
 
 .log-collection-toggle.collecting {
-  color: var(--accent);
-  border-color: var(--accent-soft);
-  background: var(--accent-soft);
+  color: var(--success);
+  border-color: var(--success-soft);
+  background: var(--success-soft);
 }
 
 .log-collection-toggle.paused {
@@ -1961,6 +1992,7 @@ body {
   line-height: 1.45;
   text-overflow: ellipsis;
   white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .raw-entry {
@@ -2159,11 +2191,10 @@ body {
   margin-top: 14px;
   padding: 14px;
   color: var(--blue);
-  border: 1px solid var(--amber-soft);
+  border: 1px solid var(--blue-soft);
   border-radius: var(--radius-md);
   background: var(--blue-soft);
   font-size: 12px;
-  border-color: transparent;
 }
 
 .rule-override-notice > svg {
@@ -2302,15 +2333,29 @@ body {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* 关键：.glass-surface 的 backdrop-filter 既创建包含块又创建层叠上下文，
+   卡片内部再怎么抬高 z-index 也永远画在 .mobile-nav(50) 之下。所以打开
+   下拉时把承载卡片整体提到 60（:has 只在打开瞬间生效，关闭即恢复），
+   此后 backdrop 的 55 与菜单的 60 在卡片上下文内正常工作，遮罩也重新
+   能拦截底栏点击（点底栏区域先关闭下拉，符合标准下拉交互）。
+   显式四边 0 而非 inset 简写：包含块是卡片时覆盖整个卡片区域。 */
+.workspace-section:has(.rule-select-control.open) {
+  position: relative;
+  z-index: 60;
+}
+
 .rule-select-backdrop {
   position: fixed;
-  z-index: 40;
-  inset: 0;
+  z-index: 55;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
 }
 
 .rule-select-menu {
   position: absolute;
-  z-index: 43;
+  z-index: 60;
   top: calc(100% + 7px);
   right: 0;
   left: 0;
@@ -3035,6 +3080,11 @@ body {
   gap: 3px;
 }
 
+.update-release-head strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .update-release-head small {
   color: var(--text-faint);
   font-family: var(--f-mono);
@@ -3280,9 +3330,9 @@ body {
 
 .status-badge.online,
 .status-badge.ready {
-  color: var(--accent);
-  border-color: var(--accent-soft);
-  background: var(--accent-soft);
+  color: var(--success);
+  border-color: var(--success-soft);
+  background: var(--success-soft);
 }
 
 .status-badge.offline {
@@ -3722,6 +3772,130 @@ body {
   color: var(--amber);
 }
 
+/* 基类保留 amber 警告；info / error 换用对应语义色。 */
+.inline-note.info {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.inline-note.info svg {
+  color: var(--blue);
+}
+
+.inline-note.error {
+  color: var(--coral);
+  background: var(--coral-soft);
+}
+
+.inline-note.error svg {
+  color: var(--coral);
+}
+
+/* 带操作按钮的提示条：横排、可换行，按钮不被挤压换行。 */
+.inline-note.action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.inline-note.action .secondary-button.compact {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* Disabled quick toggle: dim the tile but keep the label legible. */
+.quick-toggle.disabled {
+  cursor: not-allowed;
+  opacity: 0.78;
+}
+
+.quick-toggle.disabled .quick-toggle-text strong {
+  color: var(--text);
+}
+
+.quick-toggle.disabled .quick-toggle-text small,
+.quick-toggle.disabled .quick-toggle-cost {
+  color: var(--text-soft);
+}
+
+/* 操作代价说明；active 底为 --accent-soft，改用次要色保持可读。 */
+.quick-toggle-cost {
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.quick-toggle.active .quick-toggle-cost {
+  color: var(--text-soft);
+}
+
+/* 贴合 .inline-note 的横向待重载提示条，按钮靠右。 */
+.pending-reload-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 10px 12px;
+  color: var(--amber);
+  border-radius: var(--radius-sm);
+  background: var(--amber-soft);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.pending-reload-banner svg {
+  flex: 0 0 16px;
+  color: var(--amber);
+}
+
+.pending-reload-banner button {
+  margin-left: auto;
+}
+
+.draft-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  color: var(--amber);
+  border-radius: 999px;
+  background: var(--amber-soft);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.field-hint {
+  margin-top: 6px;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.load-error-panel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px;
+  color: var(--coral);
+  border: 1px solid var(--coral);
+  border-radius: 8px;
+  background: var(--coral-soft);
+}
+
+.load-error-panel > strong {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.load-error-panel .secondary-button {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .segmented-control {
   display: grid;
   /* Let the buttons create their own equal tracks: a hard-coded 3-column
@@ -3754,6 +3928,21 @@ body {
   color: var(--accent-ink);
   background: var(--accent-strong);
   box-shadow: 0 3px 10px rgba(43, 37, 64, 0.1);
+}
+
+.segmented-control button:hover:not(:disabled):not(.active) {
+  color: var(--text);
+  background: var(--surface-soft);
+}
+
+.segmented-control button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.segmented-control button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
 }
 
 /* Full-width variant used by the routing-mode control in settings. */
@@ -3862,6 +4051,30 @@ body {
 .script-modal .script-editor {
   height: min(54vh, 560px);
   min-height: 320px;
+}
+
+/* .modal 的窄版：同一卡片表面，宽度收到 420px。 */
+.confirm-dialog {
+  width: min(420px, 100%);
+  max-width: 420px;
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  padding: 22px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-strong);
+}
+
+.confirm-dialog .confirm-copy {
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.confirm-dialog .confirm-target {
+  color: var(--text);
+  font-family: var(--f-mono);
+  font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
 .form-stack {
@@ -4604,6 +4817,7 @@ body {
   .log-message {
     grid-column: 1 / -1;
     grid-row: 3;
+    white-space: normal;
   }
 
   .raw-entry {
@@ -4615,6 +4829,60 @@ body {
     grid-row: 2;
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+
+  /* 以下规则原属第二份 @media (max-width:760px)，合并到此处避免重复断点。 */
+  .power-button.active {
+    box-shadow: 0 12px 28px var(--accent-glow);
+  }
+
+  .power-label {
+    display: inline;
+    font-family: var(--f-display);
+    font-size: 16px;
+    font-weight: 700;
+  }
+
+  .traffic-chart {
+    min-height: 52px;
+  }
+
+  .list-section > .section-heading,
+  .workspace-section > .workspace-toolbar {
+    padding: 14px 16px;
+  }
+
+  .node-row,
+  .subscription-row,
+  .rule-row,
+  .log-row {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .log-table-header {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .workspace-section > .log-controls {
+    padding: 12px 16px;
+  }
+
+  .workspace-section > .rules-toolbar {
+    padding: 0 16px 12px;
+  }
+
+  /* 只改上下边距：上面的 .settings-section 已把左右压到 14px，
+     padding 简写会把它覆盖回 18px。 */
+  .settings-section {
+    padding-top: 18px;
+    padding-bottom: 18px;
+  }
+
+  .mobile-nav .nav-item {
+    border-radius: 10px;
+    gap: 3px;
   }
 }
 
@@ -4683,7 +4951,7 @@ body {
 
   .modal {
     width: 100%;
-    max-height: calc(100vh - 12px);
+    max-height: calc(100dvh - 12px);
     padding: 19px 16px;
   }
 }
@@ -4740,54 +5008,3 @@ body {
   display: none;
 }
 
-@media (max-width: 760px) {
-  .power-button.active {
-    box-shadow: 0 12px 28px var(--accent-glow);
-  }
-
-  .power-label {
-    display: inline;
-    font-family: var(--f-display);
-    font-size: 16px;
-    font-weight: 700;
-  }
-
-  .traffic-chart {
-    min-height: 52px;
-  }
-
-  .list-section > .section-heading,
-  .workspace-section > .workspace-toolbar {
-    padding: 14px 16px;
-  }
-
-  .node-row,
-  .subscription-row,
-  .rule-row,
-  .log-row {
-    padding-right: 16px;
-    padding-left: 16px;
-  }
-
-  .log-table-header {
-    padding-right: 16px;
-    padding-left: 16px;
-  }
-
-  .workspace-section > .log-controls {
-    padding: 12px 16px;
-  }
-
-  .workspace-section > .rules-toolbar {
-    padding: 0 16px 12px;
-  }
-
-  .settings-section {
-    padding: 18px;
-  }
-
-  .mobile-nav .nav-item {
-    border-radius: 10px;
-    gap: 3px;
-  }
-}
