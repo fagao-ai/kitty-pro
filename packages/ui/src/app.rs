@@ -8724,6 +8724,51 @@ mod tests {
         assert!(css_rule(".log-follow-state").contains("min-height"));
     }
 
+    /// The power control is the only affordance for starting and stopping the
+    /// core, and it used to render the same accent fill and the same glow in both
+    /// states - on phones the two rules carried a byte-identical `box-shadow`, so
+    /// "lit" told you nothing. The stopped state has to stay neutral and only
+    /// `.active` may wear the accent, in every breakpoint that styles the button.
+    #[test]
+    fn power_button_only_lights_up_when_running() {
+        // Bodies exclude the selector line, so name the rule in the message.
+        let stopped = css_rules(".power-button");
+        let running = css_rules(".power-button.active");
+        assert_eq!(stopped.len(), 2, "base and phone rule");
+        assert_eq!(running.len(), 2, "base and phone rule");
+
+        for rule in &stopped {
+            assert!(
+                !rule.contains("var(--accent-strong)"),
+                ".power-button is the stopped state and must not wear the running fill: {rule}"
+            );
+        }
+        // Only the base rule sets the fill; the phone rule deliberately overrides
+        // the shadow alone and inherits it.
+        assert!(
+            running[0].contains("background: var(--accent-strong)"),
+            ".active has to carry the running fill"
+        );
+
+        // The bug was specifically the phone pair sharing one shadow.
+        let phone_shadow = |rules: &[&'static str]| -> Option<&'static str> {
+            rules[1]
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("box-shadow:"))
+                .map(|value| value.trim().trim_end_matches(';').trim())
+        };
+        assert_ne!(
+            phone_shadow(&stopped),
+            phone_shadow(&running),
+            "the phone rules need distinct shadows"
+        );
+        assert_eq!(
+            phone_shadow(&stopped),
+            Some("none"),
+            "the phone stopped state must not glow"
+        );
+    }
+
     /// The stylesheet as authored, so the line numbers in failures match the file
     /// on disk (`APP_CSS` prefixes it with the inlined fonts).
     const SHEET: &str = include_str!("../assets/styling/app.css");
@@ -8739,14 +8784,45 @@ mod tests {
 
     /// Body of the first rule whose selector appears at the start of a line.
     fn css_rule(selector: &str) -> &'static str {
+        css_rules(selector)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing CSS rule: {selector}"))
+    }
+
+    /// Every rule with this selector, in file order, so a media-query override
+    /// cannot hide behind the base rule.
+    ///
+    /// The body ends at the rule's own closing brace, matched by brace depth
+    /// rather than by hunting for a `\n}`: rules inside a `@media` block close on
+    /// an indented line, and a plain column-zero search there swallows every rule
+    /// that follows - a guard so wide it could only ever pass by luck.
+    fn css_rules(selector: &str) -> Vec<&'static str> {
         let needle = format!("{selector} {{");
-        let start = SHEET
-            .find(&needle)
-            .unwrap_or_else(|| panic!("missing CSS rule: {selector}"));
-        let body = &SHEET[start + needle.len()..];
-        let end = body
-            .find("\n}")
-            .unwrap_or_else(|| panic!("unterminated CSS rule: {selector}"));
-        &body[..end]
+        let mut rules = Vec::new();
+        let mut offset = 0;
+        while let Some(found) = SHEET[offset..].find(&needle) {
+            let start = offset + found + needle.len();
+            let mut depth = 1usize;
+            let mut cursor = start;
+            while cursor < SHEET.len() {
+                match SHEET.as_bytes()[cursor] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            assert!(depth == 0, "unterminated CSS rule: {selector}");
+            rules.push(&SHEET[start..cursor]);
+            offset = cursor;
+        }
+        assert!(!rules.is_empty(), "missing CSS rule: {selector}");
+        rules
     }
 }
