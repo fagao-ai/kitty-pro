@@ -229,6 +229,16 @@ pub(crate) fn save_native_profile(_profile: &AppProfile) -> Result<(), ServerFnE
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 pub(crate) fn profile_path() -> Result<std::path::PathBuf, ServerFnError> {
+    // E2E isolation: the Playwright suite runs the app against a locally
+    // served release build, and the app's debounced autosave POSTs whatever
+    // profile the browser holds. Without this override those stubbed writes
+    // landed in the same shared data directory the desktop app uses and
+    // clobbered the developer's real profile (2026-11-05). Run the test
+    // server with KITTY_PROFILE_DIR pointing at a scratch directory and no
+    // suite write can touch user-owned state.
+    if let Ok(dir) = std::env::var("KITTY_PROFILE_DIR") {
+        return Ok(std::path::PathBuf::from(dir).join("profile.json"));
+    }
     let directories = directories::ProjectDirs::from("com", "kitty", "kitty-pro")
         .ok_or_else(|| ServerFnError::new("无法确定本地配置目录"))?;
     Ok(directories.data_local_dir().join("profile.json"))

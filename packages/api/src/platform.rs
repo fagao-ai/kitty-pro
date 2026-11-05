@@ -226,6 +226,13 @@ pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFn
 /// next startup notices the leftover and clears the now-dangling proxy.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub(crate) fn system_proxy_sentinel_path() -> Result<std::path::PathBuf, ServerFnError> {
+    // Follow the profile directory override (see core.rs::profile_path): the
+    // overview page renders the sentinel's "system proxy enabled" state, so
+    // an isolated test server must not observe the developer machine's live
+    // system-proxy flag (it skewed the layout fold budget by 35px once).
+    if let Ok(dir) = std::env::var("KITTY_PROFILE_DIR") {
+        return Ok(std::path::PathBuf::from(dir).join("system-proxy.pending"));
+    }
     let directories = directories::ProjectDirs::from("com", "kitty", "kitty-pro")
         .ok_or_else(|| ServerFnError::new("无法确定本地配置目录"))?;
     Ok(directories.data_local_dir().join("system-proxy.pending"))

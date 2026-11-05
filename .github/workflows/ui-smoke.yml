@@ -109,7 +109,11 @@ jobs:
           cp "$stage/server" "$RUNNER_TEMP/kitty-web/kitty-pro-web-server"
           cp -R "$stage/public" "$RUNNER_TEMP/kitty-web/public"
           cd "$RUNNER_TEMP/kitty-web"
-          PORT=7897 ./kitty-pro-web-server --daemon --log-file ./web.log
+          # The app debounces a full-profile autosave; without an isolated
+          # data directory those stubbed writes would land in the machine's
+          # real Kitty Pro state (it clobbered a developer profile once).
+          mkdir -p "$RUNNER_TEMP/kitty-profile"
+          KITTY_PROFILE_DIR="$RUNNER_TEMP/kitty-profile" PORT=7897 ./kitty-pro-web-server --daemon --log-file ./web.log
           for attempt in $(seq 1 30); do
             if curl -fsS -o /dev/null http://127.0.0.1:7897/; then
               echo "web server is up"
