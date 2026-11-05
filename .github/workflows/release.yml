@@ -419,12 +419,20 @@ jobs:
       - name: Create desktop checksums
         shell: bash
         run: |
+          # macOS runners are the only ones without GNU sha256sum; the web
+          # job below already switches on this (v1.0.13: this step shipped
+          # without the branch and failed the macOS desktop job).
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            checksum() { shasum -a 256 "$1"; }
+          else
+            checksum() { sha256sum "$1"; }
+          fi
           find "dist/${{ matrix.id }}" -maxdepth 1 -type f \
               \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
             -print0 | while IFS= read -r -d '' artifact; do
               if [[ -f "$artifact.sha256" ]]; then continue; fi
               name="$(basename "$artifact")"
-              (cd "dist/${{ matrix.id }}" && sha256sum "$name" > "$name.sha256")
+              (cd "dist/${{ matrix.id }}" && checksum "$name" > "$name.sha256")
             done
           ls -la "dist/${{ matrix.id }}"
 
