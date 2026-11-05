@@ -984,8 +984,24 @@ fn validate_privileged_cache_path(cache: &Value) -> Result<(), CoreError> {
         "/private/tmp",
         "/private/var/tmp",
         "/dev/shm",
+        // Windows world-writable temp locations. Compared case-insensitively
+        // below: Windows paths are case-insensitive, and entries here are
+        // only ever matched in lowercase form.
+        "c:\\windows\\temp",
+        "c:\\temp",
     ];
-    if GLOBAL_WRITE_DIRS.contains(&normalized) {
+    let in_global_write_dir = if cfg!(windows) {
+        // "C:" (the trimmed form of "C:\") is the Windows analogue of "/" and
+        // is compared case-insensitively: Windows paths are case-insensitive.
+        let is_drive_root = normalized.len() == 2 && normalized.as_bytes()[1] == b':';
+        is_drive_root
+            || GLOBAL_WRITE_DIRS
+                .iter()
+                .any(|dir| normalized.eq_ignore_ascii_case(dir))
+    } else {
+        GLOBAL_WRITE_DIRS.contains(&normalized)
+    };
+    if in_global_write_dir {
         return Err(CoreError::InvalidConfig(
             "特权内核缓存文件不能位于 /、/tmp、/var/tmp 等全局可写目录".to_string(),
         ));
@@ -1577,13 +1593,20 @@ mod tests {
 
     #[test]
     fn privileged_config_rejects_cache_file_in_global_write_dir() {
+        // The blacklist holds per-platform world-writable directories, and
+        // Windows does not treat "/tmp/..." as absolute at all, so each
+        // platform has to probe with its own temp location.
+        #[cfg(windows)]
+        let evil_path = r"C:\Windows\Temp\evil-cache.db";
+        #[cfg(not(windows))]
+        let evil_path = "/tmp/evil-cache.db";
         let config = serde_json::json!({
             "experimental": {
-                "cache_file": { "enabled": true, "path": "/tmp/evil-cache.db" }
+                "cache_file": { "enabled": true, "path": evil_path }
             }
         });
         let error = validate_privileged_start_config(&config)
-            .expect_err("cache file in /tmp must be rejected");
+            .expect_err("cache file in the system temp directory must be rejected");
         assert!(matches!(error, CoreError::InvalidConfig(ref message)
             if message.contains("全局可写目录")));
     }
