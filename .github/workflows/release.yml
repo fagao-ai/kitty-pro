@@ -652,16 +652,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          # The notes fallback groups commits since the previous tag, which
+          # needs real tags in the clone; the default depth-1 checkout has
+          # none.
+          fetch-depth: 0
+
       - name: Download build artifacts
         uses: actions/download-artifact@v6
         with:
           path: release-assets
           merge-multiple: true
 
+      - name: Build release notes
+        shell: bash
+        run: ./scripts/build-release-notes.sh --out release-body.md "$GITHUB_REF_NAME"
+
       - name: Publish tagged release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release-body.md
           fail_on_unmatched_files: true
           files: |
             release-assets/**/*.dmg
