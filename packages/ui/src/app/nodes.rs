@@ -35,50 +35,101 @@ pub(crate) fn NodesView(
     mut import_open: Signal<bool>,
 ) -> Element {
     let toast = use_context::<ToastManager>();
-    let needle = search().trim().to_ascii_lowercase();
-    let latency_snapshot = latency_results();
-    // The design lists every proxy group as its own section instead of a
-    // master/detail split, so one scroll shows the whole selector tree.
-    let groups_with_members = groups
-        .iter()
-        .map(|group| {
-            let mut members = proxy_group_members(group, &groups, &nodes, &needle);
-            sort_proxy_group_members(&mut members, &latency_snapshot);
-            let selected = group_selections()
-                .get(&group.tag)
-                .filter(|selected| group.outbounds.iter().any(|item| item == *selected))
-                .cloned()
-                .unwrap_or_else(|| group.selected.clone());
-            (group.clone(), members, selected)
-        })
-        .filter(|(_, members, _)| !members.is_empty())
-        .collect::<Vec<_>>();
-    let listed_member_count = groups_with_members
-        .iter()
-        .map(|(_, members, _)| members.len())
-        .sum::<usize>();
-    // Count only nodes that exist in the current subscription: after a
-    // switch the map still holds the previous provider's results, and the old
-    // count claimed "已测速 30 个节点" above a list of `-- ms` rows.
-    let listed_tags: HashMap<&str, ()> = nodes.iter().map(|node| (node.tag.as_str(), ())).collect();
-    let tested_count = latency_snapshot
-        .iter()
-        .filter(|(tag, result)| {
-            result.latency_ms.is_some() && listed_tags.contains_key(tag.as_str())
-        })
-        .count();
-    let focus = node_focus_details(
-        &groups,
-        &nodes,
-        &subscriptions,
-        &selected_tag(),
-        &latency_snapshot,
-    );
+    // U11: share the big, rarely-changing tables through Rc handles. The old
+    // code cloned the whole `nodes` Vec once per member row (O(n²)); memos and
+    // rows now take a cheap Rc clone instead of a full copy.
+    let groups = Rc::new(groups);
+    let nodes = Rc::new(nodes);
+    let subscriptions = Rc::new(subscriptions);
+    let proxy_server_nameservers = Rc::new(proxy_server_nameservers);
+    // F20: cancellation flag for the latency poll loop.
+    let mut latency_cancel = use_signal(|| false);
+    // Dedicated cheap handles for the refresh click handler: a `move` event
+    // closure must not steal the Rc tables the rest of the RSX still needs.
+    // The owned Vec copies are taken on click, not on every render.
+    let refresh_nodes = nodes.clone();
+    let refresh_nameservers = proxy_server_nameservers.clone();
+
+    // The body still needs to know whether the search box is empty (for the
+    // empty-state copy). The memos below re-read the signals themselves so
+    // they stay tracked dependencies and only recompute on a real input change.
+    let needle_empty = search().trim().is_empty();
+
+    // U10: one memo for the whole group/member derivation. It tracks search(),
+    // group_selections() and latency_results(), so an unrelated re-render
+    // (e.g. the 1 Hz traffic tick) reuses the cached tree instead of doing the
+    // per-outbound linear finds again.
+    let groups_for_memo = groups.clone();
+    let nodes_for_memo = nodes.clone();
+    let groups_with_members = use_memo(move || {
+        let needle = search().trim().to_ascii_lowercase();
+        let latency_snapshot = latency_results();
+        let selections = group_selections();
+        groups_for_memo
+            .iter()
+            .map(|group| {
+                let mut members =
+                    proxy_group_members(group, &groups_for_memo, &nodes_for_memo, &needle);
+                sort_proxy_group_members(&mut members, &latency_snapshot);
+                let selected = selections
+                    .get(&group.tag)
+                    .filter(|selected| group.outbounds.iter().any(|item| item == *selected))
+                    .cloned()
+                    .unwrap_or_else(|| group.selected.clone());
+                (group.clone(), members, selected)
+            })
+            .filter(|(_, members, _)| !members.is_empty())
+            .collect::<Vec<_>>()
+    });
+
+    // U10: the two counters derive from the memo above plus the latency map.
+    let nodes_for_stats = nodes.clone();
+    let node_stats = use_memo(move || {
+        let latency_snapshot = latency_results();
+        let listed_member_count = groups_with_members
+            .read()
+            .iter()
+            .map(|(_, members, _)| members.len())
+            .sum::<usize>();
+        // Count only nodes that exist in the current subscription: after a
+        // switch the map still holds the previous provider's results, and the
+        // old count claimed "已测速 30 个节点" above a list of `-- ms` rows.
+        let listed_tags: HashMap<&str, ()> = nodes_for_stats
+            .iter()
+            .map(|node| (node.tag.as_str(), ()))
+            .collect();
+        let tested_count = latency_snapshot
+            .iter()
+            .filter(|(tag, result)| {
+                result.latency_ms.is_some() && listed_tags.contains_key(tag.as_str())
+            })
+            .count();
+        (listed_member_count, tested_count)
+    });
+
+    // U10: the focus card resolves several linear finds; memoize it too.
+    let groups_for_focus = groups.clone();
+    let nodes_for_focus = nodes.clone();
+    let subs_for_focus = subscriptions.clone();
+    let focus = use_memo(move || {
+        node_focus_details(
+            &groups_for_focus,
+            &nodes_for_focus,
+            &subs_for_focus,
+            &selected_tag(),
+            &latency_results(),
+        )
+    });
+
+    // Read once into plain values for the RSX below.
+    let (listed_member_count, tested_count) = node_stats();
+    let focus = focus();
+    let groups_with_members = groups_with_members();
 
     rsx! {
         section { class: "workspace-section glass-surface",
             if all_count == 0 {
-                div { class: "large-empty",
+                div { class: "large-empty", role: "status",
                     EmptyNodes {}
                     button {
                         class: "primary-button",
@@ -88,18 +139,18 @@ pub(crate) fn NodesView(
                     }
                 }
             } else if groups_loading {
-                div { class: "large-empty",
-                    span { class: "spinner large" }
+                div { class: "large-empty", role: "status",
+                    span { class: "spinner large", aria_hidden: "true" }
                     strong { "正在生成代理组" }
                 }
             } else if let Some(error) = groups_error {
-                div { class: "large-empty",
+                div { class: "large-empty", role: "alert",
                     Icon { icon: LdCircleAlert, width: 28, height: 28 }
                     strong { "代理组生成失败" }
                     p { "{error}" }
                 }
             } else if groups.is_empty() {
-                div { class: "large-empty",
+                div { class: "large-empty", role: "status",
                     Icon { icon: LdRoute, width: 28, height: 28 }
                     strong { "配置中没有代理组" }
                 }
@@ -109,6 +160,7 @@ pub(crate) fn NodesView(
                         Icon { icon: LdSearch, width: 17, height: 17 }
                         input {
                             value: search,
+                            aria_label: "搜索节点、地址或协议",
                             placeholder: "搜索节点、地址或协议",
                             oninput: move |event| search.set(event.value()),
                         }
@@ -116,14 +168,23 @@ pub(crate) fn NodesView(
                                     button {
                                         class: "secondary-button compact",
                                         title: if latency_busy() { "正在刷新延迟" } else { "刷新延迟" },
+                                        aria_label: "刷新节点延迟",
+                                        aria_busy: latency_busy(),
                                         disabled: latency_busy() || nodes.is_empty(),
                                         onclick: move |_| {
-                                            let probe_nodes = nodes.clone();
-                                            let cache_nodes = nodes.clone();
+                                            // U9: arm synchronously, before the
+                                            // spawn, so a double click cannot
+                                            // start two overlapping sessions.
+                                            if *latency_busy.peek() {
+                                                return;
+                                            }
+                                            latency_busy.set(true);
+                                            latency_cancel.set(false);
+                                            let probe_nodes = (*refresh_nodes).clone();
+                                            let cache_nodes = (*refresh_nodes).clone();
                                             let proxy_server_nameservers =
-                                                proxy_server_nameservers.clone();
-                                            async move {
-                                                latency_busy.set(true);
+                                                (*refresh_nameservers).clone();
+                                            spawn(async move {
                                                 let mut failures = 0;
                                                 let session_id = match api::start_node_latency(
                                                     probe_nodes,
@@ -136,7 +197,18 @@ pub(crate) fn NodesView(
                                                         return;
                                                     }
                                                 };
+                                                // F20: bound the poll by ~60s
+                                                // (600 × the 100ms tick) and
+                                                // stop early on user cancel.
+                                                const MAX_LATENCY_POLLS: usize = 600;
+                                                let mut polls = 0usize;
+                                                let mut cancelled = false;
+                                                let mut timed_out = false;
                                                 let completed = loop {
+                                                    if *latency_cancel.peek() {
+                                                        cancelled = true;
+                                                        break 0;
+                                                    }
                                                     match api::poll_node_latency(session_id).await {
                                                         Ok(snapshot) => {
                                                             failures += snapshot
@@ -172,9 +244,18 @@ pub(crate) fn NodesView(
                                                             return;
                                                         }
                                                     }
+                                                    polls += 1;
+                                                    if polls >= MAX_LATENCY_POLLS {
+                                                        timed_out = true;
+                                                        break 0;
+                                                    }
                                                     wait_for_latency_poll().await;
                                                 };
-                                                if failures == 0 {
+                                                if cancelled {
+                                                    toast.info("已停止测速，保留已返回的结果");
+                                                } else if timed_out {
+                                                    toast.info("测速超时，已保留已返回的结果");
+                                                } else if failures == 0 {
                                                     toast.success(format!("已完成 {completed} 个节点测速"));
                                                 } else {
                                                     toast.info(format!(
@@ -185,14 +266,26 @@ pub(crate) fn NodesView(
                                                 persist_latency_cache(&cache_nodes, &latency_snapshot)
                                                     .await;
                                                 latency_busy.set(false);
-                                            }
+                                            });
                                         },
                                         if latency_busy() {
-                                            span { class: "spinner" }
+                                            span { class: "spinner", aria_hidden: "true" }
                                         } else {
                                             Icon { icon: LdRefreshCw, width: 16, height: 16 }
                                         }
                                         span { class: "nodes-refresh-label", "刷新延迟" }
+                                    }
+                                    // F20: an explicit stop control; the loop
+                                    // above polls `latency_cancel` each tick.
+                                    if latency_busy() {
+                                        button {
+                                            class: "secondary-button compact",
+                                            title: "停止测速",
+                                            aria_label: "停止测速",
+                                            onclick: move |_| latency_cancel.set(true),
+                                            Icon { icon: LdX, width: 16, height: 16 }
+                                            span { class: "nodes-refresh-label", "停止测速" }
+                                        }
                                     }
                     div { class: "nodes-toolbar-meta",
                         span { class: "nodes-toolbar-count",
@@ -208,14 +301,15 @@ pub(crate) fn NodesView(
                     }
                 }
                 if groups_with_members.is_empty() {
-                    div { class: "large-empty group-empty",
+                    div { class: "large-empty group-empty", role: "status",
                         Icon { icon: LdSearch, width: 28, height: 28 }
                         strong {
-                            if needle.is_empty() { "配置中没有代理组" } else { "没有匹配的节点" }
+                            if needle_empty { "配置中没有代理组" } else { "没有匹配的节点" }
                         }
                         p {
-                            if needle.is_empty() {
-                                "这份订阅没有可展示的代理分组。回到订阅页刷新一次；若仍为空，说明来源不含 selector/urltest 分组，请直接使用「切换节点」或检查来源格式。"
+                            // F17: no internal "selector/urltest" jargon.
+                            if needle_empty {
+                                "该订阅没有分组信息，可直接在下方选择节点"
                             } else {
                                 "换个关键词试试，节点名、地址和协议都可以搜索。"
                             }
@@ -232,6 +326,7 @@ pub(crate) fn NodesView(
                                         } else {
                                             "group-kind-mark"
                                         },
+                                        aria_hidden: "true",
                                         if group.kind == ProxyGroupKind::UrlTest {
                                             Icon { icon: LdGauge, width: 17, height: 17 }
                                         } else {
@@ -256,6 +351,7 @@ pub(crate) fn NodesView(
                                 div { class: "node-list proxy-member-list",
                                     for member in members {
                                         ProxyGroupMemberRow {
+                                            key: "{member.tag}",
                                             group_tag: group.tag.clone(),
                                             group_kind: group.kind,
                                             member,
@@ -318,6 +414,14 @@ pub(crate) fn NodesView(
                                   code { "{focus.source}" }
                               }
                           }
+                          // F20: a selected node whose last probe failed is
+                          // still selectable, but must say so out loud.
+                          if focus.status_class == "failed" {
+                              div { class: "inline-note info", role: "status", style: "color: #e5484d",
+                                  Icon { icon: LdCircleAlert, width: 15, height: 15 }
+                                  span { "该节点最近一次探测失败，可能无法连接；建议重新测速或改选其它节点。" }
+                              }
+                          }
                       }
                   }
                 }
@@ -355,6 +459,11 @@ pub(crate) fn node_focus_details(
         .find(|group| group.outbounds.iter().any(|tag| tag == selected_tag))
         .map(|group| format!("{} · {}", group.tag, proxy_group_kind_label(group.kind)))
         .unwrap_or_else(|| "未归组".to_string());
+    // Q1：focus.source 是「展示用」字段，必须经 source_label 脱敏后再进 RSX
+    // （nodes.rs 中 `code { "{focus.source}" }` 会把它写进 DOM）。source_label
+    // 只保留 scheme+host，去掉 userinfo 与 query/fragment/path，因此含 token /
+    // 密码的完整订阅 URL 不会泄露给用户。这里只替换展示值；传给内核 / 下载 /
+    // 解析器的真实 subscription.source 原样保留，不受影响。
     let source = subscriptions
         .iter()
         // Stored nodes are already namespaced by `apply_subscription_report`, so
@@ -444,8 +553,9 @@ pub(crate) fn ProxyGroupMemberRow(
     core_version: Signal<Option<String>>,
     core_note: Signal<Option<String>>,
     system_proxy: Signal<SystemProxyLoadState>,
-    nodes: Vec<ProxyNode>,
-    proxy_server_nameservers: Vec<String>,
+    // U11: shared Rc tables instead of a full Vec clone for every member row.
+    nodes: Rc<Vec<ProxyNode>>,
+    proxy_server_nameservers: Rc<Vec<String>>,
     mut selected_tag: Signal<String>,
     tunnel_mode: Signal<TunnelMode>,
     tun_enabled: Signal<bool>,
@@ -489,8 +599,10 @@ pub(crate) fn ProxyGroupMemberRow(
             onclick: move |_| {
                 let group = target_group.clone();
                 let outbound = member_tag.clone();
-                let nodes = nodes.clone();
-                let proxy_server_nameservers = proxy_server_nameservers.clone();
+                // Take owned Vecs only on click; the Rc handles stay out of the
+                // async task (which must not carry a non-Send Rc).
+                let nodes = (*nodes).clone();
+                let proxy_server_nameservers = (*proxy_server_nameservers).clone();
                 let blocked = core_busy()
                     || core_restarting()
                     || system_proxy_busy()
@@ -576,6 +688,7 @@ pub(crate) fn ProxyGroupMemberRow(
                 }
             } else {
                 span { class: if member.nested_kind == Some(ProxyGroupKind::UrlTest) { "group-kind-mark auto" } else { "group-kind-mark" },
+                    aria_hidden: "true",
                     if member.tag == "direct" {
                         Icon { icon: LdWifi, width: 17, height: 17 }
                     } else if member.tag == "block" {
@@ -594,11 +707,11 @@ pub(crate) fn ProxyGroupMemberRow(
                 span { class: "latency pending", "" }
             }
             if is_selected {
-                span { class: "selected-check", Icon { icon: LdCircleCheck, width: 19, height: 19 } }
+                span { class: "selected-check", aria_hidden: "true", Icon { icon: LdCircleCheck, width: 19, height: 19 } }
             } else if selectable {
-                span { class: "row-chevron", Icon { icon: LdChevronRight, width: 18, height: 18 } }
+                span { class: "row-chevron", aria_hidden: "true", Icon { icon: LdChevronRight, width: 18, height: 18 } }
             } else {
-                span { class: "auto-indicator", Icon { icon: LdGauge, width: 17, height: 17 } }
+                span { class: "auto-indicator", aria_hidden: "true", Icon { icon: LdGauge, width: 17, height: 17 } }
             }
         }
     }
@@ -657,9 +770,9 @@ pub(crate) fn NodeRow(
                 latency_title,
             }
             if selected {
-                span { class: "selected-check", Icon { icon: LdCircleCheck, width: 19, height: 19 } }
+                span { class: "selected-check", aria_hidden: "true", Icon { icon: LdCircleCheck, width: 19, height: 19 } }
             } else {
-                span { class: "row-chevron", Icon { icon: LdChevronRight, width: 18, height: 18 } }
+                span { class: "row-chevron", aria_hidden: "true", Icon { icon: LdChevronRight, width: 18, height: 18 } }
             }
         }
     }
@@ -675,10 +788,21 @@ pub(crate) fn LatencyCell(
     latency_title: String,
 ) -> Element {
     let (fill, tone) = latency_meter(result.as_ref());
+    // F20: flag probes that came back with no measurement at all.
+    let probe_failed = result
+        .as_ref()
+        .is_some_and(|entry| entry.latency_ms.is_none());
     rsx! {
         span { class: "latency-cell", title: latency_title,
             span { class: "latency-meter", aria_hidden: "true",
                 span { class: "latency-meter-fill {tone}", style: "width: {fill}%" }
+            }
+            if probe_failed {
+                // Existing class + inline style (no new CSS class). The mark is
+                // decorative: the "失败" label and the tooltip already name it.
+                span { class: "latency error", style: "color: #e5484d",
+                    aria_hidden: "true", title: "该节点探测失败", "⚠"
+                }
             }
             span { class: latency_class, "{latency_label}" }
         }
@@ -689,11 +813,69 @@ pub(crate) fn LatencyCell(
 pub(crate) fn EmptyNodes() -> Element {
     rsx! {
         div { class: "empty-state",
-            span { class: "empty-icon", Icon { icon: LdGlobe, width: 26, height: 26 } }
+            span { class: "empty-icon", aria_hidden: "true", Icon { icon: LdGlobe, width: 26, height: 26 } }
             div {
                 strong { "还没有节点" }
                 p { "添加订阅后会显示在这里" }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_source_never_leaks_subscription_credentials() {
+        // Q1：展示用脱敏函数必须去掉 userinfo / query / fragment，只保留
+        // scheme+host，不能把含 token / 密码的完整订阅 URL 写进 DOM。
+        let sensitive = "https://user:s3cr3t@sub.example.com/path?token=TOKEN123&x=1#frag";
+        let label = source_label(sensitive);
+        assert_eq!(label, "https://sub.example.com");
+        assert!(!label.contains("s3cr3t"));
+        assert!(!label.contains("TOKEN123"));
+        assert!(!label.contains("user:"));
+        assert!(!label.contains("token"));
+    }
+
+    #[test]
+    fn node_focus_details_source_is_redacted_before_render() {
+        // 端到端：node_focus_details 产出的 source 字段（即 RSX 渲染的
+        // "{focus.source}"）不含订阅 URL 里的凭据；真实 subscription.source
+        // 保持原样，仍可用于下载 / 刷新。
+        let parsed =
+            proxy_core::parse_subscription("trojan://password@edge.example.com:443#Edge").nodes;
+        let node = parsed[0].clone();
+        let secret_url = "https://alice:p%40ss@sub.example.com/sub?token=SECRET99";
+        let subscriptions = vec![Subscription {
+            id: 1,
+            name: "Primary".to_string(),
+            source: secret_url.to_string(),
+            nodes: vec![node.clone()],
+            proxy_server_nameservers: Vec::new(),
+            rejected_count: 0,
+        }];
+        let groups = vec![ProxyGroup {
+            tag: "proxy".to_string(),
+            kind: ProxyGroupKind::Selector,
+            outbounds: vec![node.tag.clone()],
+            selected: node.tag.clone(),
+        }];
+        let focus = node_focus_details(
+            &groups,
+            &subscriptions[0].nodes,
+            &subscriptions,
+            &node.tag,
+            &HashMap::new(),
+        )
+        .expect("focused node should resolve");
+
+        assert_eq!(focus.source, "https://sub.example.com");
+        assert!(!focus.source.contains("SECRET99"));
+        assert!(!focus.source.contains("alice"));
+        assert!(!focus.source.contains("token"));
+        // 真实值未被展示函数改写。
+        assert_eq!(subscriptions[0].source, secret_url);
     }
 }

@@ -1,6 +1,14 @@
 //! Part of the `app` module (split from the original monolithic `app.rs`).
 
 use super::*;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// U21: monotone generation for update checks. `UpdateMonitor` is built with a
+/// struct literal in `ProxyApp` (a file outside this fix's scope), so a new
+/// signal field cannot be added there. A process-wide counter shared by every
+/// `refresh` call gives the same guarantee: only the newest request may write
+/// its answer back. There is exactly one monitor per app run.
+static UPDATE_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum UpdateAction {
@@ -97,14 +105,26 @@ impl UpdateMonitor {
     }
 
     /// Ask the server for an answer. `force` ignores the daily throttle.
+    ///
+    /// U21: every call takes a fresh generation id. A slow launch check (A)
+    /// that returns after a faster manual check (B) started is stale and must
+    /// not overwrite B's `status`/`error`, fire its toast, or clear `busy`
+    /// while B is still running. Only the newest generation may write back.
     pub(crate) async fn refresh(mut self, force: bool, toast: ToastManager, announce: bool) {
         self.busy.set(Some(UpdateAction::Check));
+        let request_id = UPDATE_REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
         let request = api::update::AppUpdateRequest {
             platform: self.platform_text(),
             current_version: self.version_text(),
             force,
         };
-        match api::update::check_app_update(request).await {
+        let answer = api::update::check_app_update(request).await;
+        // Superseded: discard the whole result (answer, error, toast and busy
+        // clearing) so the newer request owns the final state.
+        if request_id != UPDATE_REQUEST_ID.load(Ordering::SeqCst) {
+            return;
+        }
+        match answer {
             Ok(answer) => {
                 let release = answer.latest.clone();
                 let available =
@@ -253,13 +273,11 @@ pub(crate) fn UpdateSettings() -> Element {
                         )}
                     }
                 }
-                input {
-                    r#type: "checkbox",
-                    aria_label: "自动检查更新",
+                Switch {
                     checked: settings.auto_check,
+                    label: "自动检查更新".to_string(),
                     disabled: !monitor.is_idle(),
-                    onchange: move |event| {
-                        let enabled = event.checked();
+                    onchange: move |enabled| {
                         spawn(async move {
                             monitor.busy.set(Some(UpdateAction::Toggle));
                             let mut next = monitor.settings();
@@ -283,7 +301,6 @@ pub(crate) fn UpdateSettings() -> Element {
                         });
                     },
                 }
-                span { class: "switch" }
             }
 
             if state == api::update::AppUpdateState::Unsupported {
@@ -359,6 +376,7 @@ pub(crate) fn UpdateSettings() -> Element {
                 button {
                     class: "secondary-button compact",
                     disabled: !monitor.is_idle() || !monitor.has_loaded(),
+                    aria_busy: monitor.is_checking(),
                     onclick: move |_| {
                         spawn(async move {
                             // A manual check answers whatever it finds, including

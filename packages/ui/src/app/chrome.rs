@@ -297,3 +297,17 @@ pub(crate) fn NavItem(
         }
     }
 }
+
+/// F22：侧栏导航分组容器。把 6 个平铺导航项按真实 `AppView` 分成
+/// 「连接 / 配置 / 运维」三组，每组带一个中文 eyebrow 标题。窄屏 tabbar
+/// 仍平铺、不分组。组内仍是原有 `NavItem`，`onclick` / `active_view` 判定、
+/// 计数徽章与更新提示点全部不变，只在外层增加分组 DOM 与标题文案。
+#[component]
+pub(crate) fn NavGroup(title: String, children: Element) -> Element {
+    rsx! {
+        div { class: "nav-group",
+            p { class: "eyebrow nav-group-label", "{title}" }
+            {children}
+        }
+    }
+}

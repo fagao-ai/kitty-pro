@@ -21,6 +21,13 @@ pub(crate) fn SystemProxyToggle(
         loading: proxy_loading,
         busy: _,
     } = proxy;
+    // F21: a disabled toggle needs a visible reason, not just a greyed switch.
+    let proxy_small =
+        if !proxy_enabled && !core_running && proxy_ready && proxy_supported && !core_action_busy {
+            "先启动代理，才能开启系统代理"
+        } else {
+            proxy_label
+        };
 
     rsx! {
         label {
@@ -28,26 +35,28 @@ pub(crate) fn SystemProxyToggle(
             title: "{proxy_detail}",
             div {
                 strong { "系统代理" }
-                small { "{proxy_label}" }
+                small { "{proxy_small}" }
             }
             if proxy_loading || proxy_busy {
                 span {
                     class: if proxy_enabled { "switch switch-loading active" } else { "switch switch-loading" },
+                    role: "status",
                     aria_busy: "true",
                     aria_label: if proxy_busy { "正在设置系统代理" } else { "正在读取系统代理状态" },
                     span { class: "spinner" }
                 }
             } else {
-                input {
-                    r#type: "checkbox",
-                    aria_label: "系统代理",
+                Switch {
                     checked: proxy_enabled,
+                    label: "系统代理".to_string(),
                     disabled: core_action_busy
                         || !proxy_ready
                         || !proxy_supported
                         || (!proxy_enabled && !core_running),
-                    onchange: move |event| {
-                        let enabled = event.checked();
+                    // F21: keep the visible disabled reason available to
+                    // assistive tech through the shared status region.
+                    hint: Some(proxy_small.to_string()),
+                    onchange: move |enabled| {
                         let blocked = core_action_busy || system_proxy_busy();
                         if !blocked {
                             system_proxy_busy.set(true);
@@ -83,7 +92,6 @@ pub(crate) fn SystemProxyToggle(
                         }
                     },
                 }
-                span { class: "switch" }
             }
         }
     }
@@ -128,6 +136,10 @@ pub(crate) fn system_proxy_view(state: SystemProxyLoadState, busy: bool) -> Syst
         } else {
             "正在应用到系统网络服务".to_string()
         }
+    } else if cfg!(target_os = "android") {
+        // F16: Android's VpnService owns all traffic; the backend's
+        // "not implemented" detail would read as a broken feature.
+        "Android 由 VPN 接管，无需系统代理".to_string()
     } else {
         status
             .as_ref()
@@ -167,10 +179,17 @@ pub(crate) fn QuickToggle(
     disabled_reason: String,
     on_toggle: EventHandler<bool>,
 ) -> Element {
+    let reason_shown = disabled && !busy && !disabled_reason.is_empty();
+    let shown_hint = if reason_shown {
+        disabled_reason.clone()
+    } else {
+        hint.clone()
+    };
     let control = if busy {
         rsx! {
             span {
                 class: if checked { "switch switch-loading active" } else { "switch switch-loading" },
+                role: "status",
                 aria_busy: "true",
                 aria_label: "{title}",
                 span { class: "spinner" }
@@ -178,21 +197,16 @@ pub(crate) fn QuickToggle(
         }
     } else {
         rsx! {
-            input {
-                r#type: "checkbox",
-                aria_label: "{title}",
-                checked,
-                disabled,
-                onchange: move |event| on_toggle.call(event.checked()),
+            Switch {
+                checked: checked,
+                label: title.clone(),
+                disabled: disabled,
+                // The disabled reason / hint is announced through the shared
+                // status region instead of living only in the tooltip.
+                hint: Some(shown_hint.clone()),
+                onchange: move |enabled| on_toggle.call(enabled),
             }
-            span { class: "switch" }
         }
-    };
-    let reason_shown = disabled && !busy && !disabled_reason.is_empty();
-    let shown_hint = if reason_shown {
-        disabled_reason.clone()
-    } else {
-        hint.clone()
     };
     rsx! {
         label {
@@ -403,7 +417,11 @@ pub(crate) fn OverviewQuickToggles(
                     disabled_reason: if busy {
                         "其它网络操作正在进行".to_string()
                     } else if !proxy.supported {
-                        "当前平台不支持系统代理".to_string()
+                        if cfg!(target_os = "android") {
+                            "Android 由 VPN 接管，无需系统代理".to_string()
+                        } else {
+                            "当前平台不支持系统代理".to_string()
+                        }
                     } else if !proxy.ready {
                         "系统代理状态读取中或不可用".to_string()
                     } else if !proxy.enabled && !core_running {

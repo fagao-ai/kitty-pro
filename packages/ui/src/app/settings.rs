@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// F1/F2/F14: apply a local config edit through the single
+/// "config pending -> reconnect" channel. A running core keeps serving the
+/// old config until a restart, so flag the edit instead of letting the UI
+/// claim the new value is already live. Returns whether the flag was set, so
+/// callers can show a plain "saved" toast when nothing is pending.
+pub(crate) fn flag_config_pending(
+    connected: bool,
+    mut pending: Signal<bool>,
+    toast: ToastManager,
+    message: &str,
+) -> bool {
+    if connected {
+        pending.set(true);
+        toast.info(message);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(all(
     feature = "native-desktop",
     any(target_os = "macos", target_os = "windows", target_os = "linux")
@@ -51,15 +71,12 @@ pub(crate) fn DesktopAutostartSettings() -> Element {
                     strong { "用户登录时启动" }
                     small { "仅启动 Kitty Pro，不自动连接代理或开启 TUN；默认关闭" }
                 }
-                input {
-                    r#type: "checkbox",
-                    aria_label: "用户登录时启动 Kitty Pro",
+                Switch {
                     checked: enabled(),
+                    label: "用户登录时启动 Kitty Pro".to_string(),
                     disabled: busy() || !ready(),
-                    onclick: move |event| {
-                        event.prevent_default();
+                    onchange: move |target| {
                         if busy() || !ready() { return; }
-                        let target = !enabled();
                         busy.set(true);
                         error.set(None);
                         spawn(async move {
@@ -82,10 +99,9 @@ pub(crate) fn DesktopAutostartSettings() -> Element {
                         });
                     },
                 }
-                span { class: "switch" }
             }
             if busy() {
-                div { class: "inline-note", aria_busy: "true",
+                div { class: "inline-note", role: "status", aria_busy: "true",
                     span { class: "spinner" }
                     span { "正在读取或更新系统启动项…" }
                 }
@@ -99,6 +115,7 @@ pub(crate) fn DesktopAutostartSettings() -> Element {
                     button {
                         class: "secondary-button compact",
                         disabled: busy(),
+                        aria_busy: busy(),
                         onclick: move |_| {
                             if busy() { return; }
                             busy.set(true);
@@ -198,6 +215,7 @@ pub(crate) fn SettingsView(
     let mut script_draft = use_signal(String::new);
     let mut copy_busy = use_signal(|| false);
     let mut copy_env_busy = use_signal(|| false);
+    let mut core_recheck_busy = use_signal(|| false);
     let toast = use_context::<ToastManager>();
     // Provided by ProxyApp; cleared centrally when a restart applies the config.
     let config_pending = use_context::<ConfigPending>().0;
@@ -205,11 +223,112 @@ pub(crate) fn SettingsView(
     let allow_lan_proxy_server_nameservers = proxy_server_nameservers.clone();
     let script_proxy_server_nameservers = proxy_server_nameservers;
     let autostart_settings = desktop_autostart_settings();
+    let core_unavailable = !matches!(core_state().as_str(), "running" | "stopped" | "checking");
+    let tun_busy_flags =
+        core_busy() || core_restarting() || system_proxy_busy() || runtime_action_busy();
+    let tun_disabled = tun_busy_flags || nodes().is_empty();
+    let tun_disabled_reason = quick_toggle_disabled_reason(tun_busy_flags, nodes().len());
+    // A wasm build is always the browser control plane; on native builds the
+    // server may still report the "Web Control" platform string.
+    let is_web_control = if cfg!(target_arch = "wasm32") {
+        true
+    } else {
+        platform == "Web Control"
+    };
+
+    // F22: filter the long settings page in place. Each major section carries
+    // a Chinese keyword string; it stays visible on an empty query or a
+    // substring hit. Only the outermost section is gated, so no DOM inside a
+    // card is reordered. Latin words are lowercased on both sides so "TUN" and
+    // "tun" both match.
+    let mut settings_search = use_signal(String::new);
+    let keyword = settings_search().trim().to_lowercase();
+    let scope_keys =
+        "连接作用域 作用域 浏览器 控制 服务器 主机 平台 scope web control tun 系统代理";
+    let core_keys = "内核 sing-box 版本 状态 javascript 配置覆写 脚本 quickjs 诊断 平台 core";
+    let routing_keys =
+        "路由模式 分流 规则模式 全局代理 全局直连 tun 局域网 允许局域网 系统代理 网络 routing";
+    let sync_keys = "同步 订阅 云同步 webdav s3 拉取 上传 覆盖 快照 配置 sync 存储";
+    let update_keys = "更新 升级 版本 检查 下载 发布 关于 update 自动检查";
+    let appearance_keys = "外观 深色 浅色 主题 语言 配色 appearance 简体中文";
+    let about_keys = "关于 诊断 内核状态 节点 订阅 规则 dns 复制 about 版本";
+    let autostart_keys = "自动启动 开机 启动 登录 桌面 autostart";
+    let show_scope =
+        is_web_control && (keyword.is_empty() || scope_keys.contains(keyword.as_str()));
+    let show_core = keyword.is_empty() || core_keys.contains(keyword.as_str());
+    let show_routing = keyword.is_empty() || routing_keys.contains(keyword.as_str());
+    let show_sync = keyword.is_empty() || sync_keys.contains(keyword.as_str());
+    let show_updates = keyword.is_empty() || update_keys.contains(keyword.as_str());
+    let show_appearance = keyword.is_empty() || appearance_keys.contains(keyword.as_str());
+    let show_about = keyword.is_empty() || about_keys.contains(keyword.as_str());
+    // The desktop autostart card is a platform capability, not a plain section;
+    // on platforms where it is an empty Element it must not count as a match.
+    let autostart_available = use_context::<DesktopAutostartCapability>().0
+        && cfg!(all(
+            feature = "native-desktop",
+            any(
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "linux"
+            )
+        ));
+    let show_autostart =
+        autostart_available && (keyword.is_empty() || autostart_keys.contains(keyword.as_str()));
+    let no_match = !keyword.is_empty()
+        && !(show_scope
+            || show_core
+            || show_routing
+            || show_sync
+            || show_updates
+            || show_appearance
+            || show_about
+            || show_autostart);
 
     rsx! {
+        // The search box lives outside .settings-grid so it does not become a
+        // grid child (which would break .settings-section:first-child).
+        label { class: "search-field",
+            Icon { icon: LdSearch, width: 17, height: 17 }
+            input {
+                value: settings_search,
+                aria_label: "搜索设置",
+                placeholder: "搜索设置项",
+                oninput: move |event| settings_search.set(event.value()),
+            }
+        }
         div { class: "settings-grid",
+            if no_match {
+                section { class: "settings-section glass-surface", role: "status",
+                    div { class: "large-empty",
+                        Icon { icon: LdSearch, width: 28, height: 28 }
+                        strong { "没有匹配的设置项" }
+                        button {
+                            class: "secondary-button compact",
+                            onclick: move |_| settings_search.set(String::new()),
+                            "清除"
+                        }
+                    }
+                }
+            }
+            // F7/F16: the browser is only a control plane; TUN / system proxy
+            // switches act on the server host, not the viewer's device.
+            if show_scope {
+                section { class: "settings-section glass-surface",
+                    div { class: "section-heading",
+                        div {
+                            p { class: "eyebrow", "SCOPE" }
+                            h2 { "连接作用域" }
+                        }
+                    }
+                    div { class: "inline-note",
+                        Icon { icon: LdInfo, width: 16, height: 16 }
+                        span { "你正在通过浏览器控制运行在服务器上的 sing-box；TUN 与系统代理开关作用于该主机，不会改变本机/手机的网络设置。" }
+                    }
+                }
+            }
             // Design row A: the core card (runtime + JS override) sits next to
             // the routing card, so both fit above the fold on a laptop screen.
+            if show_core {
             section { class: "settings-section core-settings glass-surface",
                 div { class: "section-heading",
                     div {
@@ -227,9 +346,43 @@ pub(crate) fn SettingsView(
                     span { class: "setting-value", "{platform}" }
                 }
                 if let Some(note) = core_note() {
-                    div { class: "inline-note",
+                    div { class: "inline-note", role: "status",
                         Icon { icon: LdInfo, width: 16, height: 16 }
                         span { "{note}" }
+                    }
+                }
+                if core_unavailable {
+                    div { class: "inline-note error", role: "alert",
+                        Icon { icon: LdCircleAlert, width: 16, height: 16 }
+                        span { "内核不可用。排查建议：① 检查 sing-box / 后端服务是否运行；② 确认 7890 端口未被占用；③ 确认当前平台支持此内核。" }
+                    }
+                    div { class: "rule-editor-actions",
+                        button {
+                            class: "secondary-button compact",
+                            disabled: core_recheck_busy(),
+                            onclick: move |_| {
+                                if *core_recheck_busy.peek() { return; }
+                                core_recheck_busy.set(true);
+                                spawn(async move {
+                                    match api::core_status().await {
+                                        Ok(status) => {
+                                            connected.set(status.state == "running");
+                                            core_state.set(status.state);
+                                            core_version.set(status.version);
+                                            core_note.set(status.note);
+                                        }
+                                        Err(error) => {
+                                            connected.set(false);
+                                            core_state.set("unavailable".to_string());
+                                            core_note.set(Some(error.to_string()));
+                                        }
+                                    }
+                                    core_recheck_busy.set(false);
+                                });
+                            },
+                            Icon { icon: LdRefreshCw, width: 15, height: 15 }
+                            "重新检测内核"
+                        }
                     }
                 }
                 div { class: "setting-row script-setting-row",
@@ -255,19 +408,31 @@ pub(crate) fn SettingsView(
                         Icon { icon: LdPencil, width: 17, height: 17 }
                     }
                     label { class: "compact-toggle", title: "启用 JavaScript 配置覆写",
-                        input {
-                            r#type: "checkbox",
-                            aria_label: "启用 JavaScript 配置覆写",
-                            checked: config_script_enabled,
+                        Switch {
+                            checked: config_script_enabled(),
+                            label: "启用 JavaScript 配置覆写".to_string(),
                             disabled: config_script().trim().is_empty(),
-                            onchange: move |event| config_script_enabled.set(event.checked()),
+                            onchange: move |enabled| {
+                                config_script_enabled.set(enabled);
+                                flag_config_pending(
+                                    connected(),
+                                    config_pending,
+                                    toast,
+                                    "配置脚本已更改，重新连接后生效",
+                                );
+                            },
                         }
-                        span { class: "switch" }
                     }
                 }
+                div { class: "inline-note",
+                    Icon { icon: LdInfo, width: 16, height: 16 }
+                    span { "启用后自定义分流规则将被脚本接管" }
+                }
+            }
             }
 
             // Design row A pairs routing with the core card.
+            if show_routing {
             section { class: "settings-section routing-settings glass-surface",
                 div { class: "section-heading",
                     div {
@@ -275,36 +440,66 @@ pub(crate) fn SettingsView(
                         h2 { "路由模式" }
                     }
                 }
-                div { class: "segmented-control wide", aria_label: "分流模式",
-                    button { class: if tunnel_mode() == TunnelMode::Rule { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Rule), "规则模式" }
-                    button { class: if tunnel_mode() == TunnelMode::Global { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Global), "全局代理" }
-                    button { class: if tunnel_mode() == TunnelMode::Direct { "active" }, onclick: move |_| tunnel_mode.set(TunnelMode::Direct), "全局直连" }
+                SegmentedControl {
+                    options: vec![
+                        ("rule".to_string(), "规则模式".to_string()),
+                        ("global".to_string(), "全局代理".to_string()),
+                        ("direct".to_string(), "全局直连".to_string()),
+                    ],
+                    value: match tunnel_mode() {
+                        TunnelMode::Rule => "rule".to_string(),
+                        TunnelMode::Global => "global".to_string(),
+                        TunnelMode::Direct => "direct".to_string(),
+                    },
+                    aria_label: "分流模式".to_string(),
+                    extra_class: "wide".to_string(),
+                    onchange: move |next: String| {
+                        match next.as_str() {
+                            "global" => tunnel_mode.set(TunnelMode::Global),
+                            "direct" => tunnel_mode.set(TunnelMode::Direct),
+                            _ => tunnel_mode.set(TunnelMode::Rule),
+                        }
+                        flag_config_pending(
+                            connected(),
+                            config_pending,
+                            toast,
+                            "路由模式已切换，重新连接后生效",
+                        );
+                    },
                 }
                 if !cfg!(target_os = "android") {
                 label { class: "setting-row toggle-row",
                     span { class: "setting-icon", Icon { icon: LdNetwork, width: 19, height: 19 } }
                     div {
                         strong { "TUN 模式" }
-                        small { "系统级网络接管" }
+                        small {
+                            if cfg!(target_arch = "wasm32") {
+                                "系统级网络接管（作用于服务器主机）"
+                            } else {
+                                "系统级网络接管 · 首次启用会弹出系统网络权限授权（UAC / polkit / macOS helper）"
+                            }
+                        }
+                        if !tun_disabled_reason.is_empty() {
+                            small { "{tun_disabled_reason}" }
+                        }
                     }
                     if tun_busy() {
                         span {
                             class: if tun_enabled() { "switch switch-loading active" } else { "switch switch-loading" },
+                            role: "status",
                             aria_busy: "true",
                             aria_label: if tun_enabled() { "正在关闭 TUN 模式" } else { "正在准备 TUN 权限" },
                             span { class: "spinner" }
                         }
                     } else {
-                        input {
-                            r#type: "checkbox",
-                            checked: tun_enabled,
-                            disabled: core_busy()
-                                || core_restarting()
-                                || system_proxy_busy()
-                                || runtime_action_busy(),
-                            onclick: move |event| {
-                                event.prevent_default();
-                                let enabled = !tun_enabled();
+                        Switch {
+                            checked: tun_enabled(),
+                            label: "TUN 模式".to_string(),
+                            disabled: tun_disabled,
+                            // F21: the reason a disabled TUN switch is inert
+                            // stays announced, not just a greyed track.
+                            hint: Some(tun_disabled_reason.clone()),
+                            onchange: move |enabled| {
                                 let request = build_connection_request(
                                     nodes(),
                                     selected_tag(),
@@ -343,9 +538,14 @@ pub(crate) fn SettingsView(
                                 );
                             },
                         }
-                        span { class: "switch" }
                     }
                 }
+                }
+                if cfg!(target_os = "android") {
+                    div { class: "inline-note",
+                        Icon { icon: LdInfo, width: 16, height: 16 }
+                        span { "Android 由 VPN 接管全部流量，无需 TUN / 系统代理开关。" }
+                    }
                 }
                 label {
                     class: "setting-row toggle-row",
@@ -358,59 +558,58 @@ pub(crate) fn SettingsView(
                             else { "127.0.0.1:7890" }
                         }
                     }
-                    input {
-                        r#type: "checkbox",
-                        aria_label: "允许局域网连接",
-                        checked: allow_lan,
+                    Switch {
+                        checked: allow_lan(),
+                        label: "允许局域网连接".to_string(),
                         disabled: core_busy()
                             || core_restarting()
                             || system_proxy_busy()
                             || runtime_action_busy(),
-                        onchange: move |event| {
-                                let enabled = event.checked();
-                                let request = build_connection_request(
-                                    nodes(),
-                                    selected_tag(),
-                                    allow_lan_proxy_server_nameservers.clone(),
-                                    RuntimeSettings {
-                                        tunnel_mode,
-                                        tun_enabled,
-                                        allow_lan,
-                                        custom_rules,
-                                        dns_overrides,
-                                        config_script_enabled,
-                                        config_script,
-                                    },
-                                    group_selections(),
-                                );
-                                spawn_allow_lan_toggle(
-                                    enabled,
-                                    request,
+                        onchange: move |enabled| {
+                            let request = build_connection_request(
+                                nodes(),
+                                selected_tag(),
+                                allow_lan_proxy_server_nameservers.clone(),
+                                RuntimeSettings {
+                                    tunnel_mode,
+                                    tun_enabled,
                                     allow_lan,
-                                    lan_busy,
-                                    RuntimeSignals {
-                                        status: CoreStatusSignals {
-                                            connected,
-                                            core_restarting,
-                                            core_state,
-                                            core_version,
-                                            core_note,
-                                            system_proxy,
-                                            config_pending,
-                                        },
-                                        core_busy,
-                                        system_proxy_busy,
-                                        runtime_action_busy,
+                                    custom_rules,
+                                    dns_overrides,
+                                    config_script_enabled,
+                                    config_script,
+                                },
+                                group_selections(),
+                            );
+                            spawn_allow_lan_toggle(
+                                enabled,
+                                request,
+                                allow_lan,
+                                lan_busy,
+                                RuntimeSignals {
+                                    status: CoreStatusSignals {
+                                        connected,
+                                        core_restarting,
+                                        core_state,
+                                        core_version,
+                                        core_note,
+                                        system_proxy,
+                                        config_pending,
                                     },
-                                    toast,
-                                );
-                            },
+                                    core_busy,
+                                    system_proxy_busy,
+                                    runtime_action_busy,
+                                },
+                                toast,
+                            );
+                        },
                     }
-                    span { class: "switch" }
                 }
+            }
             }
 
 
+            if show_sync {
             SyncSettings {
                 subscriptions,
                 active_subscription_id,
@@ -426,9 +625,13 @@ pub(crate) fn SettingsView(
                 config_script_enabled,
                 config_script,
             }
+            }
 
+            if show_updates {
             UpdateSettings {}
+            }
 
+            if show_appearance {
             section { class: "settings-section appearance-settings glass-surface",
                 div { class: "section-heading",
                     div {
@@ -443,14 +646,13 @@ pub(crate) fn SettingsView(
                     }
                     div {
                         strong { "深色模式" }
-                        small { if dark_mode() { "已启用" } else { "跟随浅色外观" } }
+                        small { if dark_mode() { "已启用" } else { "深色外观" } }
                     }
-                    input {
-                        r#type: "checkbox",
-                        checked: dark_mode,
-                        onchange: move |event| dark_mode.set(event.checked()),
+                    Switch {
+                        checked: dark_mode(),
+                        label: "深色模式".to_string(),
+                        onchange: move |enabled| dark_mode.set(enabled),
                     }
-                    span { class: "switch" }
                 }
                 div { class: "setting-row",
                     span { class: "setting-icon", Icon { icon: LdLanguages, width: 19, height: 19 } }
@@ -458,10 +660,12 @@ pub(crate) fn SettingsView(
                         strong { "语言" }
                         small { "界面语言" }
                     }
-                    span { class: "setting-value", "简体中文" }
+                    span { class: "setting-value", "简体中文（暂不支持切换）" }
                 }
             }
+            }
 
+            if show_about {
             section { class: "settings-section about-settings glass-surface",
                 div { class: "section-heading",
                     div {
@@ -500,8 +704,10 @@ pub(crate) fn SettingsView(
                     button {
                         class: "secondary-button compact",
                         title: "复制内核与配置诊断信息",
+                        aria_busy: copy_busy(),
                         disabled: copy_busy(),
                         onclick: move |_| {
+                            if *copy_busy.peek() { return; }
                             let payload = build_diagnostic_report(
                                 core_state(),
                                 core_version(),
@@ -515,13 +721,13 @@ pub(crate) fn SettingsView(
                                 dns_overrides().len(),
                             );
                             copy_busy.set(true);
-                            async move {
+                            spawn(async move {
                                 match copy_to_clipboard(payload).await {
                                     Ok(()) => toast.success("诊断信息已复制到剪贴板"),
                                     Err(error) => toast.error(format!("复制失败: {error}")),
                                 }
                                 copy_busy.set(false);
-                            }
+                            });
                         },
                         if copy_busy() {
                             span { class: "spinner" }
@@ -537,10 +743,12 @@ pub(crate) fn SettingsView(
                         } else {
                             "复制代理环境变量"
                         },
+                        aria_busy: copy_env_busy(),
                         disabled: copy_env_busy(),
                         onclick: move |_| {
+                            if *copy_env_busy.peek() { return; }
                             copy_env_busy.set(true);
-                            async move {
+                            spawn(async move {
                                 match api::copy_proxy_environment_variables().await {
                                     Ok(()) if cfg!(target_arch = "wasm32") => {
                                         toast.success("代理环境变量已复制到服务器主机的剪贴板");
@@ -551,7 +759,7 @@ pub(crate) fn SettingsView(
                                     }
                                 }
                                 copy_env_busy.set(false);
-                            }
+                            });
                         },
                         if copy_env_busy() {
                             span { class: "spinner" }
@@ -562,8 +770,11 @@ pub(crate) fn SettingsView(
                     }
                 }
             }
+            }
 
+            if show_autostart {
             {autostart_settings}
+            }
         }
 
         if script_editor_open() {
@@ -608,34 +819,35 @@ pub(crate) fn SettingsView(
                         class: "secondary-button",
                         disabled: script_check_busy() || script_draft().trim().is_empty(),
                         onclick: move |_| {
+                            if *script_check_busy.peek() { return; }
+                            script_check_busy.set(true);
                             let proxy_server_nameservers =
                                 script_proxy_server_nameservers.clone();
-                            async move {
-                            script_check_busy.set(true);
-                            let request = ConnectionRequest {
-                                nodes: nodes(),
-                                selected_tag: selected_tag(),
-                                proxy_server_nameservers: proxy_server_nameservers.clone(),
-                                mode: tunnel_mode(),
-                                tun: tun_enabled(),
-                                allow_lan: allow_lan(),
-                                custom_rules: Vec::new(),
-                                dns_overrides: dns_overrides(),
-                                config_script: Some(script_draft()),
-                                group_selections: group_selections(),
-                            };
-                            match api::validate_config_script(request).await {
-                                Ok(()) => toast.success(if cfg!(target_arch = "wasm32") {
-                                    "配置脚本已在服务器端校验通过"
-                                } else {
-                                    "配置脚本校验通过"
-                                }),
-                                Err(error) => {
-                                    toast.error(format!("配置脚本校验失败: {error}"));
+                            spawn(async move {
+                                let request = ConnectionRequest {
+                                    nodes: nodes(),
+                                    selected_tag: selected_tag(),
+                                    proxy_server_nameservers: proxy_server_nameservers.clone(),
+                                    mode: tunnel_mode(),
+                                    tun: tun_enabled(),
+                                    allow_lan: allow_lan(),
+                                    custom_rules: Vec::new(),
+                                    dns_overrides: dns_overrides(),
+                                    config_script: Some(script_draft()),
+                                    group_selections: group_selections(),
+                                };
+                                match api::validate_config_script(request).await {
+                                    Ok(()) => toast.success(if cfg!(target_arch = "wasm32") {
+                                        "配置脚本已在服务器端校验通过"
+                                    } else {
+                                        "配置脚本校验通过"
+                                    }),
+                                    Err(error) => {
+                                        toast.error(format!("配置脚本校验失败: {error}"));
+                                    }
                                 }
-                            }
-                            script_check_busy.set(false);
-                            }
+                                script_check_busy.set(false);
+                            });
                         },
                         if script_check_busy() {
                             span { class: "spinner" }
@@ -654,7 +866,14 @@ pub(crate) fn SettingsView(
                             }
                             config_script.set(value);
                             script_editor_open.set(false);
-                            toast.success("配置脚本已保存");
+                            if !flag_config_pending(
+                                connected(),
+                                config_pending,
+                                toast,
+                                "配置脚本已更改，重新连接后生效",
+                            ) {
+                                toast.success("配置脚本已保存");
+                            }
                         },
                         Icon { icon: LdSave, width: 16, height: 16 }
                         "保存"

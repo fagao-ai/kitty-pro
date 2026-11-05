@@ -3,6 +3,7 @@
 //! sibling module works against one scope through `use super::*`.
 
 mod chrome;
+mod components;
 mod diagnostics;
 mod domain;
 mod latency;
@@ -24,6 +25,7 @@ mod types;
 mod updates;
 
 pub(crate) use chrome::*;
+pub(crate) use components::*;
 pub(crate) use diagnostics::*;
 pub(crate) use domain::*;
 pub(crate) use latency::*;
@@ -54,11 +56,10 @@ pub(crate) use dioxus::prelude::*;
 pub(crate) use dioxus_free_icons::icons::ld_icons::{
     LdArrowDown, LdArrowDownFromLine, LdArrowUp, LdArrowUpRight, LdBan, LdBellOff, LdBellRing,
     LdCheck, LdChevronDown, LdChevronRight, LdCircleAlert, LdCircleCheck, LdClipboardCopy, LdCloud,
-    LdCloudDownload, LdCloudUpload, LdGauge, LdGitFork, LdGlobe, LdInfo, LdLanguages, LdLayers,
-    LdLayoutDashboard, LdListFilter, LdMoon, LdNetwork, LdPackage, LdPause, LdPencil, LdPlay,
-    LdPlus, LdPower, LdRadioTower, LdRefreshCw, LdRocket, LdRoute, LdRss, LdSave, LdScrollText,
-    LdSearch, LdShieldCheck, LdSlidersHorizontal, LdSplit, LdSun, LdTerminal, LdTimer, LdTrash2,
-    LdWifi, LdX,
+    LdCloudUpload, LdGauge, LdGitFork, LdGlobe, LdInfo, LdLanguages, LdLayers, LdLayoutDashboard,
+    LdListFilter, LdMoon, LdNetwork, LdPackage, LdPause, LdPencil, LdPlay, LdPlus, LdPower,
+    LdRadioTower, LdRefreshCw, LdRocket, LdRoute, LdRss, LdSave, LdScrollText, LdSearch,
+    LdShieldCheck, LdSlidersHorizontal, LdSplit, LdSun, LdTerminal, LdTimer, LdTrash2, LdWifi, LdX,
 };
 pub(crate) use dioxus_free_icons::Icon;
 pub(crate) use proxy_core::{

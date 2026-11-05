@@ -32,15 +32,45 @@ pub(crate) fn RulesView(
     let mut process_picker_loaded = use_signal(|| false);
     let mut process_picker_error = use_signal(|| None::<String>);
     let process_picker_list = use_signal(Vec::<api::RunningProcess>::new);
+    // U7: an armed delete must not stay dangerous forever. Re-arming (or a
+    // fresh arm on another row) bumps a generation so only the newest timer
+    // may clear the armed state; tab switches clear it explicitly below.
+    let mut confirm_generation = use_signal(|| 0_u64);
+    use_effect(move || {
+        if confirm_rule_delete().is_none() && confirm_dns_delete().is_none() {
+            return;
+        }
+        let generation = *confirm_generation.peek() + 1;
+        confirm_generation.set(generation);
+        spawn(async move {
+            // ~4s: long enough to confirm, short enough that a forgotten
+            // armed button cannot delete on a much later click.
+            for _ in 0..4 {
+                wait_for_traffic_tick().await;
+            }
+            if *confirm_generation.peek() != generation {
+                return;
+            }
+            confirm_rule_delete.set(None);
+            confirm_dns_delete.set(None);
+        });
+    });
     let include_process_rules = process_rules_available();
-    let all_stored = rules();
-    let stored_rule_count = all_stored.len();
-    let stored = all_stored
-        .into_iter()
-        .filter(|rule| custom_rule_visible(rule.match_type, include_process_rules))
-        .collect::<Vec<_>>();
-    let enabled_count = stored.iter().filter(|rule| rule.enabled).count();
-    let total = stored.len();
+    // U10: cloning + filter/collect of the rule Vec used to run on every
+    // render. The memo re-runs only when `rules()` changes, so unrelated
+    // re-renders (tab switch, busy flag, toast tick) reuse the cached list.
+    let rule_stats = use_memo(move || {
+        let all_stored = rules();
+        let stored_rule_count = all_stored.len();
+        let stored = all_stored
+            .into_iter()
+            .filter(|rule| custom_rule_visible(rule.match_type, include_process_rules))
+            .collect::<Vec<_>>();
+        let enabled_count = stored.iter().filter(|rule| rule.enabled).count();
+        let total = stored.len();
+        (stored, stored_rule_count, enabled_count, total)
+    });
+    let (stored, stored_rule_count, enabled_count, total) = rule_stats();
     let rule_mode_active = tunnel_mode() == TunnelMode::Rule;
     let override_active = config_script_enabled();
     // Rules stored but not shown on this platform (process rules on Android).
@@ -65,9 +95,14 @@ pub(crate) fn RulesView(
         editor_open.set(true);
     };
     let placeholder = custom_rule_placeholder(draft_match());
-    let dns_rules = dns_overrides();
-    let dns_total = dns_rules.len();
-    let dns_enabled_count = dns_rules.iter().filter(|rule| rule.enabled).count();
+    // U10: the DNS tab's counts get the same memo treatment as the routing tab.
+    let dns_stats = use_memo(move || {
+        let dns_rules = dns_overrides();
+        let dns_total = dns_rules.len();
+        let dns_enabled_count = dns_rules.iter().filter(|rule| rule.enabled).count();
+        (dns_rules, dns_total, dns_enabled_count)
+    });
+    let (dns_rules, dns_total, dns_enabled_count) = dns_stats();
     let mut dns_domain = use_signal(String::new);
     let mut dns_server = use_signal(String::new);
     let mut dns_error = use_signal(|| None::<String>);
@@ -130,15 +165,24 @@ pub(crate) fn RulesView(
                             button {
                                 class: "rules-refresh-button",
                                 title: "立即更新分流规则",
+                                aria_label: "更新分流规则",
                                 aria_busy: rule_sets_busy(),
                                 disabled: rule_sets_busy() || override_active,
-                                onclick: move |_| async move {
-                                    rule_sets_busy.set(true);
-                                    match api::update_rule_sets(true).await {
-                                        Ok(_) => toast.success("分流规则已更新"),
-                                        Err(error) => toast.error(format!("分流规则更新失败: {error}")),
+                                onclick: move |_| {
+                                    // U9: arm the guard synchronously, before
+                                    // the spawn, so a double click cannot fire
+                                    // two overlapping update_rule_sets calls.
+                                    if *rule_sets_busy.peek() {
+                                        return;
                                     }
-                                    rule_sets_busy.set(false);
+                                    rule_sets_busy.set(true);
+                                    spawn(async move {
+                                        match api::update_rule_sets(true).await {
+                                            Ok(_) => toast.success("分流规则已更新"),
+                                            Err(error) => toast.error(format!("分流规则更新失败: {error}")),
+                                        }
+                                        rule_sets_busy.set(false);
+                                    });
                                 },
                                 if rule_sets_busy() {
                                     span { class: "spinner" }
@@ -155,17 +199,29 @@ pub(crate) fn RulesView(
                     }
                 }
                 div { class: "toolbar-controls rules-toolbar-actions",
-                    div { class: "segmented-control rules-tab-control", aria_label: "规则类型",
-                        button {
-                            class: if active_tab() == RulesTab::Routing { "active" } else { "" },
-                            onclick: move |_| active_tab.set(RulesTab::Routing),
-                            "分流规则 {total}"
-                        }
-                        button {
-                            class: if active_tab() == RulesTab::Dns { "active" } else { "" },
-                            onclick: move |_| active_tab.set(RulesTab::Dns),
-                            "专用 DNS {dns_total}"
-                        }
+                    // U5: a real group with pressed state, not class-only selection.
+                    SegmentedControl {
+                        options: vec![
+                            ("routing".to_string(), format!("分流规则 {total}")),
+                            ("dns".to_string(), format!("专用 DNS {dns_total}")),
+                        ],
+                        value: if active_tab() == RulesTab::Routing {
+                            "routing".to_string()
+                        } else {
+                            "dns".to_string()
+                        },
+                        aria_label: "规则类型".to_string(),
+                        extra_class: "rules-tab-control".to_string(),
+                        onchange: move |next| {
+                            // U7: switching views cancels any armed delete.
+                            confirm_rule_delete.set(None);
+                            confirm_dns_delete.set(None);
+                            if next == "dns" {
+                                active_tab.set(RulesTab::Dns);
+                            } else {
+                                active_tab.set(RulesTab::Routing);
+                            }
+                        },
                     }
                     // Both tabs render exactly this control pair, so switching
                     // tabs moves nothing: only the label counts change.
@@ -251,7 +307,7 @@ pub(crate) fn RulesView(
                             }
                         }
                         if let Some(error) = dns_error() {
-                            div { class: "field-error",
+                            div { class: "field-error", role: "alert",
                                 Icon { icon: LdCircleAlert, width: 15, height: 15 }
                                 span { "{error}" }
                             }
@@ -318,12 +374,15 @@ pub(crate) fn RulesView(
                             label {
                                 class: "rule-enabled-toggle",
                                 title: if rule.enabled { "停用这条规则" } else { "启用这条规则" },
-                                input {
-                                    r#type: "checkbox",
-                                    aria_label: if rule.enabled { "停用 {rule.domain_suffix} 的专用 DNS" } else { "启用 {rule.domain_suffix} 的专用 DNS" },
+                                Switch {
                                     checked: rule.enabled,
-                                    onchange: move |event| {
-                                        let checked = event.checked();
+                                    label: "专用 DNS 规则开关".to_string(),
+                                    aria_label: Some(if rule.enabled {
+                                        format!("停用 {} 的专用 DNS", rule.domain_suffix)
+                                    } else {
+                                        format!("启用 {} 的专用 DNS", rule.domain_suffix)
+                                    }),
+                                    onchange: move |checked| {
                                         dns_overrides.write().iter_mut().for_each(|item| {
                                             if item.id == rule.id {
                                                 item.enabled = checked;
@@ -332,7 +391,6 @@ pub(crate) fn RulesView(
                                         notify_rule_change(connected(), toast, config_pending);
                                     },
                                 }
-                                span { class: "switch" }
                             }
                             button {
                                 class: if confirm_dns_delete() == Some(rule.id) {
@@ -508,10 +566,16 @@ pub(crate) fn RulesView(
                         }
                     }
                     if let Some(error) = editor_error() {
-                        div { class: "field-error",
+                        div { class: "field-error", role: "alert",
                             Icon { icon: LdCircleAlert, width: 15, height: 15 }
                             span { "{error}" }
                         }
+                    }
+                    // F17 / U22: rule actions ("直连/代理/拦截") are per-rule
+                    // match outcomes, not the global "直连/全局" routing mode.
+                    div { class: "inline-note info",
+                        Icon { icon: LdInfo, width: 16, height: 16 }
+                        span { "此处指单条规则的匹配动作，与全局分流模式不同" }
                     }
                     div { class: "rule-editor-actions",
                         button {
@@ -553,7 +617,7 @@ pub(crate) fn RulesView(
             }
 
             if stored.is_empty() {
-                div { class: "large-empty rules-empty",
+                div { class: "large-empty rules-empty", role: "status",
                     span { class: "empty-icon", Icon { icon: LdListFilter, width: 28, height: 28 } }
                     strong { "暂无自定义规则" }
                 }
@@ -672,17 +736,21 @@ pub(crate) fn ProcessPicker(
             div { class: "process-picker-search",
                 input {
                     value: query,
+                    aria_label: "搜索进程名或路径",
                     placeholder: "搜索进程名或路径…",
                     spellcheck: "false",
                     oninput: move |event| query.set(event.value()),
                 }
             }
             if let Some(message) = error() {
-                div { class: "process-picker-status error", "{message}" }
+                div { class: "process-picker-status error", role: "alert", "{message}" }
             } else if !loaded() {
-                div { class: "process-picker-status", span { class: "spinner" } "正在读取进程列表…" }
+                div { class: "process-picker-status", role: "status", aria_live: "polite",
+                    span { class: "spinner", aria_hidden: "true" }
+                    "正在读取进程列表…"
+                }
             } else if filtered.is_empty() {
-                div { class: "process-picker-status", "没有匹配的进程" }
+                div { class: "process-picker-status", role: "status", "没有匹配的进程" }
             } else {
                 div { class: "process-picker-list", role: "listbox",
                     for process in filtered {
@@ -722,31 +790,82 @@ pub(crate) fn RuleSelect(
     on_select: EventHandler<String>,
 ) -> Element {
     let mut open = use_signal(|| false);
+    // U24: roving active option for Home/End/Enter + aria-activedescendant.
+    // Limitation: options stay Tab-reachable buttons with no roving visual
+    // focus ring (adding one would need a new CSS class), so keyboard users
+    // rely on the option's own focus and aria-selected instead.
+    let mut active_index = use_signal(|| 0_usize);
     let selected_label = options
         .iter()
         .find(|option| option.value == value)
         .map(|option| option.label.clone())
         .unwrap_or_else(|| value.clone());
+    let selected_index = options
+        .iter()
+        .position(|option| option.value == value)
+        .unwrap_or(0);
+    let option_count = options.len();
     let trigger_label = label.clone();
-    let menu_label = label;
+    let menu_label = label.clone();
+    // Ids are scoped by the (unique) label so two selects on the page never
+    // hand aria-activedescendant the same id.
+    let id_base = format!("rule-select-{}", label.replace(' ', "-"));
+    let handler_options = options.clone();
 
     rsx! {
         div { class: if open() { "rule-select-control open" } else { "rule-select-control" },
             button {
                 r#type: "button",
                 class: "rule-select-trigger",
-                aria_label: trigger_label,
+                // U24: the accessible name must name the current value too;
+                // "动作" / "匹配类型" alone swallowed the selection.
+                aria_label: format!("{trigger_label}：{selected_label}"),
                 aria_haspopup: "listbox",
                 aria_expanded: if open() { "true" } else { "false" },
+                aria_activedescendant: if open() {
+                    Some(format!("{id_base}-{}", active_index()))
+                } else {
+                    None
+                },
                 onclick: move |event| {
                     event.stop_propagation();
-                    open.set(!open());
+                    let next = !open();
+                    open.set(next);
+                    if next {
+                        active_index.set(selected_index);
+                    }
                 },
                 onkeydown: move |event| {
                     match event.key() {
-                        Key::ArrowDown | Key::ArrowUp => {
+                        Key::ArrowDown => {
                             event.prevent_default();
                             open.set(true);
+                            active_index.set((active_index() + 1).min(option_count.saturating_sub(1)));
+                        }
+                        Key::ArrowUp => {
+                            event.prevent_default();
+                            open.set(true);
+                            active_index.set(active_index().saturating_sub(1));
+                        }
+                        Key::Home => {
+                            event.prevent_default();
+                            open.set(true);
+                            active_index.set(0);
+                        }
+                        Key::End => {
+                            event.prevent_default();
+                            open.set(true);
+                            active_index.set(option_count.saturating_sub(1));
+                        }
+                        Key::Enter => {
+                            event.prevent_default();
+                            if !open() {
+                                open.set(true);
+                                active_index.set(selected_index);
+                            } else if let Some(option) = handler_options.get(active_index()) {
+                                on_select.call(option.value.clone());
+                                open.set(false);
+                            }
                         }
                         Key::Escape => {
                             event.prevent_default();
@@ -769,13 +888,15 @@ pub(crate) fn RuleSelect(
                     onclick: move |_| open.set(false),
                 }
                 div { class: "rule-select-menu", role: "listbox", aria_label: menu_label,
-                    for option in options {
+                    for (index, option) in options.into_iter().enumerate() {
                         {
                             let option_value = option.value.clone();
                             let selected = option.value == value;
+                            let option_id = format!("{id_base}-{index}");
                             rsx! {
                                 button {
                                     key: "{option.value}",
+                                    id: option_id,
                                     r#type: "button",
                                     role: "option",
                                     aria_selected: if selected { "true" } else { "false" },
@@ -845,18 +966,17 @@ pub(crate) fn RuleListItem(
                 small { "{custom_rule_match_label(match_type)}" }
             }
             label { class: "rule-enabled-toggle", title: if enabled { "停用规则" } else { "启用规则" },
-                input {
-                    r#type: "checkbox",
+                Switch {
                     checked: enabled,
+                    label: if enabled { "停用规则".to_string() } else { "启用规则".to_string() },
                     disabled: locked,
-                    onchange: move |event| {
+                    onchange: move |checked| {
                         if let Some(stored) = rules.write().iter_mut().find(|item| item.id == rule_id) {
-                            stored.enabled = event.checked();
+                            stored.enabled = checked;
                             notify_rule_change(connected, toast, config_pending);
                         }
                     },
                 }
-                span { class: "switch" }
             }
             div { class: "rule-row-actions",
                 button {

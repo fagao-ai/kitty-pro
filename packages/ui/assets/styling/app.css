@@ -1,6 +1,12 @@
 /* z-index 层级顺序（低 → 高）：
-   0 内容 · 20 装饰/侧栏 · 50 手机底栏(.mobile-nav) · 55 规则下拉遮罩(.rule-select-backdrop)
-   · 60 规则下拉菜单(.rule-select-menu) · 100 模态(.modal-backdrop) · 120 toast(.toast-viewport) */
+   0 内容 · 1 主内容(.main-content) · 2 粘性表头(.log-table-header) · 20 装饰/侧栏(.sidebar)
+   · 42 下拉触发器(.rule-select-trigger) · 50 手机底栏(.mobile-nav)
+   · 55 规则下拉遮罩(.rule-select-backdrop) · 60 规则下拉菜单(.rule-select-menu)
+   · 100 模态(.modal-backdrop) · 120 toast(.toast-viewport)
+   注意 42 与 60 是两套提升路径：:2320 的 42 只在卡片层叠上下文内把触发器抬到
+   菜单/遮罩之上；:2342 的 60 则把整张 .workspace-section 卡片（含其
+   backdrop-filter 上下文）整体抬高，绕过 .mobile-nav(50) 的遮挡，菜单自身再用
+   60(:2358)。二者作用范围不同，不能互相替代。 */
 :root {
   color-scheme: light;
   /* 背景基础变量同时挂在根级，供 body / 根滚动条 / overscroll 取色；
@@ -37,6 +43,19 @@ button {
   color: inherit;
 }
 
+/* 仅供读屏：视觉隐藏但保留在无障碍树中。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 body {
   margin: 0;
   min-width: 320px;
@@ -57,6 +76,8 @@ body {
   --bg: #e9edf4;
   --surface: rgba(255, 255, 255, 0.68);
   --surface-strong: rgba(255, 255, 255, 0.86);
+  /* 开关滑块独立取色，避免暗色下与深灰轨道同色。 */
+  --switch-thumb: #ffffff;
   --surface-soft: rgba(255, 255, 255, 0.52);
   --surface-inset: rgba(255, 255, 255, 0.82);
   --border: rgba(23, 21, 40, 0.1);
@@ -64,6 +85,7 @@ body {
   --text: #171528;
   --text-soft: #4e4a63;
   --text-faint: #5f5b79;
+  --text-muted: #6b6a75;
   --accent: #a85208;
   --accent-strong: #8f4306;
   --accent-ink: #fff7ef;
@@ -82,6 +104,26 @@ body {
   --tint-a: rgba(255, 196, 138, 0.3);
   --tint-b: rgba(143, 199, 245, 0.27);
   --tint-c: rgba(245, 168, 192, 0.24);
+  /* 设计 token：字号 / 间距 / 字重 / 框架尺寸，供后续统一取用。 */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 14px;
+  --fs-xl: 16px;
+  --fs-display: 26px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+  --sidebar-w: 264px;
+  --tabbar-h: 65px;
+  --tabbar-gap: 10px;
   --shadow: 0 18px 54px rgba(43, 37, 64, 0.16);
   position: relative;
   display: flex;
@@ -99,13 +141,17 @@ body {
   --bg: #131218;
   --surface: rgba(26, 25, 34, 0.9);
   --surface-strong: rgba(35, 34, 44, 0.94);
+  --switch-thumb: #f3f1ec;
   --surface-soft: rgba(46, 44, 56, 0.87);
   --surface-inset: rgba(46, 44, 56, 0.78);
   --border: rgba(58, 55, 70, 0.85);
   --border-strong: rgba(58, 55, 70, 1);
   --text: #f0eef5;
   --text-soft: #a6a2b8;
-  --text-faint: #8d89a4;
+  /* U24（axe 实跑发现）：旧值 #8d89a4 在卡片底 #2c2a35 上只有 4.19:1，
+     低于 WCAG AA 小字号 4.5:1；提到 #9793ae 后为 4.77:1。 */
+  --text-faint: #9793ae;
+  --text-muted: #9a96ab;
   --accent: #d4995c;
   --accent-strong: #b37e45;
   --accent-ink: #241708;
@@ -243,6 +289,67 @@ body {
   scrollbar-width: thin;
 }
 
+/* F22：侧栏导航分组。组标题沿用 .eyebrow 的字号 / 字距，改用 --text-muted
+   保证浅色 / 深色主题都可读；.nav-group 只负责组内排列与组间间距。 */
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.nav-group .nav-group-label {
+  padding: 2px 14px 4px;
+  color: var(--text-muted);
+}
+
+/* F22 折叠预算：连接卡的「切换节点 / 测试连通 / 详细信息」合并为同一行，
+   details 展开内容从行下方流出。窄屏（≤470px 一带）允许换行，行距收紧。 */
+.connection-aux-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.connection-details {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 折叠内容必须显式受控：inline grid 会覆盖 UA 的 closed 隐藏，令内容
+   穿透 details 盒子参与布局（700px 窗口 dead=-18 的根因）。 */
+.connection-details > div {
+  display: none;
+}
+
+.connection-details[open] > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+/* 展开时 details 独占辅助行的下一行，避免 300px 列内两列网格挤成一团。 */
+.connection-details[open] {
+  flex-basis: 100%;
+}
+
+.connection-details > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 12px;
+  list-style: none;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.connection-details > summary::-webkit-details-marker {
+  display: none;
+}
+
 .nav-item {
   display: flex;
   width: 100%;
@@ -361,6 +468,12 @@ body {
   min-height: 100vh;
   margin-left: 264px;
   padding: 28px 32px 36px;
+}
+
+/* phone-only helpers: the power control carries its own label when full width
+   默认隐藏电源标签；放在所有 @media 之前，760px 断点里的 display:inline 才能按层叠生效。 */
+.power-label {
+  display: none;
 }
 
 /* Wide desktops (2K/2.5K+): cap and centre the content column instead of
@@ -526,6 +639,13 @@ body {
   outline-offset: 2px;
 }
 
+/* 兜底：:where() 特异性为 0，只给没有专属焦点样式的控件补焦点环，
+   不会覆盖上面及后文更具体的 :focus-visible 规则。 */
+:where(button, a, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .primary-button:active:not(:disabled),
 .secondary-button:active:not(:disabled) {
   transform: translateY(1px);
@@ -536,7 +656,11 @@ body {
 .icon-button:disabled,
 .power-button:disabled {
   cursor: not-allowed;
-  opacity: 0.48;
+  /* U24（axe 实跑发现）：整按钮透明度会拉低文字的复合对比度。0.48 时禁用
+     主按钮只有 4.2:1、0.62 时 4.44:1（AA 要求 4.5:1，浅色/深色各自依赖
+     按钮底色）。0.75 在两套主题、两种按钮底色上实测都 ≥4.5:1，禁用感靠
+     cursor + 变淡依然明确。 */
+  opacity: 0.75;
 }
 
 .toast-viewport {
@@ -673,7 +797,10 @@ body {
   min-width: 0;
   flex: 0 1 300px;
   flex-direction: column;
-  gap: 14px;
+  /* F22 折叠预算：700px 高的窗口里概览整页必须留在折叠线内（layout 守卫）。
+     连接卡新增测试连通 / 详细信息行后，14px 的列间距会把页面顶出折叠，
+     收紧到 10px 视觉密度仍然宽松。 */
+  gap: 10px;
 }
 
 .connection-controls {
@@ -1968,7 +2095,7 @@ body {
 .log-target strong,
 .log-outbound strong {
   font-size: 12px;
-  font-weight: 680;
+  font-weight: 700;
 }
 
 .log-target small,
@@ -2288,7 +2415,7 @@ body {
   background: var(--surface-soft);
   cursor: pointer;
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
   text-align: left;
   transition:
     border-color 150ms ease,
@@ -2565,7 +2692,7 @@ body {
 }
 
 .process-picker-item-name {
-  font-weight: 650;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2647,7 +2774,7 @@ body {
   padding: 0 8px;
   border-radius: var(--radius-xs);
   font-size: 11px;
-  font-weight: 750;
+  font-weight: 700;
 }
 
 .rule-action.direct {
@@ -2715,8 +2842,10 @@ body {
   box-shadow: inset 0 0 0 1px var(--border);
 }
 
+/* 滑块改用 --switch-thumb：暗色下轨道(--surface-inset)与基础滑块
+   (--surface-strong)同为深灰、对比不足，浅色滑块在两种主题下都清晰。 */
 .rule-enabled-toggle .switch::after {
-  background: #f7fbf9;
+  background: var(--switch-thumb);
 }
 
 .rule-enabled-toggle input:checked + .switch {
@@ -2750,13 +2879,14 @@ body {
   box-shadow: inset 0 1px 0 transparent;
 }
 
+/* 焦点环用实色 --accent，11% 透明度的 --accent-soft 对比不足。 */
 .rule-row-actions .icon-button:hover:not(:disabled),
 .rule-row-actions .icon-button:focus-visible {
   color: var(--accent);
   border-color: var(--accent-soft);
   outline: 0;
   background: var(--accent-soft);
-  box-shadow: 0 0 0 2px var(--accent-soft);
+  box-shadow: 0 0 0 2px var(--accent);
 }
 
 .rule-row-actions .icon-button.danger {
@@ -3740,6 +3870,12 @@ body {
     display: none;
   }
 
+  /* iOS Safari 会给小于 16px 的输入框自动缩放，统一抬到 16px。 */
+  .form-stack input, .form-stack textarea, .sync-field input,
+  .process-picker-search input, .rule-field input {
+    font-size: 16px;
+  }
+
   /* 16px keeps iOS Safari from auto-zooming the rule dialog inputs. */
   .rule-field input {
     height: 42px;
@@ -4088,7 +4224,7 @@ body {
   margin-bottom: 7px;
   color: var(--text-soft);
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .form-stack input,
@@ -4316,7 +4452,7 @@ body {
 
   .main-content {
     width: 100%;
-    height: calc(100dvh - 86px - env(safe-area-inset-bottom));
+    height: calc(100dvh - var(--tabbar-h) - var(--tabbar-gap) - 11px - env(safe-area-inset-bottom));
     margin: 0;
     padding: 16px 14px 8px;
     overflow-y: auto;
@@ -4354,11 +4490,17 @@ body {
     gap: 8px;
   }
 
+  /* 隐藏文字后按钮失去可访问名，依赖主 agent 在按钮上补 aria_label。
+     状态徽标不再整块隐藏，改为精简形态，手机端仍能看到连接状态。 */
   .topbar-actions .restart-core-button span,
   .topbar-actions .primary-button span,
-  .topbar-actions .log-clear-button span,
-  .topbar-actions .status-badge {
+  .topbar-actions .log-clear-button span {
     display: none;
+  }
+
+  .topbar-actions .status-badge {
+    padding: 0 7px;
+    font-size: 10px;
   }
 
   .topbar-actions .restart-core-button,
@@ -4884,12 +5026,32 @@ body {
     border-radius: 10px;
     gap: 3px;
   }
+
+  /* 触摸目标：手机端主要交互元素至少 44px 高，减少误触。 */
+  .icon-button,
+  .toast-close,
+  .rule-row-actions .icon-button,
+  .dns-row .icon-button,
+  .subscription-row .icon-button,
+  .log-collection-toggle,
+  .log-follow-button,
+  .rules-refresh-button,
+  .text-button,
+  .segmented-control button {
+    min-height: 44px;
+  }
+
+  /* 纯图标按钮再补宽度；其余按钮只加高度，避免挤出既有布局。 */
+  .icon-button,
+  .rule-row-actions .icon-button,
+  .dns-row .icon-button,
+  .subscription-row .icon-button {
+    min-width: 44px;
+  }
 }
 
 @media (max-width: 420px) {
   .main-content {
-    padding-right: 10px;
-    padding-left: 10px;
     padding: 14px 12px 8px;
   }
 
@@ -5001,10 +5163,5 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
-}
-
-/* phone-only helpers: the power control carries its own label when full width */
-.power-label {
-  display: none;
 }
 

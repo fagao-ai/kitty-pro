@@ -1,7 +1,5 @@
 use super::*;
 
-use super::*;
-
 #[test]
 fn age_labels_measure_against_the_supplied_clock() {
     // The card runs in the browser, where there is no clock to read, so an
@@ -834,6 +832,29 @@ fn dialogs_all_use_the_shared_shell() {
     assert!(
         source.contains("Key::Escape"),
         "the shell must dismiss on Escape"
+    );
+}
+
+/// F22：桌面侧栏把 6 个真实 `AppView` 导航项分成「连接 / 配置 / 运维」三组，
+/// 每组带中文 eyebrow 标题。同步 / 更新是设置页内的功能，不是独立视图，因此
+/// 不出现在分组里（不编造不存在的视图）；窄屏 tabbar 保持平铺、不分组。
+#[test]
+fn sidebar_groups_navigation_under_chinese_headings() {
+    let source = APP_SOURCE;
+    assert_eq!(
+        source.matches("NavGroup {").count(),
+        3,
+        "桌面侧栏应分成三组导航"
+    );
+    for title in ["连接", "配置", "运维"] {
+        assert!(
+            source.contains(&format!("NavGroup {{ title: \"{title}\".to_string()")),
+            "导航分组标题「{title}」应存在"
+        );
+    }
+    assert!(
+        source.contains(r#"p { class: "eyebrow nav-group-label""#),
+        "分组标题应使用现有 eyebrow 类"
     );
 }
 

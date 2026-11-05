@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// 首屏状态读取的容错次数：心跳间隔约 1s，累计失败约 8 次（≈8s）仍读不到
+/// 内核就落到明确的错误态，避免 `core_state` 永远停在 `"checking"`。
+const CORE_STATUS_FIRST_READ_ATTEMPTS: u32 = 8;
+
+/// 跨平台短延迟（防抖 / 确认复位）：wasm 走 gloo-timers，native 走 tokio。
+async fn delay_ms(millis: u32) {
+    #[cfg(target_arch = "wasm32")]
+    gloo_timers::future::TimeoutFuture::new(millis).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(std::time::Duration::from_millis(millis as u64)).await;
+}
+
+/// F13：统一取消 / 关闭导入对话框。递增代际让在途解析结果失效，并复位
+/// busy / open，保证迟到的结果不会重新打开对话框或覆盖新状态。
+fn cancel_import(mut generation: Signal<u64>, mut busy: Signal<bool>, mut open: Signal<bool>) {
+    let mut current = generation.write();
+    *current = current.wrapping_add(1);
+    busy.set(false);
+    open.set(false);
+}
+
 #[component]
 pub fn ProxyApp(
     platform: String,
@@ -27,6 +48,11 @@ pub fn ProxyApp(
     });
     let active_view = use_signal(|| AppView::Overview);
     let mut dark_mode = use_signal(|| false);
+    // U14：本次会话是否手动切换过主题。手动切换后系统明暗偏好不再覆盖用户选择。
+    let mut theme_user_overridden = use_signal(|| false);
+    // 从磁盘恢复的 dark_mode 也是一次显式选择，优先级高于系统偏好；
+    // 防止 profile 加载与系统主题 eval 的异步竞态把用户保存的主题覆盖掉。
+    let mut theme_restored_from_profile = use_signal(|| false);
     let mut connected = use_signal(|| false);
     let core_busy = use_signal(|| false);
     let mut runtime_action_busy = use_signal(|| false);
@@ -42,6 +68,35 @@ pub fn ProxyApp(
     use_context_provider(|| toast);
     use_effect(move || {
         toast.start_sweeper();
+    });
+    // U14：首屏跟随系统明暗偏好。仅在用户本次会话尚未手动切换主题时应用，
+    // 且只在挂载后执行一次：effect 主体不订阅任何 signal，所有读取与判断都
+    // 放进 `spawn(async move { ... })` 的异步块里。
+    // 跨目标说明：`document::eval` 在 wasm32 与桌面 / 移动 webview 均可用；
+    // 本项目 `chrome.rs` 的 DialogShell 焦点脚本、下方延迟缓存恢复都已无条件
+    // 调用该 API（含 `recv::<T>().await`），native 与 wasm 均可编译。因此这里
+    // 不使用 `#[cfg(target_arch = "wasm32")]` 门控——只对 wasm32 开放反而会让
+    // 桌面 webview 失去主题跟随能力；已保存配置 / 其它页面主题开关若在 eval
+    // 异步窗口内改动了 dark_mode，也不会被这次系统值覆盖。
+    use_effect(move || {
+        spawn(async move {
+            // 用户本次会话已手动切换过主题 → 直接返回，尊重用户选择。
+            if theme_user_overridden() || theme_restored_from_profile() {
+                return;
+            }
+            let mut eval = document::eval(
+                "dioxus.send(window.matchMedia('(prefers-color-scheme: dark)').matches);",
+            );
+            let Ok(prefers_dark) = eval.recv::<bool>().await else {
+                // 无 DOM / eval 失败时保持原默认值，不阻断首屏。
+                return;
+            };
+            // eval 为异步：返回期间用户可能已手动切换，或 profile 已恢复完成，
+            // 二次校验后再写入，保证任何显式选择都不会被系统偏好覆盖。
+            if !theme_user_overridden() && !theme_restored_from_profile() {
+                dark_mode.set(prefers_dark);
+            }
+        });
     });
     // "Local config drifted from what the running core applied." Set by
     // refreshes/imports/deletes/rule edits while connected; cleared by the
@@ -93,6 +148,19 @@ pub fn ProxyApp(
     let log_filter = use_signal(|| LogFilter::Routes);
     let log_search = use_signal(String::new);
     let rules_tab = use_signal(|| RulesTab::Routing);
+
+    // U13：profile 保存代际序号，用于丢弃防抖窗口内的过期快照。
+    let mut save_generation = use_signal(|| 0u64);
+    // F11：首次引导卡关闭后，本次会话不再显示。
+    let mut onboarding_dismissed = use_signal(|| false);
+    // F12：导入对话框「支持的格式」说明的展开状态。
+    let mut import_formats_open = use_signal(|| false);
+    // F13：每次导入 / 取消都自增，让在途解析结果失效，避免迟到的结果
+    // 重新打开对话框或覆盖新状态。
+    let mut import_generation = use_signal(|| 0u64);
+    // U14：清空日志两步确认的就绪状态与自动复位代际。
+    let mut clear_logs_armed = use_signal(|| false);
+    let mut clear_logs_arm_generation = use_signal(|| 0u64);
 
     use_effect(move || {
         let Some(mut bridge) = desktop_tray else {
@@ -356,51 +424,55 @@ pub fn ProxyApp(
         });
     });
 
-    #[cfg(not(target_os = "android"))]
+    // 全平台统一的 core_status 心跳：桌面/Web 以前只在启动时读一次，核心
+    // 意外停止后会永久显示「已连接」；现在和 Android 一样按心跳持续回读，
+    // `connected` / `core_state` / `core_version` / `core_note` 始终同一真相。
+    // U23：核心状态心跳属于「常驻」轮询，任何视图下都必须持续运行，绝不做
+    // active_view 门控；其余非核心轮询（流量 / 日志 / 规则集更新 / 代理组预览）
+    // 才按「对应视图可见才发请求」门控，切到别的视图即停发请求。
     use_effect(move || {
         spawn(async move {
-            match api::core_status().await {
-                Ok(status) => {
-                    connected.set(status.state == "running");
-                    core_state.set(status.state);
-                    core_version.set(status.version);
-                    core_note.set(status.note);
-                }
-                Err(error) => {
-                    // One truth: a failed first read means "not connected",
-                    // not the half-update that left the chip on 已连接.
-                    connected.set(false);
-                    core_state.set("unavailable".to_string());
-                    core_note.set(Some(error.to_string()));
-                }
-            }
-        });
-    });
-
-    #[cfg(target_os = "android")]
-    use_effect(move || {
-        spawn(async move {
+            let mut failed_attempts: u32 = 0;
+            // 是否曾成功读到一次状态：读到之后再失败说明核心在运行中掉线，
+            // 必须立刻落到不可用，不给首屏的容错窗口。
+            let mut first_read_done = false;
             loop {
                 match api::core_status().await {
                     Ok(status) => {
+                        first_read_done = true;
+                        failed_attempts = 0;
                         let is_running = status.state == "running";
                         connected.set(is_running);
-                        if is_running && toast.contains(ANDROID_VPN_WAITING_NOTICE) {
-                            toast.dismiss_message(ANDROID_VPN_WAITING_NOTICE);
-                            toast.success("Android VPN 已连接");
+                        #[cfg(target_os = "android")]
+                        {
+                            if is_running && toast.contains(ANDROID_VPN_WAITING_NOTICE) {
+                                toast.dismiss_message(ANDROID_VPN_WAITING_NOTICE);
+                                toast.success("Android VPN 已连接");
+                            }
                         }
                         core_state.set(status.state);
                         core_version.set(status.version);
+                        // 覆盖首屏「正在连接内核…」的等待提示。
                         core_note.set(status.note);
                     }
                     Err(error) => {
-                        // `connected` and `core_state` are one truth, not two:
-                        // an errored poll must move both, or the topbar chip
-                        // keeps saying 已连接 while the sidebar reads 内核不可用
-                        // and the next power click toggles from a stale value.
                         connected.set(false);
-                        core_state.set("unavailable".to_string());
-                        core_note.set(Some(error.to_string()));
+                        if first_read_done {
+                            core_state.set("unavailable".to_string());
+                            core_note.set(Some(error.to_string()));
+                        } else {
+                            failed_attempts = failed_attempts.saturating_add(1);
+                            if failed_attempts >= CORE_STATUS_FIRST_READ_ATTEMPTS {
+                                core_state.set("unavailable".to_string());
+                                core_note.set(Some(format!(
+                                    "无法连接内核，请检查服务是否运行（{error}）"
+                                )));
+                            } else {
+                                core_note.set(Some(format!(
+                                    "正在连接内核，第 {failed_attempts} 次重试…（{error}）"
+                                )));
+                            }
+                        }
                     }
                 }
                 wait_for_traffic_tick().await;
@@ -417,10 +489,14 @@ pub fn ProxyApp(
         });
     });
 
+    // U23：规则集更新检查（6h 一次）为「按需」轮询——仅当「规则」视图可见时
+    // 才发请求；其它视图跳过本次请求、继续等待下一个 tick，不删除轮询本身。
     use_effect(move || {
         spawn(async move {
             loop {
-                let _ = api::update_rule_sets(false).await;
+                if active_view() == AppView::Rules {
+                    let _ = api::update_rule_sets(false).await;
+                }
                 wait_for_rule_set_update_check().await;
             }
         });
@@ -463,6 +539,7 @@ pub fn ProxyApp(
                     tun_enabled.set(profile.tun_enabled);
                     allow_lan.set(profile.allow_lan);
                     dark_mode.set(profile.dark_mode);
+                    theme_restored_from_profile.set(true);
                     config_script_enabled.set(profile.config_script_enabled);
                     config_script.set(profile.config_script);
                     group_selections.set(profile.group_selections);
@@ -503,10 +580,18 @@ pub fn ProxyApp(
         });
     });
 
+    // U13：防抖 + 代际。快照在 effect 同步阶段一次性构造好，async 里不再
+    // 读任何 signal（否则延迟期间的变化会被重新订阅）。延迟结束后只有
+    // 代际仍是最新才真正落盘，过期的快照直接丢弃，避免 last-write-wins。
     use_effect(move || {
         if !profile_loaded() {
             return;
         }
+        let generation = {
+            let mut current = save_generation.write();
+            *current = current.wrapping_add(1);
+            *current
+        };
         let profile = AppProfile {
             subscriptions: subscriptions(),
             active_subscription_id: active_subscription_id(),
@@ -523,12 +608,43 @@ pub fn ProxyApp(
             ..AppProfile::default()
         };
         spawn(async move {
+            delay_ms(300).await;
+            if *save_generation.peek() != generation {
+                return;
+            }
             if let Err(error) = api::save_profile(profile).await {
                 toast.error(format!("本地配置保存失败: {error}"));
             }
         });
     });
 
+    // U14：清空日志确认态 3 秒后自动复位。代际校验保证「复位 → 再次 armed」
+    // 时旧定时器不会提前把新的确认态清掉。
+    use_effect(move || {
+        if !clear_logs_armed() {
+            return;
+        }
+        let generation = {
+            let mut current = clear_logs_arm_generation.write();
+            *current = current.wrapping_add(1);
+            *current
+        };
+        spawn(async move {
+            delay_ms(3_000).await;
+            if *clear_logs_arm_generation.peek() == generation {
+                clear_logs_armed.set(false);
+            }
+        });
+    });
+
+    // U14：切换视图（或点击其它位置）时复位确认态。
+    use_effect(move || {
+        let _ = active_view();
+        clear_logs_armed.set(false);
+    });
+
+    // U23：流量轮询为「按需」——仅概览视图可见且内核运行时才发请求；概览
+    // 不可见时同步阶段直接 return，循环内也持续用 active_view 复核。
     use_effect(move || {
         let running = core_state() == "running";
         let overview_visible = active_view() == AppView::Overview;
@@ -611,6 +727,8 @@ pub fn ProxyApp(
         });
     });
 
+    // U23：日志采集开关与日志读取轮询均为「按需」——仅日志视图可见且内核
+    // 运行时才启用 / 发请求；切到其它视图会自动停用采集并停止轮询。
     use_effect(move || {
         let enabled =
             core_state() == "running" && active_view() == AppView::Logs && !log_collection_paused();
@@ -662,7 +780,10 @@ pub fn ProxyApp(
         });
     });
 
+    // U23：代理组预览为「按需」——仅在节点页可见时才发起较重的预览请求；
+    // 读取 active_view 让视图切换时重新求值，其它视图下直接返回空结果。
     let proxy_groups_resource = use_resource(move || {
+        let nodes_visible = active_view() == AppView::Nodes;
         let request = ConnectionRequest {
             nodes: nodes(),
             selected_tag: selected_tag(),
@@ -687,6 +808,10 @@ pub fn ProxyApp(
             group_selections: group_selections(),
         };
         async move {
+            // U23：节点页不可见时不发预览请求，避免 6 个视图都触发较重计算。
+            if !nodes_visible {
+                return Ok(Vec::new());
+            }
             if request.nodes.is_empty() {
                 Ok(Vec::new())
             } else {
@@ -713,6 +838,22 @@ pub fn ProxyApp(
         "proxy-app"
     };
     let connection_allowed = !nodes().is_empty() && core_state() != "unavailable";
+    // U6/U14/U22：让 title / aria_label / 可见文本共享同一个文案来源。
+    let theme_label = if dark_mode() {
+        "切换浅色外观"
+    } else {
+        "切换深色外观"
+    };
+    let clear_logs_label = if clear_logs_armed() {
+        "再次点击确认清空"
+    } else {
+        "清空日志"
+    };
+    let import_formats_label = if import_formats_open() {
+        "收起支持的格式"
+    } else {
+        "支持的格式"
+    };
 
     rsx! {
         document::Style { "{APP_CSS}" }
@@ -720,33 +861,41 @@ pub fn ProxyApp(
             div { class: "ambient-grid" }
             aside { class: "sidebar glass-surface",
                 Brand { kicker: brand_kicker(core_version()) }
-                div { class: "nav-group-label", "MAIN" }
                 nav { class: "primary-nav", aria_label: "主导航",
-                    NavItem { view: AppView::Overview, active_view }
-                    NavItem {
-                        view: AppView::Nodes,
-                        active_view,
-                        count: nodes().len().to_string(),
+                    // F22：6 个真实 AppView 平铺项分成 3 组。同步 / 更新是设置页
+                    // 内的功能，不是独立 AppView，故不单列，避免编造不存在的视图。
+                    // 窄屏 tabbar 仍平铺、不分组；这里只调整桌面侧栏 DOM 与文案。
+                    NavGroup { title: "连接".to_string(),
+                        NavItem { view: AppView::Overview, active_view }
+                        NavItem {
+                            view: AppView::Nodes,
+                            active_view,
+                            count: nodes().len().to_string(),
+                        }
                     }
-                    NavItem {
-                        view: AppView::Subscriptions,
-                        active_view,
-                        count: subscriptions().len().to_string(),
+                    NavGroup { title: "配置".to_string(),
+                        NavItem {
+                            view: AppView::Subscriptions,
+                            active_view,
+                            count: subscriptions().len().to_string(),
+                        }
+                        NavItem {
+                            view: AppView::Rules,
+                            active_view,
+                            count: (custom_rules().len() + dns_overrides().len()).to_string(),
+                        }
+                        NavItem {
+                            view: AppView::Settings,
+                            active_view,
+                            dot: update.has_actionable_update(),
+                        }
                     }
-                    NavItem {
-                        view: AppView::Rules,
-                        active_view,
-                        count: (custom_rules().len() + dns_overrides().len()).to_string(),
-                    }
-                    NavItem {
-                        view: AppView::Logs,
-                        active_view,
-                        count: core_logs().len().to_string(),
-                    }
-                    NavItem {
-                        view: AppView::Settings,
-                        active_view,
-                        dot: update.has_actionable_update(),
+                    NavGroup { title: "运维".to_string(),
+                        NavItem {
+                            view: AppView::Logs,
+                            active_view,
+                            count: core_logs().len().to_string(),
+                        }
                     }
                 }
                 div { class: "sidebar-footer",
@@ -801,8 +950,14 @@ pub fn ProxyApp(
                         }
                         button {
                             class: "icon-button glass-control",
-                            title: if dark_mode() { "切换浅色主题" } else { "切换深色主题" },
-                            onclick: move |_| dark_mode.toggle(),
+                            title: theme_label,
+                            aria_label: theme_label,
+                            aria_pressed: dark_mode(),
+                            onclick: move |_| {
+                                // U14：本次会话用户已手动选择主题，系统偏好不再覆盖。
+                                theme_user_overridden.set(true);
+                                dark_mode.toggle();
+                            },
                             if dark_mode() {
                                 Icon { icon: LdSun, width: 19, height: 19 }
                             } else {
@@ -812,6 +967,7 @@ pub fn ProxyApp(
                         if matches!(current_view, AppView::Overview | AppView::Nodes | AppView::Subscriptions) {
                             button {
                                 class: "primary-button compact",
+                                aria_label: "添加订阅",
                                 onclick: move |_| {
                                     import_error.set(None);
                                     import_open.set(true);
@@ -825,11 +981,55 @@ pub fn ProxyApp(
                         if current_view == AppView::Logs {
                             button {
                                 class: "secondary-button log-clear-button",
-                                title: "清空当前缓冲区中的日志",
+                                title: clear_logs_label,
+                                aria_label: clear_logs_label,
                                 disabled: core_logs().is_empty(),
-                                onclick: move |_| core_logs.write().clear(),
+                                onclick: move |_| {
+                                    if clear_logs_armed() {
+                                        core_logs.write().clear();
+                                        clear_logs_armed.set(false);
+                                    } else {
+                                        clear_logs_armed.set(true);
+                                    }
+                                },
                                 Icon { icon: LdTrash2, width: 15, height: 15 }
-                                span { "清空日志" }
+                                span { "{clear_logs_label}" }
+                            }
+                        }
+                    }
+                }
+
+                // F11：首次引导。仅在配置已加载且没有任何订阅时出现，关闭后
+                // 本次会话不再显示。只用既有 CSS 类 + 少量内联 style。
+                if profile_loaded() && subscriptions().is_empty() && !onboarding_dismissed() {
+                    div {
+                        class: "glass-surface",
+                        style: "margin: 16px 0; padding: 18px; display: flex; flex-direction: column; gap: 12px;",
+                        div { class: "section-heading",
+                            h2 { "开始使用 Kitty Pro" }
+                        }
+                        ol {
+                            style: "margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px;",
+                            li { "第一步 · 添加订阅：粘贴订阅链接或代理分享内容" }
+                            li { "第二步 · 选择节点：在节点页挑选一条可用线路" }
+                            li { "第三步 · 启动代理：回到概览点击电源按钮连接" }
+                        }
+                        p { class: "inline-note", "完成以上三步即可开始使用代理；引导卡可随时关闭。" }
+                        div {
+                            style: "display: flex; gap: 10px; flex-wrap: wrap;",
+                            button {
+                                class: "primary-button",
+                                aria_label: "添加订阅",
+                                onclick: move |_| {
+                                    import_error.set(None);
+                                    import_open.set(true);
+                                },
+                                "添加订阅"
+                            }
+                            button {
+                                class: "secondary-button",
+                                onclick: move |_| onboarding_dismissed.set(true),
+                                "不再显示"
                             }
                         }
                     }
@@ -1060,18 +1260,19 @@ pub fn ProxyApp(
                     panel_id: "import-dialog".to_string(),
                     class: "modal glass-modal",
                     label: "添加订阅".to_string(),
-                    dismissible: !import_busy(),
-                    on_close: move |_| import_open.set(false),
+                    // F13：解析期间也允许关闭 / 取消，在途结果用代际丢弃。
+                    dismissible: true,
+                    on_close: move |_| cancel_import(import_generation, import_busy, import_open),
                     div { class: "modal-header",
                         div {
-                            p { class: "eyebrow", "SUBSCRIPTION" }
+                            p { class: "eyebrow", "SUBSCRIPTIONS / 添加订阅" }
                             h2 { "添加订阅" }
                         }
                         button {
                             class: "icon-button",
                             title: "关闭",
-                            disabled: import_busy(),
-                            onclick: move |_| import_open.set(false),
+                            aria_label: "关闭",
+                            onclick: move |_| cancel_import(import_generation, import_busy, import_open),
                             Icon { icon: LdX, width: 19, height: 19 }
                         }
                     }
@@ -1093,18 +1294,51 @@ pub fn ProxyApp(
                                 oninput: move |event| import_source.set(event.value()),
                             }
                         }
+                        // F12：字段为空时给出浅色提示，而不是只让按钮变灰。
+                        if import_source().trim().is_empty() {
+                            p { class: "inline-note", "粘贴订阅链接、Clash YAML 或单节点 URL 后即可导入。" }
+                        }
+                        // F12：可折叠的「支持的格式」说明。
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 8px;",
+                            button {
+                                class: "secondary-button",
+                                aria_expanded: "{import_formats_open()}",
+                                onclick: move |_| import_formats_open.toggle(),
+                                "{import_formats_label}"
+                            }
+                            if import_formats_open() {
+                                div { class: "inline-note",
+                                    p { "当前支持以下格式：" }
+                                    ul {
+                                        style: "margin: 0; padding-left: 20px;",
+                                        li { "Base64 分享链接订阅" }
+                                        li { "Clash YAML 的 proxies 列表" }
+                                        li { "单节点 socks5://host:port#名称" }
+                                        li { "单节点 http://host:port#名称" }
+                                        li { "单节点 https://user:pass@host:port#名称" }
+                                        li { "Hysteria2 / VMess / VLESS / Trojan / Shadowsocks 分享链接" }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(error) = import_error() {
                             div { class: "form-error",
                                 Icon { icon: LdCircleAlert, width: 16, height: 16 }
                                 span { "{error}" }
+                            }
+                            // F13：解析失败时把「支持的格式」说明直接展开。
+                            button {
+                                class: "secondary-button",
+                                onclick: move |_| import_formats_open.set(true),
+                                "查看支持格式"
                             }
                         }
                     }
                     div { class: "modal-actions",
                         button {
                             class: "secondary-button",
-                            disabled: import_busy(),
-                            onclick: move |_| import_open.set(false),
+                            onclick: move |_| cancel_import(import_generation, import_busy, import_open),
                             "取消"
                         }
                         button {
@@ -1114,10 +1348,21 @@ pub fn ProxyApp(
                                 || core_restarting()
                                 || import_source().trim().is_empty(),
                             onclick: move |_| async move {
+                                let generation = {
+                                    let mut current = import_generation.write();
+                                    *current = current.wrapping_add(1);
+                                    *current
+                                };
                                 import_busy.set(true);
                                 import_error.set(None);
                                 let source = import_source();
-                                match api::preview_subscription(source.clone()).await {
+                                let result = api::preview_subscription(source.clone()).await;
+                                // F13：用户已关闭 / 取消 / 重新发起导入，代际
+                                // 已变化，丢弃迟到结果，不重开对话框也不覆盖新状态。
+                                if *import_generation.peek() != generation {
+                                    return;
+                                }
+                                match result {
                                     Ok(report) if !report.nodes.is_empty() => {
                                         let ParseReport {
                                             nodes: report_nodes,
@@ -1141,32 +1386,30 @@ pub fn ProxyApp(
                                             proxy_server_nameservers,
                                             rejected_count: rejected,
                                         });
+                                        // F4：无论是否连接都切换到新订阅，让概览
+                                        // 「重新连接」横幅真正用上新订阅的节点。
+                                        active_subscription_id.set(Some(id));
+                                        let active_nodes = collect_subscription_nodes(
+                                            &subscriptions(),
+                                            Some(id),
+                                        );
+                                        let next_tag = select_available_tag(&active_nodes, "");
+                                        let mut next_selections = group_selections();
+                                        if next_tag.is_empty() {
+                                            next_selections.remove("proxy");
+                                        } else {
+                                            next_selections
+                                                .insert("proxy".to_string(), next_tag.clone());
+                                        }
+                                        nodes.set(active_nodes);
+                                        selected_tag.set(next_tag);
+                                        group_selections.set(next_selections);
                                         if connected() {
-                                            // The new subscription is not what
-                                            // the core runs; switching to it (or
-                                            // restarting) is a separate action,
-                                            // so flag the drift like refresh does.
                                             config_pending.set(true);
                                             toast.success(format!(
-                                                "已导入 {name}，共 {count} 个节点；当前连接未变化"
+                                                "已导入并切换到 {name}，共 {count} 个节点，重新连接后生效"
                                             ));
                                         } else {
-                                            active_subscription_id.set(Some(id));
-                                            let active_nodes = collect_subscription_nodes(
-                                                &subscriptions(),
-                                                Some(id),
-                                            );
-                                            let next_tag = select_available_tag(&active_nodes, "");
-                                            let mut next_selections = group_selections();
-                                            if next_tag.is_empty() {
-                                                next_selections.remove("proxy");
-                                            } else {
-                                                next_selections
-                                                    .insert("proxy".to_string(), next_tag.clone());
-                                            }
-                                            nodes.set(active_nodes);
-                                            selected_tag.set(next_tag);
-                                            group_selections.set(next_selections);
                                             toast.success(format!("已导入并切换到 {name}，共 {count} 个节点"));
                                         }
                                         import_source.set(String::new());
@@ -1187,7 +1430,7 @@ pub fn ProxyApp(
                             },
                             if import_busy() {
                                 span { class: "spinner" }
-                                "解析中"
+                                "解析中（可取消）"
                             } else {
                                 Icon { icon: LdPlus, width: 17, height: 17 }
                                 "导入"

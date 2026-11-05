@@ -22,29 +22,49 @@ pub(crate) fn LogsView(
     start_busy: bool,
     on_start: EventHandler<()>,
 ) -> Element {
-    let stored = logs();
-    let route_count = stored.iter().filter(|entry| entry.route.is_some()).count();
-    let direct_count = stored
-        .iter()
-        .filter(|entry| {
-            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Direct)
-        })
-        .count();
-    let proxy_count = stored
-        .iter()
-        .filter(|entry| {
-            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Proxy)
-        })
-        .count();
-    let block_count = stored
-        .iter()
-        .filter(|entry| {
-            entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Block)
-        })
-        .count();
-    let raw_count = stored.len() - route_count;
-    let query = search().trim().to_ascii_lowercase();
-    let visible_logs = visible_log_entries(&stored, filter(), &query);
+    // U10: the five full-buffer filters and the up-to-500-row clone used to
+    // run on every render (the log buffer changes at 1 Hz). Both derived
+    // values are memoized; each memo re-runs only when one of the signals it
+    // actually reads changes.
+    let log_stats = use_memo(move || {
+        let stored = logs();
+        let route_count = stored.iter().filter(|entry| entry.route.is_some()).count();
+        let direct_count = stored
+            .iter()
+            .filter(|entry| {
+                entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Direct)
+            })
+            .count();
+        let proxy_count = stored
+            .iter()
+            .filter(|entry| {
+                entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Proxy)
+            })
+            .count();
+        let block_count = stored
+            .iter()
+            .filter(|entry| {
+                entry.route.as_ref().map(|route| route.decision) == Some(RouteDecision::Block)
+            })
+            .count();
+        let raw_count = stored.len() - route_count;
+        (
+            route_count,
+            direct_count,
+            proxy_count,
+            block_count,
+            raw_count,
+            stored.len(),
+        )
+    });
+    let (route_count, direct_count, proxy_count, block_count, raw_count, stored_len) = log_stats();
+
+    let visible = use_memo(move || {
+        let stored = logs();
+        let query = search().trim().to_ascii_lowercase();
+        visible_log_entries(&stored, filter(), &query)
+    });
+    let visible_logs = visible();
     let visible_count = visible_logs.len();
 
     // The console is newest-first, so "following" simply means being parked at the
@@ -136,7 +156,10 @@ pub(crate) fn LogsView(
     rsx! {
         // Count strip doubles as the filter: each chip is one decision tally,
         // the active one carries the outline, exactly like the design.
-        div { class: "log-stats", aria_label: "日志统计", role: "status",
+        // U20: the strip holds 5 buttons, so it must NOT be a live region -
+        // the counting text below owns role=status instead. Buttons keep
+        // their aria_pressed state.
+        div { class: "log-stats", aria_label: "日志统计",
             for (label, value, tone, chip_filter) in [
                 ("全部路由", route_count, "total", LogFilter::Routes),
                 ("代理", proxy_count, "proxy", LogFilter::Proxy),
@@ -157,46 +180,49 @@ pub(crate) fn LogsView(
                 }
             }
         }
-        div { class: "log-controls",
-            label { class: "search-field log-search",
-                Icon { icon: LdSearch, width: 17, height: 17 }
-                input {
-                    value: search,
-                    placeholder: "搜索域名、IP、节点",
-                    oninput: move |event| search.set(event.value()),
-                }
-            }
-            div { class: "log-toolbar-actions",
-                button {
-                    class: collector_class,
-                    title: if connected() {
-                        if collection_paused() { "恢复采集内核日志" } else { "暂停采集内核日志" }
-                    } else {
-                        "内核未运行，日志采集已停止"
-                    },
-                    disabled: !connected(),
-                    onclick: move |_| collection_paused.toggle(),
-                    if connected() && collection_paused() {
-                        Icon { icon: LdPlay, width: 14, height: 14 }
-                    } else if connected() {
-                        Icon { icon: LdPause, width: 14, height: 14 }
-                    } else {
-                        span { class: "status-badge-dot" }
+            div { class: "log-controls",
+                label { class: "search-field log-search",
+                    Icon { icon: LdSearch, width: 17, height: 17 }
+                    input {
+                        value: search,
+                        aria_label: "搜索域名、IP、节点",
+                        placeholder: "搜索域名、IP、节点",
+                        oninput: move |event| search.set(event.value()),
                     }
-                    span { class: "log-collection-label", "{collector_label}" }
                 }
-                span { class: "log-controls-hint", "缓冲区 {stored.len()} 条记录" }
+                div { class: "log-toolbar-actions",
+                    button {
+                        class: collector_class,
+                        title: if connected() {
+                            if collection_paused() { "恢复采集内核日志" } else { "暂停采集内核日志" }
+                        } else {
+                            "内核未运行，日志采集已停止"
+                        },
+                        disabled: !connected(),
+                        onclick: move |_| collection_paused.toggle(),
+                        if connected() && collection_paused() {
+                            Icon { icon: LdPlay, width: 14, height: 14 }
+                        } else if connected() {
+                            Icon { icon: LdPause, width: 14, height: 14 }
+                        } else {
+                            span { class: "status-badge-dot", aria_hidden: "true" }
+                        }
+                        span { class: "log-collection-label", "{collector_label}" }
+                    }
+                    span { class: "log-controls-hint", role: "status", aria_live: "polite",
+                        "缓冲区 {stored_len} 条记录"
+                    }
+                }
             }
-        }
         section { class: "workspace-section log-workspace glass-surface",
             if visible_logs.is_empty() {
-                div { class: "large-empty log-empty",
-                    span { class: "empty-icon", Icon { icon: LdScrollText, width: 27, height: 27 } }
+                div { class: "large-empty log-empty", role: "status",
+                    span { class: "empty-icon", aria_hidden: "true", Icon { icon: LdScrollText, width: 27, height: 27 } }
                     strong {
                         if connected() { "暂无匹配日志" } else { "连接后显示日志" }
                     }
                     p {
-                        "启动代理后，每条连接的目标域名、命中链路与动作都会实时写入。当前 {route_count} 条路由 · {stored.len()} 条记录。"
+                        "启动代理后，每条连接的目标域名、命中链路与动作都会实时写入。当前 {route_count} 条路由 · {stored_len} 条记录。"
                     }
                     if !connected() {
                         button {
@@ -204,7 +230,7 @@ pub(crate) fn LogsView(
                             disabled: !start_allowed || start_busy,
                             onclick: move |_| on_start.call(()),
                             if start_busy {
-                                span { class: "spinner" }
+                                span { class: "spinner", aria_hidden: "true" }
                             } else {
                                 Icon { icon: LdPlay, width: 16, height: 16 }
                             }
@@ -214,7 +240,8 @@ pub(crate) fn LogsView(
                     small { class: "log-empty-hint", "{core_build_hint(core_version(), connected())}" }
                 }
             } else {
-                div { class: "log-list", aria_label: "内核日志",
+                // U24: the console is a live log stream, not a bare labelled div.
+                div { class: "log-list", role: "log", aria_label: "内核日志",
                     onscroll: track_follow,
                     onmounted: move |event| {
                         // The list mounts at the top, so it mounts following: the
@@ -232,7 +259,7 @@ pub(crate) fn LogsView(
                         span { "出口节点" }
                     }
                     for entry in visible_logs {
-                        LogRow { entry }
+                        LogRow { key: "{entry.sequence}", entry }
                     }
                 }
                 div { class: "log-list-footer",
