@@ -780,10 +780,16 @@ pub fn ProxyApp(
         });
     });
 
-    // U23：代理组预览为「按需」——仅在节点页可见时才发起较重的预览请求；
-    // 读取 active_view 让视图切换时重新求值，其它视图下直接返回空结果。
+    // The proxy groups preview is a one-shot on-demand resource that
+    // re-runs when the subscription, nodes, mode or selections change.
+    // It deliberately does NOT track active_view: an earlier revision
+    // (U23) returned Ok(vec![]) while the nodes page was hidden, which
+    // blanked the node list on every navigation INTO it — the gated
+    // empty vec was the resource's last value, so the page rendered
+    // "配置中没有代理组" until the fresh preview completed (v1.0.12
+    // user report). Gating suits loop-based polling (logs, updates),
+    // never a resource whose value IS the data.
     let proxy_groups_resource = use_resource(move || {
-        let nodes_visible = active_view() == AppView::Nodes;
         let request = ConnectionRequest {
             nodes: nodes(),
             selected_tag: selected_tag(),
@@ -808,10 +814,6 @@ pub fn ProxyApp(
             group_selections: group_selections(),
         };
         async move {
-            // U23：节点页不可见时不发预览请求，避免 6 个视图都触发较重计算。
-            if !nodes_visible {
-                return Ok(Vec::new());
-            }
             if request.nodes.is_empty() {
                 Ok(Vec::new())
             } else {
