@@ -412,6 +412,22 @@ jobs:
               ;;
           esac
 
+      # The release notes promise a .sha256 sidecar for every installer;
+      # Windows already wrote theirs during packaging, and the Web and
+      # Android jobs have their own steps. This covers the remaining
+      # desktop formats (dmg, AppImage, deb) without duplicating anything.
+      - name: Create desktop checksums
+        shell: bash
+        run: |
+          find "dist/${{ matrix.id }}" -maxdepth 1 -type f \
+              \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+            -print0 | while IFS= read -r -d '' artifact; do
+              if [[ -f "$artifact.sha256" ]]; then continue; fi
+              name="$(basename "$artifact")"
+              (cd "dist/${{ matrix.id }}" && sha256sum "$name" > "$name.sha256")
+            done
+          ls -la "dist/${{ matrix.id }}"
+
       - name: Upload ${{ matrix.name }} artifacts
         uses: actions/upload-artifact@v6
         with:
