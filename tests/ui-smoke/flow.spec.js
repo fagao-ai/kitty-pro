@@ -4,7 +4,14 @@
 // answered in-browser so the suite depends only on the release web shell and
 // cannot flake on GitHub's rate limit or a missing kernel.
 const { test, expect } = require('@playwright/test');
-const { gotoView, openApp, stopStubs, stubUpdateCheck } = require('./helpers');
+const {
+  gotoView,
+  openApp,
+  stopStubs,
+  stubUpdateCheck,
+  stubProfileWithNodes,
+  stubEmptyProfile,
+} = require('./helpers');
 
 /// Install before `openApp` (its hydration check waits for the first /api/
 /// response). Playwright routes are last-registered-first-wins, so the broad
@@ -79,6 +86,11 @@ test.describe('F23 轻量流程', () => {
   });
 
   test('概览空态提供「添加订阅」CTA', async ({ page }) => {
+    // openApp 的 baseline 桩带订阅（折叠预算以加载态为基准）；本测试要空态，
+    // 装空 profile 桩后重新加载。baselineProfile:false 防止 openApp 再注册
+    // 一次 baseline 把空桩顶掉（Playwright 后注册者优先）。
+    await stubEmptyProfile(page);
+    await openApp(page, { baselineProfile: false });
     await gotoView(page, '概览');
     // 无节点/无订阅时的空态卡片。
     await expect(page.locator('.empty-state')).toBeVisible();
@@ -100,5 +112,35 @@ test.describe('F23 轻量流程', () => {
       page.locator('.pending-reload-banner'),
       '默认（无配置变更、未连接）不应出现「重新连接」横幅',
     ).toHaveCount(0);
+  });
+  // 回归守卫（2026-11-05 用户报告，v1.0.12）：切换视图不得清空节点列表。
+  // 曾经的 U23 门控让代理组预览 resource 在节点页不可见时缓存空数组，
+  // 每次切进节点页都先渲染「配置中没有代理组」、等预览重算完才闪回，
+  // 用户感知即「不点刷新延迟就没有节点」。现在 resource 不再跟踪
+  // active_view，缓存值跨导航保持；导航本身也不应重发预览请求。
+  test('节点列表跨视图导航保持可见，导航不重发预览请求', async ({ page }) => {
+    // beforeEach 的 openApp 早于本 stub，页面此时是空 profile；注册 stub 后
+    // 重新 openApp（内部会重新 goto），让应用带着订阅数据完成 hydrate。
+    // baselineProfile:false —— openApp 默认会再注册一次空 profile 路由，
+    // Playwright 后注册者优先，会把刚装的桩数据顶掉。
+    await stubProfileWithNodes(page);
+    await openApp(page, { baselineProfile: false });
+    await gotoView(page, '节点');
+    const groupRow = page.locator('.proxy-group-section');
+    await expect(groupRow.first(), '首次进入应看到代理组').toBeVisible({ timeout: 15000 });
+    await expect(page.getByText('配置中没有代理组')).toHaveCount(0);
+
+    // 记下预览请求次数，来回导航后必须不变（依赖驱动，不随视图重发）。
+    let previewCalls = 0;
+    await page.route('**/api/proxy-groups/preview', (route) => {
+      previewCalls += 1;
+      return route.continue();
+    });
+    await gotoView(page, '订阅');
+    await gotoView(page, '日志');
+    await gotoView(page, '节点');
+    await expect(groupRow.first(), '切回后代理组必须保持可见，不得闪空').toBeVisible();
+    await expect(page.getByText('配置中没有代理组')).toHaveCount(0);
+    expect(previewCalls, '导航不得触发代理组预览重新请求').toBe(0);
   });
 });

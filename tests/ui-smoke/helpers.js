@@ -22,7 +22,103 @@ const navLabel = (view) => view;
 /// finishes downloading and hydrates. The first `/api/` round-trip is the
 /// evidence that polling started, so the listener is installed before
 /// navigation to avoid racing it.
-async function openApp(page) {
+/// The deterministic profile every spec sees unless it opts out.
+///
+/// The suite used to boot against whatever profile.json the serving machine
+/// held: locally that was the developer's live subscriptions (writes from the
+/// stubbed pages even clobbered them once), and it made layout budgets
+/// machine-dependent. The server now honours KITTY_PROFILE_DIR for storage
+/// isolation, and openApp serves this fixed profile so every measurement —
+/// fold budgets, a11y trees, flow assertions — runs against identical content
+/// on every machine. Shapes mirror the serialized AppProfile in proxy-core.
+async function stubBaselineProfile(page) {
+  // The loaded-state baseline: one subscription with two nodes plus the
+  // proxy-group preview they produce. Fold budgets and a11y trees were
+  // calibrated against a profile with subscriptions (the onboarding card is
+  // ~270px taller and legitimately scrolls); specs that need the zero-state
+  // install stubEmptyProfile afterwards — Playwright matches
+  // last-registered-first, so theirs wins.
+  const node = (tag, name) => ({
+    tag,
+    name,
+    protocol: 'shadowsocks',
+    server: '198.51.100.10',
+    port: 8443,
+    auth: { kind: 'password', password: `secret-${tag}` },
+  });
+  const profile = {
+    version: 1,
+    subscriptions: [
+      {
+        id: 1,
+        name: '守卫订阅',
+        source: 'https://sub.example.test/feed',
+        nodes: [node('guard-node-a', '守卫节点A')],
+        proxy_server_nameservers: [],
+        rejected_count: 0,
+      },
+    ],
+    active_subscription_id: 1,
+    selected_tag: 'guard-node-a',
+    tunnel_mode: 'rule',
+    tun_enabled: false,
+    allow_lan: false,
+    dark_mode: false,
+    custom_rules: [],
+    dns_overrides: [],
+    config_script_enabled: false,
+    config_script: '',
+    group_selections: {},
+  };
+  const groups = [
+    {
+      tag: 'guard-group',
+      kind: 'selector',
+      outbounds: ['guard-node-a'],
+      selected: 'guard-node-a',
+    },
+  ];
+  await page.route('**/api/profile', (route) =>
+    route.request().method() === 'GET'
+      ? route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(profile) })
+      : route.fulfill({ status: 200, contentType: 'application/json', body: 'null' }),
+  );
+  await page.route('**/api/proxy-groups/preview', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(groups) }),
+  );
+}
+
+/// Serve the pristine empty profile: the overview shows its onboarding card
+/// and every list its empty state. Fold budgets were tuned against a loaded
+/// profile (see stubBaselineProfile), so specs that need the zero-subscription
+/// state install this explicitly — registered after the baseline, it wins.
+async function stubEmptyProfile(page) {
+  const profile = {
+    version: 1,
+    subscriptions: [],
+    active_subscription_id: null,
+    selected_tag: null,
+    tunnel_mode: 'rule',
+    tun_enabled: false,
+    allow_lan: false,
+    dark_mode: false,
+    custom_rules: [],
+    dns_overrides: [],
+    config_script_enabled: false,
+    config_script: '',
+    group_selections: {},
+  };
+  await page.route('**/api/profile', (route) =>
+    route.request().method() === 'GET'
+      ? route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(profile) })
+      : route.fulfill({ status: 200, contentType: 'application/json', body: 'null' }),
+  );
+}
+
+async function openApp(page, { baselineProfile = true } = {}) {
+  // Registered first so a spec that installs its own /api/profile route
+  // afterwards still wins: Playwright matches last-registered-first.
+  if (baselineProfile) await stubBaselineProfile(page);
   let booted = false;
   page.on('response', (response) => {
     if (response.url().includes('/api/')) booted = true;
@@ -182,6 +278,67 @@ async function stubCoreLogStream(page, { firstBatch = 80, pollBatch = 3 } = {}) 
   return () => cursor;
 }
 
+/// Serve a profile with one subscription and two nodes, plus the proxy-group
+/// preview those nodes would produce.
+///
+/// The nodes page renders from `preview_proxy_groups`, a resource that used to
+/// track `active_view` (U23): navigating away cached an empty vec and every
+/// navigation back painted "配置中没有代理组" until the fresh preview landed.
+/// This stub gives the page real data so the *persistence* of that list across
+/// view switches can be asserted at all. Shapes mirror the serialized
+/// `AppProfile` / `ProxyNode` / `ProxyGroup` types in proxy-core.
+async function stubProfileWithNodes(page) {
+  const node = (tag, name) => ({
+    tag,
+    name,
+    protocol: 'shadowsocks',
+    server: '198.51.100.10',
+    port: 8443,
+    auth: { kind: 'password', password: `secret-${tag}` },
+  });
+  const profile = {
+    version: 1,
+    subscriptions: [
+      {
+        id: 1,
+        name: '守卫订阅',
+        source: 'https://sub.example.test/feed',
+        nodes: [node('guard-node-a', '守卫节点A'), node('guard-node-b', '守卫节点B')],
+        proxy_server_nameservers: [],
+        rejected_count: 0,
+      },
+    ],
+    active_subscription_id: 1,
+    selected_tag: 'guard-node-a',
+    tunnel_mode: 'rule',
+    tun_enabled: false,
+    allow_lan: false,
+    dark_mode: false,
+    custom_rules: [],
+    dns_overrides: [],
+    config_script_enabled: false,
+    config_script: '',
+    group_selections: {},
+  };
+  const groups = [
+    {
+      tag: 'guard-group',
+      kind: 'selector',
+      outbounds: ['guard-node-a', 'guard-node-b'],
+      selected: 'guard-node-a',
+    },
+  ];
+
+  await page.route('**/api/profile', (route) =>
+    route.request().method() === 'GET'
+      ? route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(profile) })
+      : route.fulfill({ status: 200, contentType: 'application/json', body: 'null' }),
+  );
+  await page.route('**/api/proxy-groups/preview', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(groups) }),
+  );
+}
+
 async function stopStubs(page) {
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 }
@@ -332,6 +489,9 @@ module.exports = {
   measureMainContent,
   stubCoreLogStream,
   stubUpdateCheck,
+  stubProfileWithNodes,
+  stubBaselineProfile,
+  stubEmptyProfile,
   UPDATE_VARIANTS,
   stopStubs,
 };
