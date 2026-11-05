@@ -131,16 +131,42 @@ jobs:
           echo "SINGBOX_CC=$mingw_bin/gcc.exe" >> "$GITHUB_ENV"
           echo 'CGO_ENABLED=1' >> "$GITHUB_ENV"
 
+      # Diagnostics matter here: this step's raw output is only visible to
+      # signed-in users, but the ::error annotation below renders on the
+      # public job page. The 2026-11-05 v1.0.12 failure produced nothing but
+      # "exit code 101" for the maintainer to work from.
       - name: Test Windows embedded core bridge
         if: matrix.id == 'windows'
         shell: bash
         run: |
-          (cd packages/singbox/bridge && go test ./...)
-          cargo test \
-            --package singbox \
-            --target x86_64-pc-windows-msvc \
-            --release \
-            --locked
+          set -o pipefail
+          log="$RUNNER_TEMP/kitty-pro-windows-test.log"
+          if {
+              (cd packages/singbox/bridge && go test ./...)
+              cargo test \
+                --package singbox \
+                --target x86_64-pc-windows-msvc \
+                --release \
+                --locked
+            } 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          {
+            echo '### Windows bridge test failure'
+            echo
+            echo '```text'
+            grep -Ein 'error(\[|:)|FAILED|panic|cannot find|unresolved' "$log" | head -n 80 || true
+            tail -n 80 "$log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          failure_tail="$(
+            {
+              (grep -Ei 'error(\[|:)|FAILED|panic|cannot find|unresolved' "$log" || true) | head -n 40
+              tail -n 20 "$log"
+            } | tr '\r\n' ' ' | cut -c1-8000
+          )"
+          echo "::error title=Windows bridge test output::$failure_tail"
+          exit 1
 
       - name: Build ${{ matrix.name }} packages
         shell: bash
