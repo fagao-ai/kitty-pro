@@ -1,0 +1,80 @@
+name: CI quality gate
+
+# 全量 Rust 门禁：PR、main 推送与手动触发统一跑 fmt / clippy / workspace 测试。
+# 此前 release.yml 只在 Windows job 里跑 go test ./... + cargo test --package singbox，
+# ui-smoke.yml 只跑 Playwright，没有任何 workflow 覆盖 cargo test --workspace、
+# rustfmt 与 clippy —— 格式/静态检查回归可以完全绕开门禁。
+#
+# 事件键带引号写成 "on"：YAML 1.1 解析器会把裸 on 折叠成布尔 true，引号保证
+# 任何解析器都把它当字符串键；GitHub Actions 使用自有解析器，同样接受这种写法。
+"on":
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # 避开 Git 版 crates.io 索引与 libgit2，CI 上更稳。
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: fmt | clippy | tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # README「Go toolchain」章节：sing-box 1.13.14 的构建脚本要求 Go 1.24，
+      # 且当前无法与 Go 1.26 链接；cargo test --workspace 会编译 singbox 的 Go
+      # bridge，缺了 Go 1.24 会在 build.rs 阶段直接失败，所以这里显式安装。
+      - name: Install Go 1.24
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: Desktop feature tests
+        run: cargo test -p desktop --features desktop
+
+      - name: Embedded-core feature tests
+        run: cargo test -p singbox --features embedded-core
+
+      # 可选：第三方 advisory 数据库可能临时不可用、或报出与本项目无关的告警，
+      # 不能让它阻塞 PR，因此整步 continue-on-error。
+      - name: Cargo audit (advisory, non-blocking)
+        continue-on-error: true
+        uses: rustsec/audit-check@v2
+
+# 注意：Playwright UI smoke 套件依赖 release wasm 产物 —— debug wasm ~84MB 在
+# CI 里永远无法完成 hydrate，必须先 dx build --release 再起 web server，成本高，
+# 因此不塞进 PR 门禁；它继续由 .github/workflows/ui-smoke.yml 负责（UI 路径的
+# PR、main 推送与 workflow_dispatch 触发）。
