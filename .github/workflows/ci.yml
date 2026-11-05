@@ -1,16 +1,18 @@
 name: CI quality gate
 
-# 全量 Rust 门禁：PR、main 推送与手动触发统一跑 fmt / clippy / workspace 测试。
+# 全量 Rust 门禁：PR 与手动触发跑 fmt / clippy / workspace 测试。
 # 此前 release.yml 只在 Windows job 里跑 go test ./... + cargo test --package singbox，
 # ui-smoke.yml 只跑 Playwright，没有任何 workflow 覆盖 cargo test --workspace、
 # rustfmt 与 clippy —— 格式/静态检查回归可以完全绕开门禁。
+#
+# 不再监听 push main：本仓库以直接推 main 为主，每次推送都拉一条全量门禁太吵，
+# 发版时还会和 release 并行出现三条 run。发 tag 前如需保险，可在 Actions 页面
+# 手动 Run workflow 跑一次，或为改动开 PR。
 #
 # 事件键带引号写成 "on"：YAML 1.1 解析器会把裸 on 折叠成布尔 true，引号保证
 # 任何解析器都把它当字符串键；GitHub Actions 使用自有解析器，同样接受这种写法。
 "on":
   pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

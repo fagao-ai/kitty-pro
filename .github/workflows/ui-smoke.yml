@@ -2,20 +2,20 @@ name: UI layout smoke
 
 # Resize and dialog regressions in this shell are invisible to `cargo test`:
 # they need a real layout engine. The suite drives the release web build in
-# headless Chromium, so it runs wherever the web bundle is worth building -
-# on pull requests that touch the UI, and before every release.
+# headless Chromium, so it runs on pull requests that touch the UI and on
+# demand. It no longer triggers on push to main: direct pushes to this repo
+# would otherwise start a full browser run next to every release, three
+# parallel runs for one change. Trigger it manually before tagging when the
+# UI is involved.
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+  pull_request:
     paths: &ui_paths
       - "packages/ui/**"
       - "packages/web/**"
       - "tests/ui-smoke/**"
       - ".github/workflows/ui-smoke.yml"
-  pull_request:
-    paths: *ui_paths
 
 permissions:
   contents: read
