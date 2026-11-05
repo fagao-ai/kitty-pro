@@ -4,10 +4,14 @@ const { expect } = require('@playwright/test');
 
 const VIEWS = ['概览', '节点', '订阅', '规则', '日志', '设置'];
 
-// Widths spanning every breakpoint in app.css (1180 / 980 / 760 / 420 / 360)
-// plus a few in between. A regression in a media query shows up as horizontal
-// overflow, which no view may ever produce.
-const WIDTHS = [1620, 1440, 1280, 1180, 1024, 980, 860, 760, 620, 430, 390, 360, 320];
+// Widths spanning every breakpoint in app.css (1600 / 1280 / 980 / 760 / 720 /
+// 420 / 359), the boundary neighbours 721 and 320, and a few widths in between.
+// A regression in a media query shows up as horizontal overflow, which no view
+// may ever produce.
+const WIDTHS = [
+  1620, 1600, 1440, 1280, 1180, 1024, 980, 860, 760, 721, 720, 620, 430, 390,
+  360, 359, 320,
+];
 
 const navLabel = (view) => view;
 
@@ -102,6 +106,22 @@ async function measureScroller(page) {
     //   buggy 100vh   -> phantom 27, dead 302, excess 27  (a strip of background)
     metrics.excessScroll = Math.min(metrics.phantom, Math.max(0, metrics.dead));
     return metrics;
+  });
+}
+
+/// Internal overflow of `.main-content` alone.
+///
+/// `measureScroller()` compares the page scroller's `scrollWidth` with the
+/// window, but `body { overflow-x: hidden }` can hide a child that is wider than
+/// its column: the document stays put while the content itself overflows or is
+/// clipped. Comparing `scrollWidth` to `clientWidth` on the container catches
+/// that case. Kept as a separate export so `measureScroller`'s signature (and
+/// every existing caller) stays untouched.
+async function measureMainContent(page) {
+  return page.evaluate(() => {
+    const el = document.querySelector('.main-content');
+    if (!el) throw new Error('.main-content is missing; cannot measure internal overflow');
+    return el.scrollWidth - el.clientWidth;
   });
 }
 
@@ -309,6 +329,7 @@ module.exports = {
   openApp,
   settlePanel,
   measureScroller,
+  measureMainContent,
   stubCoreLogStream,
   stubUpdateCheck,
   UPDATE_VARIANTS,

@@ -5,7 +5,15 @@
 // or clipping past it). Both are measurable, so they are asserted here across a
 // viewport matrix instead of by eye.
 const { test, expect } = require('@playwright/test');
-const { LIMITS, VIEWS, WIDTHS, gotoView, openApp, measureScroller } = require('./helpers');
+const {
+  LIMITS,
+  VIEWS,
+  WIDTHS,
+  gotoView,
+  openApp,
+  measureScroller,
+  measureMainContent,
+} = require('./helpers');
 
 // The four pages whose card is sized to fill the fold (plus the overview) must
 // not scroll at all on a normal desktop window: they hold a handful of rows, so
@@ -32,13 +40,74 @@ test.describe('viewport resize', () => {
       for (const view of VIEWS) {
         await gotoView(page, view);
         const metrics = await measureScroller(page);
+        // 内部容器溢出会被 body 的 overflow-x:hidden 掩盖：文档不横向滚动，
+        // 但 .main-content 里的内容已经越界或被裁剪，所以两个量都要查。
+        const innerOverflow = await measureMainContent(page);
         expect(
           metrics.horizontal,
           `horizontal overflow in ${view} at ${width}px`,
         ).toBeLessThanOrEqual(LIMITS.horizontal);
+        expect(
+          innerOverflow,
+          `.main-content internal overflow in ${view} at ${width}px: ${innerOverflow}px`,
+        ).toBeLessThanOrEqual(LIMITS.horizontal);
       }
     });
   }
+
+  test('DNS row and its inputs stay inside the column at the 720px breakpoint', async ({
+    page,
+  }) => {
+    // (max-width:720px) 把 .dns-row 重排成 4 列网格并隐藏两列。它只出现在规则
+    // 页的「专用 DNS」标签下，内联编辑器打开时还有两个 .rule-field 输入框。
+    // 覆盖断点两侧（721 / 720）以捕获 off-by-one，并直接量容器内部溢出 ——
+    // 只看 document 会被 body overflow-x:hidden 骗过去。
+    for (const width of [721, 720]) {
+      await page.setViewportSize({ width, height: 800 });
+      await gotoView(page, '规则');
+      const dnsTab = page
+        .locator('.rules-tab-control button')
+        .filter({ hasText: '专用 DNS' });
+      await dnsTab.click();
+      await page.locator('.rules-toolbar-actions button.primary-button').click();
+
+      const editorInputs = page.locator('.dns-editor-grid .rule-field input');
+      await expect(editorInputs, `DNS editor inputs missing at ${width}px`).toHaveCount(2);
+
+      const geometry = await page.evaluate(() => {
+        const container = document.querySelector('.main-content');
+        const right = container.getBoundingClientRect().right;
+        const nodes = Array.from(
+          document.querySelectorAll('.dns-editor-grid .rule-field input, .dns-row'),
+        );
+        return {
+          innerOverflow: container.scrollWidth - container.clientWidth,
+          offenders: nodes
+            .filter((el) => {
+              const box = el.getBoundingClientRect();
+              return (
+                box.width > 0 &&
+                (box.right > right + 1 || el.scrollWidth > el.clientWidth + 1)
+              );
+            })
+            .map((el) => ({
+              tag: el.tagName,
+              cls: typeof el.className === 'string' ? el.className : '',
+              right: Math.round(el.getBoundingClientRect().right),
+            })),
+        };
+      });
+
+      expect(
+        geometry.innerOverflow,
+        `.main-content overflows internally at ${width}px`,
+      ).toBeLessThanOrEqual(LIMITS.horizontal);
+      expect(
+        geometry.offenders,
+        `DNS row/input overflows its column at ${width}px: ${JSON.stringify(geometry.offenders)}`,
+      ).toEqual([]);
+    }
+  });
 
   for (const height of FOLD_HEIGHTS) {
     test(`card pages fill the fold without scrolling at 1440x${height}`, async ({ page }) => {

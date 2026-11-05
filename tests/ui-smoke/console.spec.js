@@ -23,6 +23,19 @@ const listState = (page) =>
         ? last.getBoundingClientRect().bottom <= box.bottom + 1 &&
           last.getBoundingClientRect().top >= box.top - 1
         : false,
+      // The row the reader's eye is anchored to: the first row still poking into
+      // the visible box, plus how far its top sits from the list's top edge. A
+      // parked reader is "not moved" iff BOTH stay constant while rows arrive —
+      // scrollTop itself is expected to grow, because that growth is exactly how
+      // the browser's scroll anchoring holds this row still (see below).
+      anchorTime: (() => {
+        const anchor = rows.find((r) => r.getBoundingClientRect().bottom > box.top + 1);
+        return anchor ? anchor.querySelector('.log-time').textContent : null;
+      })(),
+      anchorOff: (() => {
+        const anchor = rows.find((r) => r.getBoundingClientRect().bottom > box.top + 1);
+        return anchor ? Math.round(anchor.getBoundingClientRect().top - box.top) : null;
+      })(),
       chip: (document.querySelector('.log-follow-button') || {}).textContent || null,
     };
   });
@@ -82,7 +95,16 @@ test.describe('log console', () => {
     await page.waitForTimeout(3000);
     const grown = await listState(page);
     expect(grown.rows, 'rows keep arriving').toBeGreaterThan(away.rows);
-    expect(grown.scrollTop, 'viewport must not move').toBe(away.scrollTop);
+    // "The viewport must not move" means the row the reader is looking at stays
+    // put, NOT that scrollTop stays constant. Rows arrive above the parked
+    // viewport, and the browser's scroll anchoring compensates by growing
+    // scrollTop by exactly the height inserted above — that growth is what
+    // holds the anchor row visually still. Asserting a frozen scrollTop number
+    // would contradict the anchoring this feature relies on (it passed only
+    // because the original blind-written spec never ran against a real DOM).
+    expect(grown.anchorTime, 'the parked row stays the anchor row').toBe(away.anchorTime);
+    expect(Math.abs((grown.anchorOff ?? 0) - (away.anchorOff ?? 0)), 'the parked row must not drift').toBeLessThanOrEqual(1);
+    expect(grown.scrollTop, 'anchoring must compensate by pushing scrollTop down').toBeGreaterThan(away.scrollTop);
 
     const count = (chip) => Number(chip.match(/(\d+)/)[1]);
     // Rows only ever arrive above the parked viewport, so every extra row in the

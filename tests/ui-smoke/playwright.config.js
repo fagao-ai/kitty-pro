@@ -24,6 +24,9 @@ module.exports = defineConfig({
     trace: 'retain-on-failure',
     // app.css collapses every animation under this query, which keeps entry
     // transitions (the modal slides 8px) from skewing geometry measurements.
+    // 固定为 reduce：既有几何/布局断言依赖它，不要删。若以后要断言动画本身
+    // 的行为（时长、位移等），需另开一个不设 reducedMotion 的 project，不能靠
+    // 改动这里来切换，否则会一并改变现有用例的结果。
     reducedMotion: 'reduce',
     ...(useSystemChrome ? { channel: 'chrome' } : {}),
   },

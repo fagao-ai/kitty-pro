@@ -3,11 +3,12 @@
   "private": true,
   "description": "Headless layout and dialog guards for the Kitty Pro web shell.",
   "scripts": {
-    "test": "playwright test layout.spec.js console.spec.js dialog.spec.js sync.spec.js",
+    "test": "playwright test layout.spec.js console.spec.js dialog.spec.js sync.spec.js a11y.spec.js flow.spec.js",
     "test:all": "playwright test",
     "test:negcheck": "KITTY_NEGCHECK=1 playwright test negcheck.spec.js"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.14.0",
     "@playwright/test": "1.49.1"
   }
 }
