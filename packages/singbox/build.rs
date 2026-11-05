@@ -181,6 +181,14 @@ fn android_clang(target_arch: &str) -> PathBuf {
         }
     }
 
+    // Homebrew's NDK keg only exists on macOS. Spelled as a value rather than
+    // `.or_else(|| ...)` because clippy 1.97 rejects a lazy closure whose body
+    // is a plain cfg-selected constant.
+    #[cfg(target_os = "macos")]
+    let default_ndk_root = Some(PathBuf::from("/opt/homebrew/share/android-ndk"));
+    #[cfg(not(target_os = "macos"))]
+    let default_ndk_root: Option<PathBuf> = None;
+
     let ndk_root = [
         "ANDROID_NDK_HOME",
         "ANDROID_NDK_ROOT",
@@ -189,16 +197,7 @@ fn android_clang(target_arch: &str) -> PathBuf {
     ]
     .into_iter()
     .find_map(|variable| env::var_os(variable).map(PathBuf::from))
-    .or_else(|| {
-        #[cfg(target_os = "macos")]
-        {
-            Some(PathBuf::from("/opt/homebrew/share/android-ndk"))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
-    })
+    .or(default_ndk_root)
     .expect("set ANDROID_NDK_HOME to build the embedded Android sing-box core");
     let host_tag = if cfg!(target_os = "macos") {
         if cfg!(target_arch = "aarch64") {
