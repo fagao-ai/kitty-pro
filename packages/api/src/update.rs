@@ -26,7 +26,12 @@
 //! browser, so a page served over LAN cannot be pointed at a third-party host by
 //! anything in a profile.
 
+// wasm32（客户端）上 dioxus 会把 server fn 函数体替换成网络调用桩，
+// 本模块所有 api_err 调用点随之消失，导入在 wasm 目标下属于未使用。
+#[cfg_attr(target_arch = "wasm32", allow(unused_imports))]
+use super::{api_err, ApiErrorCode};
 use dioxus::prelude::*;
+use kitty_server_fn_macro::kitty_server_fn;
 use proxy_core::{select_asset, GitHubRelease, ReleaseTarget};
 use serde::{Deserialize, Serialize};
 // Only the throttle reads this, and the throttle exists only where a check can
@@ -156,13 +161,7 @@ pub struct AppUpdateRequest {
     pub force: bool,
 }
 
-#[cfg_attr(
-    all(
-        not(any(target_os = "android", target_os = "ios")),
-        any(target_arch = "wasm32", feature = "server")
-    ),
-    get("/api/update/settings")
-)]
+#[kitty_server_fn(get, "/api/update/settings")]
 pub async fn load_update_settings() -> Result<UpdateSettings, ServerFnError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -179,13 +178,7 @@ pub async fn load_update_settings() -> Result<UpdateSettings, ServerFnError> {
     }
 }
 
-#[cfg_attr(
-    all(
-        not(any(target_os = "android", target_os = "ios")),
-        any(target_arch = "wasm32", feature = "server")
-    ),
-    post("/api/update/settings")
-)]
+#[kitty_server_fn(post, "/api/update/settings")]
 pub async fn save_update_settings(
     settings: UpdateSettings,
 ) -> Result<UpdateSettings, ServerFnError> {
@@ -204,7 +197,7 @@ pub async fn save_update_settings(
     #[cfg(target_arch = "wasm32")]
     {
         let _ = settings;
-        Err(ServerFnError::new("浏览器端不能写入更新设置"))
+        Err(api_err(ApiErrorCode::Internal, "浏览器端不能写入更新设置"))
     }
 }
 
@@ -213,24 +206,21 @@ pub async fn save_update_settings(
 /// `force: false` honours the daily throttle and answers from the last result
 /// that reached GitHub, which is what makes a startup check free on every
 /// subsequent launch. `force: true` is the button in the settings card.
-#[cfg_attr(
-    all(
-        not(any(target_os = "android", target_os = "ios")),
-        any(target_arch = "wasm32", feature = "server")
-    ),
-    post("/api/update/check")
-)]
+#[kitty_server_fn(post, "/api/update/check")]
 pub async fn check_app_update(request: AppUpdateRequest) -> Result<AppUpdateStatus, ServerFnError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let now = unix_now();
+        // S12: the client-supplied version is untrusted. The server build's own
+        // CARGO_PKG_VERSION is the authority for "what is currently installed".
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
 
         // A shell with no published package gets an answer without touching the
         // state file or the network.
         let Some(target) = ReleaseTarget::detect(&request.platform) else {
             return Ok(AppUpdateStatus {
                 state: AppUpdateState::Unsupported,
-                current_version: request.current_version,
+                current_version,
                 latest: None,
                 last_check_at: 0,
                 snoozed: false,
@@ -272,23 +262,17 @@ pub async fn check_app_update(request: AppUpdateRequest) -> Result<AppUpdateStat
                 Err(failure) => error = Some(failure.to_string()),
             }
         }
-        Ok(status_for(&target, &request.current_version, &state, error))
+        Ok(status_for(&target, &current_version, &state, error))
     }
     #[cfg(target_arch = "wasm32")]
     {
         let _ = request;
-        Err(ServerFnError::new("浏览器端不能直接检查更新"))
+        Err(api_err(ApiErrorCode::Internal, "浏览器端不能直接检查更新"))
     }
 }
 
 /// Stop presenting one version as an update until a newer release appears.
-#[cfg_attr(
-    all(
-        not(any(target_os = "android", target_os = "ios")),
-        any(target_arch = "wasm32", feature = "server")
-    ),
-    post("/api/update/dismiss")
-)]
+#[kitty_server_fn(post, "/api/update/dismiss")]
 pub async fn dismiss_app_update(version: String) -> Result<UpdateSettings, ServerFnError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -296,7 +280,7 @@ pub async fn dismiss_app_update(version: String) -> Result<UpdateSettings, Serve
         let mut state = super::run_native_blocking("读取更新状态失败", read_state).await?;
         let version = version.trim().to_string();
         if version.len() > 64 {
-            return Err(ServerFnError::new("版本号过长"));
+            return Err(api_err(ApiErrorCode::InvalidInput, "版本号过长"));
         }
         state.snoozed_version = version;
         let saved = state.clone();
@@ -306,7 +290,7 @@ pub async fn dismiss_app_update(version: String) -> Result<UpdateSettings, Serve
     #[cfg(target_arch = "wasm32")]
     {
         let _ = version;
-        Err(ServerFnError::new("浏览器端不能写入更新设置"))
+        Err(api_err(ApiErrorCode::Internal, "浏览器端不能写入更新设置"))
     }
 }
 
@@ -404,7 +388,7 @@ async fn fetch_release(target: &ReleaseTarget) -> Result<Option<AppRelease>, Ser
         // here (the client passes it in the request), and it is not needed.
         .user_agent("kitty-pro-update-check")
         .build()
-        .map_err(|error| ServerFnError::new(error.to_string()))?;
+        .map_err(|error| api_err(ApiErrorCode::Update, error.to_string()))?;
     let response = client
         .get(format!(
             "https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
@@ -412,7 +396,7 @@ async fn fetch_release(target: &ReleaseTarget) -> Result<Option<AppRelease>, Ser
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
-        .map_err(|error| ServerFnError::new(format!("检查更新失败: {error}")))?;
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("检查更新失败: {error}")))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // A repository with no published release answers 404. That is "nothing to
         // install", not a failure worth showing as one.
@@ -420,22 +404,22 @@ async fn fetch_release(target: &ReleaseTarget) -> Result<Option<AppRelease>, Ser
     }
     let response = response
         .error_for_status()
-        .map_err(|error| ServerFnError::new(format!("更新服务返回错误: {error}")))?;
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("更新服务返回错误: {error}")))?;
     if response
         .content_length()
         .is_some_and(|size| size > MAX_RELEASE_BYTES as u64)
     {
-        return Err(ServerFnError::new("更新信息超过 1 MiB 限制"));
+        return Err(api_err(ApiErrorCode::Update, "更新信息超过 1 MiB 限制"));
     }
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| ServerFnError::new(format!("读取更新信息失败: {error}")))?;
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("读取更新信息失败: {error}")))?;
     if bytes.len() > MAX_RELEASE_BYTES {
-        return Err(ServerFnError::new("更新信息超过 1 MiB 限制"));
+        return Err(api_err(ApiErrorCode::Update, "更新信息超过 1 MiB 限制"));
     }
     let release: GitHubRelease = serde_json::from_slice(&bytes)
-        .map_err(|error| ServerFnError::new(format!("更新信息格式错误: {error}")))?;
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("更新信息格式错误: {error}")))?;
     Ok(release_for(&release, target))
 }
 
@@ -481,6 +465,16 @@ fn release_for(release: &GitHubRelease, target: &ReleaseTarget) -> Option<AppRel
 ///
 /// The rest of this module already refuses to allocate freely on a hostile
 /// redirect; a link the user clicks deserves the same suspicion.
+/// Hosts a fetched release page may live on. `html_url` becomes the card's
+/// primary `href`, so S12 pins it to GitHub-controlled hosts; a fork set via
+/// KITTY_UPDATE_REPO still resolves to `github.com`, which is in this list.
+/// Anything else falls back to the compile-time repository URL.
+const RELEASE_ALLOWED_HOSTS: [&str; 3] = [
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+];
+
 fn release_url(html_url: Option<&str>) -> String {
     let fallback = || format!("https://github.com/{UPDATE_REPO}/releases");
     let Some(url) = html_url.map(str::trim) else {
@@ -500,7 +494,29 @@ fn release_url(html_url: Option<&str>) -> String {
     {
         return fallback();
     }
+    // Scheme alone is not enough: the host must be one of the GitHub domains
+    // above, so a tampered `html_url` cannot send the user elsewhere.
+    if !release_host_allowed(&url[scheme_end + 3..]) {
+        return fallback();
+    }
     url.to_string()
+}
+
+/// Extract the host from the part after `scheme://` and check the allow-list.
+/// Strips userinfo and port and tolerates a trailing DNS dot.
+fn release_host_allowed(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Reject embedded credentials (`user:pass@host`) outright.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+        .trim_matches(|c| c == '[' || c == ']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    RELEASE_ALLOWED_HOSTS.contains(&host.as_str())
 }
 
 /// What is remembered between runs.
@@ -523,7 +539,7 @@ fn update_state_path() -> Result<std::path::PathBuf, ServerFnError> {
     super::profile_path()?
         .parent()
         .map(|directory| directory.join("update.json"))
-        .ok_or_else(|| ServerFnError::new("无法确定更新状态目录"))
+        .ok_or_else(|| api_err(ApiErrorCode::Storage, "无法确定更新状态目录"))
 }
 
 /// Read the remembered state, falling back to defaults for anything unreadable.
@@ -545,7 +561,10 @@ fn read_state() -> Result<UpdateState, ServerFnError> {
     match std::fs::read(&path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(UpdateState::default()),
-        Err(error) => Err(ServerFnError::new(format!("读取更新状态失败: {error}"))),
+        Err(error) => Err(api_err(
+            ApiErrorCode::Storage,
+            format!("读取更新状态失败: {error}"),
+        )),
     }
 }
 
@@ -562,23 +581,34 @@ fn write_state(state: &UpdateState) -> Result<(), ServerFnError> {
     let path = update_state_path()?;
     let parent = path
         .parent()
-        .ok_or_else(|| ServerFnError::new("更新状态目录无效"))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| ServerFnError::new(format!("创建更新状态目录失败: {error}")))?;
+        .ok_or_else(|| api_err(ApiErrorCode::Storage, "更新状态目录无效"))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        api_err(
+            ApiErrorCode::Storage,
+            format!("创建更新状态目录失败: {error}"),
+        )
+    })?;
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
         if metadata.file_type().is_symlink() {
-            return Err(ServerFnError::new("更新状态路径不能是符号链接"));
+            return Err(api_err(ApiErrorCode::Storage, "更新状态路径不能是符号链接"));
         }
     }
-    let bytes = serde_json::to_vec_pretty(state)
-        .map_err(|error| ServerFnError::new(format!("序列化更新状态失败: {error}")))?;
+    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+        api_err(
+            ApiErrorCode::Storage,
+            format!("序列化更新状态失败: {error}"),
+        )
+    })?;
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut file = std::fs::File::create(&temporary)
-        .map_err(|error| ServerFnError::new(format!("写入更新状态失败: {error}")))?;
+        .map_err(|error| api_err(ApiErrorCode::Storage, format!("写入更新状态失败: {error}")))?;
     if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
         drop(file);
         let _ = std::fs::remove_file(&temporary);
-        return Err(ServerFnError::new(format!("写入更新状态失败: {error}")));
+        return Err(api_err(
+            ApiErrorCode::Storage,
+            format!("写入更新状态失败: {error}"),
+        ));
     }
     drop(file);
     #[cfg(windows)]
@@ -586,7 +616,7 @@ fn write_state(state: &UpdateState) -> Result<(), ServerFnError> {
         let _ = std::fs::remove_file(&path);
     }
     std::fs::rename(&temporary, &path)
-        .map_err(|error| ServerFnError::new(format!("保存更新状态失败: {error}")))?;
+        .map_err(|error| api_err(ApiErrorCode::Storage, format!("保存更新状态失败: {error}")))?;
     Ok(())
 }
 
@@ -616,7 +646,9 @@ mod tests {
             tag_name: tag.to_string(),
             name: Some(format!("Release {tag}")),
             body: Some("- something new".to_string()),
-            html_url: Some(format!("https://github.example/{tag}")),
+            html_url: Some(format!(
+                "https://github.com/{UPDATE_REPO}/releases/tag/{tag}"
+            )),
             published_at: Some("2026-11-03T00:00:00Z".to_string()),
             prerelease: false,
             assets: assets
@@ -811,19 +843,20 @@ mod tests {
     #[test]
     fn only_an_http_release_page_ever_becomes_the_link() {
         // `html_url` is a field of a fetched document and lands in the card's
-        // primary `href`, so a non-web scheme must not reach the anchor.
+        // primary `href`, so a non-web scheme must not reach the anchor. Only
+        // GitHub-controlled hosts are accepted (S12).
         assert_eq!(
-            release_url(Some("https://github.example/v1.0.9")),
-            "https://github.example/v1.0.9"
+            release_url(Some("https://github.com/owner/repo/releases/tag/v1.0.9")),
+            "https://github.com/owner/repo/releases/tag/v1.0.9"
         );
         assert_eq!(
-            release_url(Some("  http://github.example/v1.0.9  ")),
-            "http://github.example/v1.0.9"
+            release_url(Some("  http://api.github.com/repos/owner/repo  ")),
+            "http://api.github.com/repos/owner/repo"
         );
         // Case-insensitive scheme, but a lookalike is still rejected.
         assert_eq!(
-            release_url(Some("HTTPS://github.example/v1.0.9")),
-            "HTTPS://github.example/v1.0.9"
+            release_url(Some("HTTPS://objects.githubusercontent.com/asset")),
+            "HTTPS://objects.githubusercontent.com/asset"
         );
         let fallback = format!("https://github.com/{UPDATE_REPO}/releases");
         for hostile in [
@@ -834,6 +867,11 @@ mod tests {
             "httpsx://github.example",
             "https:",
             "//github.example/v1.0.9",
+            // A valid http(s) URL on a non-GitHub host must also fall back.
+            "https://evil.example/releases/v1.0.9",
+            "https://github.example.evil.com/v1.0.9",
+            "https://user:pass@github.com/owner/repo",
+            "https://localhost/releases",
             "",
             "   ",
         ] {

@@ -11,10 +11,12 @@ use std::{
 const DAEMON_CHILD: &str = "KITTY_PRO_WEB_DAEMON_CHILD";
 const READY_PATH: &str = "/__kitty_pro_daemon_ready";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-pub const HELP: &str = "用法: web [--port <1-65535>] [--allow-lan] [--daemon [--log-file <路径>]]\n\n  --port       覆盖 PORT 环境变量（默认 7897）\n  --allow-lan  允许 IP 环境变量绑定非 loopback 地址\n  --daemon     后台启动，等待服务就绪后退出\n  --log-file   后台日志追加路径（默认 kitty-pro-web.log）\n  -h, --help   显示帮助\n\nIP 环境变量指定绑定 IP（默认 127.0.0.1）。绑定非 loopback 需要\n--allow-lan（或 KITTY_PRO_ALLOW_LAN=1），并将直连主机名加入\nKITTY_PRO_ALLOWED_HOSTS（逗号分隔后缀白名单，IP 直连不受限）。\n保留 dx serve 设置的 PORT/IP；不要在 dx serve 下使用 --daemon。";
+pub const HELP: &str = "用法: web [--port <1-65535>] [--allow-lan] [--daemon [--log-file <路径>]]\n\n  --port       覆盖 PORT 环境变量（默认 7897）\n  --allow-lan  允许 IP 环境变量绑定非 loopback 地址\n  --daemon     后台启动，等待服务就绪后退出\n  --log-file   后台日志追加路径（默认 kitty-pro-web.log）\n  -h, --help   显示帮助\n\nIP 环境变量指定绑定 IP（默认 127.0.0.1）。绑定非 loopback 需要\n--allow-lan（或 KITTY_PRO_ALLOW_LAN=1），并将直连主机名加入\nKITTY_PRO_ALLOWED_HOSTS（逗号分隔的主机名精确白名单，IP 直连不受限）。\n保留 dx serve 设置的 PORT/IP；不要在 dx serve 下使用 --daemon。";
 
-/// 非 loopback 绑定的总开关：`--allow-lan` 会写入同名环境变量传给子进程。
-pub fn lan_mode_enabled() -> bool {
+/// KITTY_PRO_ALLOW_LAN 开关：仅表示「允许绑定非 loopback 地址」，不等同于
+/// 运行期宽松策略（见 `lan_mode_enabled`）。`--allow-lan` 会写入同名环境变量
+/// 透传给 --daemon 子进程。
+fn allow_lan_flag() -> bool {
     std::env::var("KITTY_PRO_ALLOW_LAN").is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -23,8 +25,29 @@ pub fn lan_mode_enabled() -> bool {
     })
 }
 
-/// Host 白名单后缀（小写、去空白）。LAN 模式下额外放行这些主机名，
-/// IP 字面量直连始终放行；这是防 DNS rebinding 的兜底名单。
+/// 运行期 LAN 宽松策略开关：必须同时满足「显式允许对外监听」且「实际绑定地址
+/// 确实非 loopback」。prepare() 会把 IP 环境变量规范化为 Dioxus 实际监听的
+/// 地址，据此判断，杜绝「KITTY_PRO_ALLOW_LAN=1 + 只绑 127.0.0.1」组合出
+/// 只绑本机却启用宽松 Host/Origin 策略的情况。
+pub fn lan_mode_enabled() -> bool {
+    allow_lan_flag()
+        && std::env::var("IP")
+            .ok()
+            .is_some_and(|value| is_lan_binding(&value))
+}
+
+/// 字符串是否为「非 loopback」的 IP（对外/LAN 监听地址）。解析失败或 loopback
+/// 一律返回 false，保守关闭宽松策略。
+fn is_lan_binding(value: &str) -> bool {
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .is_some_and(|ip| !ip.is_loopback())
+}
+
+/// Host 白名单（小写、去空白、去前导点）。S2 起改为「精确主机名」匹配：
+/// LAN 模式下只放行与条目完全一致的主机名，子域/后缀不再匹配；
+/// IP 字面量直连始终放行。这是防 DNS rebinding 的兜底名单。
 pub fn allowed_host_suffixes() -> Vec<String> {
     std::env::var("KITTY_PRO_ALLOWED_HOSTS")
         .map(|value| {
@@ -109,7 +132,7 @@ fn address(
         Some(ip) => ip.parse().map_err(|_| format!("无效 IP 环境变量 {ip:?}"))?,
         None => Ipv4Addr::LOCALHOST.into(),
     };
-    if !ip.is_loopback() && !(options.allow_lan || lan_mode_enabled()) {
+    if !ip.is_loopback() && !(options.allow_lan || allow_lan_flag()) {
         return Err("IP 是 loopback 以外的地址，需要 --allow-lan 显式开启对外监听".into());
     }
     Ok(SocketAddr::new(ip, port))
@@ -316,6 +339,18 @@ mod tests {
     }
 
     #[test]
+    fn lan_mode_requires_non_loopback_binding() {
+        // 只有实际绑定非 loopback 地址时宽松策略才应生效。
+        assert!(is_lan_binding("192.168.1.3"));
+        assert!(is_lan_binding("0.0.0.0"));
+        assert!(is_lan_binding("2001:db8::1"));
+        assert!(!is_lan_binding("127.0.0.1"));
+        assert!(!is_lan_binding("::1"));
+        assert!(!is_lan_binding("localhost"));
+        assert!(!is_lan_binding(""));
+    }
+
+    #[test]
     fn default_and_environment_priority() {
         let opts = options(&[]).unwrap();
         assert_eq!(
@@ -465,5 +500,23 @@ mod tests {
         });
         assert!(!probe_ready(addr, "expected").unwrap_or(false));
         responder.join().unwrap();
+    }
+
+    #[test]
+    fn dioxus_router_never_enables_permissive_cors() {
+        // Q6 源码级守卫：Dioxus server 的 router(App) 默认不挂任何跨域放行层，
+        // 本仓库也不应显式启用「放行任意来源」的配置，否则 /api/* 的跨站读取
+        // 会绕过浏览器同源限制、放大 S1 的实际危害。用 include_str!("main.rs")
+        // 锁定 main.rs 源码中不存在这些放行配置（本测试位于 cli.rs，字符串不会
+        // 污染被检查的源码），防止以后有人误加。
+        // 注意：这里只禁止「任意来源放行」这一危险子集；若将来确需 CORS，应显式
+        // 白名单来源并同时保留 control_session_guard，而不是放开到任意源。
+        let source = include_str!("main.rs");
+        for forbidden in ["CorsLayer", "allow_origin", "Access-Control-Allow-Origin"] {
+            assert!(
+                !source.contains(forbidden),
+                "main.rs 不应包含放行任意来源的 CORS 配置: {forbidden}"
+            );
+        }
     }
 }

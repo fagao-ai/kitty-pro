@@ -506,6 +506,15 @@ pub struct SyncSubscription {
     pub id: u64,
     pub name: String,
     pub source: String,
+    /// Last parsed nodes travel with the snapshot so a pull restores a usable
+    /// connection without re-downloading every subscription (README).
+    /// `serde(default)` keeps snapshots written before this field parseable.
+    #[serde(default)]
+    pub nodes: Vec<ProxyNode>,
+    #[serde(default)]
+    pub proxy_server_nameservers: Vec<String>,
+    #[serde(default)]
+    pub rejected_count: usize,
 }
 
 impl From<&Subscription> for SyncSubscription {
@@ -514,6 +523,9 @@ impl From<&Subscription> for SyncSubscription {
             id: subscription.id,
             name: subscription.name.clone(),
             source: subscription.source.clone(),
+            nodes: subscription.nodes.clone(),
+            proxy_server_nameservers: subscription.proxy_server_nameservers.clone(),
+            rejected_count: subscription.rejected_count,
         }
     }
 }
@@ -524,9 +536,9 @@ impl From<SyncSubscription> for Subscription {
             id: subscription.id,
             name: subscription.name,
             source: subscription.source,
-            nodes: Vec::new(),
-            proxy_server_nameservers: Vec::new(),
-            rejected_count: 0,
+            nodes: subscription.nodes,
+            proxy_server_nameservers: subscription.proxy_server_nameservers,
+            rejected_count: subscription.rejected_count,
         }
     }
 }
@@ -634,9 +646,92 @@ const fn default_profile_version() -> u32 {
     1
 }
 
+/// 当前迁移器认识的 profile schema 版本（B9）。与 `AppProfile.version`（本地
+/// 文件格式版本，历史恒为 1）刻意区分：它供加载层从原始 JSON 判断数据新旧，
+/// 而 `migrate_app_profile` 对内存中的 AppProfile 做保守归一化、不写回 version。
+pub const CURRENT_PROFILE_SCHEMA: u32 = 3;
+
+/// 从原始 profile JSON 读取可选的 `schema_version`，缺省/非法/负数/溢出一律
+/// 返回 0（对应最旧的历史数据）。proxy-core 内部暂无生产调用点：加载与版本
+/// 协商在 api 层，故此处仅作为 crate 内工具保留，压制 dead_code 以免影响
+/// `clippy -D warnings` 门禁。
+#[allow(dead_code)]
+pub(crate) fn profile_schema_version(value: &serde_json::Value) -> u32 {
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(0)
+}
+
+/// 脚本长度的保守上限，与 api 层 `MAX_PROFILE_CONFIG_SCRIPT_BYTES`（512 KiB）
+/// 对齐；迁移时把历史遗留的超大脚本截断，避免写盘/序列化放大（REVIEW B8）。
+const MAX_MIGRATION_CONFIG_SCRIPT_BYTES: usize = 512 * 1024;
+
+/// 按字节上限安全截断字符串（不切断 UTF-8 字符边界）。
+fn truncate_utf8(value: &mut String, limit: usize) {
+    if value.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+/// 对内存中的 `AppProfile` 做幂等的旧数据归一化（B9 保守实现）。
+/// 不新增字段、不改变结构体形状、不改任何 `pub fn` 签名；重复调用结果一致，
+/// 且对已是当前版本的合法数据完全 no-op。每条规则注明它修复的历史行为。
+pub fn migrate_app_profile(profile: &mut AppProfile) {
+    // v0/v1（`default_profile_version()==1`）：导入失败会留下 source 为空的
+    // 占位订阅，早期 UI 又允许保存 tag 为空的节点；它们会让连接入口拿到空
+    // 地址、渲染出空白行。清理「数据本身为空」的项，不动合法内容。
+    profile
+        .subscriptions
+        .retain(|subscription| !subscription.source.trim().is_empty());
+    for subscription in &mut profile.subscriptions {
+        subscription
+            .nodes
+            .retain(|node| !node.tag.trim().is_empty());
+    }
+
+    // v1：`tunnel_mode` 曾以自由文本持久化并出现过已废弃的模式取值。当前
+    // `TunnelMode` 是 Rule/Global/Direct 三态枚举，serde 在反序列化阶段就拒绝
+    // 未知字符串，能进入这里的必是合法值，因此无需运行时映射，显式保持原值。
+    // `dark_mode` / `tun_enabled` / `allow_lan` 等 bool 同样保持原值，绝不重置。
+
+    // v1/v2：自定义规则与配置脚本曾无长度/数量上限，旧 profile 可能写入超大
+    // 字段。按现有常量收敛：`MAX_CUSTOM_RULES` 限条数、`MAX_CUSTOM_RULE_VALUE_BYTES`
+    // 限每条 value、512 KiB 限脚本；幂等，且对合规数据 no-op。
+    profile.custom_rules.truncate(MAX_CUSTOM_RULES);
+    for rule in &mut profile.custom_rules {
+        truncate_utf8(&mut rule.value, MAX_CUSTOM_RULE_VALUE_BYTES);
+    }
+    truncate_utf8(
+        &mut profile.config_script,
+        MAX_MIGRATION_CONFIG_SCRIPT_BYTES,
+    );
+
+    // v2：切换/刷新/删除订阅会重写 namespaced 节点 tag，旧 group_selections
+    // 被整体 clone，残留项会随每次 ConnectionRequest 下发（F18）。与 UI 层
+    // `prune_stale_group_selections` 同语义：只清理形如 `subscription-*` 且已
+    // 不存在的节点选择，内置组名 / `direct` 等非节点选择一律保留。
+    let live_tags: HashSet<String> = profile
+        .subscriptions
+        .iter()
+        .flat_map(|subscription| subscription.nodes.iter())
+        .map(|node| node.tag.clone())
+        .collect();
+    profile.group_selections.retain(|_, outbound| {
+        !outbound.starts_with("subscription-") || live_tags.contains(outbound.as_str())
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deterministic_test_support::Lcg;
 
     #[test]
     fn profile_round_trips_proxy_credentials() {
@@ -684,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_snapshot_only_contains_subscription_sources_and_rules() {
+    fn sync_snapshot_carries_parsed_nodes_and_rules() {
         let node = crate::parse_subscription(
             "vless://11111111-1111-1111-1111-111111111111@edge.example.com:443?security=tls#Edge",
         )
@@ -735,8 +830,14 @@ mod tests {
         assert_eq!(snapshot.version, SYNC_SNAPSHOT_VERSION);
         assert_eq!(snapshot.updated_at, 42);
         assert_eq!(target.subscriptions.len(), 1);
-        assert!(target.subscriptions[0].nodes.is_empty());
-        assert!(target.subscriptions[0].proxy_server_nameservers.is_empty());
+        // F6: remote snapshots now carry the last parsed nodes so a pull can be
+        // used immediately instead of forcing a manual refresh of every source.
+        assert_eq!(target.subscriptions[0].nodes, source.subscriptions[0].nodes);
+        assert_eq!(
+            target.subscriptions[0].proxy_server_nameservers,
+            source.subscriptions[0].proxy_server_nameservers
+        );
+        assert_eq!(target.subscriptions[0].rejected_count, 2);
         assert_eq!(target.active_subscription_id, None);
         assert!(target.selected_tag.is_empty());
         assert_eq!(target.custom_rules, source.custom_rules);
@@ -750,7 +851,13 @@ mod tests {
         assert!(serialized.get("active_subscription_id").is_none());
         assert!(serialized.get("selected_tag").is_none());
         assert!(serialized.get("group_selections").is_none());
-        assert!(serialized["subscriptions"][0].get("nodes").is_none());
+        assert_eq!(
+            serialized["subscriptions"][0]["nodes"]
+                .as_array()
+                .map(|nodes| nodes.len()),
+            Some(1),
+            "the snapshot should carry the last parsed nodes (F6)"
+        );
     }
 
     #[test]
@@ -976,5 +1083,340 @@ mod tests {
             validate_custom_rules(&rules),
             Err(CustomRuleValidationError::Duplicate)
         );
+    }
+
+    // ===== B9：AppProfile 版本迁移 =====
+
+    #[test]
+    fn profile_schema_version_reads_optional_schema_version() {
+        assert_eq!(profile_schema_version(&serde_json::json!({})), 0);
+        assert_eq!(
+            profile_schema_version(&serde_json::json!({ "schema_version": 0 })),
+            0
+        );
+        assert_eq!(
+            profile_schema_version(&serde_json::json!({ "schema_version": 2 })),
+            2
+        );
+        assert_eq!(
+            profile_schema_version(&serde_json::json!({
+                "schema_version": CURRENT_PROFILE_SCHEMA
+            })),
+            CURRENT_PROFILE_SCHEMA
+        );
+        // 非法/字符串/负数/溢出/非对象一律回退到 0（最旧版本）。
+        assert_eq!(
+            profile_schema_version(&serde_json::json!({ "schema_version": "3" })),
+            0
+        );
+        assert_eq!(
+            profile_schema_version(&serde_json::json!({ "schema_version": -1 })),
+            0
+        );
+        assert_eq!(
+            profile_schema_version(&serde_json::json!({ "schema_version": u64::MAX })),
+            0
+        );
+        assert_eq!(profile_schema_version(&serde_json::json!(null)), 0);
+    }
+
+    #[test]
+    fn migrate_app_profile_normalizes_legacy_data() {
+        let long_value = "x".repeat(MAX_CUSTOM_RULE_VALUE_BYTES + 200);
+        let long_script = "a".repeat(MAX_MIGRATION_CONFIG_SCRIPT_BYTES + 1024);
+        let legacy = serde_json::json!({
+            "version": 1,
+            "subscriptions": [
+                { "id": 1, "name": "empty", "source": "", "nodes": [] },
+                {
+                    "id": 2, "name": "dirty", "source": "https://example.com/sub",
+                    "nodes": [
+                        { "tag": "", "name": "blank", "protocol": "vless", "server": "a.example.com", "port": 443, "auth": {"kind":"none"} },
+                        { "tag": "subscription-2-ok", "name": "ok", "protocol": "vless", "server": "b.example.com", "port": 443, "auth": {"kind":"none"} }
+                    ]
+                }
+            ],
+            "custom_rules": [{ "id": 1, "match_type": "domain_keyword", "value": long_value, "action": "proxy" }],
+            "config_script": long_script,
+            "dark_mode": true,
+            "tun_enabled": true,
+            "allow_lan": true,
+            "tunnel_mode": "global",
+            "group_selections": {
+                "proxy": "subscription-2-ok",
+                "fallback": "subscription-99-ghost"
+            }
+        });
+        let mut profile: AppProfile =
+            serde_json::from_value(legacy).expect("legacy profile should decode");
+        migrate_app_profile(&mut profile);
+
+        // 空 source 订阅被清理、空 tag 节点被清理、合法节点保留。
+        assert_eq!(profile.subscriptions.len(), 1);
+        assert_eq!(profile.subscriptions[0].nodes.len(), 1);
+        assert_eq!(profile.subscriptions[0].nodes[0].tag, "subscription-2-ok");
+        // 超长字段被截断到既有上限。
+        assert!(profile.custom_rules[0].value.len() <= MAX_CUSTOM_RULE_VALUE_BYTES);
+        assert!(profile.config_script.len() <= MAX_MIGRATION_CONFIG_SCRIPT_BYTES);
+        // 悬空 namespaced 选择被清理，指向现存节点的选择保留。
+        assert_eq!(
+            profile.group_selections.get("proxy").map(String::as_str),
+            Some("subscription-2-ok")
+        );
+        assert!(!profile.group_selections.contains_key("fallback"));
+        // bool 与 tunnel_mode 保持原值（绝不重置）。
+        assert!(profile.dark_mode && profile.tun_enabled && profile.allow_lan);
+        assert_eq!(profile.tunnel_mode, TunnelMode::Global);
+    }
+
+    #[test]
+    fn migrate_app_profile_is_idempotent() {
+        let long_value = "y".repeat(MAX_CUSTOM_RULE_VALUE_BYTES + 300);
+        let long_script = "b".repeat(MAX_MIGRATION_CONFIG_SCRIPT_BYTES + 256);
+        let legacy = serde_json::json!({
+            "subscriptions": [
+                { "id": 1, "name": "s", "source": "", "nodes": [] },
+                { "id": 2, "name": "t", "source": "https://example.com/sub",
+                  "nodes": [ { "tag": "", "name": "x", "protocol": "vless", "server": "a", "port": 443, "auth": {"kind":"none"} } ] }
+            ],
+            "custom_rules": [{ "id": 1, "match_type": "domain_keyword", "value": long_value, "action": "proxy" }],
+            "config_script": long_script,
+            "group_selections": { "proxy": "subscription-7-ghost" }
+        });
+        let mut profile: AppProfile =
+            serde_json::from_value(legacy).expect("legacy profile should decode");
+        migrate_app_profile(&mut profile);
+        let once = profile.clone();
+        migrate_app_profile(&mut profile);
+        assert_eq!(profile, once, "迁移必须幂等：第二次调用不得改变任何字段");
+    }
+
+    #[test]
+    fn migrate_app_profile_leaves_current_data_unchanged() {
+        let node = ProxyNode {
+            tag: "subscription-7-edge".to_string(),
+            name: "Edge".to_string(),
+            protocol: ProxyProtocol::Vless,
+            server: "edge.example.com".to_string(),
+            port: 443,
+            auth: ProxyAuth::None,
+            transport: TransportOptions::default(),
+            tls: TlsOptions::default(),
+            hysteria2: None,
+        };
+        let profile = AppProfile {
+            subscriptions: vec![Subscription {
+                id: 7,
+                name: "Primary".to_string(),
+                source: "https://example.com/sub".to_string(),
+                nodes: vec![node],
+                proxy_server_nameservers: Vec::new(),
+                rejected_count: 0,
+            }],
+            active_subscription_id: Some(7),
+            selected_tag: "subscription-7-edge".to_string(),
+            tunnel_mode: TunnelMode::Global,
+            tun_enabled: true,
+            allow_lan: true,
+            dark_mode: true,
+            custom_rules: vec![CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::DomainSuffix,
+                value: "example.com".to_string(),
+                action: CustomRuleAction::Direct,
+            }],
+            config_script: "function main(c) { return c; }".to_string(),
+            config_script_enabled: true,
+            group_selections: HashMap::from([(
+                "proxy".to_string(),
+                "subscription-7-edge".to_string(),
+            )]),
+            ..AppProfile::default()
+        };
+        let mut migrated = profile.clone();
+        migrate_app_profile(&mut migrated);
+        assert_eq!(migrated, profile, "当前版本的合法数据不应被迁移改动");
+    }
+
+    // ===== T3：确定性生成式测试（纯标准库 LCG，不引入 rand/proptest）=====
+
+    #[test]
+    fn generated_profiles_and_snapshots_round_trip() {
+        const SEED: u64 = 0x4d4f_4445_4c53_5254; // "MODELSRT"
+        let mut lcg = Lcg::new(SEED);
+        for iteration in 0..150 {
+            // 生成「空 / 满 / 超长 / 特殊字符」组合的字段。
+            let tag = format!("subscription-{}-{}", lcg.next() % 8, lcg.text(6));
+            let node = ProxyNode {
+                tag: tag.clone(),
+                name: lcg.text(10),
+                protocol: ProxyProtocol::Vless,
+                server: lcg.text(12),
+                port: 443,
+                auth: ProxyAuth::None,
+                transport: TransportOptions::default(),
+                tls: TlsOptions::default(),
+                hysteria2: None,
+            };
+            let script_len = match lcg.next() % 4 {
+                0 => 0,
+                1 => 16,
+                2 => 2048, // 超长
+                _ => 5,
+            };
+            let mut profile = AppProfile {
+                subscriptions: vec![Subscription {
+                    id: lcg.next(),
+                    name: lcg.text(8),
+                    source: lcg.text(20),
+                    nodes: vec![node],
+                    proxy_server_nameservers: vec![lcg.text(8)],
+                    rejected_count: (lcg.next() % 8) as usize,
+                }],
+                selected_tag: tag.clone(),
+                config_script: lcg.text(script_len),
+                dark_mode: lcg.next().is_multiple_of(2),
+                tun_enabled: lcg.next().is_multiple_of(2),
+                allow_lan: lcg.next().is_multiple_of(2),
+                group_selections: HashMap::from([("proxy".to_string(), tag)]),
+                ..AppProfile::default()
+            };
+            profile.dns_overrides = if lcg.next().is_multiple_of(2) {
+                Vec::new()
+            } else {
+                vec![DnsOverride {
+                    id: 1,
+                    enabled: true,
+                    domain_suffix: lcg.text(8),
+                    server: lcg.text(8),
+                }]
+            };
+
+            let profile_bytes = serde_json::to_vec(&profile).unwrap_or_else(|error| {
+                panic!("seed={SEED:#x} iteration={iteration}: profile 序列化失败: {error}")
+            });
+            let restored: AppProfile =
+                serde_json::from_slice(&profile_bytes).unwrap_or_else(|error| {
+                    panic!("seed={SEED:#x} iteration={iteration}: profile 反序列化失败: {error}")
+                });
+            assert_eq!(
+                restored, profile,
+                "seed={SEED:#x} iteration={iteration}: AppProfile serde 往返必须一致"
+            );
+
+            let mut snapshot = SyncSnapshot::from_profile(&profile, lcg.next());
+            if lcg.next().is_multiple_of(2) {
+                snapshot.dns_overrides = None;
+                snapshot.config_script = None;
+            }
+            let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap_or_else(|error| {
+                panic!("seed={SEED:#x} iteration={iteration}: snapshot 序列化失败: {error}")
+            });
+            let restored_snapshot: SyncSnapshot = serde_json::from_slice(&snapshot_bytes)
+                .unwrap_or_else(|error| {
+                    panic!("seed={SEED:#x} iteration={iteration}: snapshot 反序列化失败: {error}")
+                });
+            assert_eq!(
+                restored_snapshot, snapshot,
+                "seed={SEED:#x} iteration={iteration}: SyncSnapshot serde 往返必须一致"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_legacy_snapshots_with_missing_fields_decode() {
+        const SEED: u64 = 0x4c45_4741_4359_534e; // "LEGACYSN"
+        let mut lcg = Lcg::new(SEED);
+        for iteration in 0..100 {
+            // 模拟 v1 快照：subscription 缺 nodes，顶层缺 dns_overrides /
+            // config_script，再随机省略 updated_at / subscriptions / custom_rules。
+            let mut doc = serde_json::json!({
+                "format": SYNC_SNAPSHOT_FORMAT,
+                "version": lcg.next() % 3 + 1,
+                "updated_at": lcg.next(),
+                "subscriptions": [{
+                    "id": 1,
+                    "name": lcg.text(8),
+                    "source": "https://example.com/sub",
+                    "proxy_server_nameservers": [],
+                    "rejected_count": 0
+                }],
+                "custom_rules": []
+            });
+            let object = doc
+                .as_object_mut()
+                .expect("legacy snapshot must be an object");
+            for key in ["updated_at", "subscriptions", "custom_rules"] {
+                if lcg.next().is_multiple_of(2) {
+                    object.remove(key);
+                }
+            }
+            let snapshot: SyncSnapshot = serde_json::from_value(doc).unwrap_or_else(|error| {
+                panic!("seed={SEED:#x} iteration={iteration}: 旧版快照应可解码: {error}")
+            });
+            // 缺省字段全部由 #[serde(default)] 兜底。
+            assert!(snapshot.dns_overrides.is_none());
+            assert!(snapshot.config_script.is_none());
+            assert!(snapshot
+                .subscriptions
+                .iter()
+                .all(|subscription| subscription.nodes.is_empty()));
+        }
+    }
+
+    #[test]
+    fn custom_rules_validation_survives_serde_round_trip() {
+        const SEED: u64 = 0x4355_5354_4f4d_5255; // "CUSTOMRU"
+        let mut lcg = Lcg::new(SEED);
+        for iteration in 0..100 {
+            // 每组随机选一种非法规则形态，往返后校验必须仍然拒绝。
+            let variant = iteration % 4;
+            let mut rules = vec![CustomRule {
+                id: 1,
+                enabled: true,
+                match_type: CustomRuleMatch::DomainKeyword,
+                value: "example".to_string(),
+                action: CustomRuleAction::Proxy,
+            }];
+            match variant {
+                0 => rules[0].id = 0,        // InvalidId
+                1 => rules[0].value.clear(), // Empty
+                2 => {
+                    let duplicate = rules[0].clone();
+                    rules.push(duplicate); // InvalidId（重复）
+                }
+                _ => rules[0].value = lcg.text(MAX_CUSTOM_RULE_VALUE_BYTES + 64), // TooLong
+            }
+            let profile = AppProfile {
+                custom_rules: rules,
+                ..AppProfile::default()
+            };
+            let bytes = serde_json::to_vec(&profile).unwrap_or_else(|error| {
+                panic!("seed={SEED:#x} iteration={iteration}: 序列化失败: {error}")
+            });
+            let restored: AppProfile = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                panic!("seed={SEED:#x} iteration={iteration}: 反序列化失败: {error}")
+            });
+            assert!(
+                validate_custom_rules(&restored.custom_rules).is_err(),
+                "seed={SEED:#x} iteration={iteration} variant={variant}: 往返后 custom_rules 校验仍应拒绝非法规则"
+            );
+            // 对照组：合法规则往返后必须通过校验。
+            let valid = AppProfile {
+                custom_rules: vec![CustomRule {
+                    id: 9,
+                    enabled: true,
+                    match_type: CustomRuleMatch::DomainSuffix,
+                    value: "example.com".to_string(),
+                    action: CustomRuleAction::Direct,
+                }],
+                ..AppProfile::default()
+            };
+            let valid_bytes = serde_json::to_vec(&valid).expect("serialize");
+            let restored_valid: AppProfile =
+                serde_json::from_slice(&valid_bytes).expect("deserialize");
+            assert!(validate_custom_rules(&restored_valid.custom_rules).is_ok());
+        }
     }
 }

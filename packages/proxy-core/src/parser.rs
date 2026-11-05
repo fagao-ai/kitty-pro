@@ -10,6 +10,13 @@ use std::collections::HashMap;
 use thiserror::Error;
 use url::Url;
 
+// YAML 解析前的输入预算（本地常量，不依赖 api 的 MAX_SUBSCRIPTION_BYTES）。
+// 与订阅下载 10 MiB 上限对齐，限制行数/缩进/锚点数量以抵御 alias 展开炸弹。
+const MAX_YAML_BYTES: usize = 10 * 1024 * 1024;
+const MAX_YAML_LINES: usize = 200_000;
+const MAX_YAML_INDENT_DEPTH: usize = 200;
+const MAX_YAML_ANCHOR_ALIASES: usize = 64;
+
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("不支持的协议: {0}")]
@@ -363,6 +370,13 @@ fn parse_shadowsocks(link: &str, index: usize) -> Result<ProxyNode, ParseError> 
 /// YAML 锚点复用，因此解析前先检查是否存在“anchor 定义 + alias 引用”
 /// 的组合：单独出现 `&`/`*` 字符（密码、备注里的符号）不受影响，只有
 /// 定义并被引用时才拒绝。
+///
+/// Q3：锚点名按 token 起始字符 `&`/`*` 识别，后面的名字不再限制为 ASCII——
+/// YAML 1.2 允许非 ASCII 字符作锚点名（如 `&节点` / `*节点`）。旧实现只把
+/// ASCII 字母数字/`_ - .` 当作名字，遇到 `&节点` 会读出空名字而整对漏检，
+/// 让 Unicode 锚点名炸弹绕过本启发式（yaml_input_budget 的数量上限也未必覆盖
+/// 层数少但展开量大的文档）。名字切片按 UTF-8 字节整体推进，停在分隔符上，
+/// 保证 `line[name_start..end]` 始终落在字符边界、不会 panic。
 fn yaml_expansion_bomb(text: &str) -> bool {
     let mut anchors: Vec<&str> = Vec::new();
     let mut aliases: Vec<&str> = Vec::new();
@@ -386,7 +400,10 @@ fn yaml_expansion_bomb(text: &str) -> bool {
                 let mut end = name_start;
                 while end < bytes.len()
                     && (bytes[end].is_ascii_alphanumeric()
-                        || matches!(bytes[end], b'_' | b'-' | b'.'))
+                        || matches!(bytes[end], b'_' | b'-' | b'.')
+                        // 允许任意非 ASCII 字节：UTF-8 多字节字符整体作为名字，
+                        // 不再要求后续字符必须是 ASCII（Q3）。
+                        || !bytes[end].is_ascii())
                 {
                     end += 1;
                 }
@@ -407,7 +424,98 @@ fn yaml_expansion_bomb(text: &str) -> bool {
     !anchors.is_empty() && aliases.iter().any(|alias| anchors.contains(alias))
 }
 
+/// 仅当 `#` 位于行首或前面是空白时才视为注释（值内的 `#` 不算）。
+fn strip_yaml_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] == b'#' && (index == 0 || bytes[index - 1].is_ascii_whitespace()) {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+/// 判断一行是否以块标量指示符（| / > 及其 + - 数字变体）结尾。
+fn is_block_scalar_indicator(trimmed: &str) -> bool {
+    trimmed
+        .split_whitespace()
+        .last()
+        .is_some_and(|token| token.starts_with('|') || token.starts_with('>'))
+}
+
+/// YAML 反序列化前的输入预算校验：在调用 serde_yaml::from_str 之前限制总字节、
+/// 行数、缩进深度、锚点/别名数量，并拒绝自定义标签（!!python/object 等）与
+/// 块标量之外的可疑 &/* 组合。与 yaml_expansion_bomb 启发式叠加为多层防线。
+pub(crate) fn yaml_input_budget(source: &str) -> Result<(), ParseError> {
+    if source.len() > MAX_YAML_BYTES {
+        return Err(ParseError::InvalidYaml(format!(
+            "YAML 输入超过 {MAX_YAML_BYTES} 字节安全上限"
+        )));
+    }
+    let mut lines = 0usize;
+    let mut anchor_alias_count = 0usize;
+    let mut block_scalar_indent: Option<usize> = None;
+    for line in source.lines() {
+        lines += 1;
+        if lines > MAX_YAML_LINES {
+            return Err(ParseError::InvalidYaml(format!(
+                "YAML 输入超过 {MAX_YAML_LINES} 行安全上限"
+            )));
+        }
+        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+        let content = strip_yaml_comment(line);
+        let trimmed = content.trim();
+
+        // 块标量内部的行是纯文本，不参与缩进/标签/锚点检查。
+        if let Some(base_indent) = block_scalar_indent {
+            if trimmed.is_empty() || indent > base_indent {
+                continue;
+            }
+            block_scalar_indent = None;
+        }
+        if indent > MAX_YAML_INDENT_DEPTH {
+            return Err(ParseError::InvalidYaml(format!(
+                "YAML 缩进深度超过 {MAX_YAML_INDENT_DEPTH} 层安全上限"
+            )));
+        }
+
+        let bytes = content.as_bytes();
+        let mut position = 0;
+        while position < bytes.len() {
+            let byte = bytes[position];
+            let at_token_start = position == 0
+                || bytes[position - 1].is_ascii_whitespace()
+                || matches!(bytes[position - 1], b'[' | b'{' | b',');
+            // 拒绝自定义/危险 YAML 标签（!!python/object、!!str 等）。
+            if at_token_start
+                && byte == b'!'
+                && position + 1 < bytes.len()
+                && bytes[position + 1] == b'!'
+            {
+                return Err(ParseError::InvalidYaml(
+                    "YAML 输入包含不允许的自定义标签".to_string(),
+                ));
+            }
+            // 统计块标量之外的锚点/别名标记。
+            if at_token_start && (byte == b'&' || byte == b'*') {
+                anchor_alias_count += 1;
+                if anchor_alias_count > MAX_YAML_ANCHOR_ALIASES {
+                    return Err(ParseError::InvalidYaml(format!(
+                        "YAML 锚点/别名数量超过 {MAX_YAML_ANCHOR_ALIASES} 个安全上限"
+                    )));
+                }
+            }
+            position += 1;
+        }
+        if is_block_scalar_indicator(trimmed) {
+            block_scalar_indent = Some(indent);
+        }
+    }
+    Ok(())
+}
+
 fn parse_clash_yaml(text: &str) -> Result<ParseReport, ParseError> {
+    yaml_input_budget(text)?;
     if yaml_expansion_bomb(text) {
         return Err(ParseError::InvalidYaml(
             "订阅使用了 YAML 锚点引用，出于资源安全考虑已拒绝解析".to_string(),
@@ -823,6 +931,60 @@ mod tests {
     }
 
     #[test]
+    fn yaml_expansion_bomb_detects_unicode_and_mixed_case_anchor_names() {
+        // Q3：Unicode 锚点名必须和 ASCII 名一样被识别为 anchor+alias 组合并
+        // 拒绝；旧实现只读 ASCII 名字，会把 `&节点` 读成空名字而漏检。
+        assert!(yaml_expansion_bomb(
+            "a: &节点 [1, 2]\nb: [*节点, *节点, *节点]"
+        ));
+        assert!(yaml_expansion_bomb("a: &é锚 [1]\nb: *é锚\n"));
+        assert!(yaml_expansion_bomb("proxies:\n  - &名字 1\n  - *名字\n"));
+        // 混合大小写：YAML 锚点名区分大小写，`&A`/`*A` 命中，`&A`/`*a` 是不同的
+        // 锚点（后者是未定义 alias），不应误判为炸弹。
+        assert!(yaml_expansion_bomb("a: &A 1\nb: *A\n"));
+        assert!(!yaml_expansion_bomb("a: &A 1\nb: *a\n"));
+        // `&a`/`*a` 出现在行首/值首（token 起始）算锚点/别名；出现在单词内部
+        // （前面不是空白/流起始符）只是普通字符，不误判。
+        assert!(yaml_expansion_bomb("a: &anchor 1\nb: *anchor\n"));
+        assert!(!yaml_expansion_bomb("a: x&anchor 1\nb: x*anchor\n"));
+        // 端到端：Unicode 炸弹被拒绝且不 panic。
+        let report = parse_subscription("proxies: &节点 [1]\nother: [*节点, *节点]");
+        assert!(report.nodes.is_empty());
+        assert!(report
+            .rejected
+            .iter()
+            .any(|issue| issue.reason.contains("锚点")));
+    }
+
+    #[test]
+    fn yaml_anchor_guard_ignores_block_scalar_text_and_normal_passwords() {
+        // 正常密码 / 备注里的 & / * 不被误伤：不在 token 起始，或没有同名引用。
+        let ordinary = "proxies:\n  - name: 节点 & 备注 #1\n    password: p@ss*word&x#\n    server: a*b.example.com\n    remark: *lone-alias-without-anchor\n";
+        assert!(!yaml_expansion_bomb(ordinary));
+        // 块标量 | / > 内部的 *alias 文本是纯文本，不应被当作 alias 炸弹，
+        // yaml_input_budget 也保持「块标量内部行不参与检查」的既有正确行为。
+        let block = "\
+proxies:
+  - name: test
+    type: vmess
+    server: x.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    payload: |
+      *alias *节点 plain text
+      folded > *alias *alias *alias
+";
+        assert!(!yaml_expansion_bomb(block));
+        assert!(yaml_input_budget(block).is_ok());
+        // 块标量内即便有远超 64 上限的 *alias 文本，也不计入锚点/别名预算。
+        let many = format!(
+            "proxies:\n  - payload: |\n{}",
+            "      *alias text *节点\n".repeat(80)
+        );
+        assert!(yaml_input_budget(&many).is_ok());
+    }
+
+    #[test]
     fn parses_legacy_base64_subscription() {
         let vmess_json = r#"{"v":"2","ps":"Tokyo","add":"jp.example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","host":"cdn.example.com","path":"/ws","tls":"tls","sni":"jp.example.com"}"#;
         let vmess = format!("vmess://{}", general_purpose::STANDARD.encode(vmess_json));
@@ -1001,5 +1163,193 @@ proxies:
             report.nodes[1].auth,
             ProxyAuth::UserPassword { .. }
         ));
+    }
+
+    #[test]
+    fn yaml_input_budget_rejects_oversize_source() {
+        let source = "a".repeat(MAX_YAML_BYTES + 1);
+        let error = yaml_input_budget(&source).expect_err("oversize YAML must be rejected");
+        assert!(error.to_string().contains("字节"));
+    }
+
+    #[test]
+    fn yaml_input_budget_rejects_excessive_indent() {
+        let source = format!("{}proxies: []", " ".repeat(MAX_YAML_INDENT_DEPTH + 1));
+        let error = yaml_input_budget(&source).expect_err("deep indent must be rejected");
+        assert!(error.to_string().contains("缩进"));
+    }
+
+    #[test]
+    fn yaml_input_budget_rejects_too_many_anchors_and_aliases() {
+        let mut source = String::from("proxies:\n");
+        for _ in 0..(MAX_YAML_ANCHOR_ALIASES + 1) {
+            source.push_str("  - &anchor x\n");
+        }
+        let error = yaml_input_budget(&source).expect_err("too many anchors must be rejected");
+        assert!(error.to_string().contains("锚点"));
+    }
+
+    #[test]
+    fn yaml_input_budget_rejects_custom_tags() {
+        let error = yaml_input_budget("proxies: !!python/object/apply:os.system ['x']\n")
+            .expect_err("custom YAML tags must be rejected");
+        assert!(error.to_string().contains("标签"));
+    }
+
+    #[test]
+    fn yaml_input_budget_is_wired_into_clash_yaml_parsing() {
+        // 端到端：带自定义标签的 Clash 订阅在 serde_yaml 解析前即被拒绝。
+        let report = parse_subscription("proxies: !!python/object/apply:os.system ['x']\n");
+        assert!(report.nodes.is_empty());
+        assert!(report
+            .rejected
+            .iter()
+            .any(|issue| issue.reason.contains("标签")));
+    }
+
+    #[test]
+    fn yaml_input_budget_allows_normal_clash_yaml() {
+        let source = "\
+proxies:
+  - name: HK
+    type: vmess
+    server: hk.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    password: p@ss*word&value
+";
+        assert!(yaml_input_budget(source).is_ok());
+        let report = parse_subscription(source);
+        assert_eq!(report.nodes.len(), 1);
+        assert!(report.rejected.is_empty());
+    }
+
+    // ===== T3：确定性生成式测试（纯标准库 LCG，不引入 rand/proptest）=====
+
+    #[test]
+    fn parse_subscription_never_panics_on_generated_inputs() {
+        use crate::deterministic_test_support::Lcg;
+
+        const SEED: u64 = 0x4b49_5454_5950_524f; // "KITTYPRO"
+        let mut lcg = Lcg::new(SEED);
+        // 固定的危险片段轮转叠加到随机字节串上：NUL、CRLF、BOM、YAML
+        // 锚点/别名、!!python 标签、嵌套引号、非 base64、未闭合 IPv6。
+        let hazards: &[&str] = &[
+            "\0",
+            "\r\n",
+            "\u{feff}",
+            "proxies:\n  - &a 1\n  - *a\n",
+            "!!python/object/apply:os.system ['x']\n",
+            "\"\"'':\n",
+            "vmess://!!!not-base64!!!",
+            "ss://@@@@",
+            "http://[::1\n",
+            "proxies: [",
+        ];
+        for iteration in 0..200 {
+            let mut input = String::new();
+            let raw_len = (lcg.next() % 512) as usize + 1;
+            // from_utf8_lossy 保证是合法 &str，同时保留 NUL / 控制字符。
+            input.push_str(&String::from_utf8_lossy(&lcg.bytes(raw_len)));
+            input.push_str(hazards[(lcg.next() as usize) % hazards.len()]);
+            input.push_str(&lcg.text(64));
+            if lcg.next().is_multiple_of(8) {
+                // 超长输入：只验证不 panic、不要求解析成功。
+                input.push_str(&"A".repeat(10 * 1024 + (lcg.next() % 256) as usize));
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parse_subscription(&input)
+            }));
+            let Ok(report) = outcome else {
+                panic!("seed={SEED:#x} iteration={iteration}: parse_subscription panicked");
+            };
+            // parse_subscription 返回 ParseReport（不是 Result）；"Err 情形"即
+            // rejected 非空/无有效节点。成功解析出的任意节点都必须满足不变量。
+            for node in &report.nodes {
+                assert!(
+                    !node.tag.trim().is_empty(),
+                    "seed={SEED:#x} iteration={iteration}: 节点 tag 为空"
+                );
+                assert!(
+                    !node.tag.chars().any(char::is_control),
+                    "seed={SEED:#x} iteration={iteration}: 节点 tag 含控制字符 {:?}",
+                    node.tag
+                );
+                assert!(
+                    !node.server.is_empty(),
+                    "seed={SEED:#x} iteration={iteration}: 节点 address 为空"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_input_budget_generated_hazards_and_normal_clash() {
+        use crate::deterministic_test_support::Lcg;
+
+        const SEED: u64 = 0x5941_4d4c_4255_4447; // "YAMLBUDG"
+        let mut lcg = Lcg::new(SEED);
+        for iteration in 0..200 {
+            let variant = iteration % 5;
+            let source = match variant {
+                // 10 MiB 以上
+                0 => "a".repeat(MAX_YAML_BYTES + 1 + (lcg.next() % 2048) as usize),
+                // 200 层以上缩进
+                1 => format!(
+                    "{}proxies: []",
+                    " ".repeat(MAX_YAML_INDENT_DEPTH + 1 + (lcg.next() % 64) as usize)
+                ),
+                // 超过 64 个 anchor/alias
+                2 => {
+                    let count = MAX_YAML_ANCHOR_ALIASES + 1 + (lcg.next() % 32) as usize;
+                    let mut text = String::from("proxies:\n");
+                    for _ in 0..count {
+                        text.push_str("  - &anchor x\n");
+                    }
+                    text
+                }
+                // 自定义/危险 YAML 标签。key 必须是纯字母数字：随机字符里
+                // 的 '#' 会把整行变成注释、'\n' 会拆行，那样 `!!` 根本不是
+                // 标签，测的就不是危险输入了。
+                3 => {
+                    let key: String = lcg
+                        .text(12)
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric())
+                        .collect();
+                    format!(
+                        "proxies:\n  - name: {key}\n    payload: !!python/object/apply:os.system ['x']\n"
+                    )
+                }
+                // 正常 Clash YAML（随机但安全的 name）
+                _ => {
+                    let name: String = lcg
+                        .text(16)
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric())
+                        .collect();
+                    format!(
+                        "proxies:\n  - name: {name}\n    type: vmess\n    server: edge.example.com\n    port: 443\n    uuid: 11111111-1111-1111-1111-111111111111\n"
+                    )
+                }
+            };
+            if variant < 4 {
+                assert!(
+                    yaml_input_budget(&source).is_err(),
+                    "seed={SEED:#x} iteration={iteration} variant={variant}: 危险 YAML 必须被拒绝"
+                );
+            } else {
+                assert!(
+                    yaml_input_budget(&source).is_ok(),
+                    "seed={SEED:#x} iteration={iteration}: 正常 Clash YAML 必须通过"
+                );
+                let report = parse_subscription(&source);
+                assert_eq!(
+                    report.nodes.len(),
+                    1,
+                    "seed={SEED:#x} iteration={iteration}: 正常 Clash YAML 应解析出 1 个节点"
+                );
+            }
+        }
     }
 }

@@ -64,6 +64,7 @@ dependencies = [
  "dioxus",
  "directories",
  "getrandom 0.3.4",
+ "kitty-server-fn-macro",
  "plist",
  "proxy-core",
  "reqwest",
@@ -3192,6 +3193,10 @@ dependencies = [
  "dioxus",
  "ui",
 ]
+
+[[package]]
+name = "kitty-server-fn-macro"
+version = "0.1.0"
 
 [[package]]
 name = "konst"

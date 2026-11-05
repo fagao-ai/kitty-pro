@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,6 +65,51 @@ func TestCheckConfigRejectsInvalidConfig(t *testing.T) {
 	config := `{"inbounds":[{"type":"not-a-real-inbound"}]}`
 	if err := checkConfig(config); err == nil {
 		t.Fatal("invalid config unexpectedly passed validation")
+	}
+}
+
+func TestRedactConfigErrorMasksPasswordUUIDToken(t *testing.T) {
+	// Q2：含 password / uuid / token 的配置片段被回显时，敏感值必须被脱敏，
+	// 字段名与无害结构保留。
+	raw := `decode config: {"type":"trojan","password":"SUPERSECRET","uuid":"1111-2222","token":"tok3n"}`
+	got := redactConfigError(raw)
+	for _, secret := range []string{"SUPERSECRET", "1111-2222", "tok3n"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("敏感值 %q 仍出现在脱敏结果中: %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, "***") {
+		t.Fatalf("缺少脱敏标记: %q", got)
+	}
+	if !strings.Contains(got, `"type":"trojan"`) || !strings.Contains(got, "password") {
+		t.Fatalf("字段名与无害结构应保留: %q", got)
+	}
+}
+
+func TestRedactConfigErrorLeavesPlainErrorTextUnchanged(t *testing.T) {
+	// Q2：普通错误文本（不含任何敏感字段）必须原样返回，不被改写。
+	const plain = "initialize inbound: connection refused; invalid field at line 3"
+	if got := redactConfigError(plain); got != plain {
+		t.Fatalf("普通错误文本被改动: %q -> %q", plain, got)
+	}
+}
+
+func TestRedactConfigErrorRemovesPlaintextFromVariedFormats(t *testing.T) {
+	// Q2：裸值、URL userinfo、多字段等形态脱敏后均不含明文值。
+	cases := []struct {
+		raw    string
+		secret string
+	}{
+		{`password: hunter2 uuid=abcd token = zzz`, "hunter2"},
+		{`server: trojan://user:passw0rd@host.example.com:443`, "passw0rd"},
+		{`{"auth":"aaaa","private_key":"bbbb","secret":"cccc"}`, "aaaa"},
+		{`token=TOKEN123&other=1`, "TOKEN123"},
+	}
+	for _, tc := range cases {
+		got := redactConfigError(tc.raw)
+		if strings.Contains(got, tc.secret) {
+			t.Fatalf("明文 %q 仍出现在 %q -> %q", tc.secret, tc.raw, got)
+		}
 	}
 }
 

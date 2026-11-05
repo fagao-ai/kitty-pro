@@ -1,4 +1,7 @@
-use super::{profile_path, SyncConfig, SyncProviderKind, SyncResult};
+use super::{
+    api_err, atomic_write_json, profile_path, ApiErrorCode, SyncConfig, SyncProviderKind,
+    SyncResult,
+};
 use dioxus::prelude::ServerFnError;
 use proxy_core::{
     normalize_dns_override, sync_bundle_directory as bundle_directory, validate_custom_rules,
@@ -10,9 +13,41 @@ use reqwest::{Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// B17: every client-facing error passes through `redact_secrets`, so request
+/// URLs, Basic-auth userinfo and remote response details echoed by a
+/// dependency never reach the toast / `role=alert` panel.
+fn redact(message: impl std::fmt::Display) -> ServerFnError {
+    ServerFnError::new(super::redact_secrets(&message.to_string()))
+}
+
+/// S5: lenient outbound validator for endpoints the user explicitly
+/// configured (LAN NAS / MinIO). Private IPs are allowed, but loopback,
+/// link-local, metadata addresses, non-http(s) schemes and userinfo are still
+/// refused by the shared validator. This is the storage counterpart of the
+/// strict `super::validate_outbound_url` used for subscription downloads.
+#[allow(dead_code)]
+fn validate_storage_outbound(url: &str) -> Result<(), ServerFnError> {
+    super::validate_outbound_url_inner(url, true)
+}
+
+/// Validate an assembled request URL just before it is sent.
+///
+/// Unit tests drive push/pull against `FakeRemote`, which deliberately binds a
+/// loopback listener; the loopback rule (correct in production) is relaxed only
+/// in the test build so those end-to-end sync tests stay meaningful. Production
+/// builds always call `validate_storage_outbound`.
+#[cfg(test)]
+fn check_storage_outbound(_url: &str) -> Result<(), ServerFnError> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn check_storage_outbound(url: &str) -> Result<(), ServerFnError> {
+    validate_storage_outbound(url)
+}
 
 const MAX_SYNC_BYTES: usize = 20 * 1024 * 1024;
 const LEGACY_SYNC_SNAPSHOT_VERSION: u32 = 1;
@@ -46,13 +81,12 @@ pub(super) fn load_native_sync_config() -> Result<SyncConfig, ServerFnError> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let mut value: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|error| ServerFnError::new(format!("同步配置损坏: {error}")))?;
+                .map_err(|error| redact(format!("同步配置损坏: {error}")))?;
             migrate_legacy_endpoint(&mut value);
-            serde_json::from_value(value)
-                .map_err(|error| ServerFnError::new(format!("同步配置损坏: {error}")))
+            serde_json::from_value(value).map_err(|error| redact(format!("同步配置损坏: {error}")))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SyncConfig::default()),
-        Err(error) => Err(ServerFnError::new(format!("读取同步配置失败: {error}"))),
+        Err(error) => Err(redact(format!("读取同步配置失败: {error}"))),
     }
 }
 
@@ -168,17 +202,19 @@ enum RemoteState {
 /// has not moved since. Anything else needs an explicit overwrite.
 fn require_baseline(config: &SyncConfig, revision: &str) -> Result<(), ServerFnError> {
     if config.last_sync_at == 0 && config.last_remote_revision.is_empty() {
-        return Err(ServerFnError::new(
+        return Err(api_err(
+            ApiErrorCode::Sync,
             "远程同步文件已存在，但本机没有该目标的同步基线，请先下载或明确选择覆盖上传",
         ));
     }
     if revision.is_empty() {
-        return Err(ServerFnError::new(
+        return Err(redact(
             "远端存储未提供 ETag，无法保证安全上传，请使用明确覆盖上传",
         ));
     }
     if !config.last_remote_revision.is_empty() && revision != config.last_remote_revision {
-        return Err(ServerFnError::new(
+        return Err(api_err(
+            ApiErrorCode::Conflict,
             "远程同步文件已被其他设备修改，请先下载或明确选择覆盖上传",
         ));
     }
@@ -189,9 +225,10 @@ fn require_baseline(config: &SyncConfig, revision: &str) -> Result<(), ServerFnE
 /// device last synced, whether it now holds a bundle or a legacy document.
 fn require_not_newer(config: &SyncConfig, updated_at: u64) -> Result<(), ServerFnError> {
     if updated_at > config.last_sync_at {
-        return Err(ServerFnError::new(format!(
-            "远程配置更新于本机上次同步之后（远程版本 {updated_at}），请先下载或明确选择覆盖上传",
-        )));
+        return Err(api_err(
+            ApiErrorCode::Conflict,
+            format!("远程配置更新于本机上次同步之后（远程版本 {updated_at}），请先下载或明确选择覆盖上传"),
+        ));
     }
     Ok(())
 }
@@ -232,7 +269,7 @@ pub(super) async fn push(
             RemoteState::Absent
                 if config.last_sync_at > 0 || !config.last_remote_revision.is_empty() =>
             {
-                return Err(ServerFnError::new(
+                return Err(redact(
                     "远程同步文件已在本机上次同步后被删除，请明确选择覆盖上传以重新创建",
                 ));
             }
@@ -295,7 +332,7 @@ pub(super) async fn pull(config: &SyncConfig) -> Result<DownloadedSnapshot, Serv
     validate_config(config)?;
     download_snapshot(config)
         .await?
-        .ok_or_else(|| ServerFnError::new("远程同步文件不存在，请先从一台设备上传"))
+        .ok_or_else(|| redact("远程同步文件不存在，请先从一台设备上传"))
 }
 
 fn same_remote_target(left: &SyncConfig, right: &SyncConfig) -> bool {
@@ -320,7 +357,7 @@ fn same_remote_target(left: &SyncConfig, right: &SyncConfig) -> bool {
 
 fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
     if !config.enabled {
-        return Err(ServerFnError::new("请先启用并保存同步配置"));
+        return Err(redact("请先启用并保存同步配置"));
     }
     validate_remote_path(&config.path)?;
 
@@ -328,12 +365,12 @@ fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
         SyncProviderKind::WebDav => {
             parse_http_endpoint(&config.webdav_endpoint, false)?;
             if config.username.trim().is_empty() && !config.password.is_empty() {
-                return Err(ServerFnError::new("WebDAV 密码已填写，但用户名为空"));
+                return Err(redact("WebDAV 密码已填写，但用户名为空"));
             }
         }
         SyncProviderKind::S3 => {
             if config.bucket.trim().is_empty() {
-                return Err(ServerFnError::new("S3 Bucket 不能为空"));
+                return Err(redact("S3 Bucket 不能为空"));
             }
             if config.bucket.len() > 255
                 || !config
@@ -341,10 +378,10 @@ fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
             {
-                return Err(ServerFnError::new("S3 Bucket 格式无效"));
+                return Err(redact("S3 Bucket 格式无效"));
             }
             if config.region.trim().is_empty() {
-                return Err(ServerFnError::new("S3 Region 不能为空"));
+                return Err(redact("S3 Region 不能为空"));
             }
             if config.region.len() > 64
                 || !config
@@ -352,10 +389,10 @@ fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '-')
             {
-                return Err(ServerFnError::new("S3 Region 格式无效"));
+                return Err(redact("S3 Region 格式无效"));
             }
             if config.access_key.trim().is_empty() || config.secret_key.is_empty() {
-                return Err(ServerFnError::new("S3 Access Key 和 Secret Key 不能为空"));
+                return Err(redact("S3 Access Key 和 Secret Key 不能为空"));
             }
             if !config.s3_endpoint.trim().is_empty() {
                 parse_http_endpoint(&config.s3_endpoint, true)?;
@@ -368,7 +405,7 @@ fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
 fn parse_http_endpoint(raw: &str, allow_bare_host: bool) -> Result<reqwest::Url, ServerFnError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(ServerFnError::new("同步地址不能为空"));
+        return Err(redact("同步地址不能为空"));
     }
     let normalized = if allow_bare_host && !trimmed.contains("://") {
         format!("https://{trimmed}")
@@ -376,9 +413,9 @@ fn parse_http_endpoint(raw: &str, allow_bare_host: bool) -> Result<reqwest::Url,
         trimmed.to_string()
     };
     let endpoint = reqwest::Url::parse(&normalized)
-        .map_err(|error| ServerFnError::new(format!("同步地址无效: {error}")))?;
+        .map_err(|error| api_err(ApiErrorCode::InvalidInput, format!("同步地址无效: {error}")))?;
     if !matches!(endpoint.scheme(), "http" | "https") {
-        return Err(ServerFnError::new("同步地址只支持 HTTP 或 HTTPS"));
+        return Err(redact("同步地址只支持 HTTP 或 HTTPS"));
     }
     if endpoint.host_str().is_none()
         || endpoint.query().is_some()
@@ -386,7 +423,7 @@ fn parse_http_endpoint(raw: &str, allow_bare_host: bool) -> Result<reqwest::Url,
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
     {
-        return Err(ServerFnError::new(
+        return Err(redact(
             "同步地址必须包含主机，且不能包含凭据、查询参数或片段",
         ));
     }
@@ -396,7 +433,7 @@ fn parse_http_endpoint(raw: &str, allow_bare_host: bool) -> Result<reqwest::Url,
 fn validate_remote_path(path: &str) -> Result<(), ServerFnError> {
     let path = path.trim_matches('/');
     if path.is_empty() {
-        return Err(ServerFnError::new("远程文件路径不能为空"));
+        return Err(redact("远程文件路径不能为空"));
     }
     if path.len() > 1024
         || path.contains('\0')
@@ -405,46 +442,43 @@ fn validate_remote_path(path: &str) -> Result<(), ServerFnError> {
             .split('/')
             .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
     {
-        return Err(ServerFnError::new("远程文件路径无效"));
+        return Err(redact("远程文件路径无效"));
     }
     Ok(())
 }
 
 pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnError> {
     if snapshot.format != SYNC_SNAPSHOT_FORMAT {
-        return Err(ServerFnError::new(format!(
-            "不支持的同步快照格式: {}",
-            snapshot.format
-        )));
+        return Err(redact(format!("不支持的同步快照格式: {}", snapshot.format)));
     }
     if !matches!(
         snapshot.version,
         LEGACY_SYNC_SNAPSHOT_VERSION | SYNC_SNAPSHOT_VERSION
     ) {
-        return Err(ServerFnError::new(format!(
+        return Err(redact(format!(
             "不支持的同步快照版本: {}",
             snapshot.version
         )));
     }
     validate_custom_rules(&snapshot.custom_rules)
-        .map_err(|error| ServerFnError::new(format!("远程自定义规则无效: {error}")))?;
+        .map_err(|error| redact(format!("远程自定义规则无效: {error}")))?;
     // Absent sections are not validated: nothing to check, and applying such a
     // document leaves the matching local state untouched.
     let dns_overrides = snapshot.dns_overrides.clone().unwrap_or_default();
     if dns_overrides.len() > 256 {
-        return Err(ServerFnError::new("远程专用 DNS 规则数量超过 256 条限制"));
+        return Err(redact("远程专用 DNS 规则数量超过 256 条限制"));
     }
     let mut dns_rule_suffixes = HashSet::with_capacity(dns_overrides.len());
     for rule in &dns_overrides {
         let (domain_suffix, server) = normalize_dns_override(&rule.domain_suffix, &rule.server)
-            .map_err(|error| ServerFnError::new(format!("远程专用 DNS 规则无效: {error}")))?;
+            .map_err(|error| redact(format!("远程专用 DNS 规则无效: {error}")))?;
         if !dns_rule_suffixes.insert(domain_suffix.clone()) {
-            return Err(ServerFnError::new(format!(
+            return Err(redact(format!(
                 "远程专用 DNS 域名后缀重复: {domain_suffix}"
             )));
         }
         if rule.server != server {
-            return Err(ServerFnError::new("远程专用 DNS 服务器与规范化结果不一致"));
+            return Err(redact("远程专用 DNS 服务器与规范化结果不一致"));
         }
     }
     if snapshot
@@ -452,30 +486,24 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
         .as_ref()
         .is_some_and(|script| script.script.len() > MAX_CONFIG_SCRIPT_BYTES)
     {
-        return Err(ServerFnError::new(format!(
+        return Err(redact(format!(
             "远程配置脚本超过 {} KiB 限制",
             MAX_CONFIG_SCRIPT_BYTES / 1024
         )));
     }
     if snapshot.subscriptions.len() > 1024 {
-        return Err(ServerFnError::new("远程订阅数量超过 1024 个限制"));
+        return Err(redact("远程订阅数量超过 1024 个限制"));
     }
     let mut subscription_ids = HashSet::with_capacity(snapshot.subscriptions.len());
     for subscription in &snapshot.subscriptions {
         if subscription.id == 0 {
-            return Err(ServerFnError::new("远程订阅 ID 不能为 0"));
+            return Err(redact("远程订阅 ID 不能为 0"));
         }
         if !subscription_ids.insert(subscription.id) {
-            return Err(ServerFnError::new(format!(
-                "远程订阅 ID 重复: {}",
-                subscription.id
-            )));
+            return Err(redact(format!("远程订阅 ID 重复: {}", subscription.id)));
         }
         if subscription.source.trim().is_empty() {
-            return Err(ServerFnError::new(format!(
-                "远程订阅来源为空: {}",
-                subscription.name
-            )));
+            return Err(redact(format!("远程订阅来源为空: {}", subscription.name)));
         }
     }
     Ok(())
@@ -483,25 +511,22 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
 
 fn decode_snapshot(bytes: &[u8]) -> Result<SyncSnapshot, ServerFnError> {
     let envelope: SyncSnapshotEnvelope = serde_json::from_slice(bytes)
-        .map_err(|error| ServerFnError::new(format!("远程同步文件无效: {error}")))?;
+        .map_err(|error| redact(format!("远程同步文件无效: {error}")))?;
     if envelope.format != SYNC_SNAPSHOT_FORMAT {
-        return Err(ServerFnError::new(format!(
-            "不支持的同步快照格式: {}",
-            envelope.format
-        )));
+        return Err(redact(format!("不支持的同步快照格式: {}", envelope.format)));
     }
     if !matches!(
         envelope.version,
         LEGACY_SYNC_SNAPSHOT_VERSION | SYNC_SNAPSHOT_VERSION
     ) {
-        return Err(ServerFnError::new(format!(
+        return Err(redact(format!(
             "不支持的同步快照版本: {}",
             envelope.version
         )));
     }
 
     let snapshot = serde_json::from_slice(bytes)
-        .map_err(|error| ServerFnError::new(format!("远程同步文件无效: {error}")))?;
+        .map_err(|error| redact(format!("远程同步文件无效: {error}")))?;
     validate_snapshot(&snapshot)?;
     Ok(snapshot)
 }
@@ -512,7 +537,10 @@ pub(super) fn validate_remote_revision(revision: &str) -> Result<(), ServerFnErr
             .bytes()
             .any(|byte| byte.is_ascii_control() && byte != b'\t')
     {
-        return Err(ServerFnError::new("远端同步 revision 无效"));
+        return Err(api_err(
+            ApiErrorCode::InvalidInput,
+            "远端同步 revision 无效",
+        ));
     }
     Ok(())
 }
@@ -592,8 +620,7 @@ fn bundle_sections(snapshot: &SyncSnapshot) -> Result<Vec<(String, Vec<u8>)>, Se
 }
 
 fn json_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, ServerFnError> {
-    serde_json::to_vec_pretty(value)
-        .map_err(|error| ServerFnError::new(format!("序列化同步内容失败: {error}")))
+    serde_json::to_vec_pretty(value).map_err(|error| redact(format!("序列化同步内容失败: {error}")))
 }
 
 /// Pull a bundle, falling back to the legacy single document.
@@ -639,9 +666,9 @@ async fn download_manifest(
     let revision = response_revision(&response);
     let bytes = read_limited_body(response, MAX_SYNC_BYTES, "读取远程同步清单").await?;
     let manifest: BundleManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| ServerFnError::new(format!("远程同步清单无效: {error}")))?;
+        .map_err(|error| redact(format!("远程同步清单无效: {error}")))?;
     if manifest.format != SYNC_BUNDLE_FORMAT || manifest.version != SYNC_BUNDLE_VERSION {
-        return Err(ServerFnError::new(format!(
+        return Err(redact(format!(
             "不支持的远程同步清单: {} v{}",
             manifest.format, manifest.version
         )));
@@ -658,7 +685,7 @@ async fn download_manifest(
 /// requests and lets two entries claim the same section.
 fn validate_manifest_shape(manifest: &BundleManifest) -> Result<(), ServerFnError> {
     if manifest.files.len() > MAX_BUNDLE_FILES {
-        return Err(ServerFnError::new(format!(
+        return Err(redact(format!(
             "远程同步清单条目过多（{} 项）",
             manifest.files.len()
         )));
@@ -666,16 +693,13 @@ fn validate_manifest_shape(manifest: &BundleManifest) -> Result<(), ServerFnErro
     let mut seen: HashSet<&str> = HashSet::new();
     for file in &manifest.files {
         if !BUNDLE_SECTIONS.contains(&file.section.as_str()) {
-            return Err(ServerFnError::new(format!(
+            return Err(redact(format!(
                 "远程同步清单包含未知内容: {}",
                 file.section
             )));
         }
         if !seen.insert(file.section.as_str()) {
-            return Err(ServerFnError::new(format!(
-                "远程同步清单内容重复: {}",
-                file.section
-            )));
+            return Err(redact(format!("远程同步清单内容重复: {}", file.section)));
         }
         validate_bundle_file_name(&file.name)?;
         // The object name embeds the digest this client would verify against, so
@@ -684,7 +708,7 @@ fn validate_manifest_shape(manifest: &BundleManifest) -> Result<(), ServerFnErro
             || file.sha256.len() != 64
             || !file.sha256.chars().all(|char| char.is_ascii_hexdigit())
         {
-            return Err(ServerFnError::new(format!(
+            return Err(redact(format!(
                 "远程同步清单文件 {} 与内容 {section} 不匹配",
                 file.name,
                 section = file.section
@@ -704,10 +728,10 @@ async fn download_bundle(
         let bytes = download_object(config, &bundle_path(config, &file.name)).await?;
         total = total.saturating_add(bytes.len());
         if total > MAX_SYNC_BYTES {
-            return Err(ServerFnError::new("远程同步内容超过 20 MiB 限制"));
+            return Err(redact("远程同步内容超过 20 MiB 限制"));
         }
         if bytes.len() as u64 != file.size {
-            return Err(ServerFnError::new(format!(
+            return Err(redact(format!(
                 "远程同步文件 {} 大小不符（清单 {}，实际 {}）",
                 file.section,
                 file.size,
@@ -716,7 +740,7 @@ async fn download_bundle(
         }
         let digest = sha256_hex(&bytes);
         if digest != file.sha256 {
-            return Err(ServerFnError::new(format!(
+            return Err(redact(format!(
                 "远程同步文件 {} 校验失败，请重新上传",
                 file.section
             )));
@@ -758,7 +782,7 @@ fn take_section(
         .remove(section)
         .map(|payload| {
             if payload.len() > MAX_SYNC_BYTES {
-                return Err(ServerFnError::new(format!("远程同步文件 {section} 过大")));
+                return Err(redact(format!("远程同步文件 {section} 过大")));
             }
             Ok(payload)
         })
@@ -766,8 +790,7 @@ fn take_section(
 }
 
 fn deserialize_section<T: serde::de::DeserializeOwned>(bytes: Vec<u8>) -> Result<T, ServerFnError> {
-    serde_json::from_slice(&bytes)
-        .map_err(|error| ServerFnError::new(format!("远程同步文件无效: {error}")))
+    serde_json::from_slice(&bytes).map_err(|error| redact(format!("远程同步文件无效: {error}")))
 }
 
 fn validate_bundle_file_name(name: &str) -> Result<(), ServerFnError> {
@@ -784,7 +807,7 @@ fn validate_bundle_file_name(name: &str) -> Result<(), ServerFnError> {
     if ok {
         Ok(())
     } else {
-        Err(ServerFnError::new(format!("远程同步文件名无效: {name}")))
+        Err(redact(format!("远程同步文件名无效: {name}")))
     }
 }
 
@@ -812,9 +835,7 @@ async fn download_object(config: &SyncConfig, path: &str) -> Result<Vec<u8>, Ser
         }
     };
     if response.status() == StatusCode::NOT_FOUND {
-        return Err(ServerFnError::new(format!(
-            "远程同步文件缺失: {path}，请重新上传"
-        )));
+        return Err(redact(format!("远程同步文件缺失: {path}，请重新上传")));
     }
     let response = require_success(response, "下载远程同步文件").await?;
     read_limited_body(response, MAX_SYNC_BYTES, "下载远程同步文件").await
@@ -857,7 +878,7 @@ async fn download_legacy_snapshot(
         .content_length()
         .is_some_and(|length| length > MAX_SYNC_BYTES as u64)
     {
-        return Err(ServerFnError::new("远程同步文件超过 20 MiB 限制"));
+        return Err(redact("远程同步文件超过 20 MiB 限制"));
     }
     let bytes = read_limited_body(response, MAX_SYNC_BYTES, "读取远程同步文件").await?;
     let snapshot = decode_snapshot(&bytes)?;
@@ -881,7 +902,7 @@ async fn upload_object(
         SyncProviderKind::S3 => send_s3(config, path, Method::PUT, payload, condition).await?,
     };
     if response.status() == StatusCode::PRECONDITION_FAILED {
-        return Err(ServerFnError::new(
+        return Err(redact(
             "远程同步文件在检查后发生变化，已取消上传，请先下载后重试",
         ));
     }
@@ -913,7 +934,7 @@ async fn upload_bundle(
     for (section, payload) in sections {
         total = total.saturating_add(payload.len());
         if total > MAX_SYNC_BYTES {
-            return Err(ServerFnError::new("同步内容超过 20 MiB 限制"));
+            return Err(redact("同步内容超过 20 MiB 限制"));
         }
         let name = bundle_object_name(&section, &payload);
         // Content-addressed name, so "already stored under this name" means
@@ -959,7 +980,12 @@ fn http_client() -> Result<reqwest::Client, ServerFnError> {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("kitty-pro-sync/2")
         .build()
-        .map_err(|error| ServerFnError::new(format!("创建同步客户端失败: {error}")))
+        .map_err(|error| {
+            api_err(
+                ApiErrorCode::Network,
+                format!("创建同步客户端失败: {error}"),
+            )
+        })
 }
 
 async fn send_webdav(
@@ -970,6 +996,8 @@ async fn send_webdav(
     condition: &UploadCondition,
 ) -> Result<Response, ServerFnError> {
     let url = build_remote_url(&config.webdav_endpoint, None, path)?;
+    // S5: re-check the fully assembled URL before any request leaves.
+    check_storage_outbound(url.as_str())?;
     let mut request = http_client()?.request(method, url);
     if !config.username.trim().is_empty() {
         request = request.basic_auth(&config.username, Some(&config.password));
@@ -983,7 +1011,7 @@ async fn send_webdav(
     request
         .send()
         .await
-        .map_err(|error| ServerFnError::new(format!("WebDAV 请求失败: {error}")))
+        .map_err(|error| api_err(ApiErrorCode::Network, format!("WebDAV 请求失败: {error}")))
 }
 
 /// Create the directories above an object. A single-file path needs its
@@ -999,14 +1027,17 @@ async fn ensure_webdav_collections(config: &SyncConfig, path: &str) -> Result<()
     for index in 1..segments.len() {
         let collection = segments[..index].join("/");
         let url = build_remote_url(&config.webdav_endpoint, None, &collection)?;
+        check_storage_outbound(url.as_str())?;
         let mut request = client.request(mkcol.clone(), url);
         if !config.username.trim().is_empty() {
             request = request.basic_auth(&config.username, Some(&config.password));
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| ServerFnError::new(format!("创建 WebDAV 目录失败: {error}")))?;
+        let response = request.send().await.map_err(|error| {
+            api_err(
+                ApiErrorCode::Network,
+                format!("创建 WebDAV 目录失败: {error}"),
+            )
+        })?;
         if response.status().is_success()
             || matches!(
                 response.status(),
@@ -1028,6 +1059,9 @@ async fn send_s3(
     condition: &UploadCondition,
 ) -> Result<Response, ServerFnError> {
     let url = build_s3_url(config, path)?;
+    // S5: validate before signing, so the SigV4 authorization header can
+    // never be sent to a loopback / link-local / metadata host.
+    check_storage_outbound(url.as_str())?;
     let payload_hash = sha256_hex(&body);
     let (amz_date, date_stamp) = aws_timestamp()?;
     let host = request_host(&url)?;
@@ -1084,7 +1118,7 @@ async fn send_s3(
     request
         .send()
         .await
-        .map_err(|error| ServerFnError::new(format!("S3 请求失败: {error}")))
+        .map_err(|error| api_err(ApiErrorCode::Network, format!("S3 请求失败: {error}")))
 }
 
 fn apply_upload_condition(
@@ -1114,13 +1148,13 @@ fn build_remote_url(
     path: &str,
 ) -> Result<reqwest::Url, ServerFnError> {
     let mut url = reqwest::Url::parse(endpoint.trim())
-        .map_err(|error| ServerFnError::new(format!("同步地址无效: {error}")))?;
+        .map_err(|error| redact(format!("同步地址无效: {error}")))?;
     url.set_query(None);
     url.set_fragment(None);
     {
         let mut segments = url
             .path_segments_mut()
-            .map_err(|_| ServerFnError::new("同步地址不能作为远程文件目录"))?;
+            .map_err(|_| redact("同步地址不能作为远程文件目录"))?;
         segments.pop_if_empty();
         if let Some(bucket) = bucket {
             segments.push(bucket.trim());
@@ -1151,9 +1185,7 @@ fn build_s3_url(config: &SyncConfig, path: &str) -> Result<reqwest::Url, ServerF
 }
 
 fn request_host(url: &reqwest::Url) -> Result<String, ServerFnError> {
-    let host = url
-        .host()
-        .ok_or_else(|| ServerFnError::new("S3 地址缺少主机"))?;
+    let host = url.host().ok_or_else(|| redact("S3 地址缺少主机"))?;
     Ok(match url.port() {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
@@ -1165,21 +1197,22 @@ async fn require_success(response: Response, operation: &str) -> Result<Response
         return Ok(response);
     }
     let status = response.status();
-    let message = read_limited_body(response, 64 * 1024, "读取远程错误响应")
+    // S5/B17: a remote body can carry credentials or internal details, so it
+    // goes to the server log only. The client sees just the HTTP status plus a
+    // generic message, never the response text.
+    let body = read_limited_body(response, 64 * 1024, "读取远程错误响应")
         .await
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or_default();
-    let message = message.trim();
-    let detail = if message.is_empty() {
-        status.to_string()
-    } else {
-        format!(
-            "{status}: {}",
-            message.chars().take(512).collect::<String>()
-        )
-    };
-    Err(ServerFnError::new(format!("{operation}失败: {detail}")))
+    eprintln!(
+        "[kitty-pro] {operation}失败: HTTP {status}；远端响应正文: {}",
+        body.trim()
+    );
+    Err(api_err(
+        ApiErrorCode::Network,
+        format!("{operation}失败: HTTP {status}"),
+    ))
 }
 
 async fn read_limited_body(
@@ -1191,10 +1224,10 @@ async fn read_limited_body(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| ServerFnError::new(format!("{operation}失败: {error}")))?
+        .map_err(|error| api_err(ApiErrorCode::Network, format!("{operation}失败: {error}")))?
     {
         if bytes.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(ServerFnError::new(format!(
+            return Err(redact(format!(
                 "{operation}失败: 响应体超过 {} KiB 限制",
                 max_bytes / 1024
             )));
@@ -1208,54 +1241,32 @@ fn sync_config_path() -> Result<PathBuf, ServerFnError> {
     profile_path()?
         .parent()
         .map(|directory| directory.join("sync.json"))
-        .ok_or_else(|| ServerFnError::new("无法确定同步配置目录"))
+        .ok_or_else(|| redact("无法确定同步配置目录"))
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ServerFnError> {
     let _guard = sync_write_lock()
         .lock()
-        .map_err(|_| ServerFnError::new("同步配置写入锁已损坏"))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| ServerFnError::new("同步配置目录无效"))?;
+        .map_err(|_| redact("同步配置写入锁已损坏"))?;
+    let parent = path.parent().ok_or_else(|| redact("同步配置目录无效"))?;
     std::fs::create_dir_all(parent)
-        .map_err(|error| ServerFnError::new(format!("创建同步配置目录失败: {error}")))?;
+        .map_err(|error| redact(format!("创建同步配置目录失败: {error}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| ServerFnError::new(format!("限制同步配置目录权限失败: {error}")))?;
+            .map_err(|error| redact(format!("限制同步配置目录权限失败: {error}")))?;
     }
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return Err(ServerFnError::new("同步配置路径必须是普通文件"));
+            return Err(redact("同步配置路径必须是普通文件"));
         }
     }
 
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| ServerFnError::new(format!("序列化同步配置失败: {error}")))?;
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|error| ServerFnError::new(format!("写入同步配置失败: {error}")))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| ServerFnError::new(format!("写入同步配置失败: {error}")))?;
-    drop(file);
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)
-            .map_err(|error| ServerFnError::new(format!("替换同步配置失败: {error}")))?;
-    }
-    std::fs::rename(&temporary, path)
-        .map_err(|error| ServerFnError::new(format!("保存同步配置失败: {error}")))
+    // B3/B15：统一走 atomic_write_json（临时文件 + `sync_all` + 安全替换），
+    // 消除 Windows 「先删旧文件再 rename」的数据丢失窗口；目录权限与符号链接
+    // 校验仍保留在上面。
+    atomic_write_json(path, value).map_err(|error| redact(format!("保存同步配置失败: {error}")))
 }
 
 fn sync_write_lock() -> &'static std::sync::Mutex<()> {
@@ -1267,7 +1278,7 @@ fn unix_timestamp() -> Result<u64, ServerFnError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|_| ServerFnError::new("系统时间早于 Unix 纪元，无法生成同步版本"))
+        .map_err(|_| redact("系统时间早于 Unix 纪元，无法生成同步版本"))
 }
 
 fn aws_timestamp() -> Result<(String, String), ServerFnError> {
@@ -1909,6 +1920,9 @@ mod tests {
             id: 7,
             name: "primary".to_string(),
             source: "https://example.com/subscription".to_string(),
+            nodes: Vec::new(),
+            proxy_server_nameservers: Vec::new(),
+            rejected_count: 0,
         };
         let mut snapshot = SyncSnapshot::from_profile(&Default::default(), 0);
         snapshot.subscriptions = vec![subscription.clone(), subscription];

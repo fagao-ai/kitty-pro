@@ -1,0 +1,13 @@
+[package]
+name = "kitty-server-fn-macro"
+version = "0.1.0"
+edition = "2021"
+description = "Converges the repeated Dioxus server-function cfg_attr boilerplate into one attribute"
+publish = false
+
+[lib]
+proc-macro = true
+
+# 刻意零依赖：属性参数只有 `方法名, "路径"` 两个 token，直接做字符串
+# 解析即可，不需要 syn / quote，也不拖慢 workspace 的冷编译。
+[dependencies]

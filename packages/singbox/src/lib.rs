@@ -795,39 +795,244 @@ pub fn validate_rule_set_file(path: &std::path::Path) -> Result<(), CoreError> {
 }
 
 /// Hardening checks for configs handed to the root/admin TUN helper. The
-/// helper runs with elevated privileges, so file-writing knobs that an app
-/// config never legitimately uses must be rejected outright: sing-box would
-/// otherwise create or truncate log files as root at attacker-chosen paths.
+/// helper runs with elevated privileges, so it only accepts the exact schema
+/// `build_singbox_config` produces: an unknown top-level key, a writable log
+/// target, a non-loopback Clash API, an arbitrary remote rule-set URL, or a
+/// cache file outside a private directory must all be rejected outright.
+/// The whitelist is derived from `proxy_core::singbox_config`.
 pub(crate) fn validate_privileged_start_config(config: &Value) -> Result<(), CoreError> {
-    if let Some(log) = config.get("log") {
-        // Whitelist stance: an app-generated config never sets `path`, so any
-        // presence (even an empty string) is treated as an attempt to make
-        // the root helper create or truncate a file.
-        if log.get("path").is_some() {
-            return Err(CoreError::InvalidConfig(
-                "特权内核配置不允许指定日志文件路径".to_string(),
-            ));
+    let top = config
+        .as_object()
+        .ok_or_else(|| CoreError::InvalidConfig("特权内核配置必须是 JSON 对象".to_string()))?;
+
+    // 顶层完整 schema 白名单：应用只会生成下面这六个键，其余一律拒绝。
+    const ALLOWED_TOP_LEVEL: &[&str] = &[
+        "log",
+        "dns",
+        "inbounds",
+        "outbounds",
+        "route",
+        "experimental",
+    ];
+    for key in top.keys() {
+        if !ALLOWED_TOP_LEVEL.contains(&key.as_str()) {
+            return Err(CoreError::InvalidConfig(format!(
+                "特权内核配置包含不允许的字段: {key}"
+            )));
         }
-        if log.get("outputs").is_some() {
+    }
+
+    validate_privileged_log(config)?;
+    validate_privileged_experimental(config)?;
+    validate_privileged_rule_sets(config)?;
+    Ok(())
+}
+
+fn validate_privileged_log(config: &Value) -> Result<(), CoreError> {
+    let Some(log) = config.get("log") else {
+        return Ok(());
+    };
+    // 应用从不写日志文件，任何可写输出都是 root 创建/截断文件的尝试。
+    if log.get("path").is_some() {
+        return Err(CoreError::InvalidConfig(
+            "特权内核配置不允许指定日志文件路径".to_string(),
+        ));
+    }
+    if log.get("outputs").is_some() {
+        return Err(CoreError::InvalidConfig(
+            "特权内核配置不允许自定义日志输出".to_string(),
+        ));
+    }
+    if let Some(fields) = log.as_object() {
+        // 应用实际使用的 log 子键，仅此三个。
+        const ALLOWED_LOG: &[&str] = &["level", "disabled", "timestamp"];
+        for key in fields.keys() {
+            if !ALLOWED_LOG.contains(&key.as_str()) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "特权内核配置包含不允许的字段: log.{key}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_privileged_experimental(config: &Value) -> Result<(), CoreError> {
+    let Some(experimental) = config.get("experimental") else {
+        return Ok(());
+    };
+    if let Some(fields) = experimental.as_object() {
+        // 应用只生成 cache_file 与 clash_api 两项。
+        const ALLOWED_EXPERIMENTAL: &[&str] = &["cache_file", "clash_api"];
+        for key in fields.keys() {
+            if !ALLOWED_EXPERIMENTAL.contains(&key.as_str()) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "特权内核配置包含不允许的字段: experimental.{key}"
+                )));
+            }
+        }
+    }
+    if let Some(clash_api) = experimental.get("clash_api") {
+        validate_privileged_clash_api(clash_api)?;
+    }
+    if let Some(cache) = experimental.get("cache_file") {
+        if cache.get("enabled").and_then(Value::as_bool) == Some(true) {
+            validate_privileged_cache_path(cache)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_privileged_clash_api(clash_api: &Value) -> Result<(), CoreError> {
+    // clash_api 用于流量统计，必须保留，但特权进程只接受回环监听 + 非空 secret。
+    if let Some(fields) = clash_api.as_object() {
+        const ALLOWED_CLASH_API: &[&str] = &["external_controller", "secret"];
+        for key in fields.keys() {
+            if !ALLOWED_CLASH_API.contains(&key.as_str()) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "特权内核配置包含不允许的字段: experimental.clash_api.{key}"
+                )));
+            }
+        }
+    }
+    // external_ui 系列会让特权进程读取/下载任意文件，一律拒绝。
+    for forbidden in [
+        "external_ui",
+        "external_ui_download_url",
+        "external_ui_download_detour",
+    ] {
+        if clash_api.get(forbidden).is_some() {
+            return Err(CoreError::InvalidConfig(format!(
+                "特权内核配置禁止 clash_api.{forbidden}"
+            )));
+        }
+    }
+    let controller = clash_api
+        .get("external_controller")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CoreError::InvalidConfig("特权内核 clash_api 必须提供 external_controller".to_string())
+        })?;
+    if !is_loopback_controller(controller) {
+        return Err(CoreError::InvalidConfig(
+            "特权内核 clash_api.external_controller 必须绑定回环地址 127.0.0.1 或 [::1]，端口为数字"
+                .to_string(),
+        ));
+    }
+    let secret_ok = clash_api
+        .get("secret")
+        .and_then(Value::as_str)
+        .is_some_and(|secret| !secret.is_empty());
+    if !secret_ok {
+        return Err(CoreError::InvalidConfig(
+            "特权内核 clash_api.secret 必须是非空字符串".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_loopback_controller(value: &str) -> bool {
+    for prefix in ["127.0.0.1:", "[::1]:"] {
+        if let Some(port) = value.strip_prefix(prefix) {
+            return !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok();
+        }
+    }
+    false
+}
+
+fn validate_privileged_cache_path(cache: &Value) -> Result<(), CoreError> {
+    if let Some(fields) = cache.as_object() {
+        // 应用生成的 cache_file 子键。
+        const ALLOWED_CACHE_FILE: &[&str] = &["enabled", "path", "store_fakeip"];
+        for key in fields.keys() {
+            if !ALLOWED_CACHE_FILE.contains(&key.as_str()) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "特权内核配置包含不允许的字段: experimental.cache_file.{key}"
+                )));
+            }
+        }
+    }
+    let path = cache
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            CoreError::InvalidConfig("特权内核缓存文件必须提供非空绝对路径".to_string())
+        })?;
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return Err(CoreError::InvalidConfig(
+            "特权内核缓存文件必须使用绝对路径".to_string(),
+        ));
+    }
+    // 本 crate 无法可靠取得应用数据目录（由 api 层 profile_path 决定），因此采用
+    // 回退规则：父目录不得是全局可写目录；路径若已存在必须是普通文件且非符号链接。
+    // 残留限制：这里不校验“位于应用数据目录内”与文件属主/0600；macOS 侧的
+    // validate_privileged_cache_file 会补上属主、权限与 canonicalize 的严格校验。
+    let parent = path
+        .parent()
+        .ok_or_else(|| CoreError::InvalidConfig("特权内核缓存目录无效".to_string()))?;
+    let parent_lossy = parent.to_string_lossy();
+    let trimmed = parent_lossy.trim_end_matches(['/', '\\']);
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    const GLOBAL_WRITE_DIRS: &[&str] = &[
+        "/",
+        "/tmp",
+        "/var/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+        "/dev/shm",
+    ];
+    if GLOBAL_WRITE_DIRS.contains(&normalized) {
+        return Err(CoreError::InvalidConfig(
+            "特权内核缓存文件不能位于 /、/tmp、/var/tmp 等全局可写目录".to_string(),
+        ));
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             return Err(CoreError::InvalidConfig(
-                "特权内核配置不允许自定义日志输出".to_string(),
+                "特权内核缓存路径必须是普通文件且不能是符号链接".to_string(),
             ));
         }
     }
-    if let Some(cache) = config
-        .get("experimental")
-        .and_then(|experimental| experimental.get("cache_file"))
-    {
-        if cache.get("enabled").and_then(Value::as_bool) == Some(true) {
-            let absolute = cache
-                .get("path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| std::path::Path::new(path).is_absolute());
-            if !absolute {
-                return Err(CoreError::InvalidConfig(
-                    "特权内核缓存文件必须使用绝对路径".to_string(),
-                ));
+    Ok(())
+}
+
+fn validate_privileged_rule_sets(config: &Value) -> Result<(), CoreError> {
+    let Some(rule_sets) = config
+        .get("route")
+        .and_then(|route| route.get("rule_set"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for rule_set in rule_sets {
+        match rule_set.get("type").and_then(Value::as_str) {
+            Some("remote") => {
+                // 远程规则集只允许应用内置的固定 URL，避免特权进程 SSRF。
+                let url = rule_set.get("url").and_then(Value::as_str).unwrap_or("");
+                if url != proxy_core::CHINA_GEOSITE_RULE_SET_URL
+                    && url != proxy_core::CHINA_GEOIP_RULE_SET_URL
+                {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "特权内核配置包含非内置的远程规则集 URL: {url}"
+                    )));
+                }
             }
+            Some("local") => {
+                let path = rule_set.get("path").and_then(Value::as_str).unwrap_or("");
+                let absolute = std::path::Path::new(path).is_absolute();
+                let traverses = path.split(['/', '\\']).any(|part| part == "..");
+                if !absolute || traverses {
+                    return Err(CoreError::InvalidConfig(
+                        "特权内核本地规则集路径必须是绝对路径且不含 ..".to_string(),
+                    ));
+                }
+            }
+            // 其余类型交由 sing-box 自身校验，不过度限制 inbounds/outbounds。
+            _ => {}
         }
     }
     Ok(())
@@ -1238,6 +1443,149 @@ mod tests {
                 .expect_err("file-writing log config must be rejected");
             assert!(matches!(error, CoreError::InvalidConfig(_)));
         }
+    }
+
+    #[test]
+    fn privileged_config_accepts_full_generated_schema() {
+        // 与 build_singbox_config 输出同构的完整配置应通过（含合法 clash_api 与
+        // 应用内置固定远程规则集）。
+        let config = serde_json::json!({
+            "log": { "level": "info", "timestamp": true },
+            "dns": { "servers": [], "rules": [], "final": "dns-proxy" },
+            "inbounds": [{ "type": "mixed", "listen": "127.0.0.1", "listen_port": 7890 }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": {
+                "auto_detect_interface": false,
+                "default_domain_resolver": "dns-bootstrap",
+                "rules": [],
+                "rule_set": [
+                    {
+                        "type": "remote",
+                        "tag": "geosite-cn",
+                        "url": proxy_core::CHINA_GEOSITE_RULE_SET_URL,
+                        "download_detour": "direct",
+                    },
+                    {
+                        "type": "remote",
+                        "tag": "geoip-cn",
+                        "url": proxy_core::CHINA_GEOIP_RULE_SET_URL,
+                        "download_detour": "direct",
+                    }
+                ],
+                "final": "proxy"
+            },
+            "experimental": {
+                "clash_api": {
+                    "external_controller": "127.0.0.1:17891",
+                    "secret": "test-traffic-secret"
+                },
+                "cache_file": { "enabled": false }
+            }
+        });
+        validate_privileged_start_config(&config)
+            .expect("app-generated schema must pass the whitelist");
+        // IPv6 loopback 控制器同样合法。
+        let ipv6 = serde_json::json!({
+            "experimental": {
+                "clash_api": { "external_controller": "[::1]:9090", "secret": "s" }
+            }
+        });
+        validate_privileged_start_config(&ipv6).expect("[::1] loopback controller must pass");
+    }
+
+    #[test]
+    fn privileged_config_rejects_unknown_top_level_key() {
+        let config = serde_json::json!({ "ntp": { "enabled": true } });
+        let error = validate_privileged_start_config(&config)
+            .expect_err("unknown top-level key must be rejected");
+        assert!(matches!(error, CoreError::InvalidConfig(ref message)
+            if message.contains("特权内核配置包含不允许的字段: ntp")));
+    }
+
+    #[test]
+    fn privileged_config_rejects_non_loopback_clash_api() {
+        let config = serde_json::json!({
+            "experimental": {
+                "clash_api": {
+                    "external_controller": "0.0.0.0:9090",
+                    "secret": "s"
+                }
+            }
+        });
+        assert!(validate_privileged_start_config(&config).is_err());
+        let lan = serde_json::json!({
+            "experimental": {
+                "clash_api": {
+                    "external_controller": "127.0.0.1:9090",
+                    "secret": "s",
+                    "external_ui": "/etc"
+                }
+            }
+        });
+        assert!(validate_privileged_start_config(&lan).is_err());
+    }
+
+    #[test]
+    fn privileged_config_rejects_empty_clash_api_secret() {
+        for secret in [
+            serde_json::json!(""),
+            serde_json::json!(null),
+            serde_json::json!(123),
+        ] {
+            let config = serde_json::json!({
+                "experimental": {
+                    "clash_api": {
+                        "external_controller": "127.0.0.1:9090",
+                        "secret": secret
+                    }
+                }
+            });
+            assert!(
+                validate_privileged_start_config(&config).is_err(),
+                "empty/non-string secret must be rejected: {secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn privileged_config_rejects_arbitrary_remote_rule_set_url() {
+        let config = serde_json::json!({
+            "route": {
+                "rule_set": [{
+                    "type": "remote",
+                    "tag": "evil",
+                    "url": "http://169.254.169.254/latest/meta-data/"
+                }]
+            }
+        });
+        assert!(validate_privileged_start_config(&config).is_err());
+    }
+
+    #[test]
+    fn privileged_config_rejects_local_rule_set_path_traversal() {
+        let config = serde_json::json!({
+            "route": {
+                "rule_set": [{
+                    "type": "local",
+                    "tag": "evil",
+                    "path": "/app-data/rules/../../etc/cron.d/evil"
+                }]
+            }
+        });
+        assert!(validate_privileged_start_config(&config).is_err());
+    }
+
+    #[test]
+    fn privileged_config_rejects_cache_file_in_global_write_dir() {
+        let config = serde_json::json!({
+            "experimental": {
+                "cache_file": { "enabled": true, "path": "/tmp/evil-cache.db" }
+            }
+        });
+        let error = validate_privileged_start_config(&config)
+            .expect_err("cache file in /tmp must be rejected");
+        assert!(matches!(error, CoreError::InvalidConfig(ref message)
+            if message.contains("全局可写目录")));
     }
 
     #[test]

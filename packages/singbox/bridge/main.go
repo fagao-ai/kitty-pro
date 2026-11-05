@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,45 @@ type clashAPIClient struct {
 const bridgeLogLimit = 500
 const probeTimeout = 5 * time.Second
 const bridgeRouteEnrichmentGrace = 100 * time.Millisecond
+
+// defaultProbeURL 是特权进程唯一使用的节点探测地址。客户端经 RPC/FFI 传入的
+// probe_url 一律忽略，避免被用作 SSRF 跳板。
+const defaultProbeURL = "https://www.gstatic.com/generate_204"
+
+// validateProbeURL 校验探测地址：仅允许 http/https，且字面主机不能是回环、
+// 私网、链路本地、未指定或组播地址。它是可在 main_test.go 中表驱动测试的
+// 纯函数；特权进程只把编译期常量 defaultProbeURL 交给它。
+func validateProbeURL(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid probe URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("probe URL must use http or https: %q", rawURL)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("probe URL has no host: %q", rawURL)
+	}
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return "", fmt.Errorf("probe URL host is not allowed: %q", host)
+	}
+	if ip := net.ParseIP(host); ip != nil && !isPublicProbeIP(ip) {
+		return "", fmt.Errorf("probe URL host is not a public address: %q", host)
+	}
+	return parsed.String(), nil
+}
+
+// isPublicProbeIP 报告字面 IP 是否可作为探测目标：排除回环/私网/链路本地/
+// 未指定/组播地址。域名主机不在此判定，由固定常量与 DNS 解析负责。
+func isPublicProbeIP(ip net.IP) bool {
+	return !ip.IsLoopback() &&
+		!ip.IsPrivate() &&
+		!ip.IsLinkLocalUnicast() &&
+		!ip.IsLinkLocalMulticast() &&
+		!ip.IsUnspecified() &&
+		!ip.IsMulticast()
+}
 
 type bridgeLogEntry struct {
 	Sequence      uint64    `json:"sequence"`
@@ -330,6 +370,32 @@ func validateRuleSetFile(path string) error {
 	return err
 }
 
+// sing-box 的配置校验错误可能回显传入配置的片段；配置里常含 password / uuid /
+// token 等节点凭据，直接随错误文本返回给调用方会造成泄露（B17 / Q2）。下面几个
+// 正则只覆盖「敏感字段值」这一危险子集，不依赖 cgo、不引入新 Go 依赖（均为标准库
+// regexp），因此是可在所有平台编译、测试的纯函数。
+var (
+	// 引号包裹的值："password": "xxx"、'token': 'yyy'、password: "zzz" 等。
+	redactQuotedSensitive = regexp.MustCompile(
+		`(?i)(\b(?:password|passwd|pwd|uuid|token|secret|auth|auth_token|api[_-]?key|private[_-]?key|secret[_-]?key|access[_-]?key|credential)["']?\s*[:=]\s*)["'][^"']*["']`)
+	// 裸值：password: xxx、uuid = yyy、token=zzz 等（值不以引号开头）。
+	redactBareSensitive = regexp.MustCompile(
+		`(?i)(\b(?:password|passwd|pwd|uuid|token|secret|auth|auth_token|api[_-]?key|private[_-]?key|secret[_-]?key|access[_-]?key|credential)["']?\s*[:=]\s*)([^\s,;}&)"']+)`)
+	// URL userinfo 里的密码：scheme://user:pass@host。
+	redactURLUserinfo = regexp.MustCompile(
+		`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:)[^@\s/]+@`)
+)
+
+// redactConfigError 把 check_config 对外返回错误里可能回显的敏感字段值替换为
+// "***"。仅脱敏值、保留字段名与错误结构；普通错误文本（不含敏感字段）原样返回。
+// 纯函数、无 cgo/构建标签依赖，故在所有平台可测。
+func redactConfigError(s string) string {
+	s = redactQuotedSensitive.ReplaceAllString(s, `${1}"***"`)
+	s = redactBareSensitive.ReplaceAllString(s, `${1}***`)
+	s = redactURLUserinfo.ReplaceAllString(s, `${1}***@`)
+	return s
+}
+
 func checkConfig(configContent string) error {
 	return libbox.CheckConfig(configContent)
 }
@@ -559,7 +625,13 @@ func kitty_singbox_probe(configContent *C.char, nodeTagsJSON *C.char, probeURL *
 		setLastError(err)
 		return nil
 	}
-	results, err := probe(C.GoString(configContent), nodeTags, C.GoString(probeURL))
+	// 特权进程不接受客户端传入的任意探测地址，统一使用编译期常量并做校验。
+	safeProbeURL, err := validateProbeURL(defaultProbeURL)
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	results, err := probe(C.GoString(configContent), nodeTags, safeProbeURL)
 	if err != nil {
 		setLastError(err)
 		return nil
@@ -586,7 +658,13 @@ func kitty_singbox_probe_outbound(handle C.uint64_t, tag *C.char, probeURL *C.ch
 		setLastError(&bridgeError{message: "sing-box instance is not running"})
 		return nil
 	}
-	result := service.probeOutbound(C.GoString(tag), C.GoString(probeURL))
+	// 特权进程不接受客户端传入的任意探测地址，统一使用编译期常量并做校验。
+	safeProbeURL, err := validateProbeURL(defaultProbeURL)
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	result := service.probeOutbound(C.GoString(tag), safeProbeURL)
 	payload, err := stdjson.Marshal(result)
 	if err != nil {
 		setLastError(err)
@@ -832,14 +910,17 @@ func kitty_singbox_validate_rule_set_file(path *C.char) (result *C.char) {
 func kitty_singbox_check_config(configContent *C.char) (result *C.char) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			result = C.CString(recoveredError("check sing-box config", recovered).Error())
+			// 所有对外返回的 check_config 错误都先脱敏，panic 文案同样处理。
+			result = C.CString(redactConfigError(recoveredError("check sing-box config", recovered).Error()))
 		}
 	}()
 	if configContent == nil {
 		return C.CString("missing sing-box configuration")
 	}
 	if err := checkConfig(C.GoString(configContent)); err != nil {
-		return C.CString(err.Error())
+		// libbox.CheckConfig 的错误可能回显含 password/uuid/token 的配置片段，
+		// 统一脱敏后再跨 FFI 返回（Q2 / B17）。
+		return C.CString(redactConfigError(err.Error()))
 	}
 	return nil
 }

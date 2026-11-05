@@ -26,6 +26,9 @@ const MAX_HELPER_STDERR_BYTES: u64 = 64 * 1024;
 const HELPER_START_TIMEOUT: Duration = Duration::from_secs(120);
 const HELPER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HELPER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// 特权进程不接受任意探测地址：无论 UI/调用方传入什么，RPC 一律使用这个
+/// 编译期常量（与 Go 侧 `defaultProbeURL` 一致），避免 helper 被当作 SSRF 跳板。
+const FIXED_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
 #[derive(Debug)]
 pub(crate) struct PrivilegedCore {
@@ -144,9 +147,10 @@ impl PrivilegedCore {
         tag: &str,
         probe_url: &str,
     ) -> Result<LatencyProbeResult, CoreError> {
+        let _ = probe_url; // 特权进程不接受任意探测地址，忽略调用方传入值。
         let response = self.request(HelperAction::ProbeOutbound {
             tag: tag.to_string(),
-            probe_url: probe_url.to_string(),
+            probe_url: FIXED_PROBE_URL.to_string(),
         })?;
         response.ensure_success(CoreError::ProbeUnavailable)?;
         response
@@ -518,8 +522,9 @@ fn dispatch_helper_action(action: HelperAction, core: &mut EmbeddedCore) -> (Hel
         HelperAction::SelectOutbound { group, outbound } => core
             .select_outbound(&group, &outbound)
             .map(|_| HelperResponse::success()),
-        HelperAction::ProbeOutbound { tag, probe_url } => {
-            core.probe_outbound(&tag, &probe_url).map(|probe| {
+        HelperAction::ProbeOutbound { tag, probe_url: _ } => {
+            // 特权进程不接受任意探测地址：忽略 RPC 消息里的 URL，固定使用常量。
+            core.probe_outbound(&tag, FIXED_PROBE_URL).map(|probe| {
                 let mut response = HelperResponse::success();
                 response.probe = Some(probe);
                 response
@@ -637,20 +642,43 @@ fn read_session_token(path: &std::path::Path, owner_id: u32) -> Result<String, S
 }
 
 #[cfg(windows)]
-fn read_session_token(path: &std::path::Path, _owner_id: u32) -> Result<String, String> {
+fn read_session_token(path: &std::path::Path, owner_id: u32) -> Result<String, String> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // 让 owner_id 真正参与校验：调用方（非特权父进程）把 session_owner_id()
+    // 随命令行传入，这里用常量时间比较核对它是否等于本进程期望的 owner 字符串，
+    // 不匹配即拒绝会话文件。特权进程不接受与预期不符的会话所有者。
+    let expected_owner = session_owner_id().to_string();
+    let presented_owner = owner_id.to_string();
+    if !constant_time_eq(expected_owner.as_bytes(), presented_owner.as_bytes()) {
+        return Err("TUN helper session owner mismatch".to_string());
+    }
+
     let expected_parent = std::env::temp_dir()
         .canonicalize()
         .map_err(|error| format!("resolve TUN helper session directory: {error}"))?;
-    let parent = path
+    // 路径规范化：解析后的文件必须仍位于私有临时目录内。
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|error| format!("resolve TUN helper session file: {error}"))?;
+    let parent = canonical_path
         .parent()
-        .ok_or_else(|| "TUN helper session path has no parent".to_string())?
-        .canonicalize()
-        .map_err(|error| format!("resolve TUN helper session parent: {error}"))?;
+        .ok_or_else(|| "TUN helper session path has no parent".to_string())?;
+    if parent != expected_parent {
+        return Err(
+            "TUN helper session file is outside the private temporary directory".to_string(),
+        );
+    }
+    // 拒绝符号链接点（symlink_metadata 不跟随链接，能看到链接本身）。
+    let link_metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect TUN helper session token link: {error}"))?;
+    if link_metadata.file_type().is_symlink() {
+        return Err("unsafe TUN helper session token file (symlink)".to_string());
+    }
+
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -659,8 +687,11 @@ fn read_session_token(path: &std::path::Path, _owner_id: u32) -> Result<String, 
     let metadata = file
         .metadata()
         .map_err(|error| format!("inspect TUN helper session token: {error}"))?;
-    if parent != expected_parent
-        || !metadata.file_type().is_file()
+    // 残留限制：现有 windows-sys features 不足以读取文件属主 SID/ACL，也无法像
+    // Unix 侧那样核对 uid 与 0600 权限；这里只能做「普通文件 / 非重解析点」的
+    // 基本检查，无法保证文件确由调用方用户创建。完整防护需要引入额外的 Win32
+    // 安全 API（读取文件属主 SID/ACL）与相应的 windows-sys features。
+    if !metadata.file_type().is_file()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
         return Err("unsafe TUN helper session token file".to_string());
@@ -737,6 +768,41 @@ fn launch_elevated(
         .map_err(|error| helper_error(format!("无法请求 root 授权（需要 pkexec/polkit）: {error}")))
 }
 
+// ===== S13：PowerShell 数组传参 / 命令注入加固 =====
+
+/// 把任意字符串安全地嵌入 PowerShell 单引号字符串字面量。
+/// PowerShell 单引号字符串里只有 `'` 需要转义成 `''`，分号、`$()`、反引号在
+/// 单引号内都是普通字面量；但 NUL / CR / LF 会打断 `-Command` 脚本文本结构，
+/// 必须剔除。放在无 cfg 区域，保证 macOS / Linux 也能编译并单测（S13）。
+#[allow(dead_code)] // windows 的 launch_elevated 使用；其它平台仅测试引用。
+fn escape_powershell_single_quoted(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\'' => escaped.push_str("''"),
+            '\0' | '\r' | '\n' => escaped.push(' '),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// 包成带定界符的单引号字面量 `'...'`。
+#[allow(dead_code)]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", escape_powershell_single_quoted(value))
+}
+
+/// 把一组值拼成 PowerShell 数组字面量 `@('a','b')`，每个元素都经转义。
+#[allow(dead_code)]
+fn powershell_string_array<S: AsRef<str>>(values: &[S]) -> String {
+    let items: Vec<String> = values
+        .iter()
+        .map(|value| powershell_single_quoted(value.as_ref()))
+        .collect();
+    format!("@({})", items.join(","))
+}
+
 #[cfg(target_os = "windows")]
 fn launch_elevated(
     executable: &std::path::Path,
@@ -748,10 +814,22 @@ fn launch_elevated(
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-    let executable = executable.to_string_lossy().replace('\'', "''");
-    let token_path = format!("\"{}\"", token_path.to_string_lossy()).replace('\'', "''");
+    // S13：所有来自变量的值都经 escape helper 处理，并用 `@('a','b')` 数组
+    // 字面量传参，元素里的 `'` / `;` / 换行 / `$( )` 不再能破坏脚本文本。
+    // token_path 沿用历史的双引号包裹（让 Start-Process 正确处理含空格路径），
+    // 但整串先经转义再嵌入单引号字面量。
+    let token_path_arg = format!("\"{}\"", token_path.to_string_lossy());
+    let arguments = powershell_string_array(&[
+        HELPER_FLAG.to_string(),
+        rpc_port.to_string(),
+        lease_port.to_string(),
+        token_path_arg,
+        owner_id.to_string(),
+    ]);
+    let executable_text = executable.to_string_lossy().into_owned();
+    let executable_literal = powershell_single_quoted(&executable_text);
     let script = format!(
-        "$p=Start-Process -FilePath '{executable}' -ArgumentList @('{HELPER_FLAG}','{rpc_port}','{lease_port}','{token_path}','{owner_id}') -Verb RunAs -PassThru -Wait; exit $p.ExitCode"
+        "$p=Start-Process -FilePath {executable_literal} -ArgumentList {arguments} -Verb RunAs -PassThru -Wait; exit $p.ExitCode"
     );
     Command::new("powershell.exe")
         .creation_flags(CREATE_NO_WINDOW)
@@ -801,6 +879,60 @@ fn unavailable_status(message: &str) -> CoreStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_powershell_single_quoted_leaves_plain_values_unchanged() {
+        assert_eq!(
+            escape_powershell_single_quoted(r"C:\Program Files\Kitty Pro\helper.exe"),
+            r"C:\Program Files\Kitty Pro\helper.exe"
+        );
+        assert_eq!(escape_powershell_single_quoted(""), "");
+        assert_eq!(powershell_single_quoted("plain"), "'plain'");
+    }
+
+    #[test]
+    fn escape_powershell_single_quoted_neutralizes_injection_metacharacters() {
+        let value = "O'Brien; Drop-Table\n$(Get-Process)\r\0";
+        let escaped = escape_powershell_single_quoted(value);
+        // 单引号翻倍：PowerShell 单引号字符串里唯一必需的转义。
+        assert!(escaped.contains("O''Brien"), "iteration=0: {escaped:?}");
+        // NUL / CR / LF 一律剔除，避免打断 -Command 脚本文本。
+        assert!(!escaped.contains('\0'), "iteration=0: {escaped:?}");
+        assert!(!escaped.contains('\r'), "iteration=0: {escaped:?}");
+        assert!(!escaped.contains('\n'), "iteration=0: {escaped:?}");
+        // 分号 / $() 放进单引号字面量后只是字面量，不会提前闭合引号。
+        let literal = powershell_single_quoted(value);
+        assert!(literal.starts_with('\'') && literal.ends_with('\''));
+        let inner = &literal[1..literal.len() - 1];
+        assert_eq!(
+            inner.matches('\'').count() % 2,
+            0,
+            "iteration=0: 每个内部单引号都应成对: {literal:?}"
+        );
+        assert!(literal.contains(';') && literal.contains("$(Get-Process)"));
+    }
+
+    #[test]
+    fn powershell_string_array_has_no_unescaped_single_quotes() {
+        let values = [
+            "--kitty-pro-tun-helper",
+            "9090",
+            r"C:\Users\O'Brien\token;$(whoami)",
+            "\n42\0",
+        ];
+        let literal = powershell_string_array(&values);
+        assert!(literal.starts_with("@(") && literal.ends_with(')'));
+        // 把成对转义 '' 消掉后，剩下的 ' 只能作为 4 个元素的首尾定界符。
+        let without_pairs = literal.replace("''", "");
+        assert_eq!(
+            without_pairs.matches('\'').count(),
+            values.len() * 2,
+            "iteration=0: 数组字面量不应含未转义的单引号: {literal:?}"
+        );
+        assert!(!literal.contains('\n'));
+        assert!(!literal.contains('\r'));
+        assert!(!literal.contains('\0'));
+    }
 
     #[test]
     fn constant_time_token_check_requires_exact_match() {
