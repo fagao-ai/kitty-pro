@@ -3,6 +3,7 @@
 //! One owner per piece of state. The screens call these methods and never touch a signal
 //! directly, so what a press starts stays in one place and cancels the way the code says.
 
+pub use crate::domain::SystemProxy;
 use api::{ApiCoreStatus, CoreTraffic};
 use nsh_core::prelude::*;
 use proxy_core::{
@@ -180,6 +181,9 @@ pub struct AppStore {
     import_name: Signal<String>,
     import_source: Signal<String>,
     import_busy: Signal<bool>,
+    /// Why the last import failed, shown inside the dialog rather than only in a notice: a
+    /// notice ages out while the mistyped URL stays in the field.
+    import_error: Signal<Option<String>>,
     /// Bumped when an import is abandoned, so a parse that finishes after the dialog
     /// closed cannot add a subscription the user already walked away from.
     import_generation: Signal<u64>,
@@ -190,11 +194,20 @@ pub struct AppStore {
     refresh_in_flight: Signal<Vec<RefreshTarget>>,
     /// Where every action reports what actually happened. Made with the store, under the
     /// root's owner, so its lifecycle interval ends with the app.
+    /// The operating system's proxy setting, as the backend last reported it. The core
+    /// listens on a port; this is what makes anything actually use that port, so a client
+    /// without it can connect and route nothing.
+    system_proxy: Signal<SystemProxy>,
+    system_proxy_busy: Signal<bool>,
     /// The config script editor: whether a validation is running.
     script_busy: Signal<bool>,
+    /// Whether a downloaded rule-set refresh is running.
+    rule_sets_busy: Signal<bool>,
     feedback: crate::feedback::Feedback,
     /// The poll generation: a restart or disconnect invalidates in-flight reads.
     poll_generation: Signal<u64>,
+    /// The owner every task this store starts belongs to.
+    owner: Owner,
 }
 
 impl AppStore {
@@ -240,13 +253,32 @@ impl AppStore {
             import_name: signal(String::new()),
             import_source: signal(String::new()),
             import_busy: signal(false),
+            import_error: signal(None),
             import_generation: signal(0),
             refresh_busy: signal(None),
             refresh_in_flight: signal(Vec::new()),
             script_busy: signal(false),
+            rule_sets_busy: signal(false),
+            system_proxy: signal(SystemProxy::Loading),
+            system_proxy_busy: signal(false),
             feedback: crate::feedback::Feedback::new(),
             poll_generation: signal(0),
+            owner: Owner::current(),
         }
+    }
+
+    /// Start a task that belongs to the app rather than to whatever control started it.
+    ///
+    /// `spawn` takes the current owner, and inside a press handler the current owner is the
+    /// widget that was pressed. Saving is the case that shows: a dialog closed by the same
+    /// press that submits it disposes its subtree before the write's first await, so the
+    /// file is never touched and the notice already up has said it was saved. Deleting a row
+    /// that starts a save does the same to the row's own owner. Everything here outlives the
+    /// screen that asked for it, which is the point of asking through the store.
+    fn work(self, future: impl std::future::Future<Output = ()> + 'static) {
+        self.owner.run(|| {
+            spawn(future);
+        });
     }
 
     /// The notice hub, so the shell can mount the stack and a screen can report a
@@ -348,7 +380,7 @@ impl AppStore {
 
     /// Read the profile and put it in the store. Runs once, from the root.
     pub fn load_profile(self) {
-        spawn(async move {
+        self.work(async move {
             match api::load_profile().await {
                 Ok(profile) => self.apply_profile(profile),
                 Err(error) => {
@@ -410,6 +442,9 @@ impl AppStore {
 
     /// The request the core starts with, built from current state.
     pub fn connection_request(&self) -> ConnectionRequest {
+        let script_enabled = self.config_script_enabled.get_untracked();
+        let script = self.config_script.get_untracked();
+        let script_applied = script_enabled && !script.trim().is_empty();
         ConnectionRequest {
             nodes: self.nodes.get_untracked(),
             selected_tag: self.selected_tag.get_untracked(),
@@ -417,16 +452,14 @@ impl AppStore {
             mode: self.tunnel_mode.get_untracked(),
             tun: self.tun_enabled.get_untracked(),
             allow_lan: self.allow_lan.get_untracked(),
-            custom_rules: self.custom_rules.get_untracked(),
+            custom_rules: crate::domain::connection_custom_rules(
+                script_enabled,
+                &script,
+                self.custom_rules.get_untracked(),
+                crate::domain::process_rules_supported(),
+            ),
             dns_overrides: self.dns_overrides.get_untracked(),
-            config_script: self
-                .config_script_enabled
-                .get_untracked()
-                .then(|| {
-                    let script = self.config_script.get_untracked();
-                    (!script.trim().is_empty()).then_some(script)
-                })
-                .flatten(),
+            config_script: script_applied.then_some(script),
             group_selections: self.group_selections.get_untracked(),
         }
     }
@@ -438,26 +471,109 @@ impl AppStore {
         }
         self.core_busy.set(CoreBusy::Toggling);
         self.bump_generation();
-        spawn(async move {
+        self.work(async move {
             let request = enable.then(|| self.connection_request());
+            // TUN needs the privileged helper, which does not exist while the core is
+            // stopped. Starting without acquiring it first fails with a permission error the
+            // user cannot act on, so the prompt happens here and the switch stays a
+            // preference rather than a one-shot setup. Only when TUN is on: the backend
+            // rejects a pre-flight for a plain proxy config.
+            let tun_requested = request.as_ref().is_some_and(|request| request.tun);
+            if let Some(tun_request) = request.clone().filter(|_| enable && tun_requested) {
+                if let Err(error) = api::prepare_tun_mode(tun_request).await {
+                    self.core_busy.set(CoreBusy::Idle);
+                    self.feedback
+                        .error(format!("准备 TUN 权限失败，内核未启动：{error}"));
+                    self.refresh_status();
+                    return;
+                }
+            }
             match api::set_core_enabled(enable, request).await {
                 Ok(status) => {
                     self.apply_core_status(status, enable);
                     if enable {
                         self.config_revision.set(0);
                         self.start_polling();
+                        self.feedback.success("内核已启动");
                     } else {
-                        self.connected.set(false);
-                        self.traffic.set(TrafficWindow::default());
-                        self.uptime_seconds.set(None);
+                        self.stop_side_effects();
                     }
                 }
                 Err(error) => {
                     self.core_note.set(Some(error.to_string()));
+                    self.feedback.error(error.to_string());
                 }
             }
             self.core_busy.set(CoreBusy::Idle);
+            // The OS proxy points at a port that may no longer be there: a stop tears the
+            // route down and a failed start may have too. Re-read rather than assume, since
+            // a switch left on would claim traffic is proxied when it is not.
+            if !enable || !self.connected.get_untracked() {
+                self.refresh_system_proxy();
+            }
         });
+    }
+
+    /// What has to be forgotten when the core is no longer running.
+    fn stop_side_effects(self) {
+        self.connected.set(false);
+        self.traffic.set(TrafficWindow::default());
+        self.uptime_seconds.set(None);
+    }
+
+    /// Read the operating system's proxy setting. Called on boot, after a stop, and whenever
+    /// a write is refused, because the value is not the app's to remember.
+    pub fn refresh_system_proxy(self) {
+        self.work(async move {
+            match api::system_proxy_status().await {
+                Ok(status) => self.system_proxy.set(SystemProxy::Ready(status)),
+                Err(error) => self
+                    .system_proxy
+                    .set(SystemProxy::Failed(error.to_string())),
+            }
+        });
+    }
+
+    pub fn system_proxy(&self) -> SystemProxy {
+        self.system_proxy.get()
+    }
+
+    /// Point the operating system at the core, or stop it doing so. This is what makes a
+    /// connected core actually carry anything.
+    ///
+    /// A refusal re-reads the status instead of leaving the switch where the press put it:
+    /// the write may have half-applied, and the real setting is the only truth worth showing.
+    pub fn set_system_proxy(self, enable: bool) {
+        if self.core_action_busy() || self.system_proxy_busy() {
+            return;
+        }
+        self.system_proxy_busy.set(true);
+        self.work(async move {
+            match api::set_system_proxy(enable).await {
+                Ok(status) => {
+                    self.system_proxy.set(SystemProxy::Ready(status));
+                    self.feedback.success(if enable {
+                        "系统代理已启用"
+                    } else {
+                        "系统代理已关闭"
+                    });
+                }
+                Err(error) => {
+                    self.feedback.error(format!("系统代理设置失败：{error}"));
+                    match api::system_proxy_status().await {
+                        Ok(status) => self.system_proxy.set(SystemProxy::Ready(status)),
+                        Err(refresh) => self
+                            .system_proxy
+                            .set(SystemProxy::Failed(refresh.to_string())),
+                    }
+                }
+            }
+            self.system_proxy_busy.set(false);
+        });
+    }
+
+    pub fn system_proxy_busy(&self) -> bool {
+        self.system_proxy_busy.get()
     }
 
     /// Push the current config to a running core.
@@ -468,7 +584,7 @@ impl AppStore {
         self.core_busy.set(CoreBusy::Restarting);
         self.bump_generation();
         let request = self.connection_request();
-        spawn(async move {
+        self.work(async move {
             match api::restart_core(request).await {
                 Ok(status) => {
                     self.apply_core_status(status, true);
@@ -483,7 +599,7 @@ impl AppStore {
 
     /// One status read, used on first paint and by the "重新检测" action.
     pub fn refresh_status(self) {
-        spawn(async move {
+        self.work(async move {
             match api::core_status().await {
                 Ok(status) => {
                     let running = status.state == "running";
@@ -524,7 +640,7 @@ impl AppStore {
     pub fn start_polling(self) {
         let generation = self.poll_generation.get_untracked();
         self.uptime_seconds.set(Some(0));
-        spawn(async move {
+        self.work(async move {
             let mut seconds = 0_u64;
             loop {
                 if self.poll_generation.get_untracked() != generation
@@ -602,7 +718,7 @@ impl AppStore {
     }
 
     fn persist_theme(self) {
-        spawn(async move {
+        self.work(async move {
             // Read-modify-write: the theme is the only field this path owns, so a
             // concurrent profile edit is not overwritten from a stale copy.
             let Ok(mut profile) = api::load_profile().await else {
@@ -677,7 +793,7 @@ impl AppStore {
     /// a refusal left reporting "collecting" would claim a live feed that is not one.
     pub fn set_log_collection(self, enable: bool) {
         self.log_paused.set(!enable);
-        spawn(async move {
+        self.work(async move {
             if let Err(error) = api::set_core_log_collection(enable).await {
                 if enable {
                     self.log_paused.set(true);
@@ -692,7 +808,7 @@ impl AppStore {
     /// starts it on arrival rather than keeping a poll alive behind every page.
     pub fn poll_logs(self) {
         let generation = self.log_generation.get_untracked();
-        spawn(async move {
+        self.work(async move {
             loop {
                 let open = self.screen.get_untracked() == Screen::Logs;
                 let running = self.core_state.get_untracked() == "running";
@@ -777,7 +893,8 @@ impl AppStore {
         }
         let generation = self.import_generation.get_untracked();
         self.import_busy.set(true);
-        spawn(async move {
+        self.import_error.set(None);
+        self.work(async move {
             let result = api::preview_subscription(source.clone()).await;
             // The dialog may have been closed, or another import started, while this was
             // in flight. A late result must not reopen it or overwrite the newer state.
@@ -811,7 +928,7 @@ impl AppStore {
                     if let Err(error) = self.save().await {
                         self.feedback.error(format!("配置保存失败：{error}"));
                     }
-                    let mut message = format!("已导入 {display}，共 {count} 个节点");
+                    let mut message = format!("已导入并切换到 {display}，共 {count} 个节点");
                     if rejected > 0 {
                         message.push_str(&format!("，{rejected} 个无法解析"));
                     }
@@ -820,16 +937,29 @@ impl AppStore {
                         self.mark_config_dirty();
                     }
                     self.feedback.success(message);
+                    // Closed and emptied, not left open holding the link that was just
+                    // imported: an open form invites a second press, which would add the
+                    // same provider twice under a different id.
+                    self.import_name.set(String::new());
+                    self.import_source.set(String::new());
+                    self.import_error.set(None);
+                    self.import_open.set(false);
                 }
+                // Kept open with the text intact and the reason under the field it came
+                // from: the usual cause is one mistyped character, and the user has to be
+                // able to see and fix it.
                 Ok(report) => {
                     let reason = report
                         .rejected
                         .first()
                         .map(|issue| issue.reason.clone())
                         .unwrap_or_else(|| "没有找到可用节点".to_owned());
-                    self.feedback.error(format!("订阅解析失败：{reason}"));
+                    self.import_error
+                        .set(Some(format!("订阅解析失败：{reason}")));
                 }
-                Err(error) => self.feedback.error(format!("订阅解析失败：{error}")),
+                Err(error) => self
+                    .import_error
+                    .set(Some(format!("订阅解析失败：{error}"))),
             }
         });
     }
@@ -839,6 +969,7 @@ impl AppStore {
     pub fn cancel_import(self) {
         self.import_generation.update(|n| *n = n.wrapping_add(1));
         self.import_busy.set(false);
+        self.import_error.set(None);
         self.import_open.set(false);
     }
 
@@ -855,6 +986,7 @@ impl AppStore {
     pub fn open_import(self) {
         self.import_name.set(String::new());
         self.import_source.set(String::new());
+        self.import_error.set(None);
         self.import_open.set(true);
     }
 
@@ -870,6 +1002,11 @@ impl AppStore {
     /// and the text survives a trip to another screen.
     pub fn import_fields(&self) -> (Signal<String>, Signal<String>) {
         (self.import_name, self.import_source)
+    }
+
+    /// The dialog's failure line.
+    pub fn import_error(&self) -> Signal<Option<String>> {
+        self.import_error
     }
 
     /// Make one subscription the source of the node list, keeping the selected node when
@@ -958,7 +1095,7 @@ impl AppStore {
             .filter(|subscription| ids.contains(&subscription.id))
             .map(|subscription| (subscription.id, subscription.source))
             .collect();
-        spawn(async move {
+        self.work(async move {
             let mut refreshed = 0usize;
             let mut failures: Vec<String> = Vec::new();
             for (id, source) in sources {
@@ -1266,16 +1403,39 @@ impl AppStore {
             config_script: Some(script),
             ..self.connection_request()
         };
-        spawn(async move {
+        self.work(async move {
             let result = api::validate_config_script(request).await;
             self.script_busy.set(false);
             self.feedback
-                .report("配置脚本校验", result.map(|_| "配置脚本校验通过"));
+                .settled("配置脚本校验", result.map(|_| "配置脚本校验通过"));
         });
     }
 
     pub fn script_busy(&self) -> bool {
         self.script_busy.get()
+    }
+
+    /// Refresh the rule-sets the core's geo rules download. Separate from the app's own
+    /// rules, which need no download, so the label says 规则 in the sense the provider uses.
+    ///
+    /// The flag lives here rather than on the button because the work outlives the screen: a
+    /// refresh started and then navigated away from has to finish and report, not stop
+    /// halfway with the reason never said.
+    pub fn update_rule_sets(self) {
+        if self.rule_sets_busy.get_untracked() {
+            return;
+        }
+        self.rule_sets_busy.set(true);
+        self.work(async move {
+            let result = api::update_rule_sets(true).await;
+            self.rule_sets_busy.set(false);
+            self.feedback
+                .settled("更新分流规则", result.map(|_| "分流规则已更新"));
+        });
+    }
+
+    pub fn rule_sets_busy(&self) -> bool {
+        self.rule_sets_busy.get()
     }
 
     /// The measured latency for one node, if it has been probed.
@@ -1297,7 +1457,7 @@ impl AppStore {
         let nodes = self.nodes.get_untracked();
         let generation = self.latency_generation.get_untracked();
         self.latency_busy.set(true);
-        spawn(async move {
+        self.work(async move {
             let Ok(session) = api::start_node_latency(nodes, Vec::new()).await else {
                 self.latency_busy.set(false);
                 return;
@@ -1352,6 +1512,52 @@ impl AppStore {
 
     /// Switch between rule, global and direct modes. A running core restarts so the
     /// change actually applies.
+    /// Turn TUN on or off.
+    ///
+    /// A running core picks it up through a restart. A stopped one is different in one
+    /// direction only: switching it off has to hand back the privileged helper, which stays
+    /// installed otherwise. Switching it on does not need to acquire it here, because
+    /// `toggle_core` asks for it before starting and reports a refusal where the press is.
+    pub fn set_tun_enabled(self, enable: bool) {
+        if self.tun_enabled.get_untracked() == enable {
+            return;
+        }
+        self.tun_enabled.set(enable);
+        self.mark_config_dirty();
+        self.persist_profile();
+        if self.connected.get_untracked() {
+            self.restart_core();
+            return;
+        }
+        if !enable {
+            self.core_busy.set(CoreBusy::Tun);
+            self.work(async move {
+                match api::release_tun_mode().await {
+                    Ok(()) => self.feedback.success("TUN 模式已关闭"),
+                    Err(error) => {
+                        self.feedback.error(format!("关闭 TUN 失败：{error}"));
+                        self.refresh_status();
+                    }
+                }
+                self.core_busy.set(CoreBusy::Idle);
+            });
+        }
+    }
+
+    /// Whether other machines on the network may use the proxy. Off means the listener is
+    /// loopback only, which is what the port's label on the overview says.
+    pub fn set_allow_lan(self, enable: bool) {
+        if self.allow_lan.get_untracked() == enable {
+            return;
+        }
+        self.allow_lan.set(enable);
+        self.mark_config_dirty();
+        self.persist_profile();
+        if self.connected.get_untracked() {
+            self.restart_core();
+        }
+    }
+
     pub fn set_tunnel_mode(self, mode: TunnelMode) {
         if self.tunnel_mode.get_untracked() == mode {
             return;
@@ -1391,7 +1597,7 @@ impl AppStore {
     /// Fire-and-forget save for a screen that has already said what it did. Failures are
     /// still reported: a silent one means the edit vanishes on the next launch.
     fn persist_profile(self) {
-        spawn(async move {
+        self.work(async move {
             if let Err(error) = self.save().await {
                 self.feedback.error(format!("配置保存失败：{error}"));
             }

@@ -77,6 +77,22 @@ fn desktop(profile: &Profile) -> Headless {
     .expect("the app starts")
 }
 
+/// A desktop window tall enough to show the whole overview at once. The port's label and the
+/// latency row sit below a laptop-height fold, which is normal for a scrolling page; a test
+/// that asserts their text should not have to fight the scroll position to read it.
+fn tall(profile: &Profile) -> Headless {
+    let _ = profile;
+    Headless::start(EngineConfig {
+        viewport: Size::new(px(1280.0), px(1600.0)),
+        environment: Environment {
+            window: Size::new(px(1280.0), px(1600.0)),
+            ..environment()
+        },
+        ..EngineConfig::new(nsh_app_kitty::app_root())
+    })
+    .expect("the app starts")
+}
+
 /// A phone surface, to prove the layout survives a narrow width.
 fn phone(profile: &Profile) -> Headless {
     let _ = profile;
@@ -842,6 +858,207 @@ fn the_script_editor_opens_over_the_saved_text() {
         Some(nsh_core::Checked::False),
         "loading a stored script switched it on"
     );
+}
+
+/// The subscription page's one path that reaches a network at all is a URL, and CI has no
+/// provider to point at. Pasted node links go through the same store call with the parse done
+/// locally, so this drives import end to end: the dialog, the parse, the new row becoming the
+/// active one, the nodes reaching 节点, and the file on disk.
+#[test]
+fn pasted_links_import_become_active_and_persist() {
+    let profile = Profile::claim("pasted_links_import_become_active_and_persist");
+    let mut app = desktop(&profile);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("订阅").unwrap();
+    app.wait_for("暂无订阅").unwrap();
+
+    app.press("role:button[添加订阅] >> nth=0").unwrap();
+    app.wait_for("订阅地址或节点内容").unwrap();
+    app.type_text(
+        "label:订阅地址或节点内容",
+        "vless://11111111-1111-1111-1111-111111111111@edge.example.test:443?security=tls#边缘节点",
+    )
+    .unwrap();
+    app.press("导入").unwrap();
+
+    app.wait_for("已导入并切换到 本地内容，共 1 个节点")
+        .unwrap();
+    app.wait_for("1 个订阅 · 共 1 个节点").unwrap();
+    app.wait_for("当前使用").unwrap();
+    // The dialog closes on success, and the store owns the fields, so reopening is clean
+    // rather than showing the link that was just imported.
+    app.wait_for_gone("名称（可选）", std::time::Duration::from_secs(2))
+        .unwrap();
+    wait_until_profile(|stored| stored.contains("边缘节点"), &mut app);
+    drop(app);
+
+    let mut again = desktop(&profile);
+    again.wait_for("Kitty Pro").unwrap();
+    again.press("节点").unwrap();
+    again.wait_for("边缘节点").unwrap();
+}
+
+/// The config script's two outcomes, both announced. The validator is the core's own QuickJS
+/// pass over a built config, so this needs no network and exercises the class of bug where a
+/// button does the work and never says anything: the notice is the only answer the user gets
+/// for a press whose result is invisible.
+#[test]
+fn the_script_validator_reports_both_ways() {
+    let (mut app, _profile) = seeded_test("the_script_validator_reports_both_ways", SEEDED_PROFILE);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.wait_for("JavaScript 配置覆写").unwrap();
+    app.press("编辑").unwrap();
+    app.wait_for("校验").unwrap();
+
+    app.type_text("label:脚本", "function main(config) {\n  return config;\n}")
+        .unwrap();
+    app.press("校验").unwrap();
+    app.wait_for("配置脚本校验通过").unwrap();
+
+    // Now something the runtime rejects: the draft keeps growing, so the second script is a
+    // valid function followed by a syntax error. The notice has to name the failure and say
+    // what the validator said, which is why this matches the prefix rather than a whole node.
+    app.type_text("label:脚本", "this is not javascript")
+        .unwrap();
+    app.press("校验").unwrap();
+    app.wait_for("text:/^配置脚本校验失败/").unwrap();
+    // The earlier success may still be on its way out; what matters is that the failure
+    // arrived with its own words. 校验 never writes, which is the point of the button.
+    assert!(!app.shows("配置脚本已保存"));
+}
+
+/// Saving a script is the one edit here that changes what the core would run, so it persists
+/// and comes back. An empty script cannot be left switched on.
+#[test]
+fn a_saved_script_comes_back_after_a_relaunch() {
+    let profile = Profile::claim("a_saved_script_comes_back_after_a_relaunch");
+    profile.seed(SEEDED_PROFILE);
+    let mut app = desktop(&profile);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.press("编辑").unwrap();
+    app.type_text("label:脚本", "function main(config) { return config; }")
+        .unwrap();
+    app.press("保存").unwrap();
+    app.wait_for("配置脚本已保存").unwrap();
+    app.wait_for("main(config) · QuickJS · 40 字符").unwrap();
+    // The write has to outlive the press that started it: the same press closes the editor,
+    // and a task owned by that region would be cancelled before the file is touched.
+    wait_until_profile(|stored| stored.contains("function main(config)"), &mut app);
+    // Saving keeps the switch where it was, and this profile had it off, so the script is
+    // stored inert rather than silently taking the rule set over.
+    assert!(
+        !app.shows("启用后自定义分流规则将被脚本接管。"),
+        "saving a script switched it on"
+    );
+    drop(app);
+
+    let mut again = desktop(&profile);
+    again.wait_for("Kitty Pro").unwrap();
+    again.press("设置").unwrap();
+    again.wait_for("main(config) · QuickJS · 40 字符").unwrap();
+}
+
+/// The core listens on a port; the operating system's proxy setting is what makes anything
+/// use it. A client that can connect but not point the machine at the port shows "已连接"
+/// while traffic goes nowhere, so the switch has to be there and parked with a reason when
+/// there is no core behind it yet.
+/// The switch that decides whether anything uses the port. Whether the machine is already
+/// proxied is not the app's to decide, so this asserts only what holds on any machine: the
+/// control is there, it is named, and it reports a read answer rather than a default. The
+/// wording of every branch is covered by `a_parked_proxy_switch_says_why` in `domain`.
+#[test]
+fn the_system_proxy_switch_reads_the_machine() {
+    let (mut app, _profile) = desktop_test("the_system_proxy_switch_reads_the_machine");
+    app.wait_for("系统代理").unwrap();
+    let toggle = "role:switch[系统代理]";
+    // The read has to land on something. Which of these a given machine says is not the
+    // app's business: a runner with no desktop session fails the read, and a developer's
+    // laptop may already be proxied by something else. What the test insists on is that the
+    // row stops saying "正在读取", which is what a lost boot read looks like from outside.
+    let settled = |app: &Headless| {
+        app.screen().texts().iter().any(|text| {
+            [
+                "已设置",
+                "系统当前使用其他代理",
+                "未启用系统代理",
+                "当前平台不支持系统代理",
+                "读取系统代理失败",
+                "当前平台尚未实现",
+            ]
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+        })
+    };
+    for _ in 0..30 {
+        if settled(&app) {
+            break;
+        }
+        app.idle(std::time::Duration::from_millis(300)).unwrap();
+    }
+    assert!(settled(&app), "the system-proxy read never settled");
+    // With no core running the switch is pressable only when the machine is already
+    // proxied, which is the one case where turning it off is a real action. Offering it
+    // off-and-pressable would point the machine at a closed port.
+    let enabled =
+        app.screen().accessibility_state(toggle).unwrap().checked == Some(nsh_core::Checked::True);
+    assert_eq!(
+        app.screen().enabled(toggle).unwrap(),
+        enabled,
+        "the switch is pressable with nothing behind the port, or inert while the machine \
+         is already proxied"
+    );
+}
+
+/// TUN and LAN are the two ways the machine hands traffic over, and both are settings a
+/// relaunch has to keep. Toggling with no core running writes the file and starts nothing.
+#[test]
+fn the_takeover_switches_persist_across_a_relaunch() {
+    let profile = Profile::claim("the_takeover_switches_persist_across_a_relaunch");
+    let mut app = desktop(&profile);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.wait_for("接管方式").unwrap();
+
+    let tun = "role:switch[TUN 模式]";
+    let lan = "role:switch[允许局域网连接]";
+    app.press(tun).unwrap();
+    app.press(lan).unwrap();
+    // Each note says what its own value means, so the row reads without a legend.
+    app.wait_for("接管全部流量，首次需要管理员授权").unwrap();
+    app.wait_for("局域网内其他设备可使用 7890").unwrap();
+    wait_until_profile(|stored| stored.contains(r#""tun_enabled": true"#), &mut app);
+    drop(app);
+
+    let mut again = desktop(&profile);
+    again.wait_for("Kitty Pro").unwrap();
+    again.press("设置").unwrap();
+    again.wait_for("接管全部流量，首次需要管理员授权").unwrap();
+    assert_eq!(
+        again.screen().accessibility_state(lan).unwrap().checked,
+        Some(nsh_core::Checked::True),
+        "the shared-listener choice did not come back"
+    );
+}
+
+/// The port's label on the overview is the one place the LAN choice shows up without opening
+/// Settings, so it has to move with the switch.
+/// The port's label on the overview is the one place the LAN choice shows without opening
+/// Settings. The connection card puts it below a 840pt fold, so this opens a taller window
+/// rather than pretending otherwise: the assertion is about the binding, not the scroll
+/// position.
+#[test]
+fn the_overview_port_label_follows_the_lan_switch() {
+    let profile = Profile::claim("the_overview_port_label_follows_the_lan_switch");
+    profile.seed(SEEDED_PROFILE);
+    let mut app = tall(&profile);
+    // The row names an endpoint only once there is something that could listen on it.
+    app.wait_for("本地代理 7890").unwrap();
+    app.press("设置").unwrap();
+    app.press("role:switch[允许局域网连接]").unwrap();
+    app.press("总览").unwrap();
+    app.wait_for("局域网代理 7890").unwrap();
 }
 
 /// The profile is written back on the way in, so a relaunch keeps the choice. This is

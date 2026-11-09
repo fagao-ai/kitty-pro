@@ -168,14 +168,32 @@ pub fn switch_row(
     disabled: Signal<bool>,
     on_change: impl Fn(bool) + 'static,
 ) -> impl IntoElement {
+    switch_row_state(
+        label,
+        note,
+        move || checked.get(),
+        move || disabled.get(),
+        on_change,
+    )
+}
+
+/// The same row with the state read through closures, for a value that lives in the store
+/// rather than in a signal of its own.
+pub fn switch_row_state(
+    label: impl Into<SharedString> + 'static,
+    note: impl IntoReactive<SharedString> + 'static,
+    checked: impl Fn() -> bool + 'static,
+    disabled: impl Fn() -> bool + 'static,
+    on_change: impl Fn(bool) + 'static,
+) -> impl IntoElement {
     let label = label.into();
     let control = switch_state(
         {
             let label = label.clone();
             move || Some(label.clone())
         },
-        move || checked.get(),
-        move || disabled.get(),
+        checked,
+        disabled,
         on_change,
     );
 

@@ -26,6 +26,7 @@ pub fn settings(store: AppStore) -> impl IntoElement {
             .gap_4()
             .child(appearance_card(store))
             .child(mode_card(store))
+            .child(scope_card(store))
             .child(script_card(store))
             .child(config_links_card(store)),
     )
@@ -48,6 +49,53 @@ fn appearance_card(store: AppStore) -> impl IntoElement {
                 move |next| store.set_dark_mode(next),
             )),
     )
+}
+
+/// How the machine hands traffic over. TUN takes it at the network layer and needs
+/// administrator rights the first time; sharing the listener lets other devices on the
+/// network use the same core.
+///
+/// Here rather than beside the connect control because neither is part of connecting: they
+/// change how a connection is made, and the everyday case never opens this.
+fn scope_card(store: AppStore) -> impl IntoElement {
+    controls::card(
+        view()
+            .flex_col()
+            .gap_4()
+            .child(heading("接管方式"))
+            .child(controls::switch_row_state(
+                "TUN 模式",
+                move || tun_note(store.tun_enabled()),
+                move || store.tun_enabled(),
+                move || store.core_action_busy(),
+                move |next| store.set_tun_enabled(next),
+            ))
+            .child(controls::switch_row_state(
+                "允许局域网连接",
+                move || lan_note(store.allow_lan()),
+                move || store.allow_lan(),
+                move || store.core_action_busy(),
+                move |next| store.set_allow_lan(next),
+            )),
+    )
+}
+
+/// What each value means standing on its own. Whether a change reached the running core is
+/// the press's business: the store says 重新连接后生效 when it has not.
+fn tun_note(enabled: bool) -> SharedString {
+    SharedString::from(if enabled {
+        "接管全部流量，首次需要管理员授权"
+    } else {
+        "仅接管走代理端口的流量"
+    })
+}
+
+fn lan_note(enabled: bool) -> SharedString {
+    SharedString::from(if enabled {
+        "局域网内其他设备可使用 7890"
+    } else {
+        "只监听本机"
+    })
 }
 
 /// Where traffic goes. Rule is the everyday mode, so the other two read as deliberate

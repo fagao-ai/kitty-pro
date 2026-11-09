@@ -136,7 +136,6 @@ fn routing(store: AppStore) -> impl IntoElement {
 
 /// The counts that describe the tab, with the one action that refreshes external rule-sets.
 fn summary_row(store: AppStore, tab: Tab) -> impl IntoElement {
-    let busy = signal(false);
     view()
         .flex_row()
         .items_center()
@@ -152,7 +151,7 @@ fn summary_row(store: AppStore, tab: Tab) -> impl IntoElement {
         )
         .child(when(
             move || tab == Tab::Routing,
-            move || update_rules_button(busy),
+            move || update_rules_button(store),
         ))
 }
 
@@ -162,31 +161,20 @@ fn routing_summary(store: AppStore) -> String {
     format!("{enabled} 条启用 · {} 条规则", rules.len())
 }
 
-/// Refresh the downloaded rule-sets. Distinct from the app's own rules, which need no
-/// download, so the label says 规则 in the sense the geodata provider uses.
-fn update_rules_button(busy: Signal<bool>) -> impl IntoElement {
+/// The rule-set refresh. Its running flag lives in the store rather than in a signal here,
+/// because the work outlives the screen: a refresh started and then navigated away from has to
+/// finish and report, and a button that vanished with its own progress flag would leave the
+/// second press starting a second download.
+fn update_rules_button(store: AppStore) -> impl IntoElement {
     controls::secondary_button(
         move || {
-            if busy.get() {
+            if store.rule_sets_busy() {
                 "正在更新"
             } else {
                 "更新规则"
             }
         },
-        {
-            move || {
-                if busy.get_untracked() {
-                    return;
-                }
-                busy.set(true);
-                spawn(async move {
-                    let feedback = crate::store::store().feedback();
-                    let result = api::update_rule_sets(true).await.map(|_| "分流规则已更新");
-                    feedback.report("更新分流规则", result.map_err(|error| error.to_string()));
-                    busy.set(false);
-                });
-            }
-        },
+        move || store.update_rule_sets(),
     )
 }
 

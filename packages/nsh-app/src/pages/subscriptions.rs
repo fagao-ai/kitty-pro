@@ -204,13 +204,20 @@ fn row(store: AppStore, item: ReadSignal<Subscription>) -> impl IntoElement {
                         .number_of_lines(1)
                         .text_color(move || base_theme().card_foreground),
                 )
-                .child(
-                    text(move || crate::domain::source_label(&subscription().source))
-                        .text_xs()
-                        .font_family(theme::font_mono())
-                        .number_of_lines(1)
-                        .text_color(theme::text_faint()),
-                )
+                .child(when(
+                    // Pasted content has no host to name it by, so its source label is the
+                    // same words as its name; a row repeating itself is noise.
+                    move || {
+                        crate::domain::source_label(&subscription().source) != subscription().name
+                    },
+                    move || {
+                        text(move || crate::domain::source_label(&subscription().source))
+                            .text_xs()
+                            .font_family(theme::font_mono())
+                            .number_of_lines(1)
+                            .text_color(theme::text_faint())
+                    },
+                ))
                 .child(
                     view()
                         .flex_row()
@@ -317,6 +324,7 @@ fn import_dialog(store: AppStore) -> impl IntoElement {
                     "https:// 订阅地址，或 ss://、vless:// 等节点链接",
                     8.0,
                 ))
+                .child(controls::field_error(store.import_error()))
                 .child(
                     text("名称留空时用订阅地址的主机命名。")
                         .text_xs()

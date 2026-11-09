@@ -2,7 +2,7 @@
 //! traffic of the last minute.
 
 use crate::domain;
-use crate::store::{AppStore, CoreBusy};
+use crate::store::{AppStore, CoreBusy, SystemProxy};
 use crate::ui::{controls, theme, Icon};
 use nsh_base::theme as base_theme;
 use nsh_core::prelude::*;
@@ -72,6 +72,7 @@ fn connection_panel(store: AppStore) -> impl IntoElement {
             // press repeat the first action.
             move || store.toggle_core(!store.connected()),
         ))
+        .child(system_proxy_toggle(store))
         .child(when(
             move || store.config_pending(),
             move || pending_banner(store),
@@ -113,13 +114,74 @@ fn action_label(store: AppStore) -> String {
 }
 
 fn status_title(store: AppStore) -> &'static str {
-    if store.core_action_busy() {
+    if store.system_proxy_busy() {
+        "系统代理设置中"
+    } else if store.core_action_busy() {
         "处理中"
     } else if store.connected() {
         "已连接"
     } else {
         "未连接"
     }
+}
+
+/// The switch that decides whether anything uses the port the core is listening on.
+///
+/// It is the difference between "connected" and "your traffic is going through it", and it
+/// sits beside the connect control rather than on Settings because turning it on is part of
+/// connecting, not a preference to go and find.
+///
+/// A parked switch says why. The one case that matters is trying to enable it before a core
+/// is running: the setting would point the machine at a port with nothing behind it.
+fn system_proxy_toggle(store: AppStore) -> impl IntoElement {
+    let status = computed(move || store.system_proxy());
+    let enabled = move || status.with(SystemProxy::is_enabled);
+    // The backend's own gate, asked before the press rather than after it: a switch the
+    // platform cannot honour, or that has no answer to act on, says so instead of failing.
+    let disabled = move || {
+        store.core_action_busy()
+            || store.system_proxy_busy()
+            || !status.with(SystemProxy::is_ready)
+            || !status.with(SystemProxy::is_supported)
+            || (!enabled() && !store.connected())
+    };
+    view()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0p5()
+                .child(
+                    text("系统代理")
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || base_theme().card_foreground),
+                )
+                .child(
+                    text(move || proxy_note(store))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                ),
+        )
+        .child(controls::switch_state(
+            move || Some("系统代理".into()),
+            enabled,
+            disabled,
+            move |next| store.set_system_proxy(next),
+        ))
+}
+
+/// What the backend said about the operating system, or why it has not said it yet.
+fn proxy_note(store: AppStore) -> String {
+    store.system_proxy().note(
+        store.connected(),
+        store.core_action_busy(),
+        store.system_proxy_busy(),
+    )
 }
 
 /// The chosen node's name, address and protocol.

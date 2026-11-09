@@ -125,8 +125,29 @@ impl Feedback {
         self.push(Kind::Error, message.into());
     }
 
+    /// Report both outcomes of a call whose result is only worth announcing. On success the
+    /// `Ok` carries the words to say; on failure the action names what was attempted. For a
+    /// call whose value the caller goes on to use, [`Self::report`] instead.
+    ///
+    /// Distinct from `report` on purpose: that one returns the value and stays quiet on
+    /// success, so using it to announce a finished action drops the message the user pressed
+    /// the button to get.
+    pub fn settled<T: std::fmt::Display, E: std::fmt::Display>(
+        self,
+        action: &str,
+        result: Result<T, E>,
+    ) {
+        match result {
+            Ok(message) => self.success(message.to_string()),
+            Err(error) => self.error(format!("{action}失败：{error}")),
+        }
+    }
+
     /// Report the outcome of a backend call, choosing the kind and prefixing the failure
     /// with what was attempted. Every screen ends up saying it in the same shape.
+    ///
+    /// Silent on success, because the caller keeps the value: a screen that wants the user to
+    /// hear about the success wants [`Self::settled`].
     pub fn report<T, E: std::fmt::Display>(self, action: &str, result: Result<T, E>) -> Option<T> {
         match result {
             Ok(value) => Some(value),

@@ -16,6 +16,10 @@ pub fn root() -> impl IntoElement {
     effect(move || {
         store.load_profile();
         store.refresh_status();
+        // The OS proxy is the thing that makes a running core carry traffic, and the app
+        // does not own it: a previous session, or another program, may have set it. Read it
+        // before offering a switch about it.
+        store.refresh_system_proxy();
     });
     // The core streams logs only while collection is on, and the log page is the only
     // reader, so the shell decides here rather than letting a poll run behind every screen.

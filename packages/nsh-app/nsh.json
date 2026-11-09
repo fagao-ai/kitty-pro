@@ -6,5 +6,6 @@
   "rust": ".",
   "root": "App",
   "theme": "theme.json",
-  "appearance": "system"
+  "appearance": "system",
+  "icon": "assets/icon-1024.png"
 }

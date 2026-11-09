@@ -49,7 +49,13 @@ All six destinations are ported: Overview, Nodes, Subscriptions, Rules, Logs and
 | 订阅 | Import from a URL or pasted links, refresh one or all, switch the active one, delete |
 | 规则 | Custom routing rules and per-domain DNS, on two tabs, plus the QuickJS override on Settings |
 | 日志 | The routed connections and the core's own lines, filtered by tally and search |
-| 设置 | Appearance, where traffic goes, the config script |
+| 设置 | Appearance, where traffic goes, how the machine hands it over, the config script |
+
+The overview carries the switch that points the operating system at the core. Connecting
+opens a listener on 7890; that switch is what makes anything use it, so it sits beside the
+connect control rather than among preferences, and it is parked with a reason when there is
+no core running. Its state is read from the OS at boot and re-read after any stop, since the
+setting changes underneath the app and a remembered value would overstate what is connected.
 
 Two things are worth knowing about how they behave:
 
@@ -73,6 +79,28 @@ tokens.
 The three variable faces (Space Grotesk, Inter, JetBrains Mono) are the same woff2 bytes the
 Dioxus app inlines, extracted from `packages/ui/assets/styling/fonts.css` into
 `assets/fonts/`. CJK still falls through to the system font, as it does there.
+
+## What the Dioxus shell has that this one does not
+
+Checked by reading both, not by assumption. These are the features of `packages/ui` with no
+counterpart here, roughly in the order a user would miss them:
+
+| Missing | What it means |
+| --- | --- |
+| Proxy groups | The original lists the core's `selector`/`urltest` groups and lets a member be chosen (`preview_proxy_groups`, `select_proxy_group`). Here a subscription's nodes are a flat list and only one node is chosen. A provider whose config groups its nodes by region is not selectable in this UI. |
+| Cloud sync | Push, pull, conflict resolution and the pre-pull backup (`sync_push`, `sync_pull`, `commit_sync_pull`, plus the sync config form). |
+| App updates | Version check, the "有新版本可更新" affordance, dismiss, and the update settings. |
+| Start at login | `api::autostart`. |
+| Connectivity probe | The overview's 测试连通, which dials through the running core and reports the result. |
+| Diagnostics and about | Core version, node/subscription/rule/DNS counts, the language row, and the settings search box. |
+| Copy proxy env vars | `copy_proxy_environment_variables`, which the desktop tray offers. |
+| Process picker | The rule editor offers 选择进程 from `list_running_processes`; here a process name is typed. |
+| Tray, close-to-tray | Menu-bar item and the "closing the window keeps the core running" behaviour. These live in `packages/desktop`, not in `packages/ui`, so they are outside this crate's reach. |
+| Web and mobile shells | This crate is native. Under `nsh run --target web` the backend would run in the browser and could not start a core; there is no server mode yet. |
+
+`nsh.json` carries `icon` (a copy of `assets/icon/kitty-pro-1024.png`, which is what
+`nsh package` wants: a square PNG), version and id, so a packaged build is named, versioned
+and icons correctly without flags.
 
 ## Tests
 

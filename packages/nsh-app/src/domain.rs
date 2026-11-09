@@ -329,6 +329,97 @@ mod tests {
         assert_eq!(route_chain_hops(&detail), ["代理出口"]);
     }
 
+    /// What reaches the core is not what the list shows. A script that took over owns the
+    /// route section, and a process rule the OS cannot report is a rule the user believes is
+    /// working, so both come out of the request.
+    #[test]
+    fn the_request_drops_rules_the_core_cannot_honour() {
+        let rules = vec![
+            rule(CustomRuleMatch::DomainSuffix, "a.test"),
+            rule(CustomRuleMatch::ProcessName, "Telegram"),
+        ];
+        assert_eq!(
+            connection_custom_rules(false, "", rules.clone(), true).len(),
+            2,
+            "everything applies where process rules work"
+        );
+        assert_eq!(
+            connection_custom_rules(false, "", rules.clone(), false)
+                .iter()
+                .map(|rule| rule.match_type)
+                .collect::<Vec<_>>(),
+            vec![CustomRuleMatch::DomainSuffix],
+        );
+        assert!(
+            connection_custom_rules(true, "function main(c) { return c; }", rules.clone(), true)
+                .is_empty(),
+            "a live script owns the route section"
+        );
+        assert_eq!(
+            connection_custom_rules(true, "   ", rules, true).len(),
+            2,
+            "an enabled but empty script applies nothing"
+        );
+    }
+
+    fn rule(match_type: CustomRuleMatch, value: &str) -> proxy_core::CustomRule {
+        proxy_core::CustomRule {
+            id: 1,
+            enabled: true,
+            match_type,
+            value: value.to_owned(),
+            action: CustomRuleAction::Proxy,
+        }
+    }
+
+    /// The headless test cannot assert this from a live app: whether the machine is already
+    /// proxied is not the app's to decide, so the wording depends on state the test does not
+    /// own. Every branch is here instead.
+    #[test]
+    fn a_parked_proxy_switch_says_why() {
+        let ready = |enabled: bool, supported: bool| {
+            SystemProxy::Ready(api::SystemProxyStatus {
+                supported,
+                enabled,
+                detail: "已设置 macOS 系统代理 127.0.0.1:7890".to_owned(),
+            })
+        };
+        assert_eq!(
+            SystemProxy::Loading.note(false, false, false),
+            "正在读取系统代理状态"
+        );
+        assert_eq!(
+            SystemProxy::Failed("读取失败".to_owned()).note(false, false, false),
+            "读取失败"
+        );
+        assert_eq!(
+            ready(false, false).note(true, false, false),
+            "当前平台不支持系统代理"
+        );
+        assert_eq!(
+            ready(false, true).note(false, false, false),
+            "先启动代理，才能开启系统代理"
+        );
+        // While the core is being started there is nothing to tell the user yet, and the
+        // machine's own answer is the honest line.
+        assert_eq!(
+            ready(false, true).note(false, true, false),
+            "已设置 macOS 系统代理 127.0.0.1:7890"
+        );
+        assert_eq!(
+            ready(true, true).note(false, false, false),
+            "已设置 macOS 系统代理 127.0.0.1:7890"
+        );
+        assert_eq!(
+            ready(false, true).note(false, false, true),
+            "正在应用到系统网络服务"
+        );
+        assert!(ready(false, false).is_ready());
+        assert!(!SystemProxy::Loading.is_ready());
+        assert!(!SystemProxy::Loading.is_supported());
+        assert!(ready(true, true).is_enabled());
+    }
+
     #[test]
     fn rule_ids_reuse_a_gap_rather_than_growing_forever() {
         let rules = vec![
@@ -765,6 +856,91 @@ pub fn route_chain_hops(route: &api::RouteLogDetail) -> Vec<String> {
         .filter(|tag| tag.as_str() != route.outbound_tag.as_str())
         .cloned()
         .collect()
+}
+
+/// The rules a connection should be built with.
+///
+/// Two reductions, both of which change what the core does:
+///
+/// - A config script that is on and non-empty owns the whole route section, so the app's own
+///   rules are dropped rather than layered under it. Sending both would have the script and
+///   the list argue about the same connection.
+/// - A process rule can only match where the OS reports the owning process. Sending one that
+///   cannot match is not harmless on a platform that ignores the field: it is a rule the user
+///   believes is working.
+pub fn connection_custom_rules(
+    config_script_enabled: bool,
+    config_script: &str,
+    custom_rules: Vec<proxy_core::CustomRule>,
+    process_rules_supported: bool,
+) -> Vec<proxy_core::CustomRule> {
+    if config_script_enabled && !config_script.trim().is_empty() {
+        return Vec::new();
+    }
+    custom_rules
+        .into_iter()
+        .filter(|rule| custom_rule_available(rule.match_type, process_rules_supported))
+        .collect()
+}
+
+/// What the backend says about the operating system's proxy setting.
+///
+/// Read rather than remembered: the OS proxy changes underneath the app whenever the core
+/// goes down, and a switch holding a remembered value would tell the user their traffic was
+/// proxied when the port behind it had already closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemProxy {
+    /// Not read yet.
+    Loading,
+    Ready(api::SystemProxyStatus),
+    /// The read itself failed, with the reason.
+    Failed(String),
+}
+
+impl SystemProxy {
+    /// The line under the switch: what the setting is, and when it cannot be changed, why
+    /// not. A parked switch with no reason reads as a broken control.
+    pub fn note(&self, core_running: bool, core_action_busy: bool, setting_busy: bool) -> String {
+        if setting_busy {
+            return "正在应用到系统网络服务".to_owned();
+        }
+        if cfg!(target_os = "android") {
+            // Android's VPN owns every route, so the backend's "not implemented" would read
+            // as a broken feature rather than a platform that does not need the switch.
+            return "Android 由 VPN 接管，无需系统代理".to_owned();
+        }
+        match self {
+            SystemProxy::Loading => "正在读取系统代理状态".to_owned(),
+            SystemProxy::Failed(error) => error.clone(),
+            SystemProxy::Ready(status) => {
+                if !status.supported {
+                    return "当前平台不支持系统代理".to_owned();
+                }
+                // The machine's own words, except for the one case the user can act on:
+                // turning this on with nothing behind the port sends the machine's traffic to
+                // a closed listener.
+                if status.enabled || core_running || core_action_busy {
+                    return status.detail.clone();
+                }
+                "先启动代理，才能开启系统代理".to_owned()
+            }
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, SystemProxy::Ready(status) if status.enabled)
+    }
+
+    /// Whether the switch has an answer to act on. Unread and unreadable both park it, since
+    /// writing a setting whose state is unknown can leave the machine misconfigured.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, SystemProxy::Ready(_))
+    }
+
+    /// Whether the platform can be pointed at the port at all.
+    pub fn is_supported(&self) -> bool {
+        matches!(self, SystemProxy::Ready(status) if status.supported)
+    }
 }
 
 /// The first id missing from the list, so a delete followed by an add does not hand out an
