@@ -1,0 +1,68 @@
+//! Kitty Pro on Native Shell: a sing-box client whose engine is the app itself.
+//!
+//! The backend is the workspace's own `api` and `proxy-core` crates, called directly. An NSH
+//! binary is a native process, so there is no HTTP hop and no server to run: the same functions
+//! the Dioxus shells reach over server functions are plain async calls here.
+
+mod domain;
+pub mod feedback;
+mod pages;
+pub(crate) mod shell;
+mod store;
+pub mod ui;
+
+use nsh_base::tokens_of;
+use nsh_core::{
+    element::{Registry, Root, Tokens},
+    platform::Appearance,
+    prelude::*,
+};
+
+/// The app's design tokens, from `theme.json`. A file that does not parse would otherwise
+/// leave the app silently on NSH's defaults, so the error surfaces at the caller.
+pub const THEME_JSON: &str = include_str!("../theme.json");
+
+/// The three faces the app draws with, as variable fonts. Latin only: CJK falls through to
+/// the system UI font, as it does in the Dioxus shells.
+pub const FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/Inter-Variable.woff2"),
+    include_bytes!("../assets/fonts/SpaceGrotesk-Variable.woff2"),
+    include_bytes!("../assets/fonts/JetBrainsMono-Variable.woff2"),
+];
+
+/// The component set NSH's hosts and headless tests mount.
+#[native_module("kitty/native")]
+fn native(registry: &mut Registry) {
+    registry.register::<App>();
+}
+
+/// The app's tokens, or the error from parsing `theme.json`.
+pub fn tokens() -> Result<Tokens, String> {
+    tokens_of(Some(THEME_JSON))
+}
+
+/// The root component with the app's theme and fonts attached: what every host mounts.
+///
+/// # Panics
+///
+/// If `theme.json` does not parse. The file ships in the crate and its shape is checked by
+/// `theme_json_parses`, so a panic here means the file was edited into an invalid state.
+pub fn app_root() -> Root {
+    let tokens = tokens().expect("theme.json must parse");
+    FONTS
+        .iter()
+        .fold(Root::of::<App>().tokens(tokens), |root, font| {
+            root.font(*font)
+        })
+        .app_id("com.kitty.pro")
+        // The stored profile decides the appearance once it loads, so the window starts with
+        // the system's rather than guessing light.
+        .appearance(Appearance::System)
+}
+
+/// The root component: it owns the store and the chrome, and nothing else.
+#[component]
+pub fn App() -> impl IntoElement {
+    provide_context(store::AppStore::new());
+    shell::root()
+}
