@@ -44,6 +44,24 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # 「Desktop feature tests」这一步与 packages/desktop 的默认 feature 都要链接 wry 的
+      # WebView，GitHub 的 ubuntu 镜像不带 webkit2gtk/GTK 开发包（镜像的 apt 清单里没有），
+      # 所以这里装 release.yml 同一套。少了它们，pkg-config 在编译期就会报
+      # `webkit2gtk-4.1 not found`，整条门禁红在依赖上而不是代码上。
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            pkg-config
+
       # README「Go toolchain」章节：sing-box 1.13.14 的构建脚本要求 Go 1.24，
       # 且当前无法与 Go 1.26 链接；cargo test --workspace 会编译 singbox 的 Go
       # bridge，缺了 Go 1.24 会在 build.rs 阶段直接失败，所以这里显式安装。
