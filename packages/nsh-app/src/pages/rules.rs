@@ -12,7 +12,7 @@
 use crate::domain;
 use crate::store::AppStore;
 use crate::ui::{controls, theme, Icon};
-use nsh_base::{theme as base_theme, SelectItem};
+use nsh_base::{button, dialog, theme as base_theme, SelectItem};
 use nsh_core::prelude::*;
 use proxy_core::{CustomRule, CustomRuleAction, CustomRuleMatch, DnsOverride};
 use std::time::Duration;
@@ -29,28 +29,108 @@ enum Tab {
 
 pub fn rules(store: AppStore) -> impl IntoElement {
     let tab = signal(Tab::Routing);
+    // Both drafts live here rather than in their tab's function because the page has one
+    // floating action, and it has to open whichever form the visible tab owns.
+    let draft = rule_draft();
+    let dns_draft = dns_draft();
     view()
         .flex_1()
         .min_h(px(0.0))
-        .w_full()
-        .max_w(px(1080.0))
-        .self_center()
-        .flex_col()
-        .gap_4()
-        .px_5()
-        .pt_5()
-        .pb_2()
-        .child(tab_bar(tab))
         .child(
+            // The measure column keeps `flex_1`/`min_h` from the page: the rule list below it is
+            // virtualized, and a scroll view given unbounded or zero height lays out no rows.
             view()
                 .flex_1()
                 .min_h(px(0.0))
-                .child(when(
-                    move || tab.get() == Tab::Routing,
-                    move || routing(store),
-                ))
-                .child(when(move || tab.get() == Tab::Dns, move || dns(store))),
+                .w_full()
+                .max_w(px(1080.0))
+                .self_center()
+                .flex_col()
+                .gap_4()
+                .px_5()
+                .pt_5()
+                // Room for the page's own floating "+", which sits over this column's
+                // bottom-right corner; the rule list is bounded by the column, so this lifts
+                // its last row clear of the disc.
+                .pb(controls::action_clearance())
+                .child(tab_bar(tab))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .child(when(
+                            move || tab.get() == Tab::Routing,
+                            move || routing(store, draft),
+                        ))
+                        .child(when(
+                            move || tab.get() == Tab::Dns,
+                            move || dns(store, dns_draft),
+                        )),
+                ),
         )
+        .child(controls::floating_layer(add_rule_action(
+            store, tab, draft, dns_draft,
+        )))
+}
+
+/// 规则's one action: open the current tab's form, or put it away again.
+///
+/// Both tabs used to carry a permanently visible form, which made each read as a form with
+/// some rows under it; the user asked for it to appear when the + is pressed. Pressing again
+/// closes it and clears what was typed — half-finished text is discarded, but the control that
+/// discarded it is the same one that opened it, and its glyph changed to say so. `编辑` on a
+/// rule row opens that form too, filled.
+///
+/// One disc for two tabs means its name follows the tab: a button called 添加规则 while the DNS
+/// list is showing would be a lie, and the tests press by that name.
+fn add_rule_action(
+    store: AppStore,
+    tab: Signal<Tab>,
+    draft: RuleDraft,
+    dns_draft: DnsDraft,
+) -> impl IntoElement {
+    let on_routing = move || tab.get() == Tab::Routing;
+    let open = move || {
+        if on_routing() {
+            draft.open.get()
+        } else {
+            dns_draft.open.get()
+        }
+    };
+    // The closure captures only `Copy` handles, so every binding below gets its own copy.
+    let open_press = open;
+    controls::floating_action_state(
+        move || {
+            if open() {
+                Icon::X
+            } else {
+                Icon::Plus
+            }
+        },
+        move || match (on_routing(), open()) {
+            (true, false) => "添加规则".into(),
+            (true, true) => "收起规则表单".into(),
+            (false, false) => "添加专用 DNS".into(),
+            (false, true) => "收起专用 DNS 表单".into(),
+        },
+        // A form action: nothing about it is a running state, so it stays neutral and lets the
+        // one disc that means "live" mean it.
+        || false,
+        // The override replaces the whole rule set, so custom rules cannot be edited at all.
+        move || on_routing() && store.config_script_active(),
+        move || {
+            if on_routing() {
+                // Read before `reset`, which closes the form along with clearing it.
+                let was_open = open_press();
+                reset(draft, store);
+                draft.open.set(!was_open);
+            } else {
+                let was_open = open_press();
+                reset_dns(dns_draft);
+                dns_draft.open.set(!was_open);
+            }
+        },
+    )
 }
 
 /// Two subjects, so a segmented pair rather than a list of pills: the choice is exclusive
@@ -90,15 +170,18 @@ fn tab_bar(tab: Signal<Tab>) -> impl IntoElement {
 }
 
 /// Routing rules, their editor, and the two conditions that make them inert.
-fn routing(store: AppStore) -> impl IntoElement {
-    let draft = rule_draft();
+///
+/// The draft comes from the page, which shares it with the floating "+".
+fn routing(store: AppStore, draft: RuleDraft) -> impl IntoElement {
     let armed = signal(None::<u64>);
     let arm_generation = signal(0u64);
+    let picker_open = signal(false);
     view()
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
         .gap_3()
+        .child(when(picker_open, move || process_picker(store, draft, picker_open)))
         .child(summary_row(store, Tab::Routing))
         .child(when(
             move || store.config_script_active(),
@@ -130,7 +213,11 @@ fn routing(store: AppStore) -> impl IntoElement {
                 )
             },
         ))
-        .child(editor(store, draft))
+        // The form is hidden until the floating + opens it, so the page reads as a list with
+        // one action rather than as a form with some rows under it.
+        .child(when(draft.open, move || {
+            editor(store, draft, picker_open)
+        }))
         .child(rule_list(store, draft, armed, arm_generation))
 }
 
@@ -186,6 +273,12 @@ fn update_rules_button(store: AppStore) -> impl IntoElement {
 #[derive(Clone, Copy)]
 struct RuleDraft {
     editing: Signal<Option<u64>>,
+    /// Whether the form is on screen at all. It used to be permanently open, which put three
+    /// fields and an 添加 button above every list and made the page read as a form with some
+    /// rows under it; the user asked for the form to appear when the floating + is pressed.
+    /// `编辑` on a row opens it too, and `reset` closes it, so nothing can leave it showing an
+    /// empty draft behind a list.
+    open: Signal<bool>,
     match_type: Signal<SharedString>,
     action: Signal<SharedString>,
     value: Signal<String>,
@@ -195,6 +288,7 @@ struct RuleDraft {
 fn rule_draft() -> RuleDraft {
     RuleDraft {
         editing: signal(None),
+        open: signal(false),
         match_type: signal(match_value(CustomRuleMatch::DomainSuffix)),
         action: signal(action_value(CustomRuleAction::Proxy)),
         value: signal(String::new()),
@@ -202,7 +296,35 @@ fn rule_draft() -> RuleDraft {
     }
 }
 
-fn editor(store: AppStore, draft: RuleDraft) -> impl IntoElement {
+/// The DNS tab's half of the same thing: its two fields, its error, and whether the form is on
+/// screen. Owned by the page for the same reason as `RuleDraft` — the floating disc is one
+/// control shared by both tabs, so it cannot reach into a tab's own locals.
+#[derive(Clone, Copy)]
+struct DnsDraft {
+    open: Signal<bool>,
+    domain: Signal<String>,
+    server: Signal<String>,
+    error: Signal<Option<String>>,
+}
+
+fn dns_draft() -> DnsDraft {
+    DnsDraft {
+        open: signal(false),
+        domain: signal(String::new()),
+        server: signal(String::new()),
+        error: signal(None),
+    }
+}
+
+/// Clear the DNS form and close it, the way `reset` does for a rule.
+fn reset_dns(draft: DnsDraft) {
+    draft.open.set(false);
+    draft.domain.set(String::new());
+    draft.server.set(String::new());
+    draft.error.set(None);
+}
+
+fn editor(store: AppStore, draft: RuleDraft, picker_open: Signal<bool>) -> impl IntoElement {
     let (match_type, action, value, error) =
         (draft.match_type, draft.action, draft.value, draft.error);
     let editing = draft.editing;
@@ -242,11 +364,7 @@ fn editor(store: AppStore, draft: RuleDraft) -> impl IntoElement {
                                 },
                             )),
                     )
-                    .child(view().flex_1().min_w(px(220.0)).child(controls::text_field(
-                        "匹配内容",
-                        value,
-                        move || placeholder_for(match_type.get()),
-                    )))
+                    .child(value_field(store, draft, picker_open))
                     .child(
                         view()
                             .w(px(120.0))
@@ -325,6 +443,9 @@ fn reset(draft: RuleDraft, store: AppStore) {
     let restored =
         editing.and_then(|id| store.custom_rules().into_iter().find(|rule| rule.id == id));
     draft.editing.set(None);
+    // Closing is part of clearing: a form left open with nothing in it is the state the page
+    // used to start in, which is what the user objected to.
+    draft.open.set(false);
     draft.value.set(String::new());
     draft.error.set(None);
     draft.match_type.set(match_value(
@@ -342,6 +463,9 @@ fn reset(draft: RuleDraft, store: AppStore) {
 /// Fill the draft from a stored rule so pressing 编辑 on a row visibly moves the form.
 fn fill(draft: RuleDraft, rule: CustomRule) {
     draft.editing.set(Some(rule.id));
+    // Editing opens the form the + owns: a row that says 编辑 and reveals nothing would be the
+    // same bug as the always-open form's opposite.
+    draft.open.set(true);
     draft.match_type.set(match_value(rule.match_type));
     draft.action.set(action_value(rule.action));
     draft.value.set(rule.value);
@@ -588,64 +712,65 @@ fn rule_row(
 }
 
 /// DNS overrides: a suffix, a resolver, and nothing else, so the rows stay one line.
-fn dns(store: AppStore) -> impl IntoElement {
-    let domain_field = signal(String::new());
-    let server_field = signal(String::new());
-    let error = signal(None::<String>);
+fn dns(store: AppStore, draft: DnsDraft) -> impl IntoElement {
+    let (domain_field, server_field, error) = (draft.domain, draft.server, draft.error);
     view()
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
         .gap_3()
         .child(summary_row(store, Tab::Dns))
-        .child(controls::card(
-            view()
-                .flex_col()
-                .gap_3()
-                .child(
-                    view()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_end()
-                        .gap_3()
-                        .child(view().flex_1().min_w(px(200.0)).child(controls::text_field(
-                            "域名后缀",
-                            domain_field,
-                            || "example.com",
-                        )))
-                        .child(view().flex_1().min_w(px(200.0)).child(controls::text_field(
-                            "DNS 服务器",
-                            server_field,
-                            || "223.5.5.5",
-                        )))
-                        .child(controls::primary_button_state(
-                            "添加",
-                            move || {
-                                domain_field.get().trim().is_empty()
-                                    || server_field.get().trim().is_empty()
-                            },
-                            {
-                                let (domain_field, server_field, error) =
-                                    (domain_field, server_field, error);
+        // Hidden until the page's disc opens it, exactly as the rule form is: two fields and an
+        // 添加 button above the list made this tab read as a form with some rows under it.
+        .child(when(draft.open, move || {
+            controls::card(
+                view()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        view()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_end()
+                            .gap_3()
+                            .child(view().flex_1().min_w(px(200.0)).child(controls::text_field(
+                                "域名后缀",
+                                domain_field,
+                                || "example.com",
+                            )))
+                            .child(view().flex_1().min_w(px(200.0)).child(controls::text_field(
+                                "DNS 服务器",
+                                server_field,
+                                || "223.5.5.5",
+                            )))
+                            .child(controls::primary_button_state(
+                                "添加",
                                 move || {
-                                    let result = store.add_dns_override(
-                                        &domain_field.get_untracked(),
-                                        &server_field.get_untracked(),
-                                    );
-                                    match result {
-                                        Ok(()) => {
-                                            domain_field.set(String::new());
-                                            server_field.set(String::new());
-                                            error.set(None);
+                                    domain_field.get().trim().is_empty()
+                                        || server_field.get().trim().is_empty()
+                                },
+                                {
+                                    let (store, draft) = (store, draft);
+                                    move || {
+                                        let result = store.add_dns_override(
+                                            &draft.domain.get_untracked(),
+                                            &draft.server.get_untracked(),
+                                        );
+                                        match result {
+                                            // Saved: the form has done its job and steps aside,
+                                            // the same way the rule editor does.
+                                            Ok(()) => reset_dns(draft),
+                                            // Refused: the text stays, because the reader has a
+                                            // mistake in front of them to correct.
+                                            Err(message) => draft.error.set(Some(message)),
                                         }
-                                        Err(message) => error.set(Some(message)),
                                     }
-                                }
-                            },
-                        )),
-                )
-                .child(controls::field_error(error)),
-        ))
+                                },
+                            )),
+                    )
+                    .child(controls::field_error(error)),
+            )
+        }))
         .child(dns_list(store))
 }
 
@@ -771,6 +896,233 @@ fn hidden_process_rules(store: AppStore) -> usize {
         .iter()
         .filter(|rule| process_rule(rule))
         .count()
+}
+
+/// The rule's value: a typed field, plus the picker for the two kinds that name a process.
+///
+/// A process name is the one value on this form a user cannot invent reliably — it is spelled
+/// whatever the binary is spelled, and a rule written as `Telegram.app` silently matches
+/// nothing. Where the OS can say what is running, the field gets the button that reads the
+/// answer off the machine; where it cannot, the field stays as it was and the option is not
+/// offered at all.
+fn value_field(store: AppStore, draft: RuleDraft, picker: Signal<bool>) -> impl IntoElement {
+    let match_type = draft.match_type;
+    view()
+        .flex_1()
+        .min_w(px(220.0))
+        .flex_col()
+        .gap_2()
+        .child(controls::text_field(
+            "匹配内容",
+            draft.value,
+            move || placeholder_for(match_type.get()),
+        ))
+        .child(when(
+            move || process_pick_offered(parse_match(match_type.get())),
+            move || {
+                controls::secondary_button(
+                    move || {
+                        if store.processes_busy() {
+                            "正在读取"
+                        } else {
+                            "选择进程"
+                        }
+                    },
+                    move || {
+                        if store.processes_busy() {
+                            return;
+                        }
+                        store.refresh_processes();
+                        picker.set(true);
+                    },
+                )
+            },
+        ))
+}
+
+/// Whether this match kind names something the operating system can enumerate.
+fn process_pick_offered(match_type: CustomRuleMatch) -> bool {
+    domain::process_rules_supported()
+        && matches!(
+            match_type,
+            CustomRuleMatch::ProcessName | CustomRuleMatch::ProcessPath
+        )
+}
+
+/// The process picker: a searchable list of what is running, where one press fills the field.
+///
+/// A dialog rather than an inline dropdown because the list is long — a working machine runs a
+/// couple of hundred processes — and because it is a tool for finishing one field rather than a
+/// subject of its own. It mounts as a sibling of the list rather than inside the editor card,
+/// which is the same reason the original keeps it out of the card: a card that scrolls takes a
+/// centred overlay out of reach with it.
+fn process_picker(store: AppStore, draft: RuleDraft, picker: Signal<bool>) -> impl IntoElement {
+    let query = signal(String::new());
+    // The close handler captures only a `Copy` signal, so the same one goes to the sheet's
+    // cancel, its list rows and its button without any cloning.
+    let close = move || picker.set(false);
+    dialog()
+        .presentation(ModalPresentation::PageSheet)
+        .on_cancel(close)
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .bg(move || base_theme().background.opacity(0.6))
+        .child(
+            view()
+                .w_full()
+                .max_w(px(560.0))
+                .flex_col()
+                .gap_3()
+                .m_5()
+                .p_5()
+                .rounded(theme::radius_card())
+                .border_1()
+                .border_color(move || base_theme().border)
+                .bg(move || base_theme().card)
+                .shadow_lg()
+                .child(
+                    text("选择进程")
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || base_theme().card_foreground),
+                )
+                .child(controls::search_field(
+                    "搜索进程名或路径",
+                    "搜索进程名或路径…",
+                    query,
+                ))
+                .child(picker_body(store, draft, query, close))
+                .child(controls::secondary_button("取消", close)),
+        )
+}
+
+/// The picker's middle: loading, failed, empty, or the list. Exactly one of four, because an
+/// empty list alone cannot tell a quiet machine from a failed read.
+fn picker_body(
+    store: AppStore,
+    draft: RuleDraft,
+    query: Signal<String>,
+    close: impl Fn() + Clone + 'static,
+) -> impl IntoElement {
+    view().w_full().flex_col().child(dynamic(move || {
+        if let Some(error) = store.processes_error() {
+            return controls::inline_note(theme::Tint::Danger, Icon::CircleAlert, error)
+                .into_element();
+        }
+        if !store.processes_loaded() {
+            return text("正在读取进程列表…")
+                .text_xs()
+                .text_color(theme::text_faint())
+                .into_element();
+        }
+        let keyword = domain::search_keyword(&query.get());
+        let hits = process_hits(store, &keyword);
+        if hits.is_empty() {
+            return text("没有匹配的进程")
+                .text_xs()
+                .text_color(theme::text_faint())
+                .into_element();
+        }
+        picker_rows(hits, draft, close.clone()).into_element()
+    }))
+}
+
+/// The list, in a scroll region of its own: a couple of hundred rows would otherwise push the
+/// dialog's buttons past the bottom of the window.
+fn picker_rows(
+    hits: Vec<api::RunningProcess>,
+    draft: RuleDraft,
+    close: impl Fn() + Clone + 'static,
+) -> impl IntoElement {
+    scroll()
+        .w_full()
+        .h(px(280.0))
+        .flex_col()
+        .gap_1()
+        .test_id("process-list")
+        .child(each(
+            move || hits.clone(),
+            |process| process.pid,
+            move |item, _| picker_row(item, draft, close.clone()),
+        ))
+}
+
+fn picker_row(
+    item: ReadSignal<api::RunningProcess>,
+    draft: RuleDraft,
+    close: impl Fn() + 'static,
+) -> impl IntoElement {
+    let process = move || item.get();
+    button()
+        .accessibility_label(move || Some(process().name.clone().into()))
+        .on_press(move |_: &()| {
+            // Which half of the process is copied depends on what the rule matches on: a path
+            // rule wants the path, a name rule the name. Reading the draft at press time rather
+            // than when the row was built is what keeps a kind changed while the dialog was
+            // open from filling the field with the other half.
+            let kind = parse_match(draft.match_type.get_untracked());
+            let chosen = process();
+            draft.value.set(domain::process_rule_value(&chosen, kind));
+            // The field now holds something the machine reported, so any earlier complaint
+            // about it is stale.
+            draft.error.set(None);
+            close();
+        })
+        .w_full()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .rounded(theme::radius_tile())
+        .hover(|s| s.bg(move || base_theme().accent))
+        .active(|s| s.opacity(0.8))
+        .focus(|s| s.outline(px(2.0)).outline_color(move || base_theme().ring))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0p5()
+                .child(
+                    text(move || process().name)
+                        .text_sm()
+                        .number_of_lines(1)
+                        .text_color(move || base_theme().card_foreground),
+                )
+                .child(when(
+                    move || {
+                        process()
+                            .exe_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                    },
+                    move || {
+                        text(move || process().exe_path.clone().unwrap_or_default())
+                            .text_xs()
+                            .font_family(theme::font_mono())
+                            .number_of_lines(1)
+                            .text_color(theme::text_faint())
+                    },
+                )),
+        )
+        .child(
+            text(move || format!("PID {}", process().pid))
+                .text_xs()
+                .font_family(theme::font_mono())
+                .flex_shrink_0()
+                .text_color(theme::text_faint()),
+        )
+}
+
+/// The processes the query leaves, in the order the backend reported them (by name).
+fn process_hits(store: AppStore, keyword: &str) -> Vec<api::RunningProcess> {
+    store
+        .processes()
+        .into_iter()
+        .filter(|process| domain::process_matches(process, keyword))
+        .collect()
 }
 
 /// The rule types the platform allows. Process rules are left out where the OS cannot report

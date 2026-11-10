@@ -10,7 +10,10 @@ edition = "2021"
 # runtime draws an image's `currentColor` as black: every icon would lose its tint.
 nsh-core = { version = "0.4.0", features = ["svg"] }
 nsh-base = "0.4.0"
-api = { path = "../api", default-features = false }
+# `native-desktop` is what publishes `api::autostart`; every other api function is available
+# either way. An NSH app is a native process, so the login-item API is one it can genuinely
+# offer — see `src/autostart.rs` for how a target without one is handled.
+api = { path = "../api", default-features = false, features = ["native-desktop"] }
 proxy-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

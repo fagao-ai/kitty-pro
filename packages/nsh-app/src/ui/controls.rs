@@ -64,38 +64,6 @@ pub fn primary_button_state(
         )
 }
 
-/// A card-sized primary action: connect and disconnect.
-pub fn hero_button(
-    label: impl IntoReactive<SharedString> + 'static,
-    glyph: impl Fn() -> Icon + 'static,
-    disabled: impl Fn() -> bool + 'static,
-    on_press: impl Fn() + 'static,
-) -> impl IntoElement {
-    button()
-        .disabled(disabled)
-        .on_press(move |_: &()| on_press())
-        .h(px(56.0))
-        .px_6()
-        .flex_row()
-        .items_center()
-        .justify_center()
-        .gap_3()
-        .rounded(theme::radius_card())
-        .bg(move || theme().primary)
-        .shadow_lg()
-        .active(|s| s.opacity(0.88))
-        .hover(|s| s.opacity(0.94))
-        .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
-        .disabled_style(|s| s.opacity(0.45))
-        .child(live_icon(glyph, 20.0).text_color(move || theme().primary_foreground))
-        .child(
-            text(label)
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(move || theme().primary_foreground),
-        )
-}
-
 /// A quiet action: a bordered control on the card.
 pub fn secondary_button(
     label: impl IntoReactive<SharedString> + 'static,
@@ -132,6 +100,106 @@ pub fn secondary_button_state(
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || theme().card_foreground),
+        )
+}
+
+/// A page's one floating action: a circular button at the bottom-right of its own screen.
+///
+/// One per page, and the page decides which action earns the slot — 总览 starts the proxy, 节点
+/// measures latency, 规则 adds a rule, 日志 toggles collection. A control that floats over every
+/// screen instead buries the page's own action under a global one, and the user asked for the
+/// opposite: the button should belong to what is on screen.
+///
+/// Icon-only, because the words are what made the old version ugly: a pill wide enough for
+/// 正在申请网络权限 is a banner, not a button. The name is still required — it is what a screen
+/// reader says, and the only handle a headless test has (`role:button[启动代理]`).
+///
+/// `lit` carries the page's state in the control's own colour, which is how `packages/ui` draws
+/// its power button: a neutral inset disc with no glow while nothing runs, and the accent fill,
+/// glow and 6pt halo once it does. An always-orange disc shouts the same thing whether the proxy
+/// is up or not, and spends the one colour that could say something.
+pub fn floating_action_state(
+    glyph: impl Fn() -> Icon + 'static,
+    label: impl Fn() -> SharedString + 'static,
+    lit: impl Fn() -> bool + Clone + 'static,
+    disabled: impl Fn() -> bool + 'static,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let skin = move || crate::domain::DiscSkin::for_state(lit());
+    // Each binding below takes its own copy of the reader.
+    let skin_border = skin.clone();
+    let skin_shadow = skin.clone();
+    let skin_glyph = skin.clone();
+    button()
+        .accessibility_label(move || Some(label()))
+        .disabled(disabled)
+        .on_press(move |_: &()| on_press())
+        .h(px(ACTION_DISC))
+        .w(px(ACTION_DISC))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        // Always 1pt, so switching skins moves no pixels — the rule `app.css` states for its
+        // own power button.
+        .border_1()
+        .border_color(move || theme::disc_border(skin_border()))
+        .bg(move || theme::disc_fill(skin()))
+        .style_with(move |s| s.shadow(theme::action_shadows(skin_shadow())))
+        .hover(|s| s.opacity(0.94))
+        .active(|s| s.scale(0.94).opacity(0.88))
+        .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
+        .disabled_style(|s| s.opacity(0.55))
+        // A finger aims at this one by feel; the slop is invisible and costs no layout.
+        .hit_slop(EdgeInsets::all(px(if is_desktop() { 0.0 } else { 6.0 })))
+        .child(live_icon(glyph, 24.0).text_color(move || theme::disc_glyph(skin_glyph())))
+}
+
+/// The disc's side, and the room a page must leave at its bottom edge.
+///
+/// A floating control that overlaps the last row of a list hides the thing the reader scrolled
+/// for, which is worse than the bar it replaced. Pages end in `action_clearance()` rather than
+/// their own guess at the number so the two cannot drift apart.
+pub const ACTION_DISC: f32 = 56.0;
+
+/// The gap the disc keeps from the window's bottom and right edges.
+///
+/// It is a margin on the control rather than padding on the layer, because `pb_safe_area()`
+/// replaces the layer's own bottom padding with the device's safe-area inset — 0 on a desktop —
+/// and a disc sitting flush against the window border reads as clipped rather than placed.
+pub const ACTION_EDGE: f32 = 24.0;
+
+/// Bottom padding that keeps a page's last row clear of its floating action.
+pub fn action_clearance() -> Points {
+    px(ACTION_DISC + ACTION_EDGE * 2.0)
+}
+
+/// The layer a page's floating action sits in: full size, transparent to touches everywhere
+/// except the control itself.
+///
+/// `pointer_events` is what makes this safe; the driver cannot check it, because it resolves a
+/// press through the node tree rather than hit-testing pixels, so an occluding layer looks
+/// harmless in the suite and the bug appears only in a real window. Verified by eye.
+pub fn floating_layer(action: impl IntoElement) -> impl IntoElement {
+    overlay()
+        .absolute()
+        .inset_0()
+        .flex_col()
+        .items_end()
+        .justify_end()
+        .p_5()
+        // Plain `pb_safe_area()` would replace `p_5`'s own bottom padding with the device's
+        // safe-area inset, which is 0 on a desktop — the reason the disc sat flush against the
+        // window border. `_plus` keeps both: the inset when there is one, and this gap always.
+        .pb_safe_area_plus(px(ACTION_EDGE))
+        .pointer_events(PointerEvents::BoxNone)
+        .child(
+            view()
+                // A phone keeps its tab bar along this same bottom edge; lift clear of that
+                // too, not just of the border.
+                .mb(if is_desktop() { px(0.0) } else { px(64.0) })
+                .pointer_events(PointerEvents::Auto)
+                .child(action),
         )
 }
 
@@ -226,35 +294,74 @@ pub fn switch_row_state(
 ///
 /// The name is said the same way: a switch with no label of its own and no text inside it is
 /// unnamed to a screen reader, which is why a row passes what it is switching on.
+///
+/// The parts carry the look, and every part is sized by hand. This control has no look of its
+/// own — the switch box, the track and the thumb are three views, and the state styles attach
+/// at different levels: `checked_style` paints the *box* and the track's own `checked:` paints
+/// the *track*. An unsized track fills the box, which is what turned every checked switch into
+/// an orange rectangle with a pale pill floating in the middle of it. See
+/// `domain::SwitchGeometry` for why the numbers are not written out here.
 pub fn switch_state(
     label: impl Fn() -> Option<SharedString> + 'static,
     checked: impl Fn() -> bool + 'static,
     disabled: impl Fn() -> bool + 'static,
     on_change: impl Fn(bool) + 'static,
 ) -> impl IntoElement {
+    let geo = crate::domain::SwitchGeometry::default();
+    debug_assert!(geo.thumb_fits(), "the switch's parts no longer fit");
     switch()
         .accessibility_label(label)
         .checked(checked)
         .disabled(disabled)
         .on_change(move |next: &bool| on_change(*next))
-        .h(px(22.0))
-        .w(px(38.0))
+        // The box is only a press target: no radius, no tint, so a checked switch cannot
+        // paint a rectangle around the track.
+        .h(px(geo.box_height))
+        .w(px(geo.box_width))
         .flex_shrink_0()
+        .items_center()
+        .flex_row()
+        // The whole control dims together: `disabled:` on the switch carries its parts, which
+        // is what `nsh_base::Switch` documents, and the parts' own style builders have no
+        // disabled layer to write.
+        .disabled_style(|s| s.opacity(0.45))
         .track_style(|s| {
-            s.rounded_full()
+            s.h(px(geo.track_height))
+                .w(px(geo.track_width))
+                .flex_shrink_0()
+                // A row, so the thumb sits at the near end and the inset is horizontal. As a
+                // column — the default — `items_center` would center along x instead, and the
+                // thumb would start in the middle of the track with nowhere to slide to.
+                .flex_row()
+                .items_center()
+                .px(px(geo.inset))
+                .rounded(px(geo.track_radius))
                 .border_1()
-                .border_color(move || theme().border)
+                .border_color(move || theme().input)
                 .bg(move || theme().muted)
-        })
-        .checked_style(|s| {
-            s.bg(move || theme().primary)
-                .border_color(move || theme().primary)
+                .checked(|s| {
+                    s.bg(move || theme().primary)
+                        .border_color(move || theme().primary)
+                        // `app.css` gives the rule toggle's checked track a 2pt --accent-soft
+                        // ring; here every switch gets it, because a primary track and a cream
+                        // thumb need one more edge between them to read as two shapes.
+                        .inset_ring(px(2.0))
+                        .inset_ring_color(move || theme().accent)
+                })
         })
         .thumb_style(|s| {
-            s.h(px(16.0))
-                .w(px(16.0))
+            s.h(px(geo.thumb))
+                .w(px(geo.thumb))
+                .flex_shrink_0()
                 .rounded_full()
-                .bg(move || theme().card)
+                // The thumb is opaque on purpose: see `theme::switch_thumb`.
+                .bg(theme::switch_thumb)
+                // …and lifted off the track by the shadow, which in the light appearance is
+                // the only thing separating a white thumb from an 82% white track.
+                .shadow([theme::switch_thumb_shadow()])
+                // The thumb moves by a checked translate, after layout, so the track keeps
+                // its width and nothing around the switch shifts as it is flipped.
+                .checked(|s| s.translate_x(px(geo.travel())))
         })
 }
 
@@ -352,6 +459,66 @@ pub fn metric(
         )
 }
 
+/// What a nav item says about itself beyond its name: nothing, a count, or an
+/// update the user has not looked at.
+///
+/// One type rather than two optional arguments because the two never appear together — the
+/// original keeps them in one slot — and a row carrying both would leave the user to work out
+/// which one they were being asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavMark {
+    None,
+    Count(usize),
+    Update,
+}
+
+/// The name a marked row gives a screen reader.
+///
+/// A dot is a coloured circle and a count is a number in a chip; neither says what it means to
+/// someone who cannot see it, and a label on a bare span is not reliably announced. The button's
+/// own name is the one place that is, so an unmarked row keeps the name its visible text already
+/// gives it and an update-marked row says what the dot stands for. A count needs no such
+/// translation: the digits are the message, and they are on screen as text.
+pub fn nav_name(label: &str, mark: &NavMark) -> Option<SharedString> {
+    match mark {
+        NavMark::Update => Some(format!("{label}（有新版本可更新）").into()),
+        NavMark::None | NavMark::Count(_) => None,
+    }
+}
+
+/// The mark, in the row's trailing slot.
+///
+/// Takes the reader rather than the value so the mark is a binding: an update discovered after
+/// launch appears in the rail without the page being rebuilt, and the row whose count changed
+/// repaints on its own.
+fn nav_mark(mark: impl Fn() -> NavMark + 'static) -> impl IntoElement {
+    dynamic(move || match mark() {
+        NavMark::None => view().w(px(0.0)).flex_shrink_0().into_element(),
+        NavMark::Count(count) => view()
+            .flex_shrink_0()
+            .px_2()
+            .py_0p5()
+            .rounded(theme::radius_tile())
+            .bg(move || theme().muted)
+            .child(
+                text(move || count.to_string())
+                    .text_xs()
+                    .font_family(theme::font_mono())
+                    .text_color(move || theme().muted_foreground),
+            )
+            .into_element(),
+        // Small, and in the family that already means "worth your attention, nothing is wrong",
+        // so an unaddressed update waits rather than shouts.
+        NavMark::Update => view()
+            .h(px(7.0))
+            .w(px(7.0))
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(move || theme::Tint::Warning.foreground())
+            .into_element(),
+    })
+}
+
 /// A sidebar destination. `active` is a memo the caller owns, so every binding
 /// here reads one cached answer; `button` supplies role, focus and the selected
 /// state, which is what makes the row reachable by keyboard and screen reader.
@@ -359,10 +526,15 @@ pub fn nav_row(
     label: &'static str,
     glyph: Icon,
     active: Memo<bool>,
+    mark: impl Fn() -> NavMark + Clone + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     button()
         .selected(move || active.get())
+        .accessibility_label({
+            let mark = mark.clone();
+            move || nav_name(label, &mark())
+        })
         .on_press(move |_: &()| on_press())
         .h(px(36.0))
         .w_full()
@@ -405,17 +577,27 @@ pub fn nav_row(
                     }
                 }),
         )
+        .child(nav_mark(mark))
 }
 
 /// A bottom-bar destination: glyph above a short label, tall enough for a thumb.
+///
+/// The mark sits beside the glyph rather than in a trailing slot, because a tab has no trailing
+/// slot — the label is centred, and anything appended after it would push the glyph off-centre on
+/// every tab but the marked one, which reads as a layout bug rather than as a message.
 pub fn nav_tab(
     label: &'static str,
     glyph: Icon,
     active: Memo<bool>,
+    mark: impl Fn() -> NavMark + Clone + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     button()
         .selected(move || active.get())
+        .accessibility_label({
+            let mark = mark.clone();
+            move || nav_name(label, &mark())
+        })
         .on_press(move |_: &()| on_press())
         .h(px(52.0))
         .flex_1()
@@ -425,13 +607,20 @@ pub fn nav_tab(
         .gap_1()
         .selected_style(|s| s.bg(move || theme().accent))
         .active(|s| s.opacity(0.8))
-        .child(icon(glyph, 20.0).text_color(move || {
-            if active.get() {
-                theme().accent_foreground
-            } else {
-                theme().muted_foreground
-            }
-        }))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .child(icon(glyph, 20.0).text_color(move || {
+                    if active.get() {
+                        theme().accent_foreground
+                    } else {
+                        theme().muted_foreground
+                    }
+                }))
+                .child(nav_mark(mark)),
+        )
         .child(text(label).text_size(px(11.0)).text_color(move || {
             if active.get() {
                 theme().accent_foreground
@@ -498,6 +687,42 @@ pub fn empty_state(
         .child(text(note).text_xs().text_color(theme::text_faint()))
 }
 
+/// A labeled single-line field whose value lives inside a larger struct rather than in a signal
+/// of its own.
+///
+/// `text_field` is the common case — a signal per field. The sync form edits nine fields of one
+/// saved config, and giving each a signal of its own would mean nine copies that can disagree
+/// with the config they came from. This variant reads and writes through closures, so the config
+/// stays the single owner. `masked` hides what is typed: it exists for the two secret fields,
+/// where showing a token on screen is its own leak.
+pub fn text_field_state(
+    label: &'static str,
+    value: impl Fn() -> String + 'static,
+    on_change: impl Fn(String) + 'static,
+    placeholder: impl Fn() -> &'static str + 'static,
+    masked: bool,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_col()
+        .gap_1p5()
+        .child(field_label(label.into()))
+        .child(field_frame(
+            nsh_base::input()
+                .value(value)
+                .on_change(move |text: &str| on_change(text.to_owned()))
+                .masked(move || masked)
+                .placeholder(placeholder)
+                .placeholder_color(|| color(theme().muted_foreground))
+                .caret_color(|| color(theme().primary))
+                .label(label)
+                .w_full()
+                .min_w(px(0.0))
+                .text_sm()
+                .text_color(move || theme().card_foreground),
+        ))
+}
+
 /// The bordered box a text field is drawn in, shared by the single-line and the
 /// multiline case so both answer focus the same way.
 fn field_frame(content: impl IntoElement) -> impl IntoElement {
@@ -515,20 +740,22 @@ fn field_frame(content: impl IntoElement) -> impl IntoElement {
         .focus_within(|s| s.border_color(move || theme().ring))
 }
 
-/// A labeled single-line field. The label is above rather than a placeholder standing in
-/// for it: a placeholder disappears the moment the user types, which is exactly when the
-/// field's purpose is least obvious.
-pub fn text_field(
-    label: impl Into<SharedString> + 'static,
+/// The same field with a handle, so another control can put the caret in it.
+///
+/// This exists for 规则's floating "+": a new-rule button that only clears the form leaves the
+/// reader looking at an empty box they still have to tap. The handle is the only way in — NSH
+/// has no autofocus and no way to focus a node by selector.
+pub fn text_field_focus(
+    label: &'static str,
     value: Signal<String>,
     placeholder: impl Fn() -> &'static str + 'static,
+    focus: ElementRef,
 ) -> impl IntoElement {
-    let label = label.into();
     view()
         .w_full()
         .flex_col()
         .gap_1p5()
-        .child(field_label(label.clone()))
+        .child(field_label(label.into()))
         .child(field_frame(
             nsh_base::input()
                 .value(move || value.get())
@@ -536,14 +763,24 @@ pub fn text_field(
                 .placeholder(placeholder)
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
-                // The visible label is also its name: a placeholder stops being read once
-                // the field holds text, which is when the name matters most.
                 .label(label)
+                .element_ref(&focus)
                 .w_full()
                 .min_w(px(0.0))
                 .text_sm()
                 .text_color(move || theme().card_foreground),
         ))
+}
+
+/// A labeled single-line field. The label is above rather than a placeholder standing in
+/// for it: a placeholder disappears the moment the user types, which is exactly when the
+/// field's purpose is least obvious.
+pub fn text_field(
+    label: &'static str,
+    value: Signal<String>,
+    placeholder: impl Fn() -> &'static str + 'static,
+) -> impl IntoElement {
+    text_field_focus(label, value, placeholder, element_ref())
 }
 
 /// A labeled multiline field, for the config script. `lines` sets the visible height so
@@ -796,4 +1033,105 @@ pub fn inline_note_with(
                 .text_color(move || tint.foreground()),
         )
         .child(action)
+}
+
+/// A row that states something and cannot be changed: a label and note on the left, the value
+/// on the right.
+///
+/// The counterpart to [`switch_row`] for a fact rather than a choice. It matters that the two
+/// look alike and only one has a control on it — a row with a value where a switch would be
+/// reads as a setting someone forgot to make interactive.
+pub fn value_row(
+    label: impl Into<SharedString> + 'static,
+    note: impl Into<SharedString> + 'static,
+    value: impl IntoReactive<SharedString> + 'static,
+) -> impl IntoElement {
+    let label = label.into();
+    view()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0p5()
+                .child(
+                    text(label)
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || theme().card_foreground),
+                )
+                .child(text(note.into()).text_xs().text_color(theme::text_faint())),
+        )
+        .child(
+            text(value)
+                .text_xs()
+                .flex_shrink_0()
+                .number_of_lines(1)
+                .text_color(move || theme().muted_foreground),
+        )
+}
+
+/// One fact of an about card: the word that names it above, its value below.
+///
+/// Four of these sit in a wrapped row, which is why the label is above rather than beside the
+/// value: a column of label-value pairs reads at a glance, a column of pairs sharing one line
+/// does not survive a narrow window.
+pub fn about_fact(
+    label: impl Into<SharedString> + 'static,
+    value: impl IntoReactive<SharedString> + 'static,
+) -> impl IntoElement {
+    view()
+        .flex_col()
+        .gap_0p5()
+        .child(text(label.into()).text_xs().text_color(theme::text_faint()))
+        .child(
+            text(value)
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || theme().card_foreground),
+        )
+}
+
+/// A field whose only job is to narrow a list, marked by a leading glyph instead of a label.
+///
+/// A search box is the one field whose purpose is obvious from what is being typed into, so
+/// the label would repeat the placeholder; it is still named for a screen reader, and the
+/// glyph is what distinguishes it from a form field at a glance.
+pub fn search_field(
+    name: &'static str,
+    placeholder: &'static str,
+    value: Signal<String>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .h(px(36.0))
+        .rounded(theme::radius_tile())
+        .border_1()
+        .border_color(move || theme().input)
+        .bg(move || theme().card)
+        .focus_within(|s| s.border_color(move || theme().ring))
+        .child(icon(Icon::Search, 15.0).text_color(move || theme().muted_foreground))
+        .child(
+            nsh_base::input()
+                .value(move || value.get())
+                .on_change(move |text: &str| value.set(text.to_owned()))
+                .placeholder(placeholder)
+                .placeholder_color(|| color(theme().muted_foreground))
+                .caret_color(|| color(theme().primary))
+                // The same words as the placeholder: a field with no visible label still has
+                // to say what it searches.
+                .label(name)
+                .flex_1()
+                .min_w(px(0.0))
+                .text_sm()
+                .text_color(move || theme().card_foreground),
+        )
 }

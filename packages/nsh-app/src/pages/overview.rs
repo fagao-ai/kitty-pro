@@ -2,7 +2,7 @@
 //! traffic of the last minute.
 
 use crate::domain;
-use crate::store::{AppStore, CoreBusy, SystemProxy};
+use crate::store::{AppStore, SystemProxy};
 use crate::ui::{controls, theme, Icon};
 use nsh_base::theme as base_theme;
 use nsh_core::prelude::*;
@@ -11,13 +11,48 @@ use nsh_core::prelude::*;
 const HISTORY_LEN: usize = 60;
 
 pub fn overview(store: AppStore) -> impl IntoElement {
-    crate::shell::page_scroll(
-        view()
-            .flex_col()
-            .gap_4()
-            .child(connection_panel(store))
-            .child(metrics_row(store))
-            .child(traffic_card(store)),
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .child(crate::shell::page_scroll(
+            view()
+                .flex_col()
+                .gap_4()
+                .child(connection_panel(store))
+                .child(metrics_row(store))
+                .child(traffic_card(store)),
+        ))
+        .child(controls::floating_layer(connect_action(store)))
+}
+
+/// Start and stop the core: 总览's one action.
+///
+/// Icon-only and named by the verb the press performs (启动代理, 断开, 正在启动…), so the state
+/// the user is checking is written on the control that changes it. The name also stays a stable
+/// selector while the glyph does the pointing.
+fn connect_action(store: AppStore) -> impl IntoElement {
+    controls::floating_action_state(
+        // A binding, not a value: this body runs once, so reading `connected()` here would
+        // freeze the glyph at whatever it was on the first frame.
+        move || {
+            if store.connected() {
+                Icon::Power
+            } else {
+                Icon::Rocket
+            }
+        },
+        move || crate::shell::connect_label(store).into(),
+        // Lit means the core is up. The disc is the thing a user glances at to answer "is it
+        // running?", and `app.css` lights its power button on exactly that fact.
+        move || store.connected(),
+        // With nothing to route and no core to talk to, connecting cannot succeed, so the
+        // control says so instead of failing on press. Disconnect stays available.
+        move || {
+            store.core_action_busy()
+                || (!store.connected()
+                    && (store.nodes().is_empty() || store.core_state() == "unavailable"))
+        },
+        move || store.toggle_core(!store.connected()),
     )
 }
 
@@ -49,30 +84,11 @@ fn connection_panel(store: AppStore) -> impl IntoElement {
             move || store.core_state() == "unavailable",
             move || unavailable_note(store),
         ))
-        .child(controls::hero_button(
-            move || action_label(store),
-            // A binding, not a value: the body of this function runs once, so reading
-            // `connected()` here would freeze the icon at whatever it was on the first
-            // frame and leave a connected app offering to connect again.
-            move || {
-                if store.connected() {
-                    Icon::Power
-                } else {
-                    Icon::Rocket
-                }
-            },
-            // With nothing to route and no core to talk to, connecting cannot succeed, so
-            // the control says so instead of failing on press. Disconnect stays available.
-            move || {
-                store.core_action_busy()
-                    || (!store.connected()
-                        && (store.nodes().is_empty() || store.core_state() == "unavailable"))
-            },
-            // The same applies to the decision itself. Capturing it would make the second
-            // press repeat the first action.
-            move || store.toggle_core(!store.connected()),
-        ))
+        // Connecting is not in this card any more: it is the dock's primary control, so it is
+        // reachable from 节点 or 设置 without walking back here first. What stays is everything
+        // that reads as an attribute of the connection rather than an act on it.
         .child(system_proxy_toggle(store))
+        .child(probe_row(store))
         .child(when(
             move || store.config_pending(),
             move || pending_banner(store),
@@ -101,18 +117,8 @@ fn status_line(store: AppStore) -> impl IntoElement {
         )
 }
 
-/// The button's verb says what the press will do, including while it is doing it.
-fn action_label(store: AppStore) -> String {
-    match store.busy() {
-        CoreBusy::Toggling if store.connected() => "正在断开".to_owned(),
-        CoreBusy::Toggling => "正在启动".to_owned(),
-        CoreBusy::Restarting => "正在重启".to_owned(),
-        CoreBusy::Tun => "正在申请网络权限".to_owned(),
-        CoreBusy::Idle if store.connected() => "断开".to_owned(),
-        CoreBusy::Idle => "启动代理".to_owned(),
-    }
-}
-
+/// The card's own state title. The verb of the connect action lives on the dock's button, in
+/// `shell::connect_label`, where the control now is.
 fn status_title(store: AppStore) -> &'static str {
     if store.system_proxy_busy() {
         "系统代理设置中"
@@ -435,8 +441,10 @@ fn traffic_card(store: AppStore) -> impl IntoElement {
         ))
 }
 
-/// The port the core listens on, and the way to refresh the one figure that cannot be
-/// inferred from traffic. Naming the endpoint is what makes "已连接" checkable by hand.
+/// The port the core listens on, and whether a measurement is running. The act itself is the
+/// dock's; this row keeps the two facts a user reads next to the traffic — the endpoint, and
+/// that a probe is in flight — because the dock's button changes to say the same thing and a
+/// glance at the chart is where that gets checked.
 fn measure_row(store: AppStore) -> impl IntoElement {
     view()
         .flex_row()
@@ -449,26 +457,92 @@ fn measure_row(store: AppStore) -> impl IntoElement {
                 .font_family(theme::font_mono())
                 .text_color(theme::text_faint()),
         )
+        .child(when(
+            move || store.latency_busy(),
+            || text("正在测量").text_xs().text_color(theme::text_faint()),
+        ))
+}
+
+/// Does traffic actually get out?
+///
+/// The connection state cannot answer this. A running core with a listening port is a different
+/// claim from traffic reaching the internet: the exit can be reachable enough to answer a latency
+/// ping and useless for a real connection, and a provider can be up while the account behind it
+/// is not. The probe dials out through the port, so it walks the whole chain the user depends on.
+///
+/// It sits with the connect control rather than among the figures because its answer is an
+/// action's result, and it stays parked while the core is down: with nothing behind the port the
+/// only honest answer is a connection refusal, which reads as "your proxy is broken" when the
+/// truth is "you have not started it".
+fn probe_row(store: AppStore) -> impl IntoElement {
+    view()
+        .flex_col()
+        .gap_3()
         .child(
             view()
                 .flex_row()
                 .items_center()
-                .gap_2()
-                .child(when(
-                    move || store.latency_busy(),
-                    || text("正在测量").text_xs().text_color(theme::text_faint()),
-                ))
-                .child(controls::secondary_button(
+                .justify_between()
+                .gap_3()
+                .child(
+                    text(move || probe_hint(store))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                )
+                .child(controls::secondary_button_state(
                     move || {
-                        if store.latency_busy() {
-                            "测量中"
+                        if store.probe_busy() {
+                            "正在探测出口"
                         } else {
-                            "刷新延迟"
+                            "测试连通"
                         }
                     },
-                    move || store.measure_latency(),
+                    // Busy, or nothing behind the port to probe through.
+                    move || store.probe_busy() || !store.connected(),
+                    move || store.probe_connectivity(),
                 )),
         )
+        .child(when(
+            move || store.probe_result().is_some(),
+            move || probe_result_line(store),
+        ))
+}
+
+/// What the row says while it waits to be useful. A parked control names its own reason, as the
+/// system-proxy switch does: an inert button with no explanation reads as a broken one, and here
+/// the reason is a step the user has not taken yet rather than a fault.
+fn probe_hint(store: AppStore) -> &'static str {
+    if !store.connected() {
+        "先启动代理，才能探测出口"
+    } else if store.probe_busy() {
+        "正在通过代理拨测外部地址"
+    } else {
+        "从代理拨一次外部地址，确认流量真的出得去"
+    }
+}
+
+/// The last answer, kept on screen until the next press. A notice ages out while the user is
+/// still working out what to do about a failure, and the reason is usually the useful part.
+///
+/// The whole note is rebuilt per answer rather than tinted through a binding, because
+/// `inline_note` takes its color and glyph as values: the probe finishes on a press, so a
+/// rebuild here costs nothing and reads clearer than a memo carried for the sake of one row.
+fn probe_result_line(store: AppStore) -> impl IntoElement {
+    dynamic(move || match store.probe_result() {
+        Some(outcome) if outcome.ok => controls::inline_note(
+            theme::Tint::Success,
+            Icon::CircleCheck,
+            SharedString::from(format!("连通正常：{}", outcome.detail)),
+        )
+        .into_element(),
+        Some(outcome) => controls::inline_note(
+            theme::Tint::Danger,
+            Icon::CircleAlert,
+            SharedString::from(format!("出口不可用：{}", outcome.detail)),
+        )
+        .into_element(),
+        None => view().into_element(),
+    })
 }
 
 fn chart_status(window: &crate::store::TrafficWindow, connected: bool) -> String {

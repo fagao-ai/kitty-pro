@@ -186,15 +186,21 @@ impl Feedback {
             .absolute()
             .inset_0()
             .flex_col()
-            .items_end()
-            .justify_end()
+            // The user asked for notices at the top of the middle of the page: centred across
+            // the window and hung from the top edge, which is also where the rail's own header
+            // line sits, so the eye is already there.
+            .items_center()
+            .justify_start()
             .gap_2()
             .p_5()
-            .pb_safe_area()
+            // Same trap as the floating action: `pt_safe_area` alone would replace `p_5`'s top
+            // padding with the safe-area inset, which is 0 on a desktop, putting notices flush
+            // against the top border. `_plus` keeps the inset and adds the gap.
+            .pt_safe_area_plus(px(20.0))
             .pointer_events(PointerEvents::BoxNone)
             .child(
                 toast_stack()
-                    .placement(Anchor::BottomCenter)
+                    .placement(Anchor::TopCenter)
                     .state(self.stack)
                     // Full width up to a readable measure: a fixed 420pt would overflow a
                     // phone, and a fixed narrow column wastes a desktop.

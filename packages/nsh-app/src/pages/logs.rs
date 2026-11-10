@@ -64,7 +64,10 @@ pub fn logs(store: AppStore) -> impl IntoElement {
         .flex_col()
         .gap_3()
         .px_5()
-        .py_5()
+        .pt_5()
+        // Room for the page's own floating action, which sits over this column's bottom-right
+        // corner; the log list is bounded by the column, so this lifts its last row clear.
+        .pb(controls::action_clearance())
         .child(controls::card(
             view()
                 .flex_col()
@@ -143,6 +146,35 @@ pub fn logs(store: AppStore) -> impl IntoElement {
                 ),
         ))
         .child(log_list(store, list, unseen, following))
+        // 日志's own action: pause and resume the feed. The core streams logs only while asked,
+        // so this is a real switch rather than a scroll lock, and the chip beside the search
+        // says which of the three states the page is in.
+        .child(controls::floating_layer(controls::floating_action_state(
+            move || {
+                if store.log_paused() {
+                    Icon::Play
+                } else {
+                    Icon::Pause
+                }
+            },
+            move || {
+                if !store.connected() {
+                    // Pausing is the store's doing when the core stops, so naming the press
+                    // "resume" would promise a feed there is no core to produce one.
+                    "内核未运行，无法采集日志".into()
+                } else if store.log_paused() {
+                    "继续采集日志".into()
+                } else {
+                    "暂停采集日志".into()
+                }
+            },
+            // Lit while the feed is actually flowing: paused, or stopped along with the core,
+            // is not, and the disc should not claim a live stream that is not one.
+            move || store.connected() && !store.log_paused(),
+            // With no core running there is nothing to collect, and the page already says 已停止.
+            move || !store.connected(),
+            move || store.set_log_collection(store.log_paused()),
+        )))
 }
 
 /// Collecting, paused, or stopped because there is no core. Three real states rather than a

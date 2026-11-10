@@ -20,6 +20,18 @@ pub fn root() -> impl IntoElement {
         // does not own it: a previous session, or another program, may have set it. Read it
         // before offering a switch about it.
         store.refresh_system_proxy();
+        // The same argument applies to the login item, which is a file an installer or a
+        // cleanup tool can delete while the app is closed. Both reads are here for the same
+        // reason: a switch that shows the last value this app wrote is a claim about the
+        // operating system, and the operating system was not asked.
+        store.refresh_autostart();
+        // The sync card is the one place the app can overwrite its own settings with a blank,
+        // so it waits for this read rather than offering a form: until it lands every control is
+        // parked, and a failed read stays parked with a retry.
+        store.refresh_sync_config();
+        // The update check runs here rather than from the card so it happens on launch whether or
+        // not the settings page is ever opened; the card is a view over whatever it last learned.
+        store.refresh_update_state();
     });
     // The core streams logs only while collection is on, and the log page is the only
     // reader, so the shell decides here rather than letting a poll run behind every screen.
@@ -114,11 +126,45 @@ fn nav_groups(store: AppStore) -> impl IntoElement {
         .child(group("运维", &[Screen::Logs, Screen::Settings]))
 }
 
+/// The count a rail row carries, matching the original's trailing chip.
+///
+/// Four of the six rows count something the page then lists, which is what makes the number worth
+/// its space: it says how much is waiting before the row is opened. 总览 has nothing to count and
+/// 设置 carries the update dot instead — the two never share a slot.
+fn nav_count(store: AppStore, screen: Screen) -> Option<usize> {
+    match screen {
+        Screen::Overview => None,
+        Screen::Nodes => Some(store.nodes().len()),
+        Screen::Subscriptions => Some(store.subscription_count()),
+        // Rules and its DNS overrides are one list to the user's eye: the page holds both, so the
+        // row counts both.
+        Screen::Rules => Some(store.custom_rule_count() + store.dns_overrides().len()),
+        Screen::Logs => Some(store.logs().len()),
+        Screen::Settings => None,
+    }
+}
+
+/// What the row says about itself, read at draw time so an update discovered after launch shows up
+/// without the page being rebuilt.
+fn nav_mark(store: AppStore, screen: Screen) -> controls::NavMark {
+    match nav_count(store, screen) {
+        Some(count) => controls::NavMark::Count(count),
+        None if screen == Screen::Settings && store.update_is_actionable() => {
+            controls::NavMark::Update
+        }
+        None => controls::NavMark::None,
+    }
+}
+
 fn nav_item(store: AppStore, screen: Screen) -> impl IntoElement {
     let active = computed(move || store.screen.get() == screen);
-    controls::nav_row(screen.label(), screen.icon(), active, move || {
-        store.set_screen(screen)
-    })
+    controls::nav_row(
+        screen.label(),
+        screen.icon(),
+        active,
+        move || nav_mark(store, screen),
+        move || store.set_screen(screen),
+    )
 }
 
 /// The column that is not the rail: header, page, and on a phone the tab bar under them.
@@ -155,9 +201,23 @@ pub fn page_scroll(content: impl IntoElement) -> impl IntoElement {
             .flex_col()
             .gap_4()
             .px_5()
-            .py_5()
+            .pt_5()
+            // Every page floats an action over its own bottom edge, so the frame that scrolls
+            // them all leaves the room once, rather than each page guessing at it.
+            .pb(controls::action_clearance())
             .child(content),
     )
+}
+
+pub fn connect_label(store: AppStore) -> String {
+    match store.busy() {
+        crate::store::CoreBusy::Toggling if store.connected() => "正在断开".to_owned(),
+        crate::store::CoreBusy::Toggling => "正在启动".to_owned(),
+        crate::store::CoreBusy::Restarting => "正在重启".to_owned(),
+        crate::store::CoreBusy::Tun => "正在申请网络权限".to_owned(),
+        crate::store::CoreBusy::Idle if store.connected() => "断开".to_owned(),
+        crate::store::CoreBusy::Idle => "启动代理".to_owned(),
+    }
 }
 
 fn page_header(store: AppStore) -> impl IntoElement {
@@ -268,12 +328,29 @@ fn tab_bar(store: AppStore) -> impl IntoElement {
         )
 }
 
+/// The phone's mark: the update dot only, on 设置.
+///
+/// The original's bottom bar carries no counts at all — five names in a row have no room for a
+/// chip beside each — while the dot still has to reach a phone user, since that is the only way
+/// they learn an update is waiting without opening a page.
+fn tab_mark(store: AppStore, screen: Screen) -> controls::NavMark {
+    if screen == Screen::Settings && store.update_is_actionable() {
+        controls::NavMark::Update
+    } else {
+        controls::NavMark::None
+    }
+}
+
 fn tab_item(store: AppStore, screen: Screen) -> impl IntoElement {
     let active = computed(move || store.screen.get() == screen);
     let glyph = screen.icon();
-    controls::nav_tab(screen.label(), glyph, active, move || {
-        store.set_screen(screen)
-    })
+    controls::nav_tab(
+        screen.label(),
+        glyph,
+        active,
+        move || tab_mark(store, screen),
+        move || store.set_screen(screen),
+    )
 }
 
 /// The core build as the sidebar says it: `kitty-pro-embedded/1.13.14` reads

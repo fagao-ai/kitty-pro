@@ -4,6 +4,7 @@
 //! binary is a native process, so there is no HTTP hop and no server to run: the same functions
 //! the Dioxus shells reach over server functions are plain async calls here.
 
+pub(crate) mod autostart;
 mod domain;
 pub mod feedback;
 mod pages;

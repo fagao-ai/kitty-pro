@@ -31,12 +31,10 @@ pub fn subscriptions(store: AppStore) -> impl IntoElement {
                     .flex_col()
                     .gap_4()
                     .px_5()
-                    .py_5()
+                    .pt_5()
+                    .pb(controls::action_clearance())
                     .child(toolbar(store))
-                    .child(when(
-                        move || store.subscriptions().is_empty(),
-                        move || empty_state(store),
-                    ))
+                    .child(when(move || store.subscriptions().is_empty(), empty_state))
                     .child(when(
                         move || !store.subscriptions().is_empty() && store.nodes().is_empty(),
                         move || {
@@ -59,6 +57,16 @@ pub fn subscriptions(store: AppStore) -> impl IntoElement {
                     )),
             ),
         )
+        // 订阅's own action, like every other page's. The two inline 添加订阅 buttons are gone:
+        // with a disc in the corner, the toolbar's copy was a third way to the same dialog.
+        .child(controls::floating_layer(controls::floating_action_state(
+            || Icon::Plus,
+            || "添加订阅".into(),
+            // A form action: the disc's accent is reserved for pages with a running state.
+            || false,
+            || false,
+            move || store.open_import(),
+        )))
 }
 
 /// The count, and the two actions that change it. Refresh sits beside add because both are
@@ -91,10 +99,7 @@ fn toolbar(store: AppStore) -> impl IntoElement {
             .child(when(
                 move || !store.subscriptions().is_empty(),
                 move || refresh_all_button(store),
-            ))
-            .child(controls::primary_button("添加订阅", move || {
-                store.open_import()
-            })),
+            )),
     )
 }
 
@@ -128,9 +133,9 @@ fn refresh_all_button(store: AppStore) -> impl IntoElement {
         ))
 }
 
-/// The first-run state carries the action twice on purpose: a reader who arrives by
-/// keyboard from the header should not have to hunt the toolbar for the only way forward.
-fn empty_state(store: AppStore) -> impl IntoElement {
+/// The first-run state explains what a subscription is for and stops there: the action belongs
+/// to the page's floating disc, which is in the tab ring like any other button.
+fn empty_state() -> impl IntoElement {
     controls::card(
         view()
             .flex_col()
@@ -151,10 +156,7 @@ fn empty_state(store: AppStore) -> impl IntoElement {
                 text("订阅用于导入代理节点；添加后即可在节点页挑选线路、回到概览连接。")
                     .text_xs()
                     .text_color(theme::text_faint()),
-            )
-            .child(controls::primary_button("添加订阅", move || {
-                store.open_import()
-            })),
+            ),
     )
 }
 
