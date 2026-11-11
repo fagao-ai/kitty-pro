@@ -17,6 +17,21 @@ pub fn icon(glyph: Icon, size: f32) -> Svg {
     svg(glyph.src()).w(px(size)).h(px(size)).flex_shrink_0()
 }
 
+/// Every action button is this tall: [`primary_button_state`], [`secondary_button_state`],
+/// [`destructive_button`] and [`icon_button`].
+///
+/// They were not. The primary was 36 and the other three 32, so the sync row — two quiet buttons,
+/// the accent 上传, then the coral 覆盖远端 — stepped by 4pt across one line, which is what the
+/// user pointed at. The split was never a decision: `packages/ui`'s CSS gives `.primary-button`
+/// and `.secondary-button` the same `min-height`, and the NSH port invented two numbers for what
+/// is one control family wearing four colours.
+///
+/// 36 because it is already the height of the fields and nav rows these buttons sit beside, and
+/// a button shorter than the input it submits is the same mismatch one line up. Colour is what
+/// separates the four — fill, border, and text all carry the meaning — and the four must
+/// therefore be identical in shape.
+pub const ACTION_HEIGHT: f32 = 36.0;
+
 /// A glyph that changes with app state, such as a theme toggle's sun and moon. The
 /// closure is a binding: only the image swaps, and the row around it is not rebuilt.
 pub fn live_icon(glyph: impl Fn() -> Icon + 'static, size: f32) -> Svg {
@@ -45,7 +60,7 @@ pub fn primary_button_state(
     button()
         .disabled(disabled)
         .on_press(move |_: &()| on_press())
-        .h(px(36.0))
+        .h(px(ACTION_HEIGHT))
         .px_4()
         .items_center()
         .justify_center()
@@ -82,7 +97,7 @@ pub fn secondary_button_state(
     button()
         .disabled(disabled)
         .on_press(move |_: &()| on_press())
-        .h(px(32.0))
+        .h(px(ACTION_HEIGHT))
         .px_3()
         .items_center()
         .justify_center()
@@ -213,8 +228,8 @@ pub fn icon_button(
     button()
         .accessibility_label(move || Some(label()))
         .on_press(move |_: &()| on_press())
-        .h(px(32.0))
-        .w(px(32.0))
+        .h(px(ACTION_HEIGHT))
+        .w(px(ACTION_HEIGHT))
         .items_center()
         .justify_center()
         .rounded(theme::radius_tile())
@@ -997,7 +1012,7 @@ pub fn destructive_button(
     button()
         .disabled(disabled)
         .on_press(move |_: &()| on_press())
-        .h(px(32.0))
+        .h(px(ACTION_HEIGHT))
         .px_3()
         .items_center()
         .justify_center()

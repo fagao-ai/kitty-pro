@@ -108,6 +108,28 @@ Three things are worth knowing about how they behave:
   indicator reports the backend's answer rather than the app's wish, so a refusal parks the
   page on 已暂停 instead of claiming a live feed.
 
+### A window with no title bar
+
+The user asked for a borderless window: the native bar across the top was, in their words, 很丑.
+`set_title_bar(TitleBarStyle::Hidden, Some(px(44.0)))` is called once from the root's boot effect.
+
+It is a hidden title bar rather than a frameless window, on purpose: the traffic lights stay, and
+a window whose close button is gone can only be left from the Dock or `Cmd+Q`. What hiding it
+changes is that the app's own drawing now reaches the top edge and the lights float over it, so
+two things follow:
+
+- The rail reserves `TITLE_BAR_HEIGHT` (44pt) above its brand, because the lights sit exactly
+  there. `the_rail_leaves_room_for_the_window_buttons` measures the rail's highest text and fails
+  if it climbs into that band — verified by deleting the band, which put 品牌 at 2pt, under the
+  close button. 44 is the tallest height AppKit still treats as compact chrome.
+- The rail's band and the page header both set `windowDrag`, since with no title bar they are the
+  only thing to grab. A drag region does not eat presses: NSH's own hit-testing returns "not a
+  drag" at the nearest view that has a press handler, so 深色模式 and the connection chip in that
+  header still take the click.
+
+The desktop commands are not recorded by the headless engine, so a test cannot assert that the
+bar is hidden — only what getting the geometry wrong would cost.
+
 ### One floating action per page
 
 Each screen carries its own circular button at the bottom-right, and only the page decides what

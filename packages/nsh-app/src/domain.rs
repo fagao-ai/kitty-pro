@@ -1207,11 +1207,26 @@ pub enum SettingsSection {
     Sync,
     Updates,
     Script,
-    Links,
     About,
 }
 
 impl SettingsSection {
+    /// Every card, in the order the page draws them.
+    ///
+    /// The one list: `visible_settings_sections` filters it and a test compares its length
+    /// against the whole page, so a card cannot be added to the page and forgotten by the search
+    /// (or the other way round, which reads as a card that never appears).
+    pub const ALL: [SettingsSection; 8] = [
+        SettingsSection::Appearance,
+        SettingsSection::Mode,
+        SettingsSection::Scope,
+        SettingsSection::Session,
+        SettingsSection::Sync,
+        SettingsSection::Updates,
+        SettingsSection::Script,
+        SettingsSection::About,
+    ];
+
     /// The words this card answers to, in the page's own vocabulary plus the English a user
     /// may type when the Chinese term is on the tip of their tongue.
     ///
@@ -1237,7 +1252,6 @@ impl SettingsSection {
             SettingsSection::Script => {
                 "配置脚本 内核 sing-box javascript 配置覆写 脚本 quickjs core"
             }
-            SettingsSection::Links => "配置 订阅 规则 日志 管理",
             SettingsSection::About => {
                 "关于 诊断 内核状态 内核版本 节点 订阅 规则 dns 复制 about 版本"
             }
@@ -1269,22 +1283,11 @@ pub fn search_keyword(raw: &str) -> String {
 /// untrimmed query: a search box holding only spaces is an empty search, and treating it as a
 /// filter would blank the page for someone who typed nothing.
 pub fn visible_settings_sections(query: &str) -> Vec<SettingsSection> {
-    use SettingsSection as S;
     let keyword = search_keyword(query);
-    [
-        S::Appearance,
-        S::Mode,
-        S::Scope,
-        S::Session,
-        S::Sync,
-        S::Updates,
-        S::Script,
-        S::Links,
-        S::About,
-    ]
-    .into_iter()
-    .filter(|section| section.matches(&keyword))
-    .collect()
+    SettingsSection::ALL
+        .into_iter()
+        .filter(|section| section.matches(&keyword))
+        .collect()
 }
 
 /// The name a process is matched by, for the rule editor's picker.
@@ -2397,10 +2400,38 @@ mod diagnostics_tests {
     }
 
     /// An empty query is not a filter: it has to leave the page as it was.
+    ///
+    /// Counted against `ALL` rather than a literal, so the list the search reads is the list the
+    /// page draws — a card added to one and not the other is a card that either cannot be found
+    /// or cannot be shown.
     #[test]
     fn an_empty_query_keeps_the_whole_page() {
-        assert_eq!(visible_settings_sections("").len(), 9);
-        assert_eq!(visible_settings_sections("   ").len(), 9);
+        assert_eq!(
+            visible_settings_sections("").len(),
+            SettingsSection::ALL.len()
+        );
+        assert_eq!(
+            visible_settings_sections("   ").len(),
+            SettingsSection::ALL.len()
+        );
+    }
+
+    /// The word the removed card was built from. 管理 was its buttons and nothing else on the page
+    /// is called that, so it matching no card at all is what says the card is gone rather than
+    /// merely renamed — the other words it carried (订阅, 规则, 日志) belong to honest rows now:
+    /// 流量走向 offers 规则模式, and 诊断与关于 counts rules and DNS entries.
+    #[test]
+    fn the_link_card_took_its_word_with_it() {
+        assert!(
+            SettingsSection::ALL
+                .iter()
+                .all(|section| !section.matches("管理")),
+            "something still answers to 管理: {:?}",
+            SettingsSection::ALL
+                .iter()
+                .filter(|section| section.matches("管理"))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The query is matched inside the card's words, never the other way round: typing a whole

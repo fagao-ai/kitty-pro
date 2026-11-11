@@ -2,9 +2,15 @@
 //!
 //! Every row writes through the store, which owns persistence, so this screen never touches
 //! the disk itself.
+//!
+//! Nothing here links to another screen. The rail on a desktop and the tab bar on a phone both
+//! carry 订阅, 规则 and 日志 already, so a card of 管理 buttons repeated navigation the user has
+//! on screen either way — and a settings search would have surfaced shortcuts above the pages
+//! those shortcuts open. What stays is what only this page can hold: preferences that write to
+//! the profile, and the machine's own state.
 
 use crate::domain;
-use crate::store::{AppStore, Screen, SyncAction};
+use crate::store::{AppStore, SyncAction};
 use crate::ui::{controls, theme, Icon};
 use nsh_base::{button, theme as base_theme};
 use nsh_core::prelude::*;
@@ -54,16 +60,13 @@ pub fn settings(store: AppStore) -> impl IntoElement {
             .child(when(move || shows(query, Section::Script), {
                 move || script_card(store)
             }))
-            .child(when(move || shows(query, Section::Links), {
-                move || config_links_card(store)
-            }))
             .child(when(move || shows(query, Section::About), {
                 move || about_card(store)
             })),
     )
 }
 
-/// The seven cards, under the name the search filters them by.
+/// The cards, under the name the search filters them by.
 ///
 /// An alias so the page reads as its own vocabulary rather than reaching into the domain
 /// module for a type it only passes through.
@@ -287,67 +290,7 @@ fn mode_pill(selected: Memo<bool>, on_press: impl Fn() + 'static) -> impl IntoEl
         )
 }
 
-/// The rest of the configuration belongs to its own screens; this page points there instead
-/// of keeping a second copy of it.
-fn config_links_card(store: AppStore) -> impl IntoElement {
-    view()
-        .flex_col()
-        .gap_4()
-        .child(heading("配置"))
-        .child(config_link(
-            store,
-            "订阅",
-            "导入与更新节点来源",
-            Screen::Subscriptions,
-        ))
-        .child(config_link(
-            store,
-            "自定义规则",
-            "按域名与端口改写走向",
-            Screen::Rules,
-        ))
-        .child(config_link(
-            store,
-            "日志",
-            "查看转发与拦截记录",
-            Screen::Logs,
-        ))
-        .p_5()
-        .rounded(theme::radius_card())
-        .border_1()
-        .border_color(move || base_theme().border)
-        .bg(move || base_theme().card)
-}
-
-fn config_link(
-    store: AppStore,
-    label: &'static str,
-    note: &'static str,
-    target: Screen,
-) -> impl IntoElement {
-    view()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .child(
-            view()
-                .flex_1()
-                .min_w(px(0.0))
-                .gap_0p5()
-                .child(
-                    text(label)
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(move || base_theme().card_foreground),
-                )
-                .child(text(note).text_xs().text_color(theme::text_faint())),
-        )
-        .child(controls::secondary_button("管理", move || {
-            store.set_screen(target)
-        }))
-}
-
+/// A card's own heading, in the page's voice rather than the rail's.
 fn heading(label: &'static str) -> impl IntoElement {
     text(label)
         .text_sm()

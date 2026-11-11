@@ -847,6 +847,48 @@ fn assert_exactly_one_painted(app: &Headless, drawn: &Arc<Mutex<Drawn>>, group: 
     );
 }
 
+/// With the system title bar hidden, the traffic lights float over the top-left of the window and
+/// the app's own drawing reaches the top edge. The rail is what sits there, so the rail has to
+/// leave that band empty or the brand ends up under the close button.
+///
+/// Checked on frames rather than on the window's style: the headless engine records no desktop
+/// commands, so whether `set_title_bar` reached AppKit is not observable here — what is observable
+/// is the one thing that being wrong would cost, a control you cannot click.
+#[test]
+fn the_rail_leaves_room_for_the_window_buttons() {
+    let profile = Profile::claim("the_rail_leaves_room_for_the_window_buttons");
+    let (mut app, sink) = observing(desktop(&profile));
+    app.wait_for("Kitty Pro").unwrap();
+    app.wait_for("总览").unwrap();
+
+    let band = nsh_app_kitty::TITLE_BAR_HEIGHT;
+    let drawn = sink.lock().unwrap();
+    // Everything drawn in the rail's own column, by how high it sits. The rail is 264pt wide and
+    // is the thing under the lights, so "the highest text in the rail clears the band" is the
+    // whole requirement, stated without naming a node that would have to be guessed at.
+    let mut rail: Vec<(f32, String)> = drawn
+        .texts
+        .iter()
+        .map(|(id, text)| (drawn.origin_in_root(*id), text.clone()))
+        .filter(|((x, _), _)| *x < 264.0)
+        .map(|((_, y), text)| (y, text))
+        .collect();
+    rail.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    assert!(
+        rail.len() > 5,
+        "the rail drew only {:?}: nothing to measure, so this test would pass on an empty \
+         sidebar",
+        rail
+    );
+    let (top, nearest) = &rail[0];
+    assert!(
+        *top >= band - 0.5,
+        "`{nearest}` is the rail's highest text at {top:.1}pt: the window buttons own the top \
+         {band}pt and would sit on it"
+    );
+}
+
 /// The tally strip on the log page is five pills whose only difference when chosen is a
 /// background, so it is the most direct test of the invariant above. It also has to move: a
 /// group that is painted in the initial state only would pass a single read.
@@ -2330,6 +2372,34 @@ fn a_search_that_finds_nothing_says_so_and_clears_itself() {
     app.wait_for("启动与终端").unwrap();
 }
 
+/// The settings page links to no other screen.
+///
+/// It used to carry a 配置 card of three 管理 buttons for 订阅, 规则 and 日志 — the same three
+/// destinations the rail lists, and the same three the phone's tab bar lists, so the card was
+/// navigation drawn twice. Worse, its keywords made it the top answer to a search for 规则, which
+/// put a shortcut above the page the shortcut opens. Pressing 管理 is asserted absent rather than
+/// the card's text, because 管理 appears inside a honest row's note (管理员授权) and a text
+/// comparison would be a false positive waiting to happen.
+#[test]
+fn the_settings_page_holds_no_shortcuts_to_the_rail() {
+    let (mut app, _profile) = desktop_test("the_settings_page_holds_no_shortcuts_to_the_rail");
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.wait_for("外观").unwrap();
+    // The page is fully drawn: the last card is here, so nothing below was left unmeasured.
+    app.wait_for("诊断与关于").unwrap();
+
+    assert!(
+        app.screen().count("role:button[管理]").unwrap_or(0) == 0,
+        "the settings page still offers 管理 shortcuts: {:?}",
+        app.screen().texts()
+    );
+
+    // And a search for one of the rail's words no longer surfaces a card that only points away.
+    app.type_text("搜索设置", "管理").unwrap();
+    app.wait_for("没有匹配的设置项").unwrap();
+}
+
 /// The language is stated rather than offered: neither front end can switch it, and a row with
 /// a menu of one would promise a feature the app does not have. It also has to be findable,
 /// since it is the row users look for first.
@@ -2620,6 +2690,97 @@ fn the_sync_card_reports_the_state_on_disk() {
 /// again — and gone means gone, not parked off-screen, which is the difference between a fold and
 /// a layout bug. The summary is on screen the whole time: a closed fold that says nothing is
 /// hiding the target rather than tidying it.
+/// One row of actions, one height.
+///
+/// The user's screenshot showed 上传 standing 4pt taller than 保存同步设置, 下载覆盖本机 and
+/// 覆盖远端 beside it: the accent button was the primary and the other three were not, so they
+/// came from different builders with different heights written into them. No text assertion can
+/// see that — the four labels were always right — so the frames the engine hands the platform are
+/// measured here, and the row is checked both ways: equal heights, and equal tops, which is what
+/// "lines up" actually means to an eye.
+#[test]
+fn the_sync_actions_are_one_row_of_equal_height() {
+    let (app, _profile) = sync_test(
+        "the_sync_actions_are_one_row_of_equal_height",
+        COMPLETE_SYNC_JSON,
+    );
+    let (mut app, sink) = observing(app);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.wait_for("规则与订阅同步").unwrap();
+
+    let row = ["保存同步设置", "下载覆盖本机", "上传", "覆盖远端"];
+    let mut heights = Vec::new();
+    let mut tops = Vec::new();
+    for label in row {
+        let id = app
+            .screen()
+            .press_target(format!("role:button[{label}]").as_str())
+            .unwrap_or_else(|error| panic!("`{label}`: {error}"))
+            .unwrap_or_else(|| panic!("`{label}` names nothing pressable"));
+        let drawn = sink.lock().unwrap();
+        let frame = drawn.frame(id);
+        heights.push(frame.size.height.0);
+        tops.push(drawn.origin_in_root(id).1);
+    }
+
+    let want = nsh_app_kitty::ui::controls::ACTION_HEIGHT;
+    for (label, (height, top)) in row.iter().zip(heights.iter().zip(tops.iter())) {
+        assert!(
+            (height - want).abs() < 0.6,
+            "`{label}` is {height}pt tall; the app's actions are {want}pt"
+        );
+        assert!(
+            (top - tops[0]).abs() < 0.6,
+            "`{label}` starts {top}pt down and its neighbour at {}, so the row steps",
+            tops[0]
+        );
+    }
+    let spread = heights.iter().fold(0.0f32, |spread, height| {
+        spread.max((height - heights[0]).abs())
+    });
+    assert!(
+        spread < 0.6,
+        "the four actions in one row have different heights: {heights:?}"
+    );
+}
+
+/// An icon button beside a labelled one is the same shape, for the same reason.
+///
+/// 使用, then its refresh and delete glyphs, on one line of every subscription row — the same
+/// mismatch the user pointed at one screen away, in builders nobody had compared to the first.
+#[test]
+fn a_row_of_icon_buttons_matches_the_button_beside_it() {
+    let profile = Profile::claim("a_row_of_icon_buttons_matches_the_button_beside_it");
+    profile.seed(SEEDED_PROFILE);
+    let (mut app, sink) = observing(full_height(&profile));
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("订阅").unwrap();
+    app.wait_for("使用").unwrap();
+
+    // The seeded subscription is 实验室. Its 使用 button is disabled — it is the one in use —
+    // and `press_target` refuses an unpressable match, so the row is measured through its two
+    // glyph actions, which is where the 32pt height used to live anyway.
+    let row = ["刷新 实验室", "删除 实验室"];
+    let want = nsh_app_kitty::ui::controls::ACTION_HEIGHT;
+    let mut heights = Vec::new();
+    for label in row {
+        let id = app
+            .screen()
+            .press_target(format!("role:button[{label}]").as_str())
+            .unwrap_or_else(|error| panic!("`{label}`: {error}"))
+            .unwrap_or_else(|| panic!("`{label}` names nothing pressable"));
+        let drawn = sink.lock().unwrap();
+        heights.push(drawn.frame(id).size.height.0);
+    }
+    for (label, height) in row.iter().zip(&heights) {
+        assert!(
+            (height - want).abs() < 0.6,
+            "`{label}` is {height}pt tall in a row of {want}pt actions"
+        );
+    }
+}
+
 #[test]
 fn the_sync_target_folds_its_fields_behind_one_line() {
     let (mut app, _profile) = sync_test(

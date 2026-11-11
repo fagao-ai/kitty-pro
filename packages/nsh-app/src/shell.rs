@@ -5,7 +5,32 @@ use crate::pages;
 use crate::store::{store, AppStore, Screen};
 use crate::ui::{controls, theme, Icon};
 use nsh_base::theme as base_theme;
+use nsh_core::desktop::TitleBarStyle;
+use nsh_core::element::desktop::set_title_bar;
 use nsh_core::prelude::*;
+
+/// How tall the window's top band is once the system's title bar is gone.
+///
+/// The user asked for a borderless window: the native bar across the top was the ugliest thing in
+/// it. `TitleBarStyle::Hidden` is the right call rather than a truly frameless window, because it
+/// keeps the traffic lights — a window with no close button can only be killed from the Dock or
+/// `Cmd+Q`, and the app is meant to be quittable by press — and lets our own drawing reach the
+/// top edge, which is what removes the bar.
+///
+/// What it does not do is move the lights: they float over whatever is at the top-left, so the
+/// rail has to keep this much of its own height empty or the brand sits under them. 44 is the
+/// tallest AppKit still treats as compact chrome, and the same number is handed to
+/// `set_title_bar` so the controls are centred in the band we actually reserved.
+pub const TITLE_BAR_HEIGHT: f32 = 44.0;
+
+/// The rail's empty top band: where the traffic lights live, and the window's drag handle.
+fn title_bar_band() -> impl IntoElement {
+    view()
+        .h(px(TITLE_BAR_HEIGHT))
+        .w_full()
+        .flex_shrink_0()
+        .window_drag(true)
+}
 
 /// The root's whole surface: theme, background, and the chrome for the idiom.
 pub fn root() -> impl IntoElement {
@@ -14,6 +39,12 @@ pub fn root() -> impl IntoElement {
     // Nothing else asks the core what it is running, and without this the shell sits in
     // "正在检测" for ever with an empty node list.
     effect(move || {
+        // The window has no native title bar. Asked for in the boot effect rather than in the
+        // body so it is sent once: the root re-renders on navigation, and a command per render
+        // would be a command per press for a thing that never changes.
+        if is_desktop() {
+            set_title_bar(TitleBarStyle::Hidden, Some(px(TITLE_BAR_HEIGHT)));
+        }
         store.load_profile();
         store.refresh_status();
         // The OS proxy is the thing that makes a running core carry traffic, and the app
@@ -52,6 +83,10 @@ pub fn root() -> impl IntoElement {
 }
 
 /// The rail: identity, grouped navigation, appearance at the foot.
+///
+/// Its top padding is the title-bar band rather than `p_5`'s: with the system bar hidden the
+/// traffic lights float over the top-left corner, and the brand is the one thing in the rail that
+/// must not be under them.
 fn sidebar(store: AppStore) -> impl IntoElement {
     view()
         .h_full()
@@ -59,11 +94,18 @@ fn sidebar(store: AppStore) -> impl IntoElement {
         .flex_shrink_0()
         .flex_col()
         .gap_6()
-        .p_5()
+        .px_5()
+        .pb_5()
         .border_r_1()
         .border_color(move || base_theme().border)
         .bg(move || base_theme().card)
-        .child(brand(store))
+        .child(
+            view()
+                .flex_col()
+                .gap_2()
+                .child(title_bar_band())
+                .child(brand(store)),
+        )
         .child(nav_groups(store))
 }
 
@@ -220,6 +262,13 @@ pub fn connect_label(store: AppStore) -> String {
     }
 }
 
+/// The page's own bar: its name and state on the left, the two controls that describe the
+/// window on the right.
+///
+/// It drags the window, because hiding the title bar leaves the rail's 44pt band as the only
+/// handle and a 264pt strip is a poor thing to grab. The press handlers inside it stay
+/// interactive — NSH keeps buttons working inside a drag region — so this is a title bar in
+/// behaviour as well as in position.
 fn page_header(store: AppStore) -> impl IntoElement {
     view()
         .flex_row()
@@ -228,6 +277,7 @@ fn page_header(store: AppStore) -> impl IntoElement {
         .gap_3()
         .px_5()
         .py_4()
+        .window_drag(is_desktop)
         .border_b_1()
         .border_color(move || base_theme().border)
         .child(

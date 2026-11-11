@@ -12,6 +12,11 @@ pub(crate) mod shell;
 mod store;
 pub mod ui;
 
+/// The band the window's traffic lights occupy once the title bar is hidden. Re-exported because
+/// the test that keeps the rail's brand from sitting under those buttons has to measure against
+/// the same number the shell reserves.
+pub use shell::TITLE_BAR_HEIGHT;
+
 use nsh_base::tokens_of;
 use nsh_core::{
     element::{Registry, Root, Tokens},
