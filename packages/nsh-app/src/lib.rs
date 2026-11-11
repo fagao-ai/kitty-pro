@@ -5,6 +5,8 @@
 //! is a plain async function call.
 
 pub(crate) mod autostart;
+/// The backend: called directly, or over HTTP when this build runs in a browser.
+pub mod backend;
 mod domain;
 pub mod feedback;
 /// Chinese and English, keyed by the Chinese the app was written in.

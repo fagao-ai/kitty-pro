@@ -236,6 +236,50 @@ Notices appear at the top of the window and centred across its whole width, incl
 rail. Placement is asserted through the drawn frames (`a_notice_lands_top_centre`) because a
 text check cannot fail on position — the words are identical in any corner.
 
+### The same screens in a browser
+
+`src/backend.rs` is the only module that decides where the backend lives. Every screen calls
+`backend::` rather than `api::`, and the module has two arms per endpoint: a native process calls
+`api` directly, exactly as it did before this module existed; a page posts to `/api/*` on
+`packages/server`, because a browser cannot load a Go archive and the `api` functions under
+`wasm32` are stubs that refuse.
+
+One `backend!` table writes both arms, listing 32 endpoints in the same order as the
+`endpoints!` macro in `packages/server/src/routes.rs`. Two properties are what make the split
+safe:
+
+- **The signature is identical on both sides, error type included.** `api` compiles for the
+  browser, so `api::ApiError` exists there, and the wire error is decoded back into a real
+  `ApiErrorCode` — a screen that matches on a code keeps matching when the same screen is served
+  to a page. Nothing above this module knows which side it is on.
+- **The wire keys come from the parameter names.** `stringify!($arg)` produces the JSON key, and
+  the server reads arguments by the same rule, so the two ends agree by construction. An endpoint
+  cannot be wired to one side only: adding a row to the table compiles into both arms.
+
+Three calls are deliberately absent from the table: the TUN helper dispatch,
+`cleanup_stale_system_proxy_sentinel` and `shutdown_native_runtime`. They belong to whichever
+process starts, and a page cannot spawn a root helper or take a proxy down on the way out — so
+each native entry point owns its own copy, `src/main.rs` for the desktop app and
+`packages/server/src/main.rs:70,83,102` for a browser, which is why no screen had to change. The
+deleted `packages/web/src/main.rs` dispatched the helper and cleared the sentinel too, and left
+out the exit cleanup; the server has all three.
+
+The page reaches the server with no `capabilities` entry in `nsh.json`, which is deliberate: an
+app that declares none is treated as unrestricted (`nsh-engine-0.4.0/src/lib.rs:254`, checked at
+`lib.rs:2248`), so the request leaves as the relative `/api/…` the table wrote and the browser
+resolves it against the origin that served the page. Same origin is also what the server's own
+guard requires.
+
+Verified in a real headless Chrome, not only by unit test: the overview renders the server's
+answers — the core's `EMBEDDED · 1.13.14`, a `发现新版本 v1.0.13` banner from the update
+check, this machine's actual system-proxy setting — and a write made from inside the page
+round-trips (`POST /api/profile`, read back, `profile.json` in the server's
+`KITTY_PROFILE_DIR`) with the session cookie attached. No console errors.
+
+What this does *not* cover: the 测试连通 route is exercised against a server whose core is not
+running, and the suite still never starts a core, so `measure_node_latency` has no test on either
+arm. A page-driven connect has never been clicked.
+
 ## The visual language
 
 It is carried over rather than redesigned. `theme.json` defines 45 roles
@@ -267,8 +311,7 @@ Checked by reading both, not by assumption. What is left:
 | --- | --- |
 | Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. With no tray there is also nowhere for `AppStore::copy_proxy_environment` to live, and no menu-bar quit for `api::shutdown_native_runtime`. |
 | 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
-| Web shell | **The server half works; this crate is the half that does not talk to it yet.** `packages/server` serves the site this crate builds (`nsh package --target web`: 11.8 MB, an 11.1 MB wasm) next to 32 `/api/*` endpoints, and a `save_profile` then `load_profile` round trip through HTTP is verified end to end. What is missing is a transport: `store.rs` calls `api` directly, and under wasm those calls resolve to the in-process stubs, which is why the api wasm arms all read like refusals (`native_core_status` answers `"unavailable"` at `packages/api/src/core.rs:426`). Opening the page today renders the interface with no live data. The fix is a `cfg(target_arch = "wasm32")` transport over those ~29 call sites using NSH's `fetch` (`nsh-core/src/element/ambient.rs:783`, gated by `capabilities.network`) instead of the crate, plus `nsh-platform-web` as a declared host. |
-| Mobile shells (Android, iOS) | No build today, for two unrelated reasons. **Android:** `nsh package --target android` cannot host our `VpnService` — NSH ships a prebuilt `~/.nsh/embed/android/nsh.aar` whose manifest is pinned to `com.longbridge.nsh` with only the `INTERNET` permission and whose classes are just `AppActivity`/`DevActivity`, so there is no documented way to add a service, a second package, or `BIND_VPN_SERVICE`. A phone that *runs* the proxy needs a Gradle shell of our own; a phone that *remote-controls* a machine that runs it needs only the transport above. The Kotlin bridge is restored under `packages/mobile/android/` as a reference, and it is incomplete: `AndroidManifest.xml` references `@xml/network_security_config`, a file the deleted package never carried (`dx` supplied it from its own template), and the service reads `dev.dioxus.main.R` and `System.loadLibrary("main")`, which are wry's resource package and library name, not NSH's `com.longbridge.nsh`/`libnsh.so`. **iOS:** the core cannot be built at all — `packages/singbox/build.rs:31` panics for any target OS outside `{android, macos, linux, windows}` — and NetworkExtension was never implemented. |
+| Mobile shells (Android, iOS) | No build today, for two unrelated reasons. **Android:** `nsh package --target android` cannot host our `VpnService` — NSH ships a prebuilt `~/.nsh/embed/android/nsh.aar` whose manifest is pinned to `com.longbridge.nsh` with only the `INTERNET` permission and whose classes are just `AppActivity`/`DevActivity`, so there is no documented way to add a service, a second package, or `BIND_VPN_SERVICE`. A phone that *runs* the proxy needs a Gradle shell of our own; a phone that *remote-controls* a machine that runs it needs only the transport described under "The same screens in a browser". The Kotlin bridge is restored under `packages/mobile/android/` as a reference, and it is incomplete: `AndroidManifest.xml` references `@xml/network_security_config`, a file the deleted package never carried (`dx` supplied it from its own template), and the service reads `dev.dioxus.main.R` and `System.loadLibrary("main")`, which are wry's resource package and library name, not NSH's `com.longbridge.nsh`/`libnsh.so`. **iOS:** the core cannot be built at all — `packages/singbox/build.rs:31` panics for any target OS outside `{android, macos, linux, windows}` — and NetworkExtension was never implemented. |
 | Process entry points in a **packaged** build | **KNOWN BUG: TUN is broken in every shipped build.** `nsh package` uses a runner of its own and never reaches `src/main.rs`, so the packaged app skips the helper dispatch, the boot cleanup and the exit cleanup. [Details, the hook that fixes two of the three, and what cannot be fixed that way](#known-bug-packaged-build-entry-points). |
 
 ### Known bug: packaged-build entry points

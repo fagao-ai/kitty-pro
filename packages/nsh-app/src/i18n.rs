@@ -605,6 +605,9 @@ const ENGLISH: &[(&str, &str)] = &[
     ("{}：订阅已不在列表中", "{}: that subscription is no longer listed"),
     ("关闭 TUN 失败：{}", "Could not turn TUN off: {}"),
     ("准备 TUN 权限失败，内核未启动：{}", "Could not get TUN permission; the core did not start: {}"),
+    // The web client's only window onto a server that answered something other than
+    // the agreed envelope; the status is the one clue worth showing.
+    ("服务端返回了无法理解的内容（HTTP {}）", "The server replied with something unreadable (HTTP {})"),
     ("发现新版本 v{}", "A new version is available: v{}"),
     ("已切换到 {}", "Switched to {}"),
     ("已删除 {}", "Deleted {}"),

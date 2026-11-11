@@ -4,7 +4,7 @@
 //! directly, so what a press starts stays in one place and cancels the way the code says.
 
 pub use crate::domain::SystemProxy;
-use crate::i18n;
+use crate::{backend, i18n};
 use api::{ApiCoreStatus, CoreTraffic};
 use nsh_core::prelude::*;
 use proxy_core::{
@@ -568,7 +568,7 @@ impl AppStore {
     /// Read the profile and put it in the store. Runs once, from the root.
     pub fn load_profile(self) {
         self.work(async move {
-            match api::load_profile().await {
+            match backend::load_profile().await {
                 Ok(profile) => self.apply_profile(profile),
                 Err(error) => {
                     self.core_state.set("unavailable".to_owned());
@@ -672,7 +672,7 @@ impl AppStore {
             // rejects a pre-flight for a plain proxy config.
             let tun_requested = request.as_ref().is_some_and(|request| request.tun);
             if let Some(tun_request) = request.clone().filter(|_| enable && tun_requested) {
-                if let Err(error) = api::prepare_tun_mode(tun_request).await {
+                if let Err(error) = backend::prepare_tun_mode(tun_request).await {
                     self.core_busy.set(CoreBusy::Idle);
                     self.feedback
                         .error(i18n::fill("准备 TUN 权限失败，内核未启动：{}", &[&error]));
@@ -680,7 +680,7 @@ impl AppStore {
                     return;
                 }
             }
-            match api::set_core_enabled(enable, request).await {
+            match backend::set_core_enabled(enable, request).await {
                 Ok(status) => {
                     self.apply_core_status(status, enable);
                     if enable {
@@ -717,7 +717,7 @@ impl AppStore {
     /// a write is refused, because the value is not the app's to remember.
     pub fn refresh_system_proxy(self) {
         self.work(async move {
-            match api::system_proxy_status().await {
+            match backend::system_proxy_status().await {
                 Ok(status) => self.system_proxy.set(SystemProxy::Ready(status)),
                 Err(error) => self
                     .system_proxy
@@ -741,7 +741,7 @@ impl AppStore {
         }
         self.system_proxy_busy.set(true);
         self.work(async move {
-            match api::set_system_proxy(enable).await {
+            match backend::set_system_proxy(enable).await {
                 Ok(status) => {
                     self.system_proxy.set(SystemProxy::Ready(status));
                     self.feedback.success(if enable {
@@ -753,7 +753,7 @@ impl AppStore {
                 Err(error) => {
                     self.feedback
                         .error(i18n::fill("系统代理设置失败：{}", &[&error]));
-                    match api::system_proxy_status().await {
+                    match backend::system_proxy_status().await {
                         Ok(status) => self.system_proxy.set(SystemProxy::Ready(status)),
                         Err(refresh) => self
                             .system_proxy
@@ -794,7 +794,7 @@ impl AppStore {
         self.core_busy.set(CoreBusy::Restarting);
         self.bump_generation();
         let request = self.connection_request();
-        let result = api::restart_core(request).await;
+        let result = backend::restart_core(request).await;
         self.core_busy.set(CoreBusy::Idle);
         match result {
             Ok(status) => {
@@ -814,7 +814,7 @@ impl AppStore {
     /// One status read, used on first paint and by the "重新检测" action.
     pub fn refresh_status(self) {
         self.work(async move {
-            match api::core_status().await {
+            match backend::core_status().await {
                 Ok(status) => {
                     let running = status.state == "running";
                     self.apply_core_status(status, running);
@@ -862,7 +862,7 @@ impl AppStore {
                 {
                     return;
                 }
-                let Ok(traffic) = api::core_traffic().await else {
+                let Ok(traffic) = backend::core_traffic().await else {
                     return;
                 };
                 if self.poll_generation.get_untracked() != generation {
@@ -935,11 +935,11 @@ impl AppStore {
         self.work(async move {
             // Read-modify-write: the theme is the only field this path owns, so a
             // concurrent profile edit is not overwritten from a stale copy.
-            let Ok(mut profile) = api::load_profile().await else {
+            let Ok(mut profile) = backend::load_profile().await else {
                 return;
             };
             profile.dark_mode = self.dark_mode.get_untracked();
-            let _ = api::save_profile(profile).await;
+            let _ = backend::save_profile(profile).await;
         });
     }
 
@@ -948,11 +948,11 @@ impl AppStore {
     /// profile is not overwritten from a copy taken before it.
     fn persist_language(self) {
         self.work(async move {
-            let Ok(mut profile) = api::load_profile().await else {
+            let Ok(mut profile) = backend::load_profile().await else {
                 return;
             };
             profile.language = crate::i18n::lang_untracked().as_str().to_owned();
-            let _ = api::save_profile(profile).await;
+            let _ = backend::save_profile(profile).await;
         });
     }
 
@@ -1032,7 +1032,7 @@ impl AppStore {
     pub fn set_log_collection(self, enable: bool) {
         self.log_paused.set(!enable);
         self.work(async move {
-            if let Err(error) = api::set_core_log_collection(enable).await {
+            if let Err(error) = backend::set_core_log_collection(enable).await {
                 if enable {
                     self.log_paused.set(true);
                     self.log_note.set(Some(error.to_string()));
@@ -1059,7 +1059,7 @@ impl AppStore {
                     return;
                 }
                 let cursor = self.log_cursor.get_untracked();
-                match api::core_logs(cursor).await {
+                match backend::core_logs(cursor).await {
                     Ok(batch) => {
                         // The cursor advances even for an empty batch: not moving it
                         // would re-read the same window for ever.
@@ -1133,7 +1133,7 @@ impl AppStore {
         self.import_busy.set(true);
         self.import_error.set(None);
         self.work(async move {
-            let result = api::preview_subscription(source.clone()).await;
+            let result = backend::preview_subscription(source.clone()).await;
             // The dialog may have been closed, or another import started, while this was
             // in flight. A late result must not reopen it or overwrite the newer state.
             if self.import_generation.get_untracked() != generation {
@@ -1339,7 +1339,7 @@ impl AppStore {
                     .find(|subscription| subscription.id == id)
                     .map(|subscription| subscription.name)
                     .unwrap_or_else(|| format!("#{id}"));
-                match api::preview_subscription(source).await {
+                match backend::preview_subscription(source).await {
                     Ok(report) => {
                         let mut outcome = None;
                         self.subscriptions.update(|stored| {
@@ -1660,7 +1660,7 @@ impl AppStore {
             ..self.connection_request()
         };
         self.work(async move {
-            let result = api::validate_config_script(request).await;
+            let result = backend::validate_config_script(request).await;
             self.script_busy.set(false);
             self.feedback
                 .settled("配置脚本校验", result.map(|_| "配置脚本校验通过"));
@@ -1683,7 +1683,7 @@ impl AppStore {
         }
         self.rule_sets_busy.set(true);
         self.work(async move {
-            let result = api::update_rule_sets(true).await;
+            let result = backend::update_rule_sets(true).await;
             self.rule_sets_busy.set(false);
             self.feedback
                 .settled("更新分流规则", result.map(|_| "分流规则已更新"));
@@ -1714,7 +1714,7 @@ impl AppStore {
         let generation = self.latency_generation.get_untracked();
         self.latency_busy.set(true);
         self.work(async move {
-            let Ok(session) = api::start_node_latency(nodes, Vec::new()).await else {
+            let Ok(session) = backend::start_node_latency(nodes, Vec::new()).await else {
                 self.latency_busy.set(false);
                 return;
             };
@@ -1731,7 +1731,7 @@ impl AppStore {
                     self.latency_cancel.set(false);
                     break;
                 }
-                match api::poll_node_latency(session).await {
+                match backend::poll_node_latency(session).await {
                     Ok(snapshot) => {
                         if !snapshot.results.is_empty()
                             && self.latency_generation.get_untracked() == generation
@@ -1788,7 +1788,7 @@ impl AppStore {
         if !enable {
             self.core_busy.set(CoreBusy::Tun);
             self.work(async move {
-                match api::release_tun_mode().await {
+                match backend::release_tun_mode().await {
                     Ok(()) => self.feedback.success("TUN 模式已关闭"),
                     Err(error) => {
                         self.feedback
@@ -1831,7 +1831,7 @@ impl AppStore {
     /// caller that is mid-flow (importing, say) can fold it into its own message instead of
     /// two notices arriving for one action.
     async fn save(self) -> Result<(), String> {
-        let mut profile = api::load_profile()
+        let mut profile = backend::load_profile()
             .await
             .map_err(|error| error.to_string())?;
         profile.subscriptions = self.subscriptions.get_untracked();
@@ -1847,7 +1847,7 @@ impl AppStore {
         profile.config_script_enabled = self.config_script_enabled.get_untracked();
         profile.config_script = self.config_script.get_untracked();
         profile.group_selections = self.group_selections.get_untracked();
-        api::save_profile(profile)
+        backend::save_profile(profile)
             .await
             .map_err(|error| error.to_string())
     }
@@ -1926,7 +1926,7 @@ impl AppStore {
         let group_for_call = group.clone();
         let outbound_for_call = outbound.clone();
         self.work(async move {
-            if api::select_proxy_group(group_for_call, outbound_for_call)
+            if backend::select_proxy_group(group_for_call, outbound_for_call)
                 .await
                 .is_ok()
             {
@@ -1981,7 +1981,7 @@ impl AppStore {
         self.probe_busy.set(true);
         self.probe_result.set(None);
         self.work(async move {
-            let outcome = match api::probe_connectivity().await {
+            let outcome = match backend::probe_connectivity().await {
                 Ok(probe) => ProbeOutcome {
                     ok: probe.ok,
                     detail: probe.detail,
@@ -2066,7 +2066,7 @@ impl AppStore {
         }
         self.env_copy_busy.set(true);
         self.work(async move {
-            let result = api::copy_proxy_environment_variables()
+            let result = backend::copy_proxy_environment_variables()
                 .await
                 .map_err(|error| error.to_string());
             self.env_copy_busy.set(false);
@@ -2144,7 +2144,7 @@ impl AppStore {
         self.processes_loaded.set(false);
         self.processes_error.set(None);
         self.work(async move {
-            let result = api::list_running_processes()
+            let result = backend::list_running_processes()
                 .await
                 .map_err(|error| error.to_string());
             self.processes_busy.set(false);
@@ -2184,7 +2184,7 @@ impl AppStore {
     /// loss the user cannot see coming and cannot undo.
     pub fn refresh_sync_config(self) {
         self.work(async move {
-            match api::load_sync_config().await {
+            match backend::load_sync_config().await {
                 Ok(config) => {
                     self.sync_config.set(Some(config));
                     self.sync_load_error.set(None);
@@ -2315,7 +2315,7 @@ impl AppStore {
             return;
         };
         self.work(async move {
-            let result = api::save_sync_config(config)
+            let result = backend::save_sync_config(config)
                 .await
                 .map(|saved| {
                     self.sync_config.set(Some(saved));
@@ -2348,7 +2348,7 @@ impl AppStore {
         };
         let snapshot = self.build_snapshot();
         self.work(async move {
-            let result = api::sync_push(config, snapshot, force)
+            let result = backend::sync_push(config, snapshot, force)
                 .await
                 .map(|result| {
                     self.remember_sync_checkpoint(&result);
@@ -2376,7 +2376,7 @@ impl AppStore {
         };
         let current = self.snapshot_profile();
         self.work(async move {
-            let downloaded = match api::sync_pull(config.clone()).await {
+            let downloaded = match backend::sync_pull(config.clone()).await {
                 Ok(downloaded) => downloaded,
                 Err(error) => {
                     self.settle_sync(SyncAction::Pull, Err(error.to_string()));
@@ -2388,7 +2388,7 @@ impl AppStore {
                 remote_subscriptions: snapshot.subscriptions.len(),
                 remote_rules: snapshot.custom_rules.len(),
             };
-            let result = api::commit_sync_pull(
+            let result = backend::commit_sync_pull(
                 config,
                 current,
                 snapshot.clone(),
@@ -2421,7 +2421,7 @@ impl AppStore {
     /// read has already succeeded once — the pull wrote the file.
     fn apply_profile_from_disk(self) {
         self.work(async move {
-            if let Ok(profile) = api::load_profile().await {
+            if let Ok(profile) = backend::load_profile().await {
                 self.apply_profile(profile);
                 if self.connected.get_untracked() {
                     self.mark_config_dirty();
@@ -2524,7 +2524,7 @@ impl AppStore {
     /// previous answer to avoid calling a failed check "已是最新".
     pub fn refresh_update_state(self) {
         self.work(async move {
-            match api::update::load_update_settings().await {
+            match backend::load_update_settings().await {
                 Ok(settings) => self.update_settings.set(Some(settings)),
                 Err(error) => self
                     .update_error
@@ -2551,7 +2551,7 @@ impl AppStore {
                 current_version: crate::domain::APP_VERSION.to_owned(),
                 force,
             };
-            match api::update::check_app_update(request).await {
+            match backend::check_app_update(request).await {
                 Ok(status) => {
                     // An answer replaces any earlier failure; a failure inside an otherwise
                     // good answer (a state file that would not write) is carried by the status
@@ -2633,7 +2633,7 @@ impl AppStore {
             ..settings
         };
         self.work(async move {
-            let result = api::update::save_update_settings(request)
+            let result = backend::save_update_settings(request)
                 .await
                 .map_err(|error| error.to_string());
             self.update_busy.set(false);
@@ -2670,7 +2670,7 @@ impl AppStore {
         }
         self.update_busy.set(true);
         self.work(async move {
-            let result = api::update::dismiss_app_update(version.clone())
+            let result = backend::dismiss_app_update(version.clone())
                 .await
                 .map_err(|error| error.to_string());
             self.update_busy.set(false);
@@ -2824,7 +2824,7 @@ fn watch_groups(inputs: WatchInputs) -> Resource<Vec<proxy_core::ProxyGroup>, St
             (!parts.nodes.is_empty()).then_some(parts)
         },
         |parts, _info| async move {
-            api::preview_proxy_groups(build_request(parts))
+            backend::preview_proxy_groups(build_request(parts))
                 .await
                 .map_err(|error| error.to_string())
         },

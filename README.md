@@ -118,12 +118,17 @@ web server had them: binding a non-loopback address needs `--allow-lan` (or
 `KITTY_PRO_ALLOWED_HOSTS` as an exact-match list. The session cookie is generated
 per process, so restarting the server signs out every page.
 
-**Status: this half works; the other half does not yet.** The server answers
-`/api/*` and serves the site — but the page still calls `api` in-process inside
-its own WebAssembly, where every backend function is a stub that refuses. Opening
-the URL shows the interface with no live data until the client grows a transport
-that calls `/api/*` instead. That is the next piece of work, tracked in
-`packages/nsh-app/README.md`.
+The page reaches this process through `packages/nsh-app/src/backend.rs`: one table
+of endpoints with two arms, so a native build calls `api` directly and a browser
+build posts to `/api/*`. No screen knows which side it is on — the signatures,
+including the error type, are the same on both.
+
+Verified in a real headless Chrome rather than only by unit test: the overview
+renders the server's own answers (the core's `EMBEDDED · 1.13.14` version, a
+`发现新版本 v1.0.13` banner from the update check, this machine's actual
+system-proxy setting), and a write made from inside the page — `POST /api/profile`,
+read back, `profile.json` on disk — round-trips with the session cookie attached.
+No console errors.
 
 On desktop systems, enabling TUN performs configuration validation and asks
 for network privileges immediately. Starting the core then reuses that
@@ -181,11 +186,10 @@ Each archive gets a `.sha256` sidecar. Run the workflow manually from the
 repository's **Actions** page, or push a tag such as `v1.0.14`; a `v*` tag also
 creates a GitHub Release and attaches the archives.
 
-Only the desktop app is published. `packages/server` builds and passes its tests
-but the workflow does not package it yet, and the web interface cannot drive it
-from a browser until the client grows a transport that calls `/api/*` — see
-`packages/nsh-app/README.md`. Android and iOS have no build at all, for the
-unrelated reasons recorded in the same table.
+Only the desktop app is published. `packages/server` builds, is tested and drives a
+browser, but the workflow does not package it into a release archive yet. Android
+and iOS have no build at all, for the unrelated reasons recorded in
+`packages/nsh-app/README.md`.
 
 The macOS app is ad hoc signed and the Windows and Linux builds are unsigned.
 Apple notarization and Windows Authenticode signing require developer
