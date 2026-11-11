@@ -890,6 +890,15 @@ pub(crate) fn restart_native_core(
 }
 
 #[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn restart_native_core(
+    _request: ConnectionRequest,
+    _rule_set_cache: Option<RuleSetCachePaths>,
+) -> Result<ApiCoreStatus, ApiError> {
+    Err(ApiError::new("浏览器目标不能直接运行嵌入式 sing-box 内核"))
+}
+
+#[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 pub(crate) fn prepare_native_tun_mode(
     request: ConnectionRequest,

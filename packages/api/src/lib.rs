@@ -431,10 +431,20 @@ fn validate_node_tag(tag: &str) -> Result<(), ApiError> {
 }
 
 pub async fn load_sync_config() -> Result<SyncConfig, ApiError> {
-    run_native_blocking("读取同步配置任务失败", || {
-        load_native_sync_config().map(|config| sync::masked_for_client(&config))
-    })
-    .await
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        run_native_blocking("读取同步配置任务失败", || {
+            load_native_sync_config().map(|config| sync::masked_for_client(&config))
+        })
+        .await
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // `sync` is a native module: credentials live in `sync.json`, which a browser
+        // must never read. `load_native_sync_config` already answers with a default
+        // here; the masking it used to pass through is what does not exist.
+        load_native_sync_config()
+    }
 }
 
 pub async fn save_sync_config(config: SyncConfig) -> Result<SyncConfig, ApiError> {
@@ -516,7 +526,7 @@ pub async fn sync_pull(config: SyncConfig) -> Result<SyncPullResult, ApiError> {
 
 pub async fn commit_sync_pull(
     config: SyncConfig,
-    mut current_profile: AppProfile,
+    current_profile: AppProfile,
     snapshot: SyncSnapshot,
     remote_revision: String,
 ) -> Result<SyncResult, ApiError> {
@@ -536,8 +546,8 @@ pub async fn commit_sync_pull(
         // snapshot overwrites it, so a bad pull can still be rolled back.
         let backup_note =
             run_native_blocking("备份本地配置失败", backup_local_profile_before_sync_pull).await;
-        snapshot.apply_to_profile(&mut current_profile);
-        let profile = current_profile;
+        let mut profile = current_profile;
+        snapshot.apply_to_profile(&mut profile);
         run_native_blocking("保存下载的同步配置失败", move || {
             save_native_profile(&profile)
         })
