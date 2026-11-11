@@ -1154,8 +1154,9 @@ fn pausing_collection_from_the_floating_action_stops_the_feed() {
 /// The disc is neutral while nothing runs and lights up only when the proxy does.
 ///
 /// The first cut was always orange, which shouted the same thing whether the core was up or not
-/// and spent the one colour that could carry a state. `packages/ui` draws its power button on an
-/// inset surface with no glow, and switches it to the accent with a glow and a halo when active;
+/// and spent the one colour that could carry a state. The deleted Dioxus `packages/ui` drew its
+/// power button on an inset surface with no glow, and switched it to the accent with a glow and
+/// a halo when active;
 /// that is what this checks, through the styles the platform is handed rather than by eye.
 #[test]
 fn the_disc_is_neutral_until_the_core_is_running() {
@@ -1344,8 +1345,8 @@ fn a_saved_dark_appearance_comes_back_after_a_relaunch() {
     );
 }
 
-/// A profile in the format the Dioxus app writes, generated from `AppProfile` itself so
-/// the port is shown to read real files rather than a shape invented for the test. Two
+/// A profile in the format a real release writes, generated from `AppProfile` itself so
+/// the screens are shown to read real files rather than a shape invented for the test. Two
 /// nodes, one chosen. It caught a wrong guess the first time: protocols serialize in
 /// lowercase and `auth` is internally tagged with `kind`.
 const SEEDED_PROFILE: &str = include_str!("fixtures/profile-two-nodes.json");
@@ -2390,7 +2391,8 @@ fn a_choice_with_no_core_running_is_saved_and_says_so() {
 }
 
 /// The other direction: a profile that arrives with the two fields disagreeing. This is the only
-/// route to that shape that is not this app's fault — the Dioxus shell and a sync pull write the
+/// route to that shape that is not this app's fault — a profile from an older release, or a
+/// sync pull, writes the
 /// same file — and the field the engine obeys is not the one the list shows, so loading has to
 /// reconcile them rather than draw a choice the core will not honour.
 #[test]

@@ -4,7 +4,6 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
 icon_dir="$project_dir/assets/icon"
-android_res="$project_dir/packages/mobile/android/res"
 temporary_dir="$(mktemp -d /tmp/kitty-pro-icons.XXXXXX)"
 iconset_dir="$temporary_dir/kitty-pro.iconset"
 mkdir -p "$iconset_dir"
@@ -52,27 +51,10 @@ magick \
   "$icon_dir/kitty-pro-128.png" \
   "$icon_dir/kitty-pro-256.png" \
   "$icon_dir/kitty-pro.ico"
-cp "$icon_dir/kitty-pro.ico" "$project_dir/packages/web/assets/favicon.ico"
-cp "$icon_dir/kitty-pro.svg" "$project_dir/packages/ui/assets/kitty-pro.svg"
 
-render_android_icon() {
-  local density="$1"
-  local launcher_size="$2"
-  local foreground_size="$3"
-  local launcher_dir="$android_res/mipmap-$density"
-  local foreground_dir="$android_res/drawable-$density"
-
-  render_png "$icon_dir/kitty-pro.svg" "$launcher_size" \
-    "$launcher_dir/kitty_launcher.png"
-  cp "$launcher_dir/kitty_launcher.png" "$launcher_dir/kitty_launcher_round.png"
-  render_png "$icon_dir/kitty-pro-foreground.svg" "$foreground_size" \
-    "$foreground_dir/kitty_launcher_foreground.png"
-}
-
-render_android_icon mdpi 48 108
-render_android_icon hdpi 72 162
-render_android_icon xhdpi 96 216
-render_android_icon xxhdpi 144 324
-render_android_icon xxxhdpi 192 432
+# The NSH app bundles the icon out of its own crate, so the 1024px render is copied
+# in rather than referenced across packages.
+cp "$icon_dir/kitty-pro-1024.png" \
+  "$project_dir/packages/nsh-app/assets/icon-1024.png"
 
 echo "Generated Kitty Pro icons from $icon_dir/kitty-pro.svg"

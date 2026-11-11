@@ -1,7 +1,7 @@
 //! Copy and units shared by every screen.
 //!
-//! Pure functions with no engine dependency, kept identical to the Dioxus UI so a
-//! translated screen shows the same text. `cargo test` exercises them without a surface.
+//! Pure functions with no engine dependency, so a translated screen shows the same text as any
+//! other and `cargo test` exercises them without a surface.
 
 use crate::ui::theme::Tint;
 use api::{RouteDecision, RouteTargetKind};
@@ -16,9 +16,9 @@ pub const PROXY_PORT: u16 = 7890;
 
 /// This build's version, as the about card and the diagnostic text name it.
 ///
-/// Read from the crate rather than written down: the Dioxus shells pass
-/// `env!("CARGO_PKG_VERSION")` of their own entry point, and an NSH build is one crate that
-/// serves every window, so the same expression here reports the same kind of fact.
+/// Read from the crate rather than written down: the release workflow stamps this crate's
+/// `version` from the git tag (`scripts/set-package-version.sh`), so a build can only report the
+/// version it really is. A hardcoded literal here would outlive its own release.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Two-letter protocol marks for the node row's badge.
@@ -851,8 +851,8 @@ pub fn custom_rule_match_label(match_type: CustomRuleMatch) -> &'static str {
 /// and the templated two carry their hole through `fill_at` like any other composed sentence, with
 /// the number taken from the constant that enforces it rather than from a copy of it.
 ///
-/// Pure, and taking the language, because `proxy_core` is shared with the Dioxus shell and so
-/// cannot translate anything itself; this is this app's own reading of those words.
+/// Pure, and taking the language, because `proxy_core` answers in Chinese and knows nothing of
+/// this app's languages; this is this app's own reading of those words.
 pub fn rule_error_message(
     error: &proxy_core::CustomRuleValidationError,
     lang: crate::i18n::Lang,
@@ -1545,7 +1545,7 @@ impl SyncProviderForm {
     }
 
     /// The segment's label. Both are proper nouns of the storage being spoken to, so they stay
-    /// untranslated on a Chinese page, as they do in the Dioxus shell.
+    /// untranslated on a Chinese page.
     pub fn label(self) -> &'static str {
         match self {
             SyncProviderForm::WebDav => "WebDAV",
@@ -2024,8 +2024,9 @@ mod disc_skin_tests {
 
 /// The size of a switch, and the distance its thumb travels.
 ///
-/// `packages/ui` states these once (`.switch` / `.switch::after` in `app.css`) and every
-/// toggle reuses them; the NSH control has no look of its own, so the same numbers are read
+/// The deleted Dioxus `packages/ui` stated these once (`.switch` / `.switch::after` in
+/// `app.css`) and every toggle reused them; the NSH control has no look of its own, so the same
+/// numbers are read
 /// from here instead of being repeated at each of the ten call sites — where a changed `inset`
 /// would silently stop matching `travel`, which is exactly the bug this struct exists to
 /// prevent. It was a real one: the thumb never moved, so every switch on screen looked on and

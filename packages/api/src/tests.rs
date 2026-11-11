@@ -951,7 +951,7 @@ fn latency_session_returns_only_incremental_results() {
     assert!(poll_native_latency_session(session_id).is_err());
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn native_subscription_preview_runs_in_process() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -967,7 +967,7 @@ fn native_subscription_preview_runs_in_process() {
     assert_eq!(report.nodes[0].protocol, proxy_core::ProxyProtocol::Trojan);
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn native_http_proxy_preview_is_not_downloaded_as_a_subscription() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -985,7 +985,7 @@ fn native_http_proxy_preview_is_not_downloaded_as_a_subscription() {
     assert_eq!(report.nodes[0].port, 8080);
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn native_company_proxy_preview_creates_one_socks5_node() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1014,14 +1014,14 @@ fn native_blocking_operations_run_off_the_calling_thread() {
         .expect("native test runtime should start");
     let operation_thread = runtime
         .block_on(run_native_blocking("test task failed", || {
-            Ok::<_, ServerFnError>(std::thread::current().id())
+            Ok::<_, ApiError>(std::thread::current().id())
         }))
         .expect("blocking operation should complete");
 
     assert_ne!(calling_thread, operation_thread);
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "server")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 #[ignore = "requires KITTY_TEST_SUBSCRIPTION_URL and live network access"]
 fn live_native_latency_probe_returns_without_aborting() {
@@ -1038,7 +1038,7 @@ fn live_native_latency_probe_returns_without_aborting() {
             .sort_by_key(|node| node.protocol != proxy_core::ProxyProtocol::AnyTls);
         report.nodes.truncate(8);
         if report.nodes.is_empty() {
-            return Err(ServerFnError::new("订阅没有可探测的节点"));
+            return Err(ApiError::new("订阅没有可探测的节点"));
         }
         measure_node_latency(report.nodes, report.proxy_server_nameservers).await
     });
@@ -1353,7 +1353,7 @@ fn api_error_code_http_status_is_reasonable() {
 }
 
 #[test]
-fn api_err_code_is_recoverable_from_server_fn_error() {
+fn api_err_code_is_recoverable_from_an_api_error() {
     let codes = [
         ApiErrorCode::InvalidInput,
         ApiErrorCode::NotFound,
@@ -1368,14 +1368,11 @@ fn api_err_code_is_recoverable_from_server_fn_error() {
     ];
     for code in codes {
         let error = api_err(code, "测试消息");
-        assert_eq!(error_code_from_server_fn(&error), Some(code));
+        assert_eq!(error_code(&error), Some(code));
         assert!(error.to_string().contains(code.as_str()));
     }
-    // A plain ServerFnError without a prefix carries no code.
-    assert_eq!(
-        error_code_from_server_fn(&ServerFnError::new("普通错误")),
-        None
-    );
+    // A plain ApiError without a prefix carries no code.
+    assert_eq!(error_code(&ApiError::new("普通错误")), None);
 }
 
 #[test]
@@ -1389,33 +1386,41 @@ fn api_err_redacts_secret_bearing_urls() {
     assert!(!rendered.contains("user:pass@"), "{rendered}");
     assert!(rendered.contains("[credential-redacted]"), "{rendered}");
     // The code must still be recoverable after redaction.
-    assert_eq!(
-        error_code_from_server_fn(&error),
-        Some(ApiErrorCode::Network)
-    );
+    assert_eq!(error_code(&error), Some(ApiErrorCode::Network));
 }
 
 #[test]
 fn api_error_display_includes_code_prefix() {
     let error = ApiError {
-        code: ApiErrorCode::InvalidInput,
+        code: Some(ApiErrorCode::InvalidInput),
         message: "订阅数量超过 64 个限制".to_string(),
     };
     assert_eq!(format!("{error}"), "[E1001] 订阅数量超过 64 个限制");
 }
 
 #[test]
-fn api_error_from_impl_encodes_code() {
+fn api_error_keeps_its_code_without_a_string_round_trip() {
     let error = ApiError {
-        code: ApiErrorCode::Conflict,
+        code: Some(ApiErrorCode::Conflict),
         message: "远程同步文件已被其他设备修改".to_string(),
     };
-    let server_error: ServerFnError = error.into();
-    assert_eq!(
-        error_code_from_server_fn(&server_error),
-        Some(ApiErrorCode::Conflict)
-    );
-    assert!(server_error
-        .to_string()
-        .contains("远程同步文件已被其他设备修改"));
+    assert_eq!(error_code(&error), Some(ApiErrorCode::Conflict));
+    assert!(error.to_string().contains("远程同步文件已被其他设备修改"));
+}
+
+#[test]
+fn an_unclassified_error_still_reads_a_code_embedded_in_its_message() {
+    // Call sites that assemble a message which already carries the marker hand
+    // it to `ApiError::new`; the code must still be readable, and `Display`
+    // must not double it.
+    let error = ApiError::new("[E1007] 内核未能启动");
+    assert_eq!(error_code(&error), Some(ApiErrorCode::Core));
+    assert_eq!(error.to_string(), "[E1007] 内核未能启动");
+}
+
+#[test]
+fn a_bare_message_has_no_code_and_is_rendered_verbatim() {
+    let error = ApiError::new("当前平台尚未实现系统代理适配");
+    assert_eq!(error_code(&error), None);
+    assert_eq!(error.to_string(), "当前平台尚未实现系统代理适配");
 }

@@ -5,28 +5,29 @@
 //! 写当前用户的 LaunchAgent，避免库拼接 XML 时不转义路径。
 #[cfg(target_os = "linux")]
 use auto_launch::{AutoLaunch, AutoLaunchBuilder, LinuxLaunchMode};
-use dioxus::prelude::ServerFnError;
 use std::path::{Path, PathBuf};
+
+use crate::ApiError;
 
 const ID: &str = "com.kitty-pro.autostart";
 
-pub async fn status() -> Result<bool, ServerFnError> {
+pub async fn status() -> Result<bool, ApiError> {
     super::run_native_blocking("读取登录自启动失败", || {
-        read_enabled(false).map_err(ServerFnError::new)
+        read_enabled(false).map_err(ApiError::new)
     })
     .await
 }
 
-pub async fn set_enabled(enabled: bool) -> Result<bool, ServerFnError> {
+pub async fn set_enabled(enabled: bool) -> Result<bool, ApiError> {
     super::run_native_blocking("设置登录自启动失败", move || {
         if enabled {
-            enable().map_err(ServerFnError::new)?;
+            enable().map_err(ApiError::new)?;
         } else {
-            disable().map_err(ServerFnError::new)?;
+            disable().map_err(ApiError::new)?;
         }
-        let actual = read_enabled(false).map_err(ServerFnError::new)?;
+        let actual = read_enabled(false).map_err(ApiError::new)?;
         if actual != enabled {
-            return Err(ServerFnError::new(
+            return Err(ApiError::new(
                 "系统未应用登录自启动设置，请检查当前用户的启动项权限",
             ));
         }

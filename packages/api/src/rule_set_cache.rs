@@ -16,7 +16,7 @@ pub(crate) fn rule_set_update_lock() -> &'static tokio::sync::Mutex<()> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn prepare_rule_set_cache_for_request(
     request: Option<&ConnectionRequest>,
-) -> Result<Option<RuleSetCachePaths>, ServerFnError> {
+) -> Result<Option<RuleSetCachePaths>, ApiError> {
     if request.map(|request| request.mode) != Some(TunnelMode::Rule) {
         return Ok(None);
     }
@@ -46,14 +46,12 @@ pub(crate) async fn prepare_rule_set_cache_for_request(
 #[allow(dead_code)]
 pub(crate) async fn prepare_rule_set_cache_for_request(
     _request: Option<&ConnectionRequest>,
-) -> Result<Option<RuleSetCachePaths>, ServerFnError> {
+) -> Result<Option<RuleSetCachePaths>, ApiError> {
     Ok(None)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) async fn native_update_rule_sets(
-    force: bool,
-) -> Result<RuleSetUpdateResult, ServerFnError> {
+pub(crate) async fn native_update_rule_sets(force: bool) -> Result<RuleSetUpdateResult, ApiError> {
     let _guard = rule_set_update_lock().lock().await;
     let paths = native_rule_set_cache_paths()?;
     if !force {
@@ -72,16 +70,14 @@ pub(crate) async fn native_update_rule_sets(
 
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)]
-pub(crate) async fn native_update_rule_sets(
-    _force: bool,
-) -> Result<RuleSetUpdateResult, ServerFnError> {
-    Err(ServerFnError::new("浏览器端不能直接更新分流规则"))
+pub(crate) async fn native_update_rule_sets(_force: bool) -> Result<RuleSetUpdateResult, ApiError> {
+    Err(ApiError::new("浏览器端不能直接更新分流规则"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn download_and_install_rule_sets(
     paths: RuleSetCachePaths,
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     use std::time::Duration;
 
     let client = reqwest::Client::builder()
@@ -111,7 +107,7 @@ pub(crate) async fn download_rule_set(
     client: reqwest::Client,
     url: &'static str,
     label: &'static str,
-) -> Result<Vec<u8>, ServerFnError> {
+) -> Result<Vec<u8>, ApiError> {
     let response = client
         .get(url)
         .send()
@@ -144,59 +140,58 @@ pub(crate) async fn download_rule_set(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn native_rule_set_cache_paths() -> Result<RuleSetCachePaths, ServerFnError> {
+pub(crate) fn native_rule_set_cache_paths() -> Result<RuleSetCachePaths, ApiError> {
     let profile = profile_path()?;
     let directory = profile
         .parent()
-        .ok_or_else(|| ServerFnError::new("无法确定规则缓存目录"))?
+        .ok_or_else(|| ApiError::new("无法确定规则缓存目录"))?
         .join("rules");
     let geosite = directory.join("geosite-cn.srs");
     let geoip = directory.join("geoip-cn.srs");
     Ok(RuleSetCachePaths {
         geosite: geosite
             .to_str()
-            .ok_or_else(|| ServerFnError::new("域名规则缓存路径不是有效 UTF-8"))?
+            .ok_or_else(|| ApiError::new("域名规则缓存路径不是有效 UTF-8"))?
             .to_string(),
         geoip: geoip
             .to_str()
-            .ok_or_else(|| ServerFnError::new("IP 规则缓存路径不是有效 UTF-8"))?
+            .ok_or_else(|| ApiError::new("IP 规则缓存路径不是有效 UTF-8"))?
             .to_string(),
     })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn prepare_native_cache_file() -> Result<String, ServerFnError> {
+pub(crate) fn prepare_native_cache_file() -> Result<String, ApiError> {
     let profile = profile_path()?;
     let directory = profile
         .parent()
-        .ok_or_else(|| ServerFnError::new("无法确定 sing-box 缓存目录"))?
+        .ok_or_else(|| ApiError::new("无法确定 sing-box 缓存目录"))?
         .join("cache");
     std::fs::create_dir_all(&directory)
-        .map_err(|error| ServerFnError::new(format!("创建 sing-box 缓存目录失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("创建 sing-box 缓存目录失败: {error}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).map_err(
-            |error| ServerFnError::new(format!("限制 sing-box 缓存目录权限失败: {error}")),
-        )?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| ApiError::new(format!("限制 sing-box 缓存目录权限失败: {error}")))?;
     }
 
     let path = directory.join("sing-box.db");
     prepare_private_cache_file(&path)?;
     path.to_str()
         .map(str::to_string)
-        .ok_or_else(|| ServerFnError::new("sing-box 缓存路径不是有效 UTF-8"))
+        .ok_or_else(|| ApiError::new("sing-box 缓存路径不是有效 UTF-8"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn prepare_private_cache_file(path: &std::path::Path) -> Result<(), ServerFnError> {
+pub(crate) fn prepare_private_cache_file(path: &std::path::Path) -> Result<(), ApiError> {
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
-            return Err(ServerFnError::new("sing-box 缓存文件不能是符号链接"));
+            return Err(ApiError::new("sing-box 缓存文件不能是符号链接"));
         }
         if !metadata.file_type().is_file() {
-            return Err(ServerFnError::new("sing-box 缓存路径不是普通文件"));
+            return Err(ApiError::new("sing-box 缓存路径不是普通文件"));
         }
     }
     let mut options = std::fs::OpenOptions::new();
@@ -209,31 +204,27 @@ pub(crate) fn prepare_private_cache_file(path: &std::path::Path) -> Result<(), S
     }
     let file = options
         .open(path)
-        .map_err(|error| ServerFnError::new(format!("准备 sing-box 缓存文件失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("准备 sing-box 缓存文件失败: {error}")))?;
     if !file
         .metadata()
-        .map_err(|error| ServerFnError::new(format!("检查 sing-box 缓存文件失败: {error}")))?
+        .map_err(|error| ApiError::new(format!("检查 sing-box 缓存文件失败: {error}")))?
         .is_file()
     {
-        return Err(ServerFnError::new("sing-box 缓存路径不是普通文件"));
+        return Err(ApiError::new("sing-box 缓存路径不是普通文件"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| {
-                ServerFnError::new(format!("限制 FakeIP 缓存文件权限失败: {error}"))
-            })?;
+            .map_err(|error| ApiError::new(format!("限制 FakeIP 缓存文件权限失败: {error}")))?;
     }
     drop(file);
     Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn native_rule_set_cache_ready(
-    paths: &RuleSetCachePaths,
-) -> Result<bool, ServerFnError> {
+pub(crate) fn native_rule_set_cache_ready(paths: &RuleSetCachePaths) -> Result<bool, ApiError> {
     let geosite = std::path::Path::new(&paths.geosite);
     let geoip = std::path::Path::new(&paths.geoip);
     recover_rule_set_transaction(geosite, geoip)?;
@@ -245,9 +236,7 @@ pub(crate) fn native_rule_set_cache_ready(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn native_rule_set_cache_current(
-    paths: &RuleSetCachePaths,
-) -> Result<bool, ServerFnError> {
+pub(crate) fn native_rule_set_cache_current(paths: &RuleSetCachePaths) -> Result<bool, ApiError> {
     if !native_rule_set_cache_ready(paths)? {
         return Ok(false);
     }
@@ -255,7 +244,7 @@ pub(crate) fn native_rule_set_cache_current(
         let age = std::fs::metadata(path)
             .and_then(|metadata| metadata.modified())
             .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
-            .map_err(|error| ServerFnError::new(format!("读取规则缓存时间失败: {error}")))?;
+            .map_err(|error| ApiError::new(format!("读取规则缓存时间失败: {error}")))?;
         if age > RULE_SET_CACHE_TTL {
             return Ok(false);
         }
@@ -268,19 +257,19 @@ pub(crate) fn install_rule_set_cache(
     paths: &RuleSetCachePaths,
     geosite_content: &[u8],
     geoip_content: &[u8],
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     use std::io::Write;
 
     let geosite = std::path::Path::new(&paths.geosite);
     let geoip = std::path::Path::new(&paths.geoip);
     let directory = geosite
         .parent()
-        .ok_or_else(|| ServerFnError::new("域名规则缓存目录无效"))?;
+        .ok_or_else(|| ApiError::new("域名规则缓存目录无效"))?;
     if geoip.parent() != Some(directory) {
-        return Err(ServerFnError::new("规则缓存文件不在同一目录"));
+        return Err(ApiError::new("规则缓存文件不在同一目录"));
     }
     std::fs::create_dir_all(directory)
-        .map_err(|error| ServerFnError::new(format!("创建规则缓存目录失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("创建规则缓存目录失败: {error}")))?;
     recover_rule_set_transaction(geosite, geoip)?;
 
     let geosite_temp = directory.join(".geosite-cn.pending.tmp");
@@ -309,7 +298,7 @@ pub(crate) fn install_rule_set_cache(
     {
         let _ = std::fs::remove_file(&geosite_temp);
         let _ = std::fs::remove_file(&geoip_temp);
-        return Err(ServerFnError::new(error.to_string()));
+        return Err(ApiError::new(error.to_string()));
     }
 
     let geosite_backup = rule_set_backup_path(geosite);
@@ -460,10 +449,10 @@ pub(crate) fn rollback_rule_set_pair(
 pub(crate) fn finish_rule_set_transaction(
     geosite: &std::path::Path,
     geoip: &std::path::Path,
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     let directory = geosite
         .parent()
-        .ok_or_else(|| ServerFnError::new("域名规则缓存目录无效"))?;
+        .ok_or_else(|| ApiError::new("域名规则缓存目录无效"))?;
     for path in [rule_set_backup_path(geosite), rule_set_backup_path(geoip)] {
         if path.exists() {
             std::fs::remove_file(path).map_err(|error| {
@@ -499,12 +488,12 @@ pub(crate) fn finish_rule_set_transaction(
 pub(crate) fn recover_rule_set_transaction(
     geosite: &std::path::Path,
     geoip: &std::path::Path,
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     let directory = geosite
         .parent()
-        .ok_or_else(|| ServerFnError::new("域名规则缓存目录无效"))?;
+        .ok_or_else(|| ApiError::new("域名规则缓存目录无效"))?;
     if geoip.parent() != Some(directory) {
-        return Err(ServerFnError::new("规则缓存文件不在同一目录"));
+        return Err(ApiError::new("规则缓存文件不在同一目录"));
     }
     let transaction = rule_set_transaction_path(directory);
     let committed = rule_set_commit_path(directory);
@@ -525,7 +514,7 @@ pub(crate) fn recover_rule_set_transaction(
                     && !rule_set_backup_path(geoip).exists() =>
             {
                 std::fs::remove_file(&transaction).map_err(|remove_error| {
-                    ServerFnError::new(format!(
+                    ApiError::new(format!(
                         "规则更新事务损坏: {error}；清理失败: {remove_error}"
                     ))
                 })?;
@@ -556,25 +545,25 @@ pub(crate) fn recover_rule_set_transaction(
     }
     if committed.exists() {
         std::fs::remove_file(committed)
-            .map_err(|error| ServerFnError::new(format!("清理规则提交标记失败: {error}")))?;
+            .map_err(|error| ApiError::new(format!("清理规则提交标记失败: {error}")))?;
     }
     Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn recover_rule_set_backup(path: &std::path::Path) -> Result<(), ServerFnError> {
+pub(crate) fn recover_rule_set_backup(path: &std::path::Path) -> Result<(), ApiError> {
     let backup = rule_set_backup_path(path);
     if !backup.exists() {
         return Ok(());
     }
     if path.exists() && singbox::validate_rule_set_file(path).is_ok() {
         std::fs::remove_file(backup)
-            .map_err(|error| ServerFnError::new(format!("清理旧规则备份失败: {error}")))?;
+            .map_err(|error| ApiError::new(format!("清理旧规则备份失败: {error}")))?;
         return Ok(());
     }
     if path.exists() {
         std::fs::remove_file(path)
-            .map_err(|error| ServerFnError::new(format!("移除损坏规则缓存失败: {error}")))?;
+            .map_err(|error| ApiError::new(format!("移除损坏规则缓存失败: {error}")))?;
     }
     std::fs::rename(backup, path)
         .map_err(|error| api_err(ApiErrorCode::Storage, format!("恢复规则缓存失败: {error}")))

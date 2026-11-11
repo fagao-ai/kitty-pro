@@ -1,8 +1,7 @@
 use super::{
-    api_err, atomic_write_json, profile_path, ApiErrorCode, SyncConfig, SyncProviderKind,
+    api_err, atomic_write_json, profile_path, ApiError, ApiErrorCode, SyncConfig, SyncProviderKind,
     SyncResult,
 };
-use dioxus::prelude::ServerFnError;
 use proxy_core::{
     normalize_dns_override_match, sync_bundle_directory as bundle_directory, validate_custom_rules,
     CustomRule, DnsOverride, SyncConfigScript, SyncSnapshot, SyncSubscription,
@@ -19,8 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// B17: every client-facing error passes through `redact_secrets`, so request
 /// URLs, Basic-auth userinfo and remote response details echoed by a
 /// dependency never reach the toast / `role=alert` panel.
-fn redact(message: impl std::fmt::Display) -> ServerFnError {
-    ServerFnError::new(super::redact_secrets(&message.to_string()))
+fn redact(message: impl std::fmt::Display) -> ApiError {
+    ApiError::new(super::redact_secrets(&message.to_string()))
 }
 
 /// S5: lenient outbound validator for endpoints the user explicitly
@@ -29,7 +28,7 @@ fn redact(message: impl std::fmt::Display) -> ServerFnError {
 /// refused by the shared validator. This is the storage counterpart of the
 /// strict `super::validate_outbound_url` used for subscription downloads.
 #[allow(dead_code)]
-fn validate_storage_outbound(url: &str) -> Result<(), ServerFnError> {
+fn validate_storage_outbound(url: &str) -> Result<(), ApiError> {
     super::validate_outbound_url_inner(url, true)
 }
 
@@ -40,12 +39,12 @@ fn validate_storage_outbound(url: &str) -> Result<(), ServerFnError> {
 /// in the test build so those end-to-end sync tests stay meaningful. Production
 /// builds always call `validate_storage_outbound`.
 #[cfg(test)]
-fn check_storage_outbound(_url: &str) -> Result<(), ServerFnError> {
+fn check_storage_outbound(_url: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
 #[cfg(not(test))]
-fn check_storage_outbound(url: &str) -> Result<(), ServerFnError> {
+fn check_storage_outbound(url: &str) -> Result<(), ApiError> {
     validate_storage_outbound(url)
 }
 
@@ -76,7 +75,7 @@ enum UploadCondition {
 /// 内可被被动抓包，密码与 S3 SecretKey 不能原样下发。
 pub(super) const SECRET_PLACEHOLDER: &str = "••••••••";
 
-pub(super) fn load_native_sync_config() -> Result<SyncConfig, ServerFnError> {
+pub(super) fn load_native_sync_config() -> Result<SyncConfig, ApiError> {
     let path = sync_config_path()?;
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -133,7 +132,7 @@ pub(super) fn masked_for_client(config: &SyncConfig) -> SyncConfig {
 }
 
 /// 前端提交的掩码字段还原为磁盘上的真值；不含掩码时不读磁盘。
-fn resolve_secrets(config: &SyncConfig) -> Result<SyncConfig, ServerFnError> {
+fn resolve_secrets(config: &SyncConfig) -> Result<SyncConfig, ApiError> {
     if config.password != SECRET_PLACEHOLDER && config.secret_key != SECRET_PLACEHOLDER {
         return Ok(config.clone());
     }
@@ -148,7 +147,7 @@ fn resolve_secrets(config: &SyncConfig) -> Result<SyncConfig, ServerFnError> {
     Ok(resolved)
 }
 
-pub(super) fn save_native_sync_config(config: &SyncConfig) -> Result<SyncConfig, ServerFnError> {
+pub(super) fn save_native_sync_config(config: &SyncConfig) -> Result<SyncConfig, ApiError> {
     let config = resolve_secrets(config)?;
     let existing = load_native_sync_config()?;
     let saved = merge_sync_metadata(&existing, &config);
@@ -168,7 +167,7 @@ fn merge_sync_metadata(existing: &SyncConfig, config: &SyncConfig) -> SyncConfig
     saved
 }
 
-pub(super) fn save_native_sync_state(config: &SyncConfig) -> Result<(), ServerFnError> {
+pub(super) fn save_native_sync_state(config: &SyncConfig) -> Result<(), ApiError> {
     if config.enabled {
         validate_config(config)?;
     }
@@ -200,7 +199,7 @@ enum RemoteState {
 /// The three conditions that make a remote safe to write over: this device owns
 /// a baseline for it, the store hands out revisions to compare, and that revision
 /// has not moved since. Anything else needs an explicit overwrite.
-fn require_baseline(config: &SyncConfig, revision: &str) -> Result<(), ServerFnError> {
+fn require_baseline(config: &SyncConfig, revision: &str) -> Result<(), ApiError> {
     if config.last_sync_at == 0 && config.last_remote_revision.is_empty() {
         return Err(api_err(
             ApiErrorCode::Sync,
@@ -223,7 +222,7 @@ fn require_baseline(config: &SyncConfig, revision: &str) -> Result<(), ServerFnE
 
 /// Refuse to overwrite a remote that another device has updated since this
 /// device last synced, whether it now holds a bundle or a legacy document.
-fn require_not_newer(config: &SyncConfig, updated_at: u64) -> Result<(), ServerFnError> {
+fn require_not_newer(config: &SyncConfig, updated_at: u64) -> Result<(), ApiError> {
     if updated_at > config.last_sync_at {
         return Err(api_err(
             ApiErrorCode::Conflict,
@@ -236,7 +235,7 @@ fn require_not_newer(config: &SyncConfig, updated_at: u64) -> Result<(), ServerF
 /// Read enough about the remote to decide a conditional write. Deliberately
 /// fetches only the manifest: `push` needs freshness, not another copy of data
 /// it already holds, and a bundle can be several objects.
-async fn remote_state(config: &SyncConfig) -> Result<RemoteState, ServerFnError> {
+async fn remote_state(config: &SyncConfig) -> Result<RemoteState, ApiError> {
     if let Some((manifest, revision)) = download_manifest(config).await? {
         return Ok(RemoteState::Bundle {
             updated_at: manifest.updated_at,
@@ -257,7 +256,7 @@ pub(super) async fn push(
     config: &SyncConfig,
     mut snapshot: SyncSnapshot,
     force: bool,
-) -> Result<SyncResult, ServerFnError> {
+) -> Result<SyncResult, ApiError> {
     validate_config(config)?;
     validate_snapshot(&snapshot)?;
     snapshot.version = SYNC_SNAPSHOT_VERSION;
@@ -328,7 +327,7 @@ pub(super) async fn push(
     })
 }
 
-pub(super) async fn pull(config: &SyncConfig) -> Result<DownloadedSnapshot, ServerFnError> {
+pub(super) async fn pull(config: &SyncConfig) -> Result<DownloadedSnapshot, ApiError> {
     validate_config(config)?;
     download_snapshot(config)
         .await?
@@ -355,7 +354,7 @@ fn same_remote_target(left: &SyncConfig, right: &SyncConfig) -> bool {
     }
 }
 
-fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
+fn validate_config(config: &SyncConfig) -> Result<(), ApiError> {
     if !config.enabled {
         return Err(redact("请先启用并保存同步配置"));
     }
@@ -402,7 +401,7 @@ fn validate_config(config: &SyncConfig) -> Result<(), ServerFnError> {
     Ok(())
 }
 
-fn parse_http_endpoint(raw: &str, allow_bare_host: bool) -> Result<reqwest::Url, ServerFnError> {
+fn parse_http_endpoint(raw: &str, allow_bare_host: bool) -> Result<reqwest::Url, ApiError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(redact("同步地址不能为空"));
@@ -430,7 +429,7 @@ fn parse_http_endpoint(raw: &str, allow_bare_host: bool) -> Result<reqwest::Url,
     Ok(endpoint)
 }
 
-fn validate_remote_path(path: &str) -> Result<(), ServerFnError> {
+fn validate_remote_path(path: &str) -> Result<(), ApiError> {
     let path = path.trim_matches('/');
     if path.is_empty() {
         return Err(redact("远程文件路径不能为空"));
@@ -447,7 +446,7 @@ fn validate_remote_path(path: &str) -> Result<(), ServerFnError> {
     Ok(())
 }
 
-pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnError> {
+pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ApiError> {
     if snapshot.format != SYNC_SNAPSHOT_FORMAT {
         return Err(redact(format!("不支持的同步快照格式: {}", snapshot.format)));
     }
@@ -512,7 +511,7 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
     Ok(())
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<SyncSnapshot, ServerFnError> {
+fn decode_snapshot(bytes: &[u8]) -> Result<SyncSnapshot, ApiError> {
     let envelope: SyncSnapshotEnvelope = serde_json::from_slice(bytes)
         .map_err(|error| redact(format!("远程同步文件无效: {error}")))?;
     if envelope.format != SYNC_SNAPSHOT_FORMAT {
@@ -534,7 +533,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<SyncSnapshot, ServerFnError> {
     Ok(snapshot)
 }
 
-pub(super) fn validate_remote_revision(revision: &str) -> Result<(), ServerFnError> {
+pub(super) fn validate_remote_revision(revision: &str) -> Result<(), ApiError> {
     if revision.len() > 1024
         || revision
             .bytes()
@@ -603,7 +602,7 @@ fn bundle_object_name(section: &str, payload: &[u8]) -> String {
 /// The sections a snapshot carries, in a fixed order. A `None` section writes no
 /// object at all, which is how "this device never had the feature" stays
 /// distinguishable from "this device has zero rules".
-fn bundle_sections(snapshot: &SyncSnapshot) -> Result<Vec<(String, Vec<u8>)>, ServerFnError> {
+fn bundle_sections(snapshot: &SyncSnapshot) -> Result<Vec<(String, Vec<u8>)>, ApiError> {
     let mut sections = Vec::new();
     sections.push((
         "subscriptions".to_string(),
@@ -622,14 +621,12 @@ fn bundle_sections(snapshot: &SyncSnapshot) -> Result<Vec<(String, Vec<u8>)>, Se
     Ok(sections)
 }
 
-fn json_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, ServerFnError> {
+fn json_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, ApiError> {
     serde_json::to_vec_pretty(value).map_err(|error| redact(format!("序列化同步内容失败: {error}")))
 }
 
 /// Pull a bundle, falling back to the legacy single document.
-async fn download_snapshot(
-    config: &SyncConfig,
-) -> Result<Option<DownloadedSnapshot>, ServerFnError> {
+async fn download_snapshot(config: &SyncConfig) -> Result<Option<DownloadedSnapshot>, ApiError> {
     match download_manifest(config).await? {
         Some(manifest) => download_bundle(config, manifest).await.map(Some),
         None => download_legacy_snapshot(config).await,
@@ -638,7 +635,7 @@ async fn download_snapshot(
 
 async fn download_manifest(
     config: &SyncConfig,
-) -> Result<Option<(BundleManifest, String)>, ServerFnError> {
+) -> Result<Option<(BundleManifest, String)>, ApiError> {
     let path = bundle_path(config, MANIFEST_NAME);
     let response = match config.provider {
         SyncProviderKind::WebDav => {
@@ -686,7 +683,7 @@ async fn download_manifest(
 /// is verified by size and hash afterwards, but the list itself has to hold up
 /// on its own, or a corrupt or hostile one turns a pull into an unbounded loop of
 /// requests and lets two entries claim the same section.
-fn validate_manifest_shape(manifest: &BundleManifest) -> Result<(), ServerFnError> {
+fn validate_manifest_shape(manifest: &BundleManifest) -> Result<(), ApiError> {
     if manifest.files.len() > MAX_BUNDLE_FILES {
         return Err(redact(format!(
             "远程同步清单条目过多（{} 项）",
@@ -723,7 +720,7 @@ fn validate_manifest_shape(manifest: &BundleManifest) -> Result<(), ServerFnErro
 async fn download_bundle(
     config: &SyncConfig,
     manifest: (BundleManifest, String),
-) -> Result<DownloadedSnapshot, ServerFnError> {
+) -> Result<DownloadedSnapshot, ApiError> {
     let (manifest, revision) = manifest;
     let mut payloads: HashMap<String, Vec<u8>> = HashMap::new();
     let mut total = 0_usize;
@@ -780,7 +777,7 @@ async fn download_bundle(
 fn take_section(
     payloads: &mut HashMap<String, Vec<u8>>,
     section: &str,
-) -> Result<Option<Vec<u8>>, ServerFnError> {
+) -> Result<Option<Vec<u8>>, ApiError> {
     payloads
         .remove(section)
         .map(|payload| {
@@ -792,11 +789,11 @@ fn take_section(
         .transpose()
 }
 
-fn deserialize_section<T: serde::de::DeserializeOwned>(bytes: Vec<u8>) -> Result<T, ServerFnError> {
+fn deserialize_section<T: serde::de::DeserializeOwned>(bytes: Vec<u8>) -> Result<T, ApiError> {
     serde_json::from_slice(&bytes).map_err(|error| redact(format!("远程同步文件无效: {error}")))
 }
 
-fn validate_bundle_file_name(name: &str) -> Result<(), ServerFnError> {
+fn validate_bundle_file_name(name: &str) -> Result<(), ApiError> {
     let ok = !name.is_empty()
         && name.len() <= 128
         && name.ends_with(".json")
@@ -814,7 +811,7 @@ fn validate_bundle_file_name(name: &str) -> Result<(), ServerFnError> {
     }
 }
 
-async fn download_object(config: &SyncConfig, path: &str) -> Result<Vec<u8>, ServerFnError> {
+async fn download_object(config: &SyncConfig, path: &str) -> Result<Vec<u8>, ApiError> {
     let response = match config.provider {
         SyncProviderKind::WebDav => {
             send_webdav(
@@ -849,7 +846,7 @@ async fn download_object(config: &SyncConfig, path: &str) -> Result<Vec<u8>, Ser
 /// always write a bundle.
 async fn download_legacy_snapshot(
     config: &SyncConfig,
-) -> Result<Option<DownloadedSnapshot>, ServerFnError> {
+) -> Result<Option<DownloadedSnapshot>, ApiError> {
     let response = match config.provider {
         SyncProviderKind::WebDav => {
             send_webdav(
@@ -896,7 +893,7 @@ async fn upload_object(
     path: &str,
     payload: Vec<u8>,
     condition: &UploadCondition,
-) -> Result<String, ServerFnError> {
+) -> Result<String, ApiError> {
     let response = match config.provider {
         SyncProviderKind::WebDav => {
             ensure_webdav_collections(config, path).await?;
@@ -930,7 +927,7 @@ async fn upload_bundle(
     snapshot: &SyncSnapshot,
     condition: &UploadCondition,
     known_objects: &HashSet<String>,
-) -> Result<String, ServerFnError> {
+) -> Result<String, ApiError> {
     let sections = bundle_sections(snapshot)?;
     let mut files = Vec::with_capacity(sections.len());
     let mut total = 0_usize;
@@ -976,7 +973,7 @@ async fn upload_bundle(
     .await
 }
 
-fn http_client() -> Result<reqwest::Client, ServerFnError> {
+fn http_client() -> Result<reqwest::Client, ApiError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(45))
@@ -997,7 +994,7 @@ async fn send_webdav(
     method: Method,
     body: Option<Vec<u8>>,
     condition: &UploadCondition,
-) -> Result<Response, ServerFnError> {
+) -> Result<Response, ApiError> {
     let url = build_remote_url(&config.webdav_endpoint, None, path)?;
     // S5: re-check the fully assembled URL before any request leaves.
     check_storage_outbound(url.as_str())?;
@@ -1020,7 +1017,7 @@ async fn send_webdav(
 /// Create the directories above an object. A single-file path needs its
 /// parents; a bundle also needs its own directory, which is why the object name
 /// is excluded rather than every segment but the last two.
-async fn ensure_webdav_collections(config: &SyncConfig, path: &str) -> Result<(), ServerFnError> {
+async fn ensure_webdav_collections(config: &SyncConfig, path: &str) -> Result<(), ApiError> {
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
     if segments.len() < 2 {
         return Ok(());
@@ -1060,7 +1057,7 @@ async fn send_s3(
     method: Method,
     body: Vec<u8>,
     condition: &UploadCondition,
-) -> Result<Response, ServerFnError> {
+) -> Result<Response, ApiError> {
     let url = build_s3_url(config, path)?;
     // S5: validate before signing, so the SigV4 authorization header can
     // never be sent to a loopback / link-local / metadata host.
@@ -1149,7 +1146,7 @@ fn build_remote_url(
     endpoint: &str,
     bucket: Option<&str>,
     path: &str,
-) -> Result<reqwest::Url, ServerFnError> {
+) -> Result<reqwest::Url, ApiError> {
     let mut url = reqwest::Url::parse(endpoint.trim())
         .map_err(|error| redact(format!("同步地址无效: {error}")))?;
     url.set_query(None);
@@ -1169,7 +1166,7 @@ fn build_remote_url(
     Ok(url)
 }
 
-fn build_s3_url(config: &SyncConfig, path: &str) -> Result<reqwest::Url, ServerFnError> {
+fn build_s3_url(config: &SyncConfig, path: &str) -> Result<reqwest::Url, ApiError> {
     let endpoint = config.s3_endpoint.trim();
     if endpoint.is_empty() || endpoint.contains("amazonaws.com") {
         if config.bucket.contains('.') {
@@ -1187,7 +1184,7 @@ fn build_s3_url(config: &SyncConfig, path: &str) -> Result<reqwest::Url, ServerF
     build_remote_url(endpoint.as_str(), Some(&config.bucket), path)
 }
 
-fn request_host(url: &reqwest::Url) -> Result<String, ServerFnError> {
+fn request_host(url: &reqwest::Url) -> Result<String, ApiError> {
     let host = url.host().ok_or_else(|| redact("S3 地址缺少主机"))?;
     Ok(match url.port() {
         Some(port) => format!("{host}:{port}"),
@@ -1195,7 +1192,7 @@ fn request_host(url: &reqwest::Url) -> Result<String, ServerFnError> {
     })
 }
 
-async fn require_success(response: Response, operation: &str) -> Result<Response, ServerFnError> {
+async fn require_success(response: Response, operation: &str) -> Result<Response, ApiError> {
     if response.status().is_success() {
         return Ok(response);
     }
@@ -1222,7 +1219,7 @@ async fn read_limited_body(
     mut response: Response,
     max_bytes: usize,
     operation: &str,
-) -> Result<Vec<u8>, ServerFnError> {
+) -> Result<Vec<u8>, ApiError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -1240,14 +1237,14 @@ async fn read_limited_body(
     Ok(bytes)
 }
 
-fn sync_config_path() -> Result<PathBuf, ServerFnError> {
+fn sync_config_path() -> Result<PathBuf, ApiError> {
     profile_path()?
         .parent()
         .map(|directory| directory.join("sync.json"))
         .ok_or_else(|| redact("无法确定同步配置目录"))
 }
 
-fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ServerFnError> {
+fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ApiError> {
     let _guard = sync_write_lock()
         .lock()
         .map_err(|_| redact("同步配置写入锁已损坏"))?;
@@ -1277,14 +1274,14 @@ fn sync_write_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-fn unix_timestamp() -> Result<u64, ServerFnError> {
+fn unix_timestamp() -> Result<u64, ApiError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| redact("系统时间早于 Unix 纪元，无法生成同步版本"))
 }
 
-fn aws_timestamp() -> Result<(String, String), ServerFnError> {
+fn aws_timestamp() -> Result<(String, String), ApiError> {
     let timestamp = unix_timestamp()?;
     let days = (timestamp / 86_400) as i64;
     let seconds = timestamp % 86_400;

@@ -1,22 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "packages/ui",
     "packages/nsh-app",
-    "packages/web",
-    "packages/desktop",
-    "packages/mobile",
     "packages/api",
     "packages/proxy-core",
     "packages/singbox",
-    "packages/server-fn-macro",
 ]
 
 [workspace.dependencies]
-dioxus = { version = "0.7.1" }
-
 # workspace
-ui = { path = "packages/ui" }
 api = { path = "packages/api" }
 proxy-core = { path = "packages/proxy-core" }
 singbox = { path = "packages/singbox" }

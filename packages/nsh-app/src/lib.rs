@@ -1,8 +1,8 @@
 //! Kitty Pro on Native Shell: a sing-box client whose engine is the app itself.
 //!
 //! The backend is the workspace's own `api` and `proxy-core` crates, called directly. An NSH
-//! binary is a native process, so there is no HTTP hop and no server to run: the same functions
-//! the Dioxus shells reach over server functions are plain async calls here.
+//! binary is a native process, so there is no HTTP hop and no server to run: every backend call
+//! is a plain async function call.
 
 pub(crate) mod autostart;
 mod domain;
@@ -31,7 +31,7 @@ use nsh_core::{
 pub const THEME_JSON: &str = include_str!("../theme.json");
 
 /// The three faces the app draws with, as variable fonts. Latin only: CJK falls through to
-/// the system UI font, as it does in the Dioxus shells.
+/// the system UI font.
 pub const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/Inter-Variable.woff2"),
     include_bytes!("../assets/fonts/SpaceGrotesk-Variable.woff2"),

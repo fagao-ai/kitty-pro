@@ -6,8 +6,9 @@
 //! platform decision, in one file, in the same shape `packages/api` uses for its own
 //! per-target functions.
 //!
-//! Errors come back as `String` rather than the backend's `ServerFnError`: this crate does not
-//! depend on Dioxus, and every caller here only wants the text to put on screen.
+//! Errors come back as `String` rather than the backend's `api::ApiError`: this crate does not
+//! want a backend type in its signature, and every caller here only wants the text to put on
+//! screen.
 
 /// Whether this build can offer a login item at all, so the row is absent rather than dead.
 pub const SUPPORTED: bool = cfg!(any(

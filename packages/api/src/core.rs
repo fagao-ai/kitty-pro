@@ -7,7 +7,7 @@ use super::*;
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-pub(crate) fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
+pub(crate) fn native_core_status() -> Result<ApiCoreStatus, ApiError> {
     use singbox::{unavailable_status, SingBox};
 
     // Start/restart transactions keep the slot lock for as long as the bind
@@ -46,10 +46,10 @@ pub(crate) fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
-pub(crate) fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
+pub(crate) fn native_core_status() -> Result<ApiCoreStatus, ApiError> {
     singbox::android::status()
         .map(api_core_status)
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -70,7 +70,7 @@ pub(crate) fn api_core_status(status: singbox::CoreStatus) -> ApiCoreStatus {
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn load_native_profile() -> Result<AppProfile, ServerFnError> {
+pub(crate) fn load_native_profile() -> Result<AppProfile, ApiError> {
     use std::fs;
 
     // B16：统一崩溃恢复入口，放在读取配置之前。已确认不会递归：本函数只被
@@ -91,22 +91,22 @@ pub(crate) fn load_native_profile() -> Result<AppProfile, ServerFnError> {
             if !backup.exists() {
                 let _ = fs::copy(&path, &backup);
             }
-            ServerFnError::new(format!("本地配置损坏: {error}"))
+            ApiError::new(format!("本地配置损坏: {error}"))
         }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AppProfile::default()),
-        Err(error) => Err(ServerFnError::new(format!("读取本地配置失败: {error}"))),
+        Err(error) => Err(ApiError::new(format!("读取本地配置失败: {error}"))),
     }
 }
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn load_native_profile() -> Result<AppProfile, ServerFnError> {
+pub(crate) fn load_native_profile() -> Result<AppProfile, ApiError> {
     Ok(AppProfile::default())
 }
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn save_native_profile(profile: &AppProfile) -> Result<(), ServerFnError> {
+pub(crate) fn save_native_profile(profile: &AppProfile) -> Result<(), ApiError> {
     let path = profile_path()?;
     save_native_profile_to_path(profile, &path)
 }
@@ -119,7 +119,7 @@ pub(crate) const MAX_PROFILE_BACKUPS: usize = 10;
 /// overwrites it. Returns an optional user-visible note describing the backup
 /// (or the failure). Failures never block the pull itself.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn backup_local_profile_before_sync_pull() -> Result<Option<String>, ServerFnError> {
+pub(crate) fn backup_local_profile_before_sync_pull() -> Result<Option<String>, ApiError> {
     use std::fs;
 
     let path = profile_path()?;
@@ -128,10 +128,10 @@ pub(crate) fn backup_local_profile_before_sync_pull() -> Result<Option<String>, 
     }
     let directory = path
         .parent()
-        .ok_or_else(|| ServerFnError::new("本地配置目录无效"))?
+        .ok_or_else(|| ApiError::new("本地配置目录无效"))?
         .join("profile-backups");
     fs::create_dir_all(&directory)
-        .map_err(|error| ServerFnError::new(format!("创建配置备份目录失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("创建配置备份目录失败: {error}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -144,7 +144,7 @@ pub(crate) fn backup_local_profile_before_sync_pull() -> Result<Option<String>, 
         .unwrap_or_default();
     let backup = directory.join(format!("profile-{seconds}.json"));
     fs::copy(&path, &backup)
-        .map_err(|error| ServerFnError::new(format!("备份本地配置失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("备份本地配置失败: {error}")))?;
 
     let mut entries = fs::read_dir(&directory)
         .map(|reader| {
@@ -178,14 +178,14 @@ pub(crate) fn backup_local_profile_before_sync_pull() -> Result<Option<String>, 
 pub(crate) fn save_native_profile_to_path(
     profile: &AppProfile,
     path: &std::path::Path,
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     let _guard = profile_write_lock()
         .lock()
-        .map_err(|_| ServerFnError::new("本地配置写入锁已损坏"))?;
+        .map_err(|_| ApiError::new("本地配置写入锁已损坏"))?;
     // B3/B15：统一走 atomic_write_json（临时文件 + `sync_all` + 安全替换），
     // 保留 pretty JSON 输出；彻底消除 Windows 「先删旧文件再 rename」的数据丢失窗口。
     atomic_write_json(path, profile)
-        .map_err(|error| ServerFnError::new(format!("保存本地配置失败: {error}")))
+        .map_err(|error| ApiError::new(format!("保存本地配置失败: {error}")))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -223,12 +223,12 @@ pub(crate) fn create_unique_profile_temporary_file(
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn save_native_profile(_profile: &AppProfile) -> Result<(), ServerFnError> {
-    Err(ServerFnError::new("浏览器端不能直接写入本地配置"))
+pub(crate) fn save_native_profile(_profile: &AppProfile) -> Result<(), ApiError> {
+    Err(ApiError::new("浏览器端不能直接写入本地配置"))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-pub(crate) fn profile_path() -> Result<std::path::PathBuf, ServerFnError> {
+pub(crate) fn profile_path() -> Result<std::path::PathBuf, ApiError> {
     // E2E isolation: the Playwright suite runs the app against a locally
     // served release build, and the app's debounced autosave POSTs whatever
     // profile the browser holds. Without this override those stubbed writes
@@ -240,15 +240,15 @@ pub(crate) fn profile_path() -> Result<std::path::PathBuf, ServerFnError> {
         return Ok(std::path::PathBuf::from(dir).join("profile.json"));
     }
     let directories = directories::ProjectDirs::from("com", "kitty", "kitty-pro")
-        .ok_or_else(|| ServerFnError::new("无法确定本地配置目录"))?;
+        .ok_or_else(|| ApiError::new("无法确定本地配置目录"))?;
     Ok(directories.data_local_dir().join("profile.json"))
 }
 
 #[cfg(target_os = "android")]
-pub(crate) fn profile_path() -> Result<std::path::PathBuf, ServerFnError> {
+pub(crate) fn profile_path() -> Result<std::path::PathBuf, ApiError> {
     singbox::android::files_dir()
         .map(|directory| directory.join("profile.json"))
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -266,88 +266,75 @@ pub(crate) fn create_private_file(path: &std::path::Path) -> std::io::Result<std
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn validate_native_config_script(
-    request: ConnectionRequest,
-) -> Result<(), ServerFnError> {
+pub(crate) fn validate_native_config_script(request: ConnectionRequest) -> Result<(), ApiError> {
     if request.config_script.is_none() {
-        return Err(ServerFnError::new("脚本内容为空"));
+        return Err(ApiError::new("脚本内容为空"));
     }
     build_native_config(&request, &SingBoxOptions::default()).map(|_| ())
 }
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn validate_native_config_script(
-    _request: ConnectionRequest,
-) -> Result<(), ServerFnError> {
-    Err(ServerFnError::new("浏览器端不能直接执行配置脚本"))
+pub(crate) fn validate_native_config_script(_request: ConnectionRequest) -> Result<(), ApiError> {
+    Err(ApiError::new("浏览器端不能直接执行配置脚本"))
 }
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn preview_native_proxy_groups(
     request: ConnectionRequest,
-) -> Result<Vec<ProxyGroup>, ServerFnError> {
+) -> Result<Vec<ProxyGroup>, ApiError> {
     let config = build_native_config(&request, &SingBoxOptions::default())?;
     Ok(proxy_core::extract_proxy_groups(&config))
 }
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-pub(crate) fn select_native_proxy_group(
-    group: String,
-    outbound: String,
-) -> Result<(), ServerFnError> {
+pub(crate) fn select_native_proxy_group(group: String, outbound: String) -> Result<(), ApiError> {
     if group.trim().is_empty() || outbound.trim().is_empty() {
-        return Err(ServerFnError::new("代理组和节点不能为空"));
+        return Err(ApiError::new("代理组和节点不能为空"));
     }
     // B12：短操作不排队到长事务后面，锁忙时直接给中文提示。
     let Some(guard) = try_lock_core_slot()? else {
-        return Err(ServerFnError::new("内核正在切换，请稍后重试"));
+        return Err(ApiError::new("内核正在切换，请稍后重试"));
     };
     let core = guard
         .as_ref()
-        .ok_or_else(|| ServerFnError::new("sing-box 尚未启动"))?;
+        .ok_or_else(|| ApiError::new("sing-box 尚未启动"))?;
     core.engine
         .select_outbound(&group, &outbound)
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
-pub(crate) fn select_native_proxy_group(
-    group: String,
-    outbound: String,
-) -> Result<(), ServerFnError> {
+pub(crate) fn select_native_proxy_group(group: String, outbound: String) -> Result<(), ApiError> {
     if group.trim().is_empty() || outbound.trim().is_empty() {
-        return Err(ServerFnError::new("代理组和节点不能为空"));
+        return Err(ApiError::new("代理组和节点不能为空"));
     }
     singbox::android::select_outbound(&group, &outbound)
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn select_native_proxy_group(
-    _group: String,
-    _outbound: String,
-) -> Result<(), ServerFnError> {
-    Err(ServerFnError::new("浏览器端不能直接切换代理组"))
+pub(crate) fn select_native_proxy_group(_group: String, _outbound: String) -> Result<(), ApiError> {
+    Err(ApiError::new("浏览器端不能直接切换代理组"))
 }
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn preview_native_proxy_groups(
     _request: ConnectionRequest,
-) -> Result<Vec<ProxyGroup>, ServerFnError> {
-    Err(ServerFnError::new("浏览器端不能直接生成代理组"))
+) -> Result<Vec<ProxyGroup>, ApiError> {
+    Err(ApiError::new("浏览器端不能直接生成代理组"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn build_native_config(
     request: &ConnectionRequest,
     options: &SingBoxOptions,
-) -> Result<serde_json::Value, ServerFnError> {
+) -> Result<serde_json::Value, ApiError> {
     let mut config = proxy_core::build_singbox_config(request, options);
     if let Some(script) = request.config_script.as_deref() {
         let node_names = request
@@ -362,7 +349,7 @@ pub(crate) fn build_native_config(
             .collect::<serde_json::Map<_, _>>();
         config["__kitty_context"] = serde_json::json!({ "node_names": node_names });
         config = proxy_core::apply_config_script(script, config)
-            .map_err(|error| ServerFnError::new(error.to_string()))?;
+            .map_err(|error| ApiError::new(error.to_string()))?;
         if let Some(config) = config.as_object_mut() {
             config.remove("__kitty_context");
         }
@@ -372,7 +359,7 @@ pub(crate) fn build_native_config(
     proxy_core::apply_proxy_group_selections(&mut config, &request.group_selections);
     #[cfg(target_os = "macos")]
     macos_route::pin_non_default_outbound_sources(&mut config)
-        .map_err(|error| ServerFnError::new(format!("TUN 路由预检失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("TUN 路由预检失败: {error}")))?;
     Ok(config)
 }
 
@@ -436,7 +423,7 @@ pub(crate) fn apply_owned_cache_config(
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn native_core_status() -> Result<ApiCoreStatus, ServerFnError> {
+pub(crate) fn native_core_status() -> Result<ApiCoreStatus, ApiError> {
     Ok(ApiCoreStatus {
         state: "unavailable".to_string(),
         version: None,
@@ -467,22 +454,22 @@ pub(crate) fn toggle_native_core(
     enabled: bool,
     request: Option<ConnectionRequest>,
     rule_set_cache: Option<RuleSetCachePaths>,
-) -> Result<ApiCoreStatus, ServerFnError> {
+) -> Result<ApiCoreStatus, ApiError> {
     use proxy_core::SingBoxOptions;
     use singbox::SingBox;
 
     if !enabled {
         // Never leave the OS pointing at a loopback listener that is about to
         // disappear. If disabling the proxy fails, keep the core alive.
-        disable_managed_system_proxy_before_core_outage().map_err(ServerFnError::new)?;
+        disable_managed_system_proxy_before_core_outage().map_err(ApiError::new)?;
         let mut guard = core_slot()
             .lock()
-            .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+            .map_err(|_| ApiError::new("sing-box 状态锁已损坏"))?;
         if let Some(core) = guard.as_mut() {
             if core
                 .engine
                 .is_running()
-                .map_err(|error| ServerFnError::new(error.to_string()))?
+                .map_err(|error| ApiError::new(error.to_string()))?
             {
                 if let Err(stop_error) = core.engine.stop() {
                     let state = match core.engine.is_running() {
@@ -494,7 +481,7 @@ pub(crate) fn toggle_native_core(
                     };
                     core.engine.force_shutdown();
                     core.config = None;
-                    return Err(ServerFnError::new(format!(
+                    return Err(ApiError::new(format!(
                         "停止 sing-box 内核返回错误，{state}；已强制清理内核: {stop_error}"
                     )));
                 }
@@ -506,9 +493,9 @@ pub(crate) fn toggle_native_core(
         return native_core_status();
     }
 
-    let request = request.ok_or_else(|| ServerFnError::new("缺少连接配置"))?;
+    let request = request.ok_or_else(|| ApiError::new("缺少连接配置"))?;
     if request.nodes.is_empty() {
-        return Err(ServerFnError::new("请先导入并选择一个节点"));
+        return Err(ApiError::new("请先导入并选择一个节点"));
     }
     let options = SingBoxOptions {
         listen: mixed_listen_address(request.allow_lan).to_string(),
@@ -520,23 +507,23 @@ pub(crate) fn toggle_native_core(
     };
     let config = build_native_config(&request, &options)?;
     singbox::check_config(&config)
-        .map_err(|error| ServerFnError::new(redact_secrets(&error.to_string())))?;
+        .map_err(|error| ApiError::new(redact_secrets(&error.to_string())))?;
 
     let mut guard = core_slot()
         .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+        .map_err(|_| ApiError::new("sing-box 状态锁已损坏"))?;
     if guard.is_none() {
         *guard = Some(
             SingBox::discover()
                 .map(NativeCore::new)
-                .map_err(|error| ServerFnError::new(error.to_string()))?,
+                .map_err(|error| ApiError::new(error.to_string()))?,
         );
     }
     let core = guard.as_mut().expect("sing-box core was just initialized");
     if core
         .engine
         .is_running()
-        .map_err(|error| ServerFnError::new(error.to_string()))?
+        .map_err(|error| ApiError::new(error.to_string()))?
     {
         drop(guard);
         return native_core_status();
@@ -546,7 +533,7 @@ pub(crate) fn toggle_native_core(
     // current status snapshot first so concurrent polls keep reporting it.
     refresh_core_status_snapshot(core);
     if let Err(error) = start_config_with_bind_retry(&mut core.engine, &config) {
-        return Err(ServerFnError::new(error));
+        return Err(ApiError::new(error));
     }
     core.config = Some(config);
     drop(guard);
@@ -845,7 +832,7 @@ pub(crate) fn disable_managed_system_proxy_before_core_outage() -> Result<(), St
 pub(crate) fn restart_native_core(
     request: ConnectionRequest,
     rule_set_cache: Option<RuleSetCachePaths>,
-) -> Result<ApiCoreStatus, ServerFnError> {
+) -> Result<ApiCoreStatus, ApiError> {
     use proxy_core::SingBoxOptions;
     use singbox::SingBox;
 
@@ -861,12 +848,12 @@ pub(crate) fn restart_native_core(
 
     let mut guard = core_slot()
         .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+        .map_err(|_| ApiError::new("sing-box 状态锁已损坏"))?;
     if guard.is_none() {
         *guard = Some(
             SingBox::discover()
                 .map(NativeCore::new)
-                .map_err(|error| ServerFnError::new(error.to_string()))?,
+                .map_err(|error| ApiError::new(error.to_string()))?,
         );
     }
     let core = guard.as_mut().expect("sing-box core was just initialized");
@@ -876,7 +863,7 @@ pub(crate) fn restart_native_core(
     refresh_core_status_snapshot(core);
     core.engine
         .prepare_config(&candidate)
-        .map_err(|error| ServerFnError::new(format!("新配置预检失败，内核未重启: {error}")))?;
+        .map_err(|error| ApiError::new(format!("新配置预检失败，内核未重启: {error}")))?;
     let restart_result =
         restart_core_transaction(&mut core.engine, &candidate, previous.as_ref(), |_| Ok(()));
     core.engine.discard_prepared_config();
@@ -887,7 +874,7 @@ pub(crate) fn restart_native_core(
         restart_result,
         disable_managed_system_proxy_before_core_outage,
     )
-    .map_err(ServerFnError::new)?;
+    .map_err(ApiError::new)?;
     native_core_status()
 }
 
@@ -896,7 +883,7 @@ pub(crate) fn restart_native_core(
 pub(crate) fn restart_native_core(
     request: ConnectionRequest,
     rule_set_cache: Option<RuleSetCachePaths>,
-) -> Result<ApiCoreStatus, ServerFnError> {
+) -> Result<ApiCoreStatus, ApiError> {
     // Starting the active VpnService again makes it stop the previous core,
     // establish a fresh VPN interface, and apply the replacement config.
     toggle_native_core(true, Some(request), rule_set_cache)
@@ -907,7 +894,7 @@ pub(crate) fn restart_native_core(
 pub(crate) fn prepare_native_tun_mode(
     request: ConnectionRequest,
     rule_set_cache: Option<RuleSetCachePaths>,
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     use proxy_core::SingBoxOptions;
     use singbox::SingBox;
 
@@ -922,21 +909,21 @@ pub(crate) fn prepare_native_tun_mode(
     let candidate = build_native_config(&request, &options)?;
     let mut guard = core_slot()
         .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+        .map_err(|_| ApiError::new("sing-box 状态锁已损坏"))?;
     if guard.is_none() {
         *guard = Some(
             SingBox::discover()
                 .map(NativeCore::new)
-                .map_err(|error| ServerFnError::new(error.to_string()))?,
+                .map_err(|error| ApiError::new(error.to_string()))?,
         );
     }
     let core = guard.as_mut().expect("sing-box core was just initialized");
     if core
         .engine
         .is_running()
-        .map_err(|error| ServerFnError::new(error.to_string()))?
+        .map_err(|error| ApiError::new(error.to_string()))?
     {
-        return Err(ServerFnError::new(
+        return Err(ApiError::new(
             "sing-box 已在运行，请通过核心重启应用 TUN 设置",
         ));
     }
@@ -945,22 +932,22 @@ pub(crate) fn prepare_native_tun_mode(
     refresh_core_status_snapshot(core);
     core.engine
         .prepare_config(&candidate)
-        .map_err(|error| ServerFnError::new(format!("TUN 配置或权限预检失败: {error}")))
+        .map_err(|error| ApiError::new(format!("TUN 配置或权限预检失败: {error}")))
 }
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-pub(crate) fn release_native_tun_mode() -> Result<(), ServerFnError> {
+pub(crate) fn release_native_tun_mode() -> Result<(), ApiError> {
     let mut guard = core_slot()
         .lock()
-        .map_err(|_| ServerFnError::new("sing-box 状态锁已损坏"))?;
+        .map_err(|_| ApiError::new("sing-box 状态锁已损坏"))?;
     if let Some(core) = guard.as_mut() {
         if core
             .engine
             .is_running()
-            .map_err(|error| ServerFnError::new(error.to_string()))?
+            .map_err(|error| ApiError::new(error.to_string()))?
         {
-            return Err(ServerFnError::new(
+            return Err(ApiError::new(
                 "sing-box 正在运行，不能单独释放当前 TUN helper",
             ));
         }
@@ -974,13 +961,13 @@ pub(crate) fn release_native_tun_mode() -> Result<(), ServerFnError> {
 pub(crate) fn prepare_native_tun_mode(
     _request: ConnectionRequest,
     _rule_set_cache: Option<RuleSetCachePaths>,
-) -> Result<(), ServerFnError> {
-    Err(ServerFnError::new("当前平台不使用桌面 TUN 权限预检"))
+) -> Result<(), ApiError> {
+    Err(ApiError::new("当前平台不使用桌面 TUN 权限预检"))
 }
 
 #[allow(dead_code)]
 #[cfg(any(target_arch = "wasm32", target_os = "android"))]
-pub(crate) fn release_native_tun_mode() -> Result<(), ServerFnError> {
+pub(crate) fn release_native_tun_mode() -> Result<(), ApiError> {
     Ok(())
 }
 
@@ -990,21 +977,21 @@ pub(crate) fn toggle_native_core(
     enabled: bool,
     request: Option<ConnectionRequest>,
     rule_set_cache: Option<RuleSetCachePaths>,
-) -> Result<ApiCoreStatus, ServerFnError> {
+) -> Result<ApiCoreStatus, ApiError> {
     if !enabled {
-        singbox::android::stop().map_err(|error| ServerFnError::new(error.to_string()))?;
+        singbox::android::stop().map_err(|error| ApiError::new(error.to_string()))?;
         return native_core_status();
     }
 
-    let mut request = request.ok_or_else(|| ServerFnError::new("缺少连接配置"))?;
+    let mut request = request.ok_or_else(|| ApiError::new("缺少连接配置"))?;
     if request.nodes.is_empty() {
-        return Err(ServerFnError::new("请先导入并选择一个节点"));
+        return Err(ApiError::new("请先导入并选择一个节点"));
     }
     // Android always owns the TUN through VpnService. A loopback mixed proxy
     // alone would not route device traffic.
     request.tun = true;
     proxy_core::validate_custom_rules(&request.custom_rules)
-        .map_err(|error| ServerFnError::new(format!("自定义规则无效: {error}")))?;
+        .map_err(|error| ApiError::new(format!("自定义规则无效: {error}")))?;
     let options = SingBoxOptions {
         listen: mixed_listen_address(request.allow_lan).to_string(),
         traffic_api_port: Some(allocate_loopback_port()?),
@@ -1016,14 +1003,14 @@ pub(crate) fn toggle_native_core(
     let mut config = build_native_config(&request, &options)?;
     config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
     let config = serde_json::to_string(&config)
-        .map_err(|error| ServerFnError::new(format!("序列化 Android VPN 配置失败: {error}")))?;
-    singbox::android::start(&config).map_err(|error| ServerFnError::new(error.to_string()))?;
+        .map_err(|error| ApiError::new(format!("序列化 Android VPN 配置失败: {error}")))?;
+    singbox::android::start(&config).map_err(|error| ApiError::new(error.to_string()))?;
     native_core_status()
 }
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
+pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ApiError> {
     // Frequent polling: never queue behind a long start/restart transaction.
     let Some(guard) = try_lock_core_slot()? else {
         return Ok(CoreTraffic::default());
@@ -1034,14 +1021,14 @@ pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
     if !core
         .engine
         .is_running()
-        .map_err(|error| ServerFnError::new(error.to_string()))?
+        .map_err(|error| ApiError::new(error.to_string()))?
     {
         return Ok(CoreTraffic::default());
     }
     let traffic = core
         .engine
         .traffic()
-        .map_err(|error| ServerFnError::new(error.to_string()))?;
+        .map_err(|error| ApiError::new(error.to_string()))?;
     Ok(CoreTraffic {
         upload_total: traffic.upload_total,
         download_total: traffic.download_total,
@@ -1051,9 +1038,8 @@ pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
-pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
-    let traffic =
-        singbox::android::traffic().map_err(|error| ServerFnError::new(error.to_string()))?;
+pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ApiError> {
+    let traffic = singbox::android::traffic().map_err(|error| ApiError::new(error.to_string()))?;
     Ok(CoreTraffic {
         upload_total: traffic.upload_total,
         download_total: traffic.download_total,
@@ -1063,13 +1049,13 @@ pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ServerFnError> {
+pub(crate) fn native_core_traffic() -> Result<CoreTraffic, ApiError> {
     Ok(CoreTraffic::default())
 }
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
+pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ApiError> {
     // Frequent polling: never queue behind a long start/restart transaction.
     let Some(guard) = try_lock_core_slot()? else {
         return Ok(CoreLogBatch {
@@ -1086,7 +1072,7 @@ pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnErro
     if !core
         .engine
         .is_running()
-        .map_err(|error| ServerFnError::new(error.to_string()))?
+        .map_err(|error| ApiError::new(error.to_string()))?
     {
         return Ok(CoreLogBatch {
             next_cursor: cursor,
@@ -1096,20 +1082,20 @@ pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnErro
     core.engine
         .logs(cursor)
         .map(normalize_log_batch)
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
-pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
+pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ApiError> {
     singbox::android::logs(cursor)
         .map(normalize_log_batch)
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnError> {
+pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ApiError> {
     Ok(CoreLogBatch {
         next_cursor: cursor,
         entries: Vec::new(),
@@ -1118,10 +1104,10 @@ pub(crate) fn native_core_logs(cursor: u64) -> Result<CoreLogBatch, ServerFnErro
 
 #[allow(dead_code)]
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-pub(crate) fn native_set_core_log_collection(enabled: bool) -> Result<(), ServerFnError> {
+pub(crate) fn native_set_core_log_collection(enabled: bool) -> Result<(), ApiError> {
     // B12：短操作不排队到长事务后面，锁忙时直接给中文提示。
     let Some(guard) = try_lock_core_slot()? else {
-        return Err(ServerFnError::new("内核正在切换，请稍后重试"));
+        return Err(ApiError::new("内核正在切换，请稍后重试"));
     };
     let Some(core) = guard.as_ref() else {
         return Ok(());
@@ -1129,25 +1115,24 @@ pub(crate) fn native_set_core_log_collection(enabled: bool) -> Result<(), Server
     if !core
         .engine
         .is_running()
-        .map_err(|error| ServerFnError::new(error.to_string()))?
+        .map_err(|error| ApiError::new(error.to_string()))?
     {
         return Ok(());
     }
     core.engine
         .set_log_enabled(enabled)
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[allow(dead_code)]
 #[cfg(target_os = "android")]
-pub(crate) fn native_set_core_log_collection(enabled: bool) -> Result<(), ServerFnError> {
-    singbox::android::set_log_enabled(enabled)
-        .map_err(|error| ServerFnError::new(error.to_string()))
+pub(crate) fn native_set_core_log_collection(enabled: bool) -> Result<(), ApiError> {
+    singbox::android::set_log_enabled(enabled).map_err(|error| ApiError::new(error.to_string()))
 }
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn native_set_core_log_collection(_enabled: bool) -> Result<(), ServerFnError> {
+pub(crate) fn native_set_core_log_collection(_enabled: bool) -> Result<(), ApiError> {
     Ok(())
 }
 
@@ -1256,24 +1241,24 @@ pub(crate) fn split_route_target(target: &str) -> (String, Option<u16>) {
 // 用 Unix domain socket 并配合 SO_PEERCRED 校验对端 uid/pid，消除「释放→重绑」
 // 窗口。本轮仅评估、记录结论，不改动实现。
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn allocate_loopback_port() -> Result<u16, ServerFnError> {
+pub(crate) fn allocate_loopback_port() -> Result<u16, ApiError> {
     use std::net::TcpListener;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|error| ServerFnError::new(format!("分配流量统计端口失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("分配流量统计端口失败: {error}")))?;
     listener
         .local_addr()
         .map(|address| address.port())
-        .map_err(|error| ServerFnError::new(format!("读取流量统计端口失败: {error}")))
+        .map_err(|error| ApiError::new(format!("读取流量统计端口失败: {error}")))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn generate_traffic_api_secret() -> Result<String, ServerFnError> {
+pub(crate) fn generate_traffic_api_secret() -> Result<String, ApiError> {
     use std::fmt::Write;
 
     let mut bytes = [0u8; 24];
     getrandom::fill(&mut bytes)
-        .map_err(|error| ServerFnError::new(format!("生成流量统计令牌失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("生成流量统计令牌失败: {error}")))?;
     let mut secret = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = write!(secret, "{byte:02x}");
@@ -1287,8 +1272,6 @@ pub(crate) fn toggle_native_core(
     _enabled: bool,
     _request: Option<ConnectionRequest>,
     _rule_set_cache: Option<RuleSetCachePaths>,
-) -> Result<ApiCoreStatus, ServerFnError> {
-    Err(ServerFnError::new(
-        "浏览器目标不能直接运行嵌入式 sing-box 内核",
-    ))
+) -> Result<ApiCoreStatus, ApiError> {
+    Err(ApiError::new("浏览器目标不能直接运行嵌入式 sing-box 内核"))
 }

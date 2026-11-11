@@ -312,7 +312,7 @@ pub struct AppStore {
     /// overwrite the real settings with blanks. That is the one failure this field exists to
     /// prevent rather than merely record.
     sync_config: Signal<Option<api::SyncConfig>>,
-    /// Why the sync settings could not be read, with the retry the Dioxus shell offers.
+    /// Why the sync settings could not be read, alongside the retry the card offers.
     sync_load_error: Signal<Option<String>>,
     /// Which sync action is in flight, so one press cannot start two and the right button
     /// carries the spinner. Save, push, force-push and pull are four different pieces of work
@@ -1719,7 +1719,7 @@ impl AppStore {
                 return;
             };
             // A bounded poll: a core that stops answering must not leave the button
-            // spinning for ever. 600 x 100ms, as the Dioxus app caps it.
+            // spinning for ever. 600 x 100ms, the budget this app has always used.
             for _ in 0..600 {
                 if self.latency_generation.get_untracked() != generation {
                     self.latency_busy.set(false);
@@ -2079,13 +2079,14 @@ impl AppStore {
         self.env_copy_busy.get()
     }
 
-    /// Which shell this is, in the words the Dioxus shells use for the same fact.
+    /// Which shell this is, in the words the update check classifies on.
     ///
-    /// The original takes the name as a prop from each entry point; an NSH build is one binary
-    /// that changes shape with the window it is in, so the idiom answers instead. It stays
-    /// "Desktop"/"Mobile" rather than naming the operating system: the core's own build string
-    /// already says which OS is behind it, and the diagnostic text is compared against the
-    /// other shells' output when a bug report spans both.
+    /// An NSH build is one binary that changes shape with the window it is in, so NSH's own
+    /// idiom answers rather than a prop passed in by each entry point. It stays
+    /// "Desktop"/"Mobile" rather than naming the operating system, because
+    /// `api::update::AppUpdateRequest` maps that value onto a `ReleaseKind` and a desktop app
+    /// is what a desktop archive is for; the core's own build string already says which OS is
+    /// behind it.
     pub fn platform_label(&self) -> &'static str {
         if is_desktop() {
             "Desktop"
@@ -2289,7 +2290,7 @@ impl AppStore {
             Err(error) => {
                 // Redaction is the backend's job — every sync error it builds goes through its
                 // own `redact` before it leaves `packages/api` — so the text is shown as it
-                // arrived, which is also what the Dioxus shell does.
+                // arrived.
                 let (friendly, is_conflict) = crate::domain::classify_sync_error(&error);
                 // Both pieces are looked up before being joined. A toast holds finished text and
                 // is translated as it is drawn, so a string assembled here would reach the table

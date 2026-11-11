@@ -1,20 +1,19 @@
-//! Unified, machine-readable error codes for client-facing server functions.
+//! Unified, machine-readable error codes for the api crate's public functions.
 //!
-//! `ServerFnError` (Dioxus 0.7, re-exported from `dioxus_fullstack_core`) is an
-//! enum. We confirmed its real API: it has a
-//! `ServerError { message, code, details }` variant carrying an HTTP `code`,
-//! plus `ServerFnError::new(impl ToString)` (status 500, `details: None`) as the
-//! only constructor that is stable across every target, including wasm32.
+//! [`ApiError`] is the crate's own type: an api call is a plain async function now
+//! that the NSH app is the only shell, so nothing wraps these messages in a
+//! transport layer any more. That is a behaviour change worth knowing about — the
+//! Dioxus shells saw `Display` output that read
+//! "error running server function: … (details: None)", and a shell that prints
+//! `error.to_string()` gets the bare message today.
 //!
-//! Tradeoff: we deliberately do NOT construct the `ServerError { .. }` variant
-//! by hand. Relying on that internal shape would couple us to one Dioxus
-//! release and would not help the UI, which surfaces the **message string** in
-//! toasts (B6/B7). Instead `api_err` embeds the `ApiErrorCode` into the message
-//! as a `[Exxxx]` prefix, and `error_code_from_server_fn` decodes it from
-//! `ServerFnError::to_string()`. Because that Display output wraps the message
-//! ("error running server function: … (details: None)"), the marker is not at
-//! byte 0; the decoder scans bracketed tokens instead of assuming a start
-//! position. This keeps one code path on native and wasm32 alike.
+//! The category lives in a field, not in the string: [`api_err`] records the
+//! `ApiErrorCode` structurally, while `Display` still renders the `[Exxxx]` prefix
+//! that the codes have always carried, so anything matching on the rendered text
+//! keeps working. [`error_code`] reports the code and additionally decodes a
+//! `[Exxxx]` marker embedded in an unclassified message, which is what keeps the
+//! contract intact for errors that were built by [`ApiError::new`] from an
+//! already-formatted string.
 
 use super::*;
 
@@ -52,7 +51,7 @@ impl ApiErrorCode {
         }
     }
 
-    /// A sensible HTTP status per category. `ServerFnError::new` always reports
+    /// A sensible HTTP status per category. `ApiError::new` always reports
     /// 500 at the transport layer; this table is the catalog the UI (and any
     /// future HTTP-layer integration) uses to classify a code.
     pub fn http_status(self) -> u16 {
@@ -86,53 +85,71 @@ impl ApiErrorCode {
     }
 }
 
-/// A structured error before it is flattened into a `ServerFnError`.
+/// A failed api call: a user-facing message plus, where the site knew one, the
+/// [`ApiErrorCode`] it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
-    pub code: ApiErrorCode,
+    /// `None` for the many sites that only know how to phrase a message; see
+    /// [`ApiError::new`].
+    pub code: Option<ApiErrorCode>,
     pub message: String,
 }
 
-/// Build a `ServerFnError` whose message carries a `[Exxxx]` code prefix.
-///
-/// Every message is passed through `redact_secrets` here, so subscription URLs
-/// (userinfo / `?token=`) echoed by `reqwest` can never reach a toast. Call
-/// sites therefore pass the raw Chinese message and do not redact themselves.
-pub fn api_err(code: ApiErrorCode, message: impl Into<String>) -> ServerFnError {
-    let raw: String = message.into();
-    let redacted = redact_secrets(&raw);
-    ServerFnError::new(format!("[{}] {}", code.as_str(), redacted))
-}
+impl ApiError {
+    /// An unclassified failure. Prefer [`api_err`] where the category is known.
+    ///
+    /// The message goes through `redact_secrets`, because the majority of these
+    /// carry text echoed back by `reqwest` or the OS — subscription URLs with
+    /// userinfo or `?token=` must never reach a toast.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: redact_secrets(&message.into()),
+        }
+    }
 
-/// Recover the code that [`api_err`] embedded in a `ServerFnError`.
-///
-/// `ServerFnError::to_string()` wraps the message, so the `[Exxxx]` marker is
-/// not necessarily at the start; we scan bracketed tokens and resolve the
-/// first one that is a known code.
-pub fn error_code_from_server_fn(error: &ServerFnError) -> Option<ApiErrorCode> {
-    let rendered = error.to_string();
-    let mut tail = rendered.as_str();
-    while let Some(open) = tail.find('[') {
-        let after = &tail[open + 1..];
-        let Some(close) = after.find(']') else {
-            break;
-        };
-        if let Some(code) = ApiErrorCode::from_str_code(&after[..close]) {
+    /// The category, and for an unclassified error the `[Exxxx]` marker embedded
+    /// in its message. The fallback keeps the code readable in the case that
+    /// matters: an error that was assembled from an already-formatted string.
+    pub fn code(&self) -> Option<ApiErrorCode> {
+        if let Some(code) = self.code {
             return Some(code);
         }
-        tail = &after[close + 1..];
+        let mut tail = self.message.as_str();
+        while let Some(open) = tail.find('[') {
+            let after = &tail[open + 1..];
+            let Some(close) = after.find(']') else {
+                break;
+            };
+            if let Some(code) = ApiErrorCode::from_str_code(&after[..close]) {
+                return Some(code);
+            }
+            tail = &after[close + 1..];
+        }
+        None
     }
-    None
 }
 
-impl From<ApiError> for ServerFnError {
-    fn from(value: ApiError) -> Self {
-        api_err(value.code, value.message)
+/// Build an [`ApiError`] with a known category.
+pub fn api_err(code: ApiErrorCode, message: impl Into<String>) -> ApiError {
+    ApiError {
+        code: Some(code),
+        ..ApiError::new(message)
     }
+}
+
+/// The category of an [`ApiError`], if it has one.
+pub fn error_code(error: &ApiError) -> Option<ApiErrorCode> {
+    error.code()
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {}", self.code.as_str(), self.message)
+        match self.code {
+            Some(code) => write!(f, "[{}] {}", code.as_str(), self.message),
+            None => f.write_str(&self.message),
+        }
     }
 }
+
+impl std::error::Error for ApiError {}

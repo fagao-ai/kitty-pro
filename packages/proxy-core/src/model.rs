@@ -393,9 +393,10 @@ pub struct DnsOverride {
     pub match_type: CustomRuleMatch,
     /// The thing to match, in the form `match_type` describes.
     ///
-    /// The field keeps its original name so an old file loads unchanged and the Dioxus shell,
-    /// which only ever wrote suffixes, compiles and behaves exactly as before. Renaming it to
-    /// `value` would have been tidier and would have broken both.
+    /// The field keeps its original name so an existing `profile.json`, and an existing remote
+    /// sync snapshot, load unchanged: it only ever held domain suffixes, so the name was
+    /// accurate until per-kind matching was added. Renaming it to `value` would have been
+    /// tidier and would have broken both files.
     pub domain_suffix: String,
     pub server: String,
 }
@@ -456,9 +457,6 @@ pub fn dns_override_matches(rule: &DnsOverride, host: &str) -> bool {
 
 /// Validate one DNS override, normalising the value the same way a routing rule of the same kind
 /// is normalised so the two screens cannot disagree about what `*.example.com` means.
-///
-/// Separate from [`normalize_dns_override`] rather than a wider signature on it: the older
-/// function is what the Dioxus shell calls, and that shell is being kept as it is.
 pub fn normalize_dns_override_match(
     match_type: CustomRuleMatch,
     value: &str,
@@ -492,21 +490,6 @@ fn dns_value_invalid_message(match_type: CustomRuleMatch) -> String {
         // an existing muscle memory both still read the same thing.
         _ => "域名后缀无效".to_string(),
     }
-}
-
-pub fn normalize_dns_override(
-    domain_suffix: &str,
-    server: &str,
-) -> Result<(String, String), String> {
-    let domain = normalize_custom_rule_value(CustomRuleMatch::DomainSuffix, domain_suffix)
-        .map_err(|_| "域名后缀无效".to_string())?;
-    let server = server.trim();
-    let valid_server = server.parse::<std::net::IpAddr>().is_ok()
-        || normalize_custom_rule_value(CustomRuleMatch::Domain, server).is_ok();
-    if !valid_server {
-        return Err("DNS 服务器必须是 IP 或域名".to_string());
-    }
-    Ok((domain, server.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,11 +579,12 @@ pub struct AppProfile {
     pub dark_mode: bool,
     /// The interface language, as a short code (`"zh"`, `"en"`).
     ///
-    /// Empty means "never chosen", which the shells read as their own default rather than as a
-    /// language: the Dioxus app has only Chinese, and the NSH app falls back to the system locale
-    /// on first launch. Kept here rather than in the NSH app because it belongs to the same
-    /// record as `dark_mode` — a preference about the machine's display, portable between the
-    /// two shells by design.
+    /// Empty means "never chosen", which the app reads as its own default rather than as a
+    /// language. Every profile written before the language switch existed, and every profile
+    /// written by the Dioxus shell that this app replaced, is empty and was Chinese-only, so an
+    /// empty value has to keep meaning Chinese rather than the system locale. Kept here rather
+    /// than in the interface crate because it belongs to the same record as `dark_mode` — a
+    /// preference about the machine's display, and one that travels through a sync snapshot.
     #[serde(default)]
     pub language: String,
     #[serde(default)]

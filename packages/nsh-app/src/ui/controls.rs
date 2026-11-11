@@ -38,8 +38,9 @@ pub fn icon(glyph: Icon, size: f32) -> Svg {
 ///
 /// They were not. The primary was 36 and the other three 32, so the sync row — two quiet buttons,
 /// the accent 上传, then the coral 覆盖远端 — stepped by 4pt across one line, which is what the
-/// user pointed at. The split was never a decision: `packages/ui`'s CSS gives `.primary-button`
-/// and `.secondary-button` the same `min-height`, and the NSH port invented two numbers for what
+/// user pointed at. The split was never a decision: the deleted Dioxus `packages/ui` gave
+/// `.primary-button` and `.secondary-button` the same `min-height`, and the NSH port invented
+/// two numbers for what
 /// is one control family wearing four colours.
 ///
 /// 36 because it is already the height of the fields and nav rows these buttons sit beside, and
@@ -151,8 +152,9 @@ pub fn secondary_button_state(
 /// 正在申请网络权限 is a banner, not a button. The name is still required — it is what a screen
 /// reader says, and the only handle a headless test has (`role:button[启动代理]`).
 ///
-/// `lit` carries the page's state in the control's own colour, which is how `packages/ui` draws
-/// its power button: a neutral inset disc with no glow while nothing runs, and the accent fill,
+/// `lit` carries the page's state in the control's own colour, which is how the deleted Dioxus
+/// `packages/ui` drew its power button: a neutral inset disc with no glow while nothing runs,
+/// and the accent fill,
 /// glow and 6pt halo once it does. An always-orange disc shouts the same thing whether the proxy
 /// is up or not, and spends the one colour that could say something.
 pub fn floating_action_state(

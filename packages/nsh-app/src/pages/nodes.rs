@@ -179,7 +179,7 @@ enum ListRow {
         group: Option<String>,
         /// Shared rather than copied: a row is rebuilt for every cell that shows it, and a
         /// subscription's nodes barely change between two frames. The same reasoning behind the
-        /// `Rc<Vec<ProxyNode>>` tables in the Dioxus shell.
+        /// `Rc<Vec<ProxyNode>>` tables this app had before NSH.
         node: Rc<proxy_core::ProxyNode>,
         current: bool,
         selectable: bool,

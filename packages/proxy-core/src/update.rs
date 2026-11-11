@@ -551,6 +551,48 @@ mod tests {
         select_asset(&fixtures(), &target(kind, os, arch)).map(|asset| asset.name.clone())
     }
 
+    /// The names `nsh package` produces, which the release workflow renames to.
+    /// `Desktop` installs come from the NSH host on every platform, so this is the
+    /// set an update check really sees from here on.
+    fn select_from(kind: ReleaseKind, os: &str, arch: &str, names: &[&str]) -> Option<String> {
+        let assets: Vec<GitHubReleaseAsset> = names
+            .iter()
+            .map(|name| GitHubReleaseAsset {
+                name: (*name).to_string(),
+                size: 1,
+                browser_download_url: format!("https://example.invalid/{name}"),
+            })
+            .collect();
+        select_asset(&assets, &target(kind, os, arch)).map(|asset| asset.name.clone())
+    }
+
+    #[test]
+    fn the_native_shell_package_names_select_their_own_platform() {
+        let names = [
+            "Kitty-Pro-macos-aarch64.zip",
+            "Kitty-Pro-windows-x86_64.zip",
+            "Kitty-Pro-linux-x86_64.tar.gz",
+        ];
+        for (os, arch, expected) in [
+            ("macos", "aarch64", "Kitty-Pro-macos-aarch64.zip"),
+            ("windows", "x86_64", "Kitty-Pro-windows-x86_64.zip"),
+            ("linux", "x86_64", "Kitty-Pro-linux-x86_64.tar.gz"),
+        ] {
+            assert_eq!(
+                select_from(ReleaseKind::Desktop, os, arch, &names).as_deref(),
+                Some(expected),
+                "{os}/{arch} must get its own archive"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_app_bundle_is_never_offered_as_an_installer() {
+        // NSH emits `Kitty Pro.app` next to its zip. Publishing the directory's
+        // name would hand a user something no installer can open.
+        assert_eq!(ReleaseKind::from_asset_name("Kitty Pro.app"), None);
+    }
+
     #[test]
     fn every_platform_gets_exactly_its_own_installer() {
         assert_eq!(

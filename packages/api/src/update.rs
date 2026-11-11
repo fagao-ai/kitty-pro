@@ -21,17 +21,10 @@
 //! release page is also where the checksums live, which keeps verification with
 //! the installer instead of duplicating an installer here.
 //!
-//! Requests go out from the native side - the desktop process, the Android
-//! process, or the self-hosted web server for browser clients - never from a
-//! browser, so a page served over LAN cannot be pointed at a third-party host by
-//! anything in a profile.
+//! Requests go out from the app process, never from a browser, so a page served
+//! over LAN cannot be pointed at a third-party host by anything in a profile.
 
-// wasm32（客户端）上 dioxus 会把 server fn 函数体替换成网络调用桩，
-// 本模块所有 api_err 调用点随之消失，导入在 wasm 目标下属于未使用。
-#[cfg_attr(target_arch = "wasm32", allow(unused_imports))]
-use super::{api_err, ApiErrorCode};
-use dioxus::prelude::*;
-use kitty_server_fn_macro::kitty_server_fn;
+use super::{api_err, ApiError, ApiErrorCode};
 use proxy_core::{select_asset, GitHubRelease, ReleaseTarget};
 use serde::{Deserialize, Serialize};
 // Only the throttle reads this, and the throttle exists only where a check can
@@ -161,8 +154,7 @@ pub struct AppUpdateRequest {
     pub force: bool,
 }
 
-#[kitty_server_fn(get, "/api/update/settings")]
-pub async fn load_update_settings() -> Result<UpdateSettings, ServerFnError> {
+pub async fn load_update_settings() -> Result<UpdateSettings, ApiError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         super::run_native_blocking("读取更新设置失败", || {
@@ -178,10 +170,7 @@ pub async fn load_update_settings() -> Result<UpdateSettings, ServerFnError> {
     }
 }
 
-#[kitty_server_fn(post, "/api/update/settings")]
-pub async fn save_update_settings(
-    settings: UpdateSettings,
-) -> Result<UpdateSettings, ServerFnError> {
+pub async fn save_update_settings(settings: UpdateSettings) -> Result<UpdateSettings, ApiError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _guard = state_lock().lock().await;
@@ -206,8 +195,7 @@ pub async fn save_update_settings(
 /// `force: false` honours the daily throttle and answers from the last result
 /// that reached GitHub, which is what makes a startup check free on every
 /// subsequent launch. `force: true` is the button in the settings card.
-#[kitty_server_fn(post, "/api/update/check")]
-pub async fn check_app_update(request: AppUpdateRequest) -> Result<AppUpdateStatus, ServerFnError> {
+pub async fn check_app_update(request: AppUpdateRequest) -> Result<AppUpdateStatus, ApiError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let now = unix_now();
@@ -272,8 +260,7 @@ pub async fn check_app_update(request: AppUpdateRequest) -> Result<AppUpdateStat
 }
 
 /// Stop presenting one version as an update until a newer release appears.
-#[kitty_server_fn(post, "/api/update/dismiss")]
-pub async fn dismiss_app_update(version: String) -> Result<UpdateSettings, ServerFnError> {
+pub async fn dismiss_app_update(version: String) -> Result<UpdateSettings, ApiError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _guard = state_lock().lock().await;
@@ -377,7 +364,7 @@ fn unix_now() -> u64 {
 
 /// Ask GitHub for the newest release and pick the asset for `target`.
 #[cfg(not(target_arch = "wasm32"))]
-async fn fetch_release(target: &ReleaseTarget) -> Result<Option<AppRelease>, ServerFnError> {
+async fn fetch_release(target: &ReleaseTarget) -> Result<Option<AppRelease>, ApiError> {
     use std::time::Duration;
 
     let client = reqwest::Client::builder()
@@ -535,7 +522,7 @@ struct UpdateState {
 
 /// `<data dir>/update.json`, beside `profile.json` and `sync.json`.
 #[cfg(not(target_arch = "wasm32"))]
-fn update_state_path() -> Result<std::path::PathBuf, ServerFnError> {
+fn update_state_path() -> Result<std::path::PathBuf, ApiError> {
     super::profile_path()?
         .parent()
         .map(|directory| directory.join("update.json"))
@@ -556,7 +543,7 @@ fn update_state_path() -> Result<std::path::PathBuf, ServerFnError> {
 /// app cannot stat) still surface, because defaults would not fix those and the
 /// write path has to report them anyway.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_state() -> Result<UpdateState, ServerFnError> {
+fn read_state() -> Result<UpdateState, ApiError> {
     let path = update_state_path()?;
     match std::fs::read(&path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
@@ -575,7 +562,7 @@ fn read_state() -> Result<UpdateState, ServerFnError> {
 /// a corrupt file would otherwise black-hole the card until it was deleted by
 /// hand. Defaults cover a missing file, so writing is best-effort by design.
 #[cfg(not(target_arch = "wasm32"))]
-fn write_state(state: &UpdateState) -> Result<(), ServerFnError> {
+fn write_state(state: &UpdateState) -> Result<(), ApiError> {
     use std::io::Write;
 
     let path = update_state_path()?;

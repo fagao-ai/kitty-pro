@@ -100,7 +100,7 @@ pub fn font_mono() -> SharedString {
 /// The switch's thumb. Opaque in both appearances, which is the whole reason it has a role of
 /// its own: the card color is a 68% white and the track it sits on is an 82% white, so a thumb
 /// painted with the card is the same color as the track and the switch shows no state at all.
-/// `packages/ui` reaches for `--switch-thumb` for the same reason.
+/// The deleted Dioxus `packages/ui` reached for `--switch-thumb` for the same reason.
 pub fn switch_thumb() -> AdaptiveColor {
     theme()
         .color("switch-thumb")

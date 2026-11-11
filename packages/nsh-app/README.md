@@ -1,13 +1,14 @@
 # Kitty Pro on Native Shell
 
-The NSH rewrite of this app's interface. It is a second front end, added alongside the
-Dioxus one rather than replacing it: `packages/ui`, `web`, `desktop` and `mobile` still
-build, still pass, and are untouched.
+This is the app's interface. The Dioxus front end that was here first — `packages/ui`,
+`web`, `desktop`, `mobile` — has been deleted, so everything below describes the only
+shipped UI rather than a port in progress.
 
 ```sh
 cargo run -p nsh-app-kitty --features desktop   # a real window, no NSH CLI needed
 cargo test -p nsh-app-kitty                     # the screens under NSH's engine, headless
 nsh run                                         # every target, with hot updates (needs the nsh CLI)
+nsh package --target macos                      # a distributable .app
 ```
 
 `desktop` is a Cargo feature because the Linux host needs GTK 4.14 development packages,
@@ -17,9 +18,11 @@ which the CI runners do not carry. The default build pulls no system libraries, 
 ## The backend is shared, not rewritten
 
 `api`, `proxy-core` and `singbox` are used as they are. An NSH app is a native process, so
-the server-function hop the Dioxus shells make is simply a function call here, and the
-`#[kitty_server_fn]` macro adds no HTTP attribute without the `server` feature. Nothing in
-`src/` re-implements profile storage, the sing-box control plane, rule parsing or sync.
+there is no transport hop at all: every backend call is a plain async function call into
+`api`. That is also why `api` no longer depends on Dioxus — with one native shell left, its
+server functions and their `ServerFnError` lost their reason to exist, and it now returns
+its own `ApiError`. Nothing in `src/` re-implements profile storage, the sing-box control
+plane, rule parsing or sync.
 
 ### This app runs no JavaScript, and the binary still contains a JS engine
 
@@ -31,10 +34,10 @@ dependency tree — `cargo tree` says so and `nm` on the linked binary agrees, z
 symbols. NSH *does* ship a TSX mode, where UI is TypeScript on QuickJS with hot updates; this
 crate simply is not that.
 
-The binary nevertheless carries `rquickjs` symbols (518 in this one, 532 in the Dioxus build),
-because the shared backend needs them: `proxy-core`'s config-script override runs the user's
-JavaScript through `rquickjs`, so the same engine is in the Dioxus build too. That is a feature
-of `proxy-core`, not a sign of a JS front end — it is the same reason the binary carries a Go
+The binary nevertheless carries `rquickjs` symbols, because the shared backend needs them:
+`proxy-core`'s config-script override runs the user's JavaScript through `rquickjs`, exactly as
+it did for the shell this crate replaced. That is a feature of `proxy-core`, not a sign of a JS
+front end — it is the same reason the binary carries a Go
 archive.
 
 ## Layout of the crate
@@ -236,8 +239,8 @@ text check cannot fail on position — the words are identical in any corner.
 ## The visual language
 
 It is carried over rather than redesigned. `theme.json` defines 45 roles
-per appearance and carries every color and radius from `app.css` at its original value,
-including the `rgba()` alphas the cards rely on. Three of those roles exist because the CSS has
+per appearance and keeps every color and radius the deleted Dioxus stylesheet (`app.css`) used,
+at its original value, including the `rgba()` alphas the cards rely on. Three of those roles exist because that CSS had
 them and the first port dropped them: `--switch-thumb`, the thumb's opaque fill,
 `--switch-thumb-shadow`, the shadow that is the only thing separating a white thumb from an 82%
 white track, and `--accent-glow`, the floating action's own shadow colour while it is lit. Where the CSS file also keeps a type scale, font weights, spacing steps and layout
@@ -248,23 +251,24 @@ A control whose look is made of parts needs those parts styled at the right leve
 where the port's first pass went wrong: `checked_style` paints a `switch`'s own box, not its
 track, so the checked fill drew an orange rectangle around a track that had never been sized.
 `ui::controls::switch_state` now styles the track and the thumb themselves, takes their sizes
-from `domain::SwitchGeometry` (the same numbers `app.css` gives `.switch` and `.switch::after`,
+from `domain::SwitchGeometry` (the same numbers the old `app.css` gave `.switch` and `.switch::after`,
 with the thumb's travel derived so it cannot stop matching the inset), and the box paints
 nothing at all.
 
-The three variable faces (Space Grotesk, Inter, JetBrains Mono) are the same woff2 bytes the
-Dioxus app inlines, extracted from `packages/ui/assets/styling/fonts.css` into
-`assets/fonts/`. CJK still falls through to the system font, as it does there.
+The three variable faces (Space Grotesk, Inter, JetBrains Mono) are the woff2 bytes this crate
+serves from `assets/fonts/`, the same faces the deleted Dioxus stylesheet inlined. CJK falls
+through to the system font.
 
-## What the Dioxus shell has that this one does not
+## What is still missing
 
 Checked by reading both, not by assumption. What is left:
 
 | Missing | What it means |
 | --- | --- |
-| Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. `packages/desktop` has both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. |
+| Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. With no tray there is also nowhere for `AppStore::copy_proxy_environment` to live, and no menu-bar quit for `api::shutdown_native_runtime`. |
 | 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
 | Web and mobile shells | This crate is native. Under `nsh run --target web` the backend would run in the browser and could not start a core; there is no server mode yet. |
+| Process entry points in a **packaged** build | The deleted Dioxus `main.rs` owned three things that belong to whichever entry point starts the process: dispatching the privileged TUN helper (`api::run_tun_helper_from_args`, because the helper is this same executable re-launched with a flag), clearing a system proxy left dangling by a crashed run (`api::cleanup_stale_system_proxy_sentinel`), and taking the proxy and core down on exit (`api::shutdown_native_runtime`). `src/main.rs` does all three, so `cargo run --features desktop` is complete. `nsh package` does **not** use that file: it generates and builds its own runner (`.nsh/rust/<target>-app/main.rs`), so a packaged build reaches none of them. TUN is the one that breaks rather than degrades — the authorized helper would skip its dispatch, open a second GUI as root, and the parent's RPC would time out. Either give the packaged runner these calls or keep shipping from `cargo build --features desktop`; verify TUN on a packaged build before the next release. |
 
 Every screen is ported and every settings card has a home here. The rows above are the whole
 distance between the two front ends, and none of them is a decision this crate can make on its own.
@@ -279,8 +283,8 @@ window has no scroll budget to spend on a card the user reads once.
 
 Both are ported, each in the form this shell can honestly offer.
 
-The about card reports the same figures the Dioxus one does, and `复制诊断信息` produces the same
-text. Two things differ. The platform is derived from NSH's own idiom (`Desktop`/`Mobile`) rather
+The about card reports the figures the deleted Dioxus one reported, and `复制诊断信息` produces
+the same text. Two things differ. The platform is derived from NSH's own idiom (`Desktop`/`Mobile`) rather
 than passed in as a prop by each entry point — there is one binary here, and it changes shape with
 the window it is in. And the copy goes through NSH's system clipboard instead of forking `pbcopy`:
 the report is meant for a bug report or a chat window, which is what the system clipboard is for.
@@ -341,7 +345,7 @@ Unverified). It is worth running once against a real WebDAV host.
 
 ### App updates
 
-The card reads the same state file the Dioxus shell writes, from the same three calls, and the
+The card reads the same state file the deleted Dioxus shell wrote, from the same three calls, and the
 check runs on launch whether or not the settings page is ever opened — the settings read and the
 check are separate boot reads because the card must not be the only thing that ever asks. Whether
 this build has a channel at all is the backend's answer (`AppUpdateState::Unsupported`) and the
@@ -382,7 +386,7 @@ second: `ALLOWED_SCRIPT_KEYS` does not admit `outbounds`, and `reject_clash_conf
 script that returns `proxy-groups`. The Clash YAML parser never reads a provider's own
 `proxy-groups` section at all — `parser.rs` has no concept of a group — so it keeps the nodes
 and drops the grouping. A provider that ships nodes grouped by region is therefore a flat list
-here, but it is a flat list in the Dioxus shell too, and in the core: that is a decision in
+here, and a flat list in the core: that is a decision in
 `proxy-core`'s parser, not a gap in this front end, and no screen in this crate can offer a
 group the engine does not build. Closing it for real means teaching the parser to carry
 provider groups into the config, which is a change to the shared backend.
@@ -408,7 +412,7 @@ worth knowing about them:
   checked by putting the bug back and watching the test fail.
 - Each test takes an exclusive scratch `KITTY_PROFILE_DIR`, because the screens read and
   write the real profile store. `tests/fixtures/profile-two-nodes.json` is generated from
-  `AppProfile` itself, so a pass means the port reads what the Dioxus app writes.
+  `AppProfile` itself, so a pass means the screens read what the backend writes.
 
 `every_status_pair_clears_aa_contrast` reads `theme.json` and checks every status color
 against its own background in both appearances, so a token added later is covered by the

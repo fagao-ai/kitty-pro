@@ -68,8 +68,9 @@ impl Lang {
 
     /// The language a stored code asks for.
     ///
-    /// Empty — every profile written before this feature, and every profile the Dioxus shell
-    /// writes — is Chinese, *not* the system locale. Defaulting to the system would flip a
+    /// Empty — every profile written before this feature, and every profile written by the
+    /// Dioxus shell this app replaced — is Chinese, *not* the system locale. Defaulting to the
+    /// system would flip a
     /// reader's interface on the update that introduced the switch, for a choice they never made,
     /// and NSH's own fallback locale is `en-US`: on the machine this app is developed on that is a
     /// silent switch to English for everyone. The system locale is honoured only where the user
@@ -448,8 +449,8 @@ const ENGLISH: &[(&str, &str)] = &[
     ("命中域名用专用 DNS 解析并直连，任何分流模式都生效", "Matching domains resolve here and go direct, in every mode"),
     ("为指定域名固定 DNS，避免公共 DNS 解析到错误地址。", "Pin DNS for a domain when public resolvers answer wrongly."),
     // The words `proxy_core` answers with when a DNS field is refused. They are listed here rather
-    // than in the crate that writes them because that crate is shared with the Dioxus shell, which
-    // draws them as they are and knows nothing of this table.
+    // than in the crate that writes them because `proxy_core` stays language-agnostic: an older
+    // build or a sync peer reads those words as they are and knows nothing of this table.
     ("域名无效", "that domain is not valid"),
     ("域名关键字无效", "that keyword is not valid"),
     ("域名后缀无效", "that domain suffix is not valid"),
@@ -810,8 +811,9 @@ mod tests {
         }
     }
 
-    /// The stored form is what lands in `profile.json`, which the Dioxus shell also reads, so it
-    /// has to be stable and short rather than `format!("{:?}", lang)`.
+    /// The stored form is what lands in `profile.json`, which a profile written by an older
+    /// release or pulled from another device also carries, so it has to be stable and short
+    /// rather than `format!("{:?}", lang)`.
     #[test]
     fn a_language_stores_a_short_code() {
         assert_eq!(Lang::Chinese.as_str(), "zh");
