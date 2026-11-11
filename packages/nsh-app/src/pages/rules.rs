@@ -935,18 +935,34 @@ fn dns_row(
                 }
             },
         ))
-        .child(controls::badge(
-            // The resolver, in the slot the routing row spends on its action: both answer "and
-            // then what?". Not translated — an address is data, not the app's vocabulary.
-            move || {
-                item.with(|item| {
-                    item.as_ref()
-                        .map(|item| item.server.clone())
-                        .unwrap_or_default()
-                })
-            },
-            || theme::Tint::Dns,
-        ))
+        .child(
+            // Wrapped exactly as the routing row wraps its action badge, and the wrapper is the
+            // whole reason the pill sits level here. `controls::badge` carries `.self_start()`,
+            // which is load-bearing where a badge is a child of a *column* — the log row gives one
+            // a fixed 52pt width and the pill must not stretch to fill it — and reads as a bug
+            // anywhere else: inside a row it overrides that row's `items_center` and pins the pill
+            // to the top edge, so a two-line row shows it floating. NSH has no `items_start` to
+            // undo it from the parent, so a caller that wants a centred badge supplies a wrapper the
+            // height of one line, which is what the routing row has always done.
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .flex_shrink_0()
+                .child(controls::badge(
+                    // The resolver, in the slot the routing row spends on its action: both answer
+                    // "and then what?". Not translated — an address is data, not the app's
+                    // vocabulary.
+                    move || {
+                        item.with(|item| {
+                            item.as_ref()
+                                .map(|item| item.server.clone())
+                                .unwrap_or_default()
+                        })
+                    },
+                    || theme::Tint::Dns,
+                )),
+        )
         .child(controls::icon_button(
             move || Icon::Trash2,
             // One press, as this row always was. The routing row arms because a rule sits in an

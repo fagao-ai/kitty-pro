@@ -1781,6 +1781,50 @@ fn the_dns_list_draws_like_the_routing_list() {
     );
 }
 
+/// The DNS row's badge is vertically centred, not pinned to the top of the row.
+///
+/// Reported from a screenshot: the resolver pill sat high beside a two-line row. The cause was in
+/// `controls::badge` — a `.self_start()` that is load-bearing where a badge is a child of a column
+/// (the log row gives one a 52pt width and it must not stretch) and wrong everywhere else, since
+/// inside a row it overrides that row's `items_center`.
+///
+/// Asserted on frames rather than on strings because the bug is exactly the kind a text sweep
+/// cannot see: every word was present, correctly translated, in the right row, and drawn too high.
+#[test]
+fn the_dns_badge_sits_level_with_its_row() {
+    let (app, _profile) = seeded_test("the_dns_badge_sits_level_with_its_row", PROFILE_TWO_DNS);
+    let (mut app, drawn) = observing(app);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("规则").unwrap();
+    app.press("专用 DNS").unwrap();
+    app.wait_for("et.net").unwrap();
+
+    let badge = drawn
+        .lock()
+        .expect("the observer's record")
+        .node_with_text("100.100.100.101")
+        .expect("the resolver badge is drawn");
+    let record = drawn.lock().expect("the observer's record");
+    let (_, badge_y) = record.center_in_root(badge);
+    // The two-line column beside it, whose own centre *is* the row's: it is the tallest child of a
+    // row that centres its children, so whatever is level with the row is level with this.
+    let value = record
+        .node_with_text("et.net")
+        .expect("the row's value is drawn");
+    let column = record.parent[&value];
+    let (_, column_y) = record.center_in_root(column);
+    // Two points, not zero: the badge is an odd number of pixels tall and the row's centre is not,
+    // so the two land on neighbouring half-points when they agree perfectly. What this rules out is
+    // the reported bug — a pill pinned to the top of a 34pt row sits about 13pt high, which no
+    // tolerance worth having would let through.
+    assert!(
+        (badge_y - column_y).abs() < 2.0,
+        "the resolver badge centres at {badge_y} and the row it belongs to at {column_y}: \
+         the badge sits {}",
+        if badge_y < column_y { "high" } else { "low" }
+    );
+}
+
 /// A subscription's nodes go with it and cannot be recovered without the provider, so the
 /// deletion asks in a native alert naming the one being removed.
 #[test]
