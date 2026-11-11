@@ -9,6 +9,7 @@
 //! to collect parks the page on "已暂停" instead of claiming a live feed.
 
 use crate::domain::{self, LogFilter};
+use crate::i18n;
 use crate::store::{AppStore, LOG_BUFFER};
 use crate::ui::{controls, theme, Icon};
 use api::CoreLogEntry;
@@ -140,7 +141,7 @@ pub fn logs(store: AppStore) -> impl IntoElement {
                         )),
                 )
                 .child(
-                    text(move || buffer_note(store))
+                    text(move || i18n::tr(&(buffer_note(store))))
                         .text_xs()
                         .text_color(theme::text_faint()),
                 ),
@@ -191,7 +192,7 @@ fn collection_chip(store: AppStore) -> impl IntoElement {
         .bg(move || collection_tint(store).wash())
         .child(controls::status_dot_tinted(move || collection_tint(store)))
         .child(
-            text(move || collection_label(store))
+            text(move || i18n::tr(collection_label(store)))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || collection_tint(store).foreground()),
@@ -218,15 +219,24 @@ fn collection_label(store: AppStore) -> &'static str {
     }
 }
 
+/// How many lines are held and how many are showing.
+///
+/// Built from translated *templates* rather than translated after formatting: `fill` looks the
+/// sentence up with its holes still in it, so English can say `0 of 0 lines shown` where the
+/// Chinese puts the counts before the nouns. A `format!` first would hand the table a string no
+/// table can hold.
 fn buffer_note(store: AppStore) -> String {
     let stored = store.logs().len();
     let shown = visible(store).len();
-    let mut note = format!("缓冲区 {stored} 条记录 · 当前显示 {shown} 条");
+    let mut note = i18n::fill("缓冲区 {} 条记录 · 当前显示 {} 条", &[&stored, &shown]);
     if stored >= LOG_BUFFER {
-        note.push_str(&format!("（最多保留 {LOG_BUFFER} 条）"));
+        note.push_str(&i18n::in_parens(&i18n::fill(
+            "最多保留 {} 条",
+            &[&LOG_BUFFER],
+        )));
     }
     if let Some(reason) = store.log_note() {
-        note.push_str(&format!(" · 采集失败：{reason}"));
+        note.push_str(&i18n::fill(" · 采集失败：{}", &[&reason]));
     }
     note
 }
@@ -318,7 +328,7 @@ fn header_row() -> impl IntoElement {
         .child(column_label("命中链路", 160.0))
         .child(column_label("出口节点", 160.0))
         .child(
-            text("消息")
+            text(move || i18n::tr("消息"))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .flex_1()
@@ -328,7 +338,8 @@ fn header_row() -> impl IntoElement {
 }
 
 fn column_label(label: &'static str, width: f32) -> impl IntoElement {
-    text(label)
+    // Translated here: one line covers all six column headers, and the words are ours.
+    text(move || i18n::tr(label))
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .w(px(width))

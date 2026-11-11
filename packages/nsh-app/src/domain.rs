@@ -131,6 +131,11 @@ pub fn format_latency(latency_ms: Option<u64>, error: Option<&str>) -> (String, 
     }
 }
 
+/// Every assertion in this file is about the Chinese wording, so the tests name the language they
+/// ask for rather than inheriting one from a global a parallel test could have changed.
+#[cfg(test)]
+const ZH: crate::i18n::Lang = crate::i18n::Lang::Chinese;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,18 +1356,18 @@ impl SyncStatus {
     ///
     /// Days rather than hours because a sync baseline is something a user checks on the order
     /// of weekly, and `4320 小时前` is unreadable at exactly the scale that matters.
-    pub fn since_label(self, now: u64) -> Option<String> {
+    pub fn since_label(self, now: u64, lang: crate::i18n::Lang) -> Option<String> {
         let SyncStatus::Synced(at) = self else {
             return None;
         };
         let ago = now.saturating_sub(at);
         const DAY: u64 = 86_400;
         Some(if ago < 60 {
-            "刚刚".to_owned()
+            crate::i18n::translate(lang, "刚刚")
         } else if ago < DAY {
-            format!("{} 小时前", ago / 3_600)
+            crate::i18n::fill_at(lang, "{} 小时前", &[&(ago / 3_600)])
         } else {
-            format!("{} 天前", ago / DAY)
+            crate::i18n::fill_at(lang, "{} 天前", &[&(ago / DAY)])
         })
     }
 }
@@ -1755,21 +1760,26 @@ pub fn update_display_state(
 }
 
 /// Elapsed time in the largest unit that still reads as "recent".
-pub fn relative_age(seconds_ago: u64) -> String {
+///
+/// `lang` is a parameter rather than a read of the current language so this stays a pure function:
+/// `domain` is unit-tested without a reactive runtime, and `i18n::translate` is the half of that
+/// module that does not need one.
+pub fn relative_age(seconds_ago: u64, lang: crate::i18n::Lang) -> String {
+    use crate::i18n::{self, translate};
     if seconds_ago == 0 {
-        return "刚刚".to_owned();
+        return translate(lang, "刚刚");
     }
     const MINUTE: u64 = 60;
     const HOUR: u64 = MINUTE * 60;
     const DAY: u64 = HOUR * 24;
     if seconds_ago < MINUTE {
-        format!("{seconds_ago} 秒前")
+        i18n::fill_at(lang, "{} 秒前", &[&seconds_ago])
     } else if seconds_ago < HOUR {
-        format!("{} 分钟前", seconds_ago / MINUTE)
+        i18n::fill_at(lang, "{} 分钟前", &[&(seconds_ago / MINUTE)])
     } else if seconds_ago < DAY {
-        format!("{} 小时前", seconds_ago / HOUR)
+        i18n::fill_at(lang, "{} 小时前", &[&(seconds_ago / HOUR)])
     } else {
-        format!("{} 天前", seconds_ago / DAY)
+        i18n::fill_at(lang, "{} 天前", &[&(seconds_ago / DAY)])
     }
 }
 
@@ -1779,25 +1789,30 @@ pub fn relative_age(seconds_ago: u64) -> String {
 /// that contacted the release feed is the only one whose clock means anything for a timestamp it
 /// wrote, and a client with no usable clock would otherwise render "从未检查" forever. Zero for
 /// `then` is "never", not the epoch.
-pub fn age_label(then: u64, now: u64) -> Option<String> {
+pub fn age_label(then: u64, now: u64, lang: crate::i18n::Lang) -> Option<String> {
     if now == 0 {
         return None;
     }
     Some(if then == 0 {
-        "从未检查".to_owned()
+        crate::i18n::translate(lang, "从未检查")
     } else {
-        relative_age(now.saturating_sub(then))
+        relative_age(now.saturating_sub(then), lang)
     })
 }
 
 /// The auto-check row's subtitle: how often it runs, and when it last did.
-pub fn auto_check_label(auto_check: bool, last_check_at: u64, server_time: u64) -> String {
+pub fn auto_check_label(
+    auto_check: bool,
+    last_check_at: u64,
+    server_time: u64,
+    lang: crate::i18n::Lang,
+) -> String {
     if !auto_check {
-        return "仅手动检查，启动时不再联网".to_owned();
+        return crate::i18n::translate(lang, "仅手动检查，启动时不再联网");
     }
-    match age_label(last_check_at, server_time) {
-        Some(age) => format!("每天一次 · {age}"),
-        None => "每天一次 · 启动时检查".to_owned(),
+    match age_label(last_check_at, server_time, lang) {
+        Some(age) => crate::i18n::fill_at(lang, "每天一次 · {}", &[&age]),
+        None => crate::i18n::translate(lang, "每天一次 · 启动时检查"),
     }
 }
 
@@ -2752,25 +2767,29 @@ mod sync_tests {
     fn the_age_is_said_in_the_unit_the_user_thinks_in() {
         let now = 1_700_000_000;
         assert_eq!(
-            SyncStatus::Synced(now - 10).since_label(now).as_deref(),
+            SyncStatus::Synced(now - 10).since_label(now, ZH).as_deref(),
             Some("刚刚")
         );
         assert_eq!(
-            SyncStatus::Synced(now - 7_200).since_label(now).as_deref(),
+            SyncStatus::Synced(now - 7_200)
+                .since_label(now, ZH)
+                .as_deref(),
             Some("2 小时前")
         );
         assert_eq!(
             SyncStatus::Synced(now - 3 * 86_400)
-                .since_label(now)
+                .since_label(now, ZH)
                 .as_deref(),
             Some("3 天前")
         );
         // A clock that went backwards (an NTP correction) must not print a huge age.
         assert_eq!(
-            SyncStatus::Synced(now + 500).since_label(now).as_deref(),
+            SyncStatus::Synced(now + 500)
+                .since_label(now, ZH)
+                .as_deref(),
             Some("刚刚")
         );
-        assert_eq!(SyncStatus::Pending.since_label(now), None);
+        assert_eq!(SyncStatus::Pending.since_label(now, ZH), None);
     }
 
     #[test]
@@ -2970,24 +2989,24 @@ mod update_tests {
 
     #[test]
     fn an_age_uses_the_largest_unit_that_still_reads_as_recent() {
-        assert_eq!(relative_age(0), "刚刚");
-        assert_eq!(relative_age(45), "45 秒前");
-        assert_eq!(relative_age(120), "2 分钟前");
-        assert_eq!(relative_age(7_200), "2 小时前");
-        assert_eq!(relative_age(172_800), "2 天前");
+        assert_eq!(relative_age(0, ZH), "刚刚");
+        assert_eq!(relative_age(45, ZH), "45 秒前");
+        assert_eq!(relative_age(120, ZH), "2 分钟前");
+        assert_eq!(relative_age(7_200, ZH), "2 小时前");
+        assert_eq!(relative_age(172_800, ZH), "2 天前");
         // One hour reads in minutes rather than as "0 小时前".
-        assert_eq!(relative_age(3_600), "1 小时前");
+        assert_eq!(relative_age(3_600, ZH), "1 小时前");
     }
 
     /// `then == 0` means "never", not the epoch; `now == 0` means the answering clock is unknown
     /// and no age can be stated at all.
     #[test]
     fn never_is_not_the_epoch() {
-        assert_eq!(age_label(0, 1_700_000_000).as_deref(), Some("从未检查"));
-        assert_eq!(age_label(1_700_000_000, 0), None);
-        assert_eq!(age_label(0, 0), None);
+        assert_eq!(age_label(0, 1_700_000_000, ZH).as_deref(), Some("从未检查"));
+        assert_eq!(age_label(1_700_000_000, 0, ZH), None);
+        assert_eq!(age_label(0, 0, ZH), None);
         assert_eq!(
-            age_label(1_700_000_000 - 120, 1_700_000_000).as_deref(),
+            age_label(1_700_000_000 - 120, 1_700_000_000, ZH).as_deref(),
             Some("2 分钟前")
         );
     }
@@ -2996,7 +3015,7 @@ mod update_tests {
     #[test]
     fn a_future_stamp_does_not_underflow() {
         assert_eq!(
-            age_label(1_700_000_500, 1_700_000_000).as_deref(),
+            age_label(1_700_000_500, 1_700_000_000, ZH).as_deref(),
             Some("刚刚")
         );
     }
@@ -3006,14 +3025,14 @@ mod update_tests {
     #[test]
     fn the_auto_check_row_always_says_something() {
         assert_eq!(
-            auto_check_label(false, 1_700_000_000, 1_700_000_060),
+            auto_check_label(false, 1_700_000_000, 1_700_000_060, ZH),
             "仅手动检查，启动时不再联网"
         );
         assert_eq!(
-            auto_check_label(true, 1_700_000_000, 1_700_000_060),
+            auto_check_label(true, 1_700_000_000, 1_700_000_060, ZH),
             "每天一次 · 1 分钟前"
         );
-        assert_eq!(auto_check_label(true, 0, 0), "每天一次 · 启动时检查");
+        assert_eq!(auto_check_label(true, 0, 0, ZH), "每天一次 · 启动时检查");
     }
 
     /// Titles are whatever the publisher typed. When the title already is the version, printing

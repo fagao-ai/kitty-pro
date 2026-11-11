@@ -73,6 +73,17 @@ pub fn root() -> impl IntoElement {
         let _ = (store.screen.get(), store.core_state());
         store.sync_log_collection();
     });
+    // Reading the language here is what makes a switch reach every label in the app.
+    //
+    // Most labels are built as `text("节点")` — the lookup happens when the element is built, and
+    // NSH gives an app no way to rebuild a tree from inside, so such a label would keep the
+    // language the page was first opened in. A component re-renders when a signal it reads
+    // changes, and a re-render runs its body again, which builds the pages afresh in the new
+    // language. So this one read turns "every label must be written as a closure" from a rule
+    // ~450 call sites have to obey into one the root obeys for them.
+    //
+    // Labels that already read `tr` inside a binding are unaffected — they were correct either
+    // way — and a rebuild costs one frame per press of a control the user pressed deliberately.
     view()
         .flex_1()
         .flex_row()
@@ -360,13 +371,23 @@ fn screen_body(store: AppStore) -> impl IntoElement {
     // Only the current screen is built. Keeping the others mounted behind `hidden()`
     // would hold their timers and polls alive and would let a text assertion pass for a
     // screen nobody is looking at.
-    dynamic(move || match screen.get() {
-        Screen::Overview => pages::overview::overview(store).into_element(),
-        Screen::Settings => pages::settings::settings(store).into_element(),
-        Screen::Nodes => pages::nodes::nodes(store).into_element(),
-        Screen::Subscriptions => pages::subscriptions::subscriptions(store).into_element(),
-        Screen::Rules => pages::rules::rules(store).into_element(),
-        Screen::Logs => pages::logs::logs(store).into_element(),
+    //
+    // `i18n::lang()` is read *inside* the closure, next to `screen.get()`, and that is what makes
+    // a language change reach a page. A `dynamic` region re-runs its closure when a signal read in
+    // the closure changes, and re-running it builds the page again — so every label the page builds
+    // as a plain `text("节点")` is looked up afresh, in the new language, without any of the ~450
+    // call sites needing to know a table exists. Reading it in `root()` instead would not do: the
+    // region's closure is not the root's body, and it only follows signals it reads itself.
+    dynamic(move || {
+        let _lang = i18n::lang();
+        match screen.get() {
+            Screen::Overview => pages::overview::overview(store).into_element(),
+            Screen::Settings => pages::settings::settings(store).into_element(),
+            Screen::Nodes => pages::nodes::nodes(store).into_element(),
+            Screen::Subscriptions => pages::subscriptions::subscriptions(store).into_element(),
+            Screen::Rules => pages::rules::rules(store).into_element(),
+            Screen::Logs => pages::logs::logs(store).into_element(),
+        }
     })
 }
 

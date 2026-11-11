@@ -149,6 +149,16 @@ fn desktop_test(test: &str) -> (Headless, Profile) {
     (app, profile)
 }
 
+/// A whole-surface test: tall enough that the settings page's last card is laid out, so
+/// `Screen::texts` reports it. A test that sweeps every string on a screen has to see every string
+/// on it — clipped text is not reported, and a sweep that silently skipped the bottom of a page
+/// would pass while saying it had checked the page.
+fn tall_test(test: &str) -> (Headless, Profile) {
+    let profile = Profile::claim(test);
+    let app = windowed(&profile, 3000.0);
+    (app, profile)
+}
+
 /// Claim a profile and start a phone engine on it.
 fn phone_test(test: &str) -> (Headless, Profile) {
     let profile = Profile::claim(test);
@@ -2502,58 +2512,136 @@ fn a_chosen_language_is_written_to_the_profile() {
     panic!("the chosen language never reached profile.json: language={stored:?}");
 }
 
-/// The chrome — rail, header, and the appearance card the picker sits on — has no Chinese left in
-/// it when English is on.
+/// No Chinese anywhere, on any screen, once English is on.
 ///
-/// Scoped deliberately to what is finished. The app holds ~330 strings; the screens behind the
-/// chrome are translated less, and an untranslated one falls back to its Chinese rather than
-/// vanishing, which is the right failure for a reader who needs a working proxy while the table is
-/// being filled in. A test that demanded zero Chinese anywhere would have to be skipped or
-/// loosened until it proved nothing, so this asserts the invariant that holds today — the parts
-/// that are always on screen — and `i18n`'s own fallback test covers what happens to the rest.
+/// This is the test that answers "切换英文后还有中文啊" — and it is the reason the translation table
+/// exists as data rather than as translated literals: a claim like "every label goes through `tr`"
+/// can only be checked by drawing every screen and looking for what got away. Each page is walked
+/// by its English name, which also proves the rail relabelled itself enough to be pressed by the
+/// new words.
+///
+/// One string is excepted: `简体中文` is a language option's own name, written in the language it
+/// selects so the reader who switched into English by accident can still find the way back. That is
+/// the only Chinese an English screen should ever draw, and the exception names it rather than
+/// allowing "any Chinese".
 #[test]
-fn the_chrome_is_fully_english_when_english_is_on() {
-    let (mut app, _profile) = desktop_test("the_chrome_is_fully_english_when_english_is_on");
+fn english_leaves_no_chinese_on_any_screen() {
+    let (mut app, _profile) = tall_test("english_leaves_no_chinese_on_any_screen");
     app.wait_for("Kitty Pro").unwrap();
     app.press("设置").unwrap();
     app.press("English").unwrap();
     app.wait_for("Overview").unwrap();
 
-    let cjk = |c: char| ('\u{3400}'..='\u{9fff}').contains(&c);
-    let shown = app.screen().texts();
-    let chinese: Vec<&str> = shown
-        .iter()
-        .copied()
-        .filter(|t| t.chars().any(cjk))
-        .filter(|t| {
-            // Only the chrome is measured: the rail's rows and groups, the header, and the
-            // appearance card. Everything below it is the partly-translated body.
-            const CHROME: &[&str] = &[
-                "总览",
-                "节点",
-                "订阅",
-                "规则",
-                "日志",
-                "设置",
-                "连接",
-                "配置",
-                "运维",
-                "外观",
-                "深色模式",
-                "语言",
-                "界面语言",
-                "流量走向",
-                "接管方式",
-                "内核已就绪",
-            ];
-            // A page's own text can legitimately contain a chrome word (a rule is about 规则), so
-            // match the whole node, not a substring.
-            CHROME.contains(t)
-        })
-        .collect();
+    let mut offenders: Vec<(String, String)> = Vec::new();
+    let mut seen = 0usize;
+    for page in [
+        "Overview",
+        "Nodes",
+        "Subscriptions",
+        "Rules",
+        "Logs",
+        "Settings",
+    ] {
+        app.press(page).unwrap();
+        // Each page reads the profile and the core on arrival; give those reads a frame to land
+        // so a note that has not arrived yet is not mistaken for an untranslated one.
+        app.idle(std::time::Duration::from_millis(400)).unwrap();
+        seen += app.screen().texts().len();
+        for text in app.screen().texts() {
+            let cjk = text.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
+            if cjk && text != "简体中文" {
+                offenders.push((page.to_string(), text.to_string()));
+            }
+        }
+    }
+    offenders.sort();
+    offenders.dedup();
+    // The sweep has to have looked at something: "nothing I collected is Chinese" passes trivially
+    // on an empty collection, and `texts()` reports only laid-out text, so a page that rendered
+    // nothing at all would satisfy the assertion below perfectly. Six pages draw ~230 strings.
     assert!(
-        chinese.is_empty(),
-        "the chrome still draws Chinese: {chinese:?}"
+        seen > 100,
+        "the sweep saw {seen} strings across six pages: it is not looking at the app"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} string(s) still draw Chinese in English: {:?}",
+        offenders.len(),
+        offenders
+    );
+}
+
+/// The surfaces a page sweep cannot see: folded forms, the import dialog, and a floating action's
+/// name.
+///
+/// The sweep above walks six pages, and every one of those forms is *closed* by default — the user
+/// asked for exactly that — so the form's own fields, headings and empty states are never on screen
+/// while the sweep runs. The floating discs have the same problem in a different way: they are
+/// icon-only, so their only words are an accessibility name, which is not drawn and so is not in
+/// `texts()` either. Both were found this way after the visible sweep was already green: the rule
+/// form's heading and the DNS tab's summary line were computing a Chinese key inside their closure
+/// and never looking it up, which re-runs correctly on every poll and still says the wrong thing.
+#[test]
+fn english_holds_in_the_surfaces_a_page_sweep_cannot_open() {
+    let (mut app, _profile) = tall_test("english_holds_in_the_surfaces_a_page_sweep_cannot_open");
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.press("English").unwrap();
+    app.wait_for("Overview").unwrap();
+
+    let cjk = |t: &str| t.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c));
+    let mut offenders: Vec<(String, String)> = Vec::new();
+    let mut seen = 0usize;
+    // Names are checked by pressing them: `press` resolves an accessibility name, so a disc whose
+    // name stayed Chinese simply cannot be found by its English one.
+    let mut look = |app: &mut Headless, where_: &str| {
+        app.idle(std::time::Duration::from_millis(300)).unwrap();
+        let shown = app.screen().texts();
+        seen += shown.len();
+        for text in shown {
+            if cjk(text) && text != "简体中文" {
+                offenders.push((where_.to_string(), text.to_string()));
+            }
+        }
+    };
+
+    app.press("Rules").unwrap();
+    // The rule form, opened by its English name — which only works if the disc relabelled itself.
+    app.press("role:button[Add rule]").unwrap();
+    app.wait_for("Match").unwrap();
+    look(&mut app, "rule form");
+    // The DNS tab, its summary line and its own form.
+    app.press("Dedicated DNS").unwrap();
+    look(&mut app, "DNS tab");
+    app.press("role:button[Add dedicated DNS]").unwrap();
+    app.wait_for("Domain suffix").unwrap();
+    look(&mut app, "DNS form");
+
+    // The import dialog.
+    app.press("Subscriptions").unwrap();
+    app.press("role:button[Add subscription]").unwrap();
+    look(&mut app, "import dialog");
+
+    // The folded sync form.
+    app.press("Settings").unwrap();
+    app.press("Backup location").unwrap();
+    look(&mut app, "sync form");
+
+    offenders.sort();
+    offenders.dedup();
+    // The same non-vacuity guard the page sweep carries: an empty `offenders` is also what an
+    // empty screen looks like. Five surfaces are opened here and each `wait_for` above proves one
+    // was really drawn, so a count this low means the sweep stopped opening them.
+    assert!(
+        seen > 150,
+        "the hidden-surface sweep saw {seen} strings across five opened surfaces: \
+         it is not opening them"
+    );
+    assert!(
+        offenders.is_empty(),
+        "{} string(s) in a closed-by-default surface are still Chinese: {:?}",
+        offenders.len(),
+        offenders
     );
 }
 

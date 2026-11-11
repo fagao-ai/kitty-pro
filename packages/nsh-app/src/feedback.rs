@@ -139,7 +139,10 @@ impl Feedback {
     ) {
         match result {
             Ok(message) => self.success(message.to_string()),
-            Err(error) => self.error(format!("{action}失败：{error}")),
+            Err(error) => self.error(crate::i18n::fill(
+                "{}失败：{}",
+                &[&crate::i18n::tr(action), &error],
+            )),
         }
     }
 
@@ -152,7 +155,10 @@ impl Feedback {
         match result {
             Ok(value) => Some(value),
             Err(error) => {
-                self.error(format!("{action}失败：{error}"));
+                self.error(crate::i18n::fill(
+                    "{}失败：{}",
+                    &[&crate::i18n::tr(action), &error],
+                ));
                 None
             }
         }
@@ -216,7 +222,9 @@ impl Feedback {
                             let id = move || item.get().0;
                             toast()
                                 .transition_status(move || item.get().2)
-                                .accessibility_label(move || Some(item.get().1.text.clone().into()))
+                                .accessibility_label(move || {
+                                    Some(crate::i18n::tr(&item.get().1.text).into())
+                                })
                                 .on_dismiss_request(move || self.dismiss(id()))
                                 .pointer_events(PointerEvents::Auto)
                                 .flex_row()
@@ -234,7 +242,11 @@ impl Feedback {
                                         .text_color(move || item.get().1.kind.tint().foreground()),
                                 )
                                 .child(
-                                    text(move || item.get().1.text.clone())
+                                    // The notice holds the Chinese key and is looked up here, so
+                                    // a toast that is on screen when the language changes
+                                    // relabels itself instead of staying in the old language
+                                    // for its remaining seconds.
+                                    text(move || crate::i18n::tr(&item.get().1.text))
                                         .flex_1()
                                         .min_w(px(0.0))
                                         .text_sm()

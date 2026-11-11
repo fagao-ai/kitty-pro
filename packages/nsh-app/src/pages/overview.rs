@@ -2,6 +2,7 @@
 //! traffic of the last minute.
 
 use crate::domain;
+use crate::i18n;
 use crate::store::{AppStore, SystemProxy};
 use crate::ui::{controls, theme, Icon};
 use nsh_base::theme as base_theme;
@@ -105,13 +106,13 @@ fn status_line(store: AppStore) -> impl IntoElement {
             domain::core_tint(store.connected(), &store.core_state())
         }))
         .child(
-            text(move || status_title(store))
+            text(move || i18n::tr(status_title(store)))
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(move || base_theme().card_foreground),
         )
         .child(
-            text(move || format!("· {}", domain::mode_label(store.tunnel_mode())))
+            text(move || format!("· {}", i18n::tr(domain::mode_label(store.tunnel_mode()))))
                 .text_xs()
                 .text_color(theme::text_soft()),
         )
@@ -162,13 +163,13 @@ fn system_proxy_toggle(store: AppStore) -> impl IntoElement {
                 .min_w(px(0.0))
                 .gap_0p5()
                 .child(
-                    text("系统代理")
+                    text(move || i18n::tr("系统代理"))
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(move || base_theme().card_foreground),
                 )
                 .child(
-                    text(move || proxy_note(store))
+                    text(move || i18n::tr(&proxy_note(store)))
                         .text_xs()
                         .text_color(theme::text_faint()),
                 ),
@@ -255,7 +256,7 @@ fn unavailable_note(store: AppStore) -> impl IntoElement {
                         .text_color(move || domain::core_tint(false, "unavailable").foreground()),
                 )
                 .child(
-                    text("内核不可用，请重新检测；若仍失败，请检查服务是否运行、端口是否被占用。")
+                    text(move || i18n::tr("内核不可用，请重新检测；若仍失败，请检查服务是否运行、端口是否被占用。"))
                         .text_xs()
                         .text_color(move || domain::core_tint(false, "unavailable").foreground()),
                 ),
@@ -278,7 +279,7 @@ fn pending_banner(store: AppStore) -> impl IntoElement {
         .rounded(theme::radius_tile())
         .bg(move || theme::Tint::Warning.wash())
         .child(
-            text("本地配置已改动，运行中的内核还是旧的。")
+            text(move || i18n::tr("本地配置已改动，运行中的内核还是旧的。"))
                 .text_xs()
                 .text_color(move || theme::Tint::Warning.foreground()),
         )
@@ -333,26 +334,35 @@ fn metric_card(store: AppStore, kind: MetricKind) -> impl IntoElement {
                 .child(
                     controls::icon(glyph, 15.0).text_color(move || base_theme().muted_foreground),
                 )
-                .child(text(label).text_xs().text_color(theme::text_faint())),
+                .child(
+                    text(move || i18n::tr(label))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                ),
         )
         .child(metric_value(store, kind))
 }
 
 /// A figure and the line that explains it. Both are closures: this function runs once,
 /// and a value read here would sit at whatever the profile held on the first frame.
+///
+/// `i18n::tr` is applied to both: each helper returns a key (`空闲`, `等待导入订阅`, a formatted
+/// figure whose words are ours), and a closure that reads a key without looking it up is the
+/// subtle version of the frozen-label bug — it re-runs correctly on every poll and still says the
+/// same untranslated thing.
 fn metric_value(store: AppStore, kind: MetricKind) -> impl IntoElement {
     view()
         .flex_col()
         .gap_0p5()
         .child(
-            text(move || metric_figure(store, kind))
+            text(move || i18n::tr(&metric_figure(store, kind)))
                 .text_size(px(22.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .font_family(theme::font_display())
                 .text_color(move || base_theme().card_foreground),
         )
         .child(
-            text(move || metric_note(store, kind))
+            text(move || i18n::tr(metric_note(store, kind)))
                 .text_xs()
                 .text_color(theme::text_faint()),
         )
@@ -428,7 +438,7 @@ fn traffic_card(store: AppStore) -> impl IntoElement {
         .child(controls::section_header(
             "近一分钟流量",
             Some(
-                text(move || chart_status(&history.get(), store.connected()))
+                text(move || i18n::tr(&(chart_status(&history.get(), store.connected()))))
                     .text_xs()
                     .text_color(theme::text_faint()),
             ),
@@ -459,7 +469,11 @@ fn measure_row(store: AppStore) -> impl IntoElement {
         )
         .child(when(
             move || store.latency_busy(),
-            || text("正在测量").text_xs().text_color(theme::text_faint()),
+            || {
+                text(move || i18n::tr("正在测量"))
+                    .text_xs()
+                    .text_color(theme::text_faint())
+            },
         ))
 }
 
@@ -485,7 +499,7 @@ fn probe_row(store: AppStore) -> impl IntoElement {
                 .justify_between()
                 .gap_3()
                 .child(
-                    text(move || probe_hint(store))
+                    text(move || i18n::tr(probe_hint(store)))
                         .text_xs()
                         .text_color(theme::text_faint()),
                 )
@@ -642,7 +656,11 @@ fn legend_dot(tint: theme::Tint, label: &'static str) -> impl IntoElement {
         .items_center()
         .gap_1()
         .child(controls::status_dot_tinted(move || tint))
-        .child(text(label).text_xs().text_color(theme::text_faint()))
+        .child(
+            text(move || i18n::tr(label))
+                .text_xs()
+                .text_color(theme::text_faint()),
+        )
 }
 
 /// The live rate, not the cumulative total: a chart of per-second samples is only

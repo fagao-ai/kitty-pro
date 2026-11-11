@@ -132,13 +132,30 @@ Four things about the design are load-bearing:
   system's.** NSH's own fallback locale is `en-US`, so keying off the platform would have flipped
   every existing install to English on the update that introduces the switch, for readers who never
   chose anything.
-- **Coverage is partial and says so.** ~330 strings exist; the chrome (rail, header, page titles,
-  card headings, connect action) is complete and *asserted* complete by
-  `the_chrome_is_fully_english_when_english_is_on`. The page bodies are translated less, and an
-  untranslated string falls back to its Chinese rather than vanishing — the right failure for a
-  reader who still needs a working proxy while the table is filled in. That is why the test is
-  scoped to the chrome: a test demanding zero Chinese anywhere would have to be loosened until it
-  proved nothing. `i18n::translate`'s fallback test pins what happens to the rest.
+- **One test sweeps the whole app, and it is the reason the table is finished.**
+  `english_leaves_no_chinese_on_any_screen` switches to English, walks all six pages by their new
+  names and fails on any Chinese left on any of them — reporting the page and the string. It also
+  asserts it saw over 100 strings, because "nothing I collected is Chinese" passes trivially on an
+  empty collection, and `Screen::texts` reports only laid-out text: a page that rendered nothing
+  would otherwise satisfy it perfectly. The one allowed string is `简体中文`, a language option's own
+  name, which stays in the language it selects on purpose.
+- **A page rebuilds when the language changes, so most labels need no closure.** `screen_body`'s
+  `dynamic` closure reads `i18n::lang()` beside the current screen, and a `dynamic` region re-runs
+  its closure when a signal read *inside it* changes — which builds the page again in the new
+  language. That is what lets ~450 call sites keep writing `text("节点")`. Labels in the rail and
+  header, which live outside that region, read `tr` inside their own bindings instead.
+- **Composed sentences are translated as templates.** `format!("缓冲区 {n} 条记录")` produces a
+  string no table can hold, so `i18n::fill` looks the *template* up with its holes in place and
+  substitutes afterwards — the only way English can put the count where English puts it. A unit
+  test checks each template's English has the same number of holes as its Chinese, because a
+  missing one shows a literal `{}` on screen.
+- **`domain` stays pure.** The four time-ago formatters (`relative_age`, `age_label`,
+  `since_label`, `auto_check_label`) take a `Lang` argument and use `i18n::translate` — the half of
+  the module that needs no reactive runtime — so their unit tests still run on a bare thread and
+  state which language they expect. The views pass `store.language()`, which is also what makes
+  those notes re-render on a switch.
+- **An untranslated string falls back to its Chinese** rather than vanishing, which is the right
+  failure while the table is being filled. `i18n`'s own fallback test pins it.
 
 ### A window with no title bar
 

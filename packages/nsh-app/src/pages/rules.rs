@@ -10,6 +10,7 @@
 //! config, so each edit says that plainly rather than implying the rule is live.
 
 use crate::domain;
+use crate::i18n;
 use crate::store::AppStore;
 use crate::ui::{controls, theme, Icon};
 use nsh_base::{button, dialog, theme as base_theme, SelectItem};
@@ -150,7 +151,7 @@ fn tab_bar(tab: Signal<Tab>) -> impl IntoElement {
             .hover(|s| s.bg(move || base_theme().accent))
             .focus(|s| s.outline(px(2.0)).outline_color(move || base_theme().ring))
             .child(
-                text(label)
+                text(move || i18n::tr(label))
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(move || {
@@ -229,9 +230,15 @@ fn summary_row(store: AppStore, tab: Tab) -> impl IntoElement {
         .justify_between()
         .gap_3()
         .child(
-            text(move || match tab {
-                Tab::Routing => routing_summary(store),
-                Tab::Dns => "命中域名后缀用专用 DNS 解析并直连，任何分流模式都生效".to_owned(),
+            // `tr` outside the match, not inside it: the closure returns a *key* either way, and
+            // a closure that computes a key without looking it up is the version of the frozen-
+            // label bug that still re-runs on every poll.
+            text(move || {
+                let key = match tab {
+                    Tab::Routing => routing_summary(store),
+                    Tab::Dns => "命中域名后缀用专用 DNS 解析并直连，任何分流模式都生效".to_owned(),
+                };
+                i18n::tr(&key)
             })
             .text_xs()
             .text_color(theme::text_faint()),
@@ -245,7 +252,7 @@ fn summary_row(store: AppStore, tab: Tab) -> impl IntoElement {
 fn routing_summary(store: AppStore) -> String {
     let rules = store.custom_rules();
     let enabled = rules.iter().filter(|rule| rule.enabled).count();
-    format!("{enabled} 条启用 · {} 条规则", rules.len())
+    i18n::fill("{} 条启用 · {} 条规则", &[&enabled, &rules.len()])
 }
 
 /// The rule-set refresh. Its running flag lives in the store rather than in a signal here,
@@ -334,11 +341,11 @@ fn editor(store: AppStore, draft: RuleDraft, picker_open: Signal<bool>) -> impl 
             .gap_3()
             .child(
                 text(move || {
-                    if editing.get().is_some() {
+                    i18n::tr(if editing.get().is_some() {
                         "编辑规则"
                     } else {
                         "添加规则"
-                    }
+                    })
                 })
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -388,7 +395,7 @@ fn editor(store: AppStore, draft: RuleDraft, picker_open: Signal<bool>) -> impl 
                     .justify_between()
                     .gap_3()
                     .child(
-                        text("此处指单条规则的匹配动作，与全局分流模式不同")
+                        text(move || i18n::tr("此处指单条规则的匹配动作，与全局分流模式不同"))
                             .text_xs()
                             .text_color(theme::text_faint()),
                     )
@@ -982,7 +989,7 @@ fn process_picker(store: AppStore, draft: RuleDraft, picker: Signal<bool>) -> im
                 .bg(move || base_theme().card)
                 .shadow_lg()
                 .child(
-                    text("选择进程")
+                    text(move || i18n::tr("选择进程"))
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(move || base_theme().card_foreground),
@@ -1011,7 +1018,7 @@ fn picker_body(
                 .into_element();
         }
         if !store.processes_loaded() {
-            return text("正在读取进程列表…")
+            return text(move || i18n::tr("正在读取进程列表…"))
                 .text_xs()
                 .text_color(theme::text_faint())
                 .into_element();
@@ -1019,7 +1026,7 @@ fn picker_body(
         let keyword = domain::search_keyword(&query.get());
         let hits = process_hits(store, &keyword);
         if hits.is_empty() {
-            return text("没有匹配的进程")
+            return text(move || i18n::tr("没有匹配的进程"))
                 .text_xs()
                 .text_color(theme::text_faint())
                 .into_element();

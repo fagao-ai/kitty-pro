@@ -12,6 +12,21 @@ use nsh_base::{button, switch, theme, SelectItem};
 use nsh_core::prelude::*;
 use std::rc::Rc;
 
+/// The words of a control, in the language on screen.
+///
+/// Every text sink in this file draws through `i18n::tr`, which is what keeps ~300 labels from
+/// needing a call at each of their ~300 call sites: a control's own text is always one of our
+/// strings, and a string with no English yet comes back unchanged (`i18n`), so an unwritten
+/// translation reads as Chinese rather than as a blank. A value that is *data* — a node name, a
+/// URL, a count — is deliberately not routed through a table at all.
+///
+/// Called from inside a binding (`text(move || t(&label))`) rather than when the element is built:
+/// nothing rebuilds an NSH app from inside, so a lookup done at build time freezes the first
+/// language in place. See `crate::i18n`.
+fn t(words: &str) -> SharedString {
+    i18n::tr(words).into()
+}
+
 /// A glyph at the size the app actually uses it. The stroke is `currentColor`, so the
 /// caller's `text_color` tints it.
 pub fn icon(glyph: Icon, size: f32) -> Svg {
@@ -153,7 +168,11 @@ pub fn floating_action_state(
     let skin_shadow = skin.clone();
     let skin_glyph = skin.clone();
     button()
-        .accessibility_label(move || Some(label()))
+        // The name is looked up, not just the glyph: it is what a screen reader says and the only
+        // handle a test has (`role:button[启动代理]`), so an English screen that still answers to
+        // Chinese names would be an inaccessible one — and the icon-only disc has no visible words
+        // left to translate in its place.
+        .accessibility_label(move || Some(i18n::tr(&label()).into()))
         .disabled(disabled)
         .on_press(move |_: &()| on_press())
         .h(px(ACTION_DISC))
@@ -233,7 +252,9 @@ pub fn icon_button(
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     button()
-        .accessibility_label(move || Some(label()))
+        // Same reason as the floating action: this is a glyph with no visible text, so its name
+        // is the only thing there is to translate.
+        .accessibility_label(move || Some(i18n::tr(&label()).into()))
         .on_press(move |_: &()| on_press())
         .h(px(ACTION_HEIGHT))
         .w(px(ACTION_HEIGHT))
@@ -449,7 +470,7 @@ pub fn disclosure_row(
         .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
         .disabled_style(|s| s.opacity(0.45))
         .child(
-            text(label_text)
+            text(move || t(&label_text))
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .flex_shrink_0()
@@ -505,6 +526,7 @@ pub fn badge(
     label: impl IntoReactive<SharedString> + 'static,
     tint: impl IntoReactive<Tint> + 'static,
 ) -> impl IntoElement {
+    let label = label.into_reactive();
     let tint = Rc::new(tint.into_reactive());
     let tint_bg = tint.clone();
     let tint_fg = tint;
@@ -518,7 +540,7 @@ pub fn badge(
         .rounded(theme::radius_tile())
         .bg(move || tint_bg.get().wash())
         .child(
-            text(label)
+            text(move || t(&label.get()))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || tint_fg.get().foreground()),
@@ -541,10 +563,15 @@ pub fn metric(
     value: String,
     unit: String,
 ) -> impl IntoElement {
+    let label: SharedString = label.into();
     view()
         .flex_col()
         .gap_1()
-        .child(text(label.into()).text_xs().text_color(theme::text_faint))
+        .child(
+            text(move || t(&label))
+                .text_xs()
+                .text_color(theme::text_faint),
+        )
         .child(
             view()
                 .flex_row()
@@ -558,7 +585,7 @@ pub fn metric(
                 )
                 .child(when(!unit.is_empty(), {
                     let unit = unit.clone();
-                    move || text(unit.clone()).text_xs().text_color(theme::text_faint)
+                    move || text(t(&unit)).text_xs().text_color(theme::text_faint)
                 })),
         )
 }
@@ -795,12 +822,16 @@ pub fn empty_state(
         .gap_1()
         .py_10()
         .child(
-            text(title)
+            text(move || t(&title))
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || theme().foreground),
         )
-        .child(text(note).text_xs().text_color(theme::text_faint()))
+        .child(
+            text(move || t(&note))
+                .text_xs()
+                .text_color(theme::text_faint()),
+        )
 }
 
 /// A labeled single-line field whose value lives inside a larger struct rather than in a signal
@@ -828,7 +859,7 @@ pub fn text_field_state(
                 .value(value)
                 .on_change(move |text: &str| on_change(text.to_owned()))
                 .masked(move || masked)
-                .placeholder(placeholder)
+                .placeholder(move || i18n::tr(placeholder()))
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
                 .label(label)
@@ -876,7 +907,7 @@ pub fn text_field_focus(
             nsh_base::input()
                 .value(move || value.get())
                 .on_change(move |text: &str| value.set(text.to_owned()))
-                .placeholder(placeholder)
+                .placeholder(move || i18n::tr(placeholder()))
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
                 .label(label)
@@ -918,7 +949,7 @@ pub fn text_editor(
                 .multiline(true)
                 .value(move || value.get())
                 .on_change(move |text: &str| value.set(text.to_owned()))
-                .placeholder(placeholder)
+                .placeholder(move || i18n::tr(placeholder))
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
                 .label(label)
@@ -932,7 +963,7 @@ pub fn text_editor(
 }
 
 fn field_label(label: SharedString) -> impl IntoElement {
-    text(label)
+    text(move || t(&label))
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(move || theme().muted_foreground)
@@ -1004,7 +1035,7 @@ pub fn choice_field(
                         .border_color(move || theme().input)
                         .focus_within(|s| s.border_color(move || theme().ring))
                         .child(
-                            text(title)
+                            text(move || t(&title()))
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .text_sm()
@@ -1037,6 +1068,7 @@ pub fn destructive_button(
     disabled: impl Fn() -> bool + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
+    let label = label.into_reactive();
     button()
         .disabled(disabled)
         .on_press(move |_: &()| on_press())
@@ -1054,7 +1086,7 @@ pub fn destructive_button(
         .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
         .disabled_style(|s| s.opacity(0.45))
         .child(
-            text(label)
+            text(move || t(&label.get()))
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || theme::Tint::Danger.foreground()),
@@ -1089,7 +1121,7 @@ pub fn filter_pill(
         .active(|s| s.opacity(0.8))
         .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
         .child(
-            text(label)
+            text(move || t(&label))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || {
@@ -1132,6 +1164,7 @@ pub fn inline_note_with(
     message: impl IntoReactive<SharedString> + 'static,
     action: Option<impl IntoElement>,
 ) -> impl IntoElement {
+    let message = message.into_reactive();
     view()
         .w_full()
         .flex_row()
@@ -1142,7 +1175,7 @@ pub fn inline_note_with(
         .bg(move || tint.wash())
         .child(icon(glyph, 15.0).text_color(move || tint.foreground()))
         .child(
-            text(message)
+            text(move || t(&message.get()))
                 .flex_1()
                 .min_w(px(0.0))
                 .text_xs()
@@ -1163,6 +1196,7 @@ pub fn value_row(
     value: impl IntoReactive<SharedString> + 'static,
 ) -> impl IntoElement {
     let label = label.into();
+    let note = note.into();
     view()
         .flex_row()
         .items_center()
@@ -1174,12 +1208,16 @@ pub fn value_row(
                 .min_w(px(0.0))
                 .gap_0p5()
                 .child(
-                    text(label)
+                    text(move || t(&label))
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(move || theme().card_foreground),
                 )
-                .child(text(note.into()).text_xs().text_color(theme::text_faint())),
+                .child(
+                    text(move || t(&note))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                ),
         )
         .child(
             text(value)
@@ -1202,7 +1240,12 @@ pub fn about_fact(
     view()
         .flex_col()
         .gap_0p5()
-        .child(text(label.into()).text_xs().text_color(theme::text_faint()))
+        .child({
+            let label: SharedString = label.into();
+            text(move || t(&label))
+                .text_xs()
+                .text_color(theme::text_faint)
+        })
         .child(
             text(value)
                 .text_sm()
@@ -1239,7 +1282,7 @@ pub fn search_field(
             nsh_base::input()
                 .value(move || value.get())
                 .on_change(move |text: &str| value.set(text.to_owned()))
-                .placeholder(placeholder)
+                .placeholder(move || i18n::tr(placeholder))
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
                 // The same words as the placeholder: a field with no visible label still has

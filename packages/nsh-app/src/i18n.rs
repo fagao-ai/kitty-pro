@@ -18,13 +18,20 @@
 //! language every existing profile was written in.
 //!
 //! ## Why every label reads through a closure
+//! ## How a change reaches a label
 //!
 //! There is no way for an app to rebuild itself: `Root::remount` and `Engine::remount` belong to
-//! the host, not to app code. A language change therefore has to propagate the way a theme change
-//! does — as a reactive read — which means a label is `text(move || tr("总览"))` and not
-//! `text("总览")`. The second form would translate correctly at startup and then sit there in
-//! Chinese forever. `tests/app.rs` switches language and reads the same screen again, so a label
-//! that missed its closure shows up as stale text rather than surviving review.
+//! the host, not to app code. But a `dynamic` region re-runs its closure when a signal read
+//! *inside that closure* changes, and re-running it builds its subtree again — so
+//! `shell::screen_body` reads `lang()` next to the current screen, and every page is rebuilt in
+//! the new language when it changes. That is why `text("节点")` is enough on a page: ~450 call
+//! sites did not have to become closures.
+//!
+//! Two places are outside that region and do need the closure form, `text(move || tr("总览"))`:
+//! the rail and header, which are built by `root()` and survive a language change. A label there
+//! written without a closure translates correctly at startup and then sits in the first language
+//! forever — which happened twice while this was being written, and `tests/app.rs` names both by
+//! walking every screen after a switch.
 
 use nsh_core::prelude::*;
 
@@ -115,6 +122,44 @@ pub fn set_lang(next: Lang) -> bool {
     true
 }
 
+/// A sentence with holes: translate the *template*, then fill it.
+///
+/// `format!("刷新 {}", name)` cannot be a table key — the string reaching `tr` would be
+/// `刷新 实验室`, which no table can hold. Translating the whole formatted result would need a key
+/// per value; translating only the verb would bake the Chinese word order into every language,
+/// since `{} 个节点` puts the count before the noun and English puts it after. So the template is
+/// the key and the holes are filled after: `fill("刷新 {}", &[&name])` and
+/// `fill("{} 个节点", &[&count])` become `Refresh …` and `… nodes`.
+///
+/// Holes are positional. A template written with named captures (`"共 {nodes} 个节点"`) has them
+/// flattened at the call site, because the names are a convenience for the reader of the Chinese
+/// and the English sentence has no reason to keep the same order or the same number of holes.
+pub fn fill(key: &str, holes: &[&dyn std::fmt::Display]) -> String {
+    fill_at(lang(), key, holes)
+}
+
+/// [`fill`] with the language named, so the hole arithmetic is testable without a reactive
+/// runtime (`global` needs the engine's thread, which a unit test is not on).
+pub fn fill_at(lang: Lang, key: &str, holes: &[&dyn std::fmt::Display]) -> String {
+    let template = translate(lang, key);
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut rest = template.as_str();
+    let mut holes = holes.iter();
+    while let Some(at) = rest.find("{}") {
+        out.push_str(&rest[..at]);
+        // A template with more holes than the caller passed keeps the hole rather than dropping
+        // it: a visible `{}` is a bug someone can see and report, a silently deleted word is one
+        // nobody notices.
+        match holes.next() {
+            Some(value) => out.push_str(&value.to_string()),
+            None => out.push_str("{}"),
+        }
+        rest = &rest[at + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// [`tr`] for a word that is a *qualifier* on something else: `控件（已禁用）`, `Control
 /// (disabled)`.
 ///
@@ -128,6 +173,20 @@ pub fn parenthesised(key: &str) -> String {
         format!("（{inner}）")
     } else {
         format!(" ({inner})")
+    }
+}
+
+/// Put already-translated words in the brackets this language uses.
+///
+/// [`parenthesised`] takes a *key*; this takes text that has been through the table already — a
+/// filled template, a computed note — which is the common case once a sentence is built from
+/// parts. Both exist because a full-width bracket reads correctly between Chinese glyphs and
+/// wrong around Latin ones.
+pub fn in_parens(words: &str) -> String {
+    if lang() == Lang::Chinese {
+        format!("（{words}）")
+    } else {
+        format!(" ({words})")
     }
 }
 
@@ -185,11 +244,11 @@ const ENGLISH: &[(&str, &str)] = &[
     ("内核已就绪", "Core ready"),
     ("内核运行中", "Core running"),
     ("内核不可用", "Core unavailable"),
-    ("正在检测", "Checking"),
+    ("正在检测", "Detecting"),
     ("已启用", "On"),
     ("已停用", "Off"),
     ("未启用", "Not enabled"),
-    ("读取中", "Reading"),
+    ("读取中", "Loading"),
     ("规则模式", "Rule mode"),
     ("全局模式", "Global mode"),
     ("直连模式", "Direct mode"),
@@ -232,6 +291,269 @@ const ENGLISH: &[(&str, &str)] = &[
     ("关闭提示", "Dismiss"),
     ("已复制代理环境变量", "Proxy environment copied"),
     ("内核已启动", "Core started"),
+    // Overview.
+    ("未连接", "Not connected"),
+    ("空闲", "Idle"),
+    ("内核未启动", "Core stopped"),
+    ("可用节点", "Nodes available"),
+    ("没有可用节点", "No nodes available"),
+    ("活动连接", "Active connections"),
+    ("近一分钟流量", "Traffic, last minute"),
+    ("运行时长", "Uptime"),
+    ("节点延迟", "Node latency"),
+    ("系统代理", "System proxy"),
+    ("测试连通", "Test connectivity"),
+    ("先启动代理，才能探测出口", "Connect first to test the exit"),
+    ("等待导入订阅", "Waiting for a subscription"),
+    ("下载", "Download"),
+    ("上传", "Upload"),
+    // Nodes.
+    ("没有匹配的节点", "No nodes match"),
+    (
+        "换个关键词，或先刷新订阅。",
+        "Try another word, or refresh a subscription first.",
+    ),
+    (
+        "还没有节点，先在订阅页导入",
+        "No nodes yet — import one on the Subscriptions page",
+    ),
+    // Subscriptions.
+    ("暂无订阅", "No subscriptions yet"),
+    ("还没有订阅", "No subscriptions"),
+    (
+        "订阅用于导入代理节点；添加后即可在节点页挑选线路、回到概览连接。",
+        "Subscriptions import proxy nodes. Add one, pick a line on the Nodes page, then connect \
+         from the Overview.",
+    ),
+    // Rules.
+    ("分流规则", "Routing rules"),
+    ("专用 DNS", "Dedicated DNS"),
+    ("暂无自定义规则", "No custom rules yet"),
+    ("更新规则", "Update rule sets"),
+    // Logs.
+    ("全部路由", "All routes"),
+    ("代理", "Proxied"),
+    ("直连", "Direct"),
+    ("拦截", "Blocked"),
+    ("内核日志", "Core log"),
+    ("时间", "Time"),
+    ("动作", "Action"),
+    ("目标", "Target"),
+    ("出口节点", "Exit node"),
+    ("命中链路", "Matched chain"),
+    ("消息", "Message"),
+    ("清空日志", "Clear log"),
+    ("已停止", "Stopped"),
+    // Settings: takeover and mode rows.
+    ("TUN 模式", "TUN mode"),
+    (
+        "仅接管走代理端口的流量",
+        "Takes over only traffic on the proxy port",
+    ),
+    ("允许局域网连接", "Allow devices on the network"),
+    ("只监听本机", "Listens on this device only"),
+    ("国内直连，其余走代理", "Domestic direct, the rest proxied"),
+    ("全部流量走代理", "All traffic through the proxy"),
+    ("全部直连，仅本机监听", "All direct, listening locally"),
+    ("启用", "Enable"),
+    // Settings: sync card.
+    ("WebDAV 地址", "WebDAV address"),
+    ("S3 兼容", "S3 compatible"),
+    ("远程路径", "Remote path"),
+    ("用户名", "Username"),
+    ("密码 / 应用密码", "Password / app password"),
+    ("尚未填写", "Not filled in"),
+    ("保存同步设置", "Save sync settings"),
+    ("下载覆盖本机", "Download and replace this device"),
+    ("覆盖远端", "Overwrite the remote"),
+    (
+        "远端内容包含订阅来源（含令牌）、自定义规则、专用 DNS 与配置脚本。",
+        "The remote holds subscription sources (including tokens), custom rules, dedicated DNS \
+         and the config script.",
+    ),
+    // Settings: updates, script, about.
+    ("检查更新", "Check for updates"),
+    ("每天自动检查", "Check daily"),
+    ("已是最新", "Up to date"),
+    ("JavaScript 配置覆写", "JavaScript config override"),
+    ("main(config) · 尚未配置", "main(config) · not configured"),
+    ("手动打开后才工作", "Starts when you open it"),
+    ("跟随系统", "Follow the system"),
+    // A few labels are built from data and never appear alone; these do.
+    ("自定义规则", "Custom rules"),
+    ("节点 / 订阅", "Nodes / subscriptions"),
+    // Sentence *templates*, keyed with their holes in place. `i18n::fill` looks these up before
+    // substituting, which is the only way English can move a number to where English puts it.
+    (
+        "缓冲区 {} 条记录 · 当前显示 {} 条",
+        "{} lines buffered, {} shown",
+    ),
+    ("最多保留 {} 条", "holds at most {}"),
+    (" · 采集失败：{}", " · collection failed: {}"),
+    ("{} 条启用 · {} 条规则", "{} enabled · {} rules"),
+    ("内容写入同级目录 {}/", "written alongside {}/"),
+    ("当前 v{} · 上次检查 {}", "Now v{} · last checked {}"),
+    (
+        "已设置 macOS 系统代理 127.0.0.1:7890",
+        "macOS system proxy set to 127.0.0.1:7890",
+    ),
+    ("每天一次 · 启动时检查", "Daily · checked at launch"),
+    ("每天一次", "Daily"),
+    ("未启动", "Not started"),
+    // Time, in the largest unit that still reads as recent. `刚刚` and `从未检查` are the two
+    // answers that are not a count at all.
+    ("刚刚", "just now"),
+    ("从未检查", "never checked"),
+    ("{} 秒前", "{}s ago"),
+    ("{} 分钟前", "{} min ago"),
+    ("{} 小时前", "{} hours ago"),
+    ("{} 天前", "{} days ago"),
+    ("每天一次 · {}", "Daily · {}"),
+    (
+        "仅手动检查，启动时不再联网",
+        "Manual only — no check at launch",
+    ),
+    ("尚未测量", "Not measured"),
+    ("探测中", "Probing"),
+    ("未测试", "Untested"),
+    ("最近一次探测", "Last probe"),
+    ("正在逐个测量", "Measuring nodes"),
+    ("订阅内节点", "Nodes in subscriptions"),
+    ("正在转发", "Forwarding"),
+    ("已连接", "Connected"),
+    ("处理中", "Working"),
+    ("系统代理设置中", "Setting the system proxy"),
+    // Fields' placeholders and labels — invisible to a screen sweep, since a placeholder is not
+    // a text node and an accessibility name is not drawn at all.
+    ("搜索设置项", "Search settings"),
+    ("搜索节点、地址或协议", "Search nodes, addresses or protocols"),
+    ("搜索域名、IP、节点", "Search domains, IPs or nodes"),
+    ("搜索进程名或路径", "Search a process name or path"),
+    ("搜索进程名或路径…", "Search a process name or path…"),
+    ("https:// 订阅地址，或 ss://、vless:// 等节点链接", "https:// subscription URL, or ss://, vless:// links"),
+    ("订阅地址或节点内容", "Subscription URL or node links"),
+    ("名称（可选）", "Name (optional)"),
+    ("名称留空时用订阅地址的主机命名。", "Left empty, the subscription's host is used as the name."),
+    ("域名后缀", "Domain suffix"),
+    ("DNS 服务器", "DNS server"),
+    ("尚未配置专用 DNS", "No dedicated DNS yet"),
+    ("匹配内容", "Match"),
+    ("匹配类型", "Match type"),
+    ("此处指单条规则的匹配动作，与全局分流模式不同", "The action for this rule, not the global mode"),
+    ("命中域名后缀用专用 DNS 解析并直连，任何分流模式都生效", "Matching domains resolve here and go direct, in every mode"),
+    ("为指定域名后缀固定 DNS，避免公共 DNS 解析到错误地址。", "Pin DNS for a domain suffix when public resolvers answer wrongly."),
+    ("添加一条规则，为指定域名或网段固定走向。", "Add a rule to pin a domain or range to one route."),
+    ("JavaScript 配置覆写已启用，自定义分流规则暂不可用。", "The JavaScript override is on, so custom routing rules are inactive."),
+    ("启用 JavaScript 配置覆写", "Enable the JavaScript config override"),
+    ("启用后自定义分流规则将被脚本接管。", "When on, a script takes over custom routing rules."),
+    ("还没有填写脚本", "No script yet"),
+    ("配置脚本校验", "Validate the config script"),
+    ("脚本", "Script"),
+    ("选择", "Select"),
+    // Buttons and their states.
+    ("添加订阅", "Add subscription"),
+    ("添加规则", "Add rule"),
+    ("添加专用 DNS", "Add dedicated DNS"),
+    ("收起", "Collapse"),
+    ("收起规则表单", "Close the rule form"),
+    ("收起专用 DNS 表单", "Close the DNS form"),
+    ("编辑规则", "Edit rule"),
+    ("编辑这条规则", "Edit this rule"),
+    ("删除这条规则", "Delete this rule"),
+    ("再次点击确认删除这条规则", "Press again to delete this rule"),
+    ("上移", "Move up"),
+    ("下移", "Move down"),
+    ("导入", "Import"),
+    ("使用", "Use"),
+    ("刷新中", "Refreshing"),
+    ("刷新全部订阅", "Refresh all"),
+    ("刷新延迟", "Check latency"),
+    ("停止测速", "Stop measuring"),
+    ("自动测速", "Auto-measure"),
+    ("手动选择", "Choose manually"),
+    ("内置出口", "Built-in exit"),
+    ("重新连接", "Reconnect"),
+    ("重新检测内核", "Re-check the core"),
+    ("重试", "Retry"),
+    ("更新分流规则", "Update rule sets"),
+    ("忽略这个版本", "Ignore this release"),
+    ("正在保存", "Saving"),
+    ("正在校验", "Validating"),
+    ("正在检查", "Checking"),
+    ("正在测量", "Measuring"),
+    ("正在更新", "Updating"),
+    ("正在刷新", "Refreshing"),
+    ("正在读取", "Reading"),
+    ("正在解析", "Parsing"),
+    ("正在覆盖", "Overwriting"),
+    ("正在下载", "Downloading"),
+    ("正在上传", "Uploading"),
+    ("正在探测出口", "Probing the exit"),
+    ("正在生成代理组", "Building proxy groups"),
+    ("正在通过代理拨测外部地址", "Dialling an external address through the proxy"),
+    ("从代理拨一次外部地址，确认流量真的出得去", "Dial out through the proxy to confirm traffic leaves"),
+    ("运行中", "Running"),
+    ("等待代理流量", "Waiting for proxied traffic"),
+    ("本地配置已改动，运行中的内核还是旧的。", "Local settings changed; the running core still has the old config."),
+    ("内核不可用，请重新检测；若仍失败，请检查服务是否运行、端口是否被占用。", "The core is unavailable — re-check; if it stays unavailable, see whether it runs and the port is free."),
+    ("内核未能直接切换，正在重新连接以应用", "The core could not switch in place; reconnecting to apply"),
+    ("内核正在处理其他请求", "The core is busy with another request"),
+    ("局域网内其他设备可使用 7890", "Other devices on the network can use 7890"),
+    ("接管全部流量，首次需要管理员授权", "Takes over all traffic; needs administrator rights the first time"),
+    // Notices, which arrive late and so are the strings a screen sweep never sees.
+    ("分流规则已更新", "Routing rules updated"),
+    ("规则已保存", "Rule saved"),
+    ("规则已保存，重新连接后生效", "Rule saved; applies after reconnecting"),
+    ("要编辑的规则不存在", "The rule to edit no longer exists"),
+    ("无法生成规则 ID", "Could not allocate a rule id"),
+    ("最多添加 {} 条规则", "At most {} rules"),
+    ("没有匹配的进程", "No processes match"),
+    ("没有找到可用节点", "No usable node found"),
+    ("正在读取进程列表…", "Reading the process list…"),
+    ("进程分流需开启 TUN 才能覆盖所有进程；仅系统代理模式下，进程规则只作用于走代理的进程。", "Process routing needs TUN to cover every process; in system-proxy mode a process rule only covers proxied traffic."),
+    ("TUN 模式已关闭", "TUN mode is off"),
+    ("已切换订阅，重新连接后生效", "Subscription switched; applies after reconnecting"),
+    ("订阅已刷新，可重新连接或启动", "Subscription refreshed; reconnect or connect now"),
+    ("订阅已更新但节点尚未解析，连接前请先刷新全部订阅。", "The subscription changed but its nodes are not parsed — refresh all before connecting."),
+    ("请先填写订阅地址或内容", "Enter a subscription URL or links first"),
+    ("我的订阅", "My subscription"),
+    ("该订阅的节点会一并移除，正在使用的节点会改用其他订阅。", "Its nodes go too; the one in use moves to another subscription."),
+    ("当前使用", "In use"),
+    ("已暂停", "Paused"),
+    ("采集中", "Collecting"),
+    ("暂停采集日志", "Pause log collection"),
+    ("继续采集日志", "Resume log collection"),
+    ("暂无匹配日志", "No log lines match"),
+    ("换个筛选或关键词；启动代理后每条连接都会写在这里。", "Try another filter or word; every connection is written here once the proxy runs."),
+    ("内核未运行，无法采集日志", "The core is not running, so there is nothing to collect"),
+    ("同步配置已保存", "Sync settings saved"),
+    ("同步配置保存失败", "Could not save the sync settings"),
+    ("正在读取同步设置", "Reading the sync settings"),
+    ("正在读取已保存的同步设置", "Reading the saved sync settings"),
+    ("远端上传失败", "Upload to the remote failed"),
+    ("远端下载失败", "Download from the remote failed"),
+    ("覆盖远端失败", "Overwriting the remote failed"),
+    ("确认覆盖本机", "Confirm replacing this device"),
+    ("确认覆盖远端", "Confirm overwriting the remote"),
+    ("正在读取登录项", "Reading the login item"),
+    ("正在写入当前用户的登录项", "Writing the login item for this user"),
+    ("已加入登录启动项", "Added to login items"),
+    ("已移出登录启动项", "Removed from login items"),
+    ("登录后自动启动，不自动连接", "Opens at login, connects when you do"),
+    ("当前平台没有登录启动项", "This platform has no login item"),
+    ("系统代理已启用", "System proxy enabled"),
+    ("系统代理已关闭", "System proxy disabled"),
+    ("配置脚本已保存", "Config script saved"),
+    ("配置脚本已保存，重新连接后生效", "Config script saved; applies after reconnecting"),
+    ("配置脚本校验通过", "Config script validated"),
+    ("已开启每日自动检查", "Daily automatic checks are on"),
+    ("已改为仅手动检查", "Set to manual checks only"),
+    ("已忽略这个版本，下次有更新再提醒", "This release is ignored; the next one will ask"),
+    ("尚未检查过更新", "Not checked yet"),
+    ("有新版本可更新", "a newer version is available"),
+    ("代理环境变量", "proxy environment variables"),
+    ("失败", "failed"),
+    ("超时", "timed out"),
 ];
 
 /// The English for one key, if this build has any.
@@ -259,6 +581,36 @@ mod tests {
     #[test]
     fn a_string_with_no_english_keeps_its_own_words() {
         assert_eq!(translate(Lang::English, "没有这个词条"), "没有这个词条");
+    }
+
+    /// A sentence is translated as a template and filled afterwards, which is the only way English
+    /// can put the count *after* the noun where Chinese puts it before.
+    #[test]
+    fn a_template_is_translated_then_filled() {
+        assert_eq!(
+            translate(Lang::Chinese, "刷新 {}"),
+            "刷新 {}",
+            "a template is stored in the language it was written in"
+        );
+        // Filling is done on the translated text, so an English template with a different hole
+        // order works unchanged.
+        let holes: Vec<&dyn std::fmt::Display> = vec![&"实验室"];
+        assert_eq!(fill_at(Lang::Chinese, "刷新 {}", &holes), "刷新 实验室");
+        let english = translate(Lang::English, "刷新 {}");
+        assert!(
+            english.contains("{}") || english == "刷新 {}",
+            "the template must keep its hole to be fillable: {english}"
+        );
+    }
+
+    /// More holes than arguments is a programming error, and the worst version of it is a silent
+    /// one: a dropped word reads as prose and nobody reports it.
+    #[test]
+    fn a_missing_argument_leaves_the_hole_visible() {
+        let none: Vec<&dyn std::fmt::Display> = vec![];
+        assert_eq!(fill_at(Lang::Chinese, "{} 个节点", &none), "{} 个节点");
+        let one: Vec<&dyn std::fmt::Display> = vec![&"3"];
+        assert_eq!(fill_at(Lang::Chinese, "共 {} 和 {}", &one), "共 3 和 {}");
     }
 
     #[test]
@@ -312,21 +664,36 @@ mod tests {
         assert_eq!(Lang::from_stored("  EN "), Lang::English);
     }
 
-    /// No key maps to two different English strings, and no key is listed twice: a 300-arm `match`
-    /// is exactly the shape in which that happens silently.
+    /// Every template's English has exactly as many holes as its Chinese.
+    ///
+    /// `fill` substitutes positionally and leaves a hole it cannot fill visible, so an English
+    /// side written with three `{}` against a Chinese `{}` × 2 puts a literal `{}` on the screen —
+    /// the one failure mode of this design that no rendering test would describe usefully. The
+    /// count is checked instead.
     #[test]
-    fn no_key_is_answered_twice() {
-        // Duplicate patterns in a `match` on a `&str` are a compile error for literals, so this
-        // checks the thing the compiler cannot: that two *different* Chinese keys were given the
-        // same English, which would make two distinct controls read alike.
+    fn a_template_keeps_its_holes() {
+        for (from, to) in ENGLISH {
+            let (want, got) = (from.matches("{}").count(), to.matches("{}").count());
+            assert_eq!(want, got, "`{from}` has {want} holes but `{to}` has {got}");
+        }
+    }
+
+    /// No key may appear twice.
+    ///
+    /// A table of ~270 rows edited by hand is exactly the shape in which a row gets pasted twice
+    /// with different English, and `english` returns the first match, so the second one is dead
+    /// code that reads as if it applied. (This caught two while the table was being written.)
+    ///
+    /// Two *different* keys answering with the same English is fine and is not checked: 正在刷新
+    /// and 刷新中 are both "Refreshing", because English has no separate word for the in-progress
+    /// aspect Chinese marks with 正在/中. Forbidding that would only push the table into invented
+    /// English to satisfy a test.
+    #[test]
+    fn no_key_is_listed_twice() {
         let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-        for (key, value) in ENGLISH {
-            if let Some(before) = seen.insert(*value, *key) {
-                assert_eq!(
-                    before, *key,
-                    "`{value}` is the English for both `{before}` and `{key}`: two different \
-                     controls would read the same"
-                );
+        for (from, to) in ENGLISH {
+            if let Some(before) = seen.insert(*from, *to) {
+                panic!("`{from}` is listed twice, as `{before}` and `{to}`");
             }
         }
     }

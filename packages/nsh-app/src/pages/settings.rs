@@ -96,7 +96,7 @@ fn unmatched(query: Signal<String>) -> impl IntoElement {
         .py_10()
         .child(controls::icon(Icon::Search, 28.0).text_color(move || base_theme().muted_foreground))
         .child(
-            text("没有匹配的设置项")
+            text(move || i18n::tr("没有匹配的设置项"))
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || base_theme().card_foreground),
@@ -321,12 +321,19 @@ fn mode_row(store: AppStore, mode: TunnelMode, note: &'static str) -> impl IntoE
                 .min_w(px(0.0))
                 .gap_0p5()
                 .child(
-                    text(domain::mode_label(mode))
+                    // `mode_label` returns a key (规则模式), and `note` explains the mode in our
+                    // own words; both are looked up per render so a switch reaches a card the user
+                    // is already looking at.
+                    text(move || i18n::tr(domain::mode_label(mode)))
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(move || base_theme().card_foreground),
                 )
-                .child(text(note).text_xs().text_color(theme::text_faint())),
+                .child(
+                    text(move || i18n::tr(note))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                ),
         )
         .child(mode_pill(selected, move || store.set_tunnel_mode(mode)))
 }
@@ -352,7 +359,7 @@ fn mode_pill(selected: Memo<bool>, on_press: impl Fn() + 'static) -> impl IntoEl
         .active(|s| s.opacity(0.8))
         .focus(|s| s.outline(px(2.0)).outline_color(move || base_theme().ring))
         .child(
-            text("启用")
+            text(move || i18n::tr("启用"))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || {
@@ -442,7 +449,7 @@ fn about_identity(store: AppStore) -> impl IntoElement {
                         .text_color(move || base_theme().card_foreground),
                 )
                 .child(
-                    text(move || about_line(store))
+                    text(move || i18n::tr(&(about_line(store))))
                         .text_xs()
                         .font_family(theme::font_mono())
                         .text_color(theme::text_faint()),
@@ -511,13 +518,13 @@ fn script_card(store: AppStore) -> impl IntoElement {
                         .min_w(px(0.0))
                         .gap_0p5()
                         .child(
-                            text("JavaScript 配置覆写")
+                            text(move || i18n::tr("JavaScript 配置覆写"))
                                 .text_sm()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(move || base_theme().card_foreground),
                         )
                         .child(
-                            text(move || script_note(store))
+                            text(move || i18n::tr(&(script_note(store))))
                                 .text_xs()
                                 .text_color(theme::text_faint()),
                         ),
@@ -699,7 +706,11 @@ fn sync_age(store: AppStore) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    status.since_label(now).unwrap_or_default()
+    // `store.language()` reads the language signal, so these notes re-render on a switch —
+    // the formatters take it as an argument because `domain` must stay pure and unit-testable.
+    status
+        .since_label(now, store.language())
+        .unwrap_or_default()
 }
 
 fn sync_enable_note(store: AppStore) -> String {
@@ -743,7 +754,7 @@ fn provider_row(store: AppStore) -> impl IntoElement {
         .justify_between()
         .gap_3()
         .child(
-            text("存储类型")
+            text(move || i18n::tr("存储类型"))
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || base_theme().card_foreground),
@@ -783,14 +794,16 @@ fn provider_pill(store: AppStore, s3: bool) -> impl IntoElement {
         .focus(|s| s.outline(px(2.0)).outline_color(move || base_theme().ring))
         .disabled_style(|s| s.opacity(0.45))
         .child(
-            text(
-                domain::SyncProviderForm::from_kind(if s3 {
-                    api::SyncProviderKind::S3
-                } else {
-                    api::SyncProviderKind::WebDav
-                })
-                .label(),
-            )
+            text(move || {
+                i18n::tr(
+                    domain::SyncProviderForm::from_kind(if s3 {
+                        api::SyncProviderKind::S3
+                    } else {
+                        api::SyncProviderKind::WebDav
+                    })
+                    .label(),
+                )
+            })
             .text_xs()
             .font_weight(FontWeight::MEDIUM)
             .text_color(move || {
@@ -859,7 +872,12 @@ fn sync_open(chosen: Signal<Option<bool>>, store: AppStore) -> bool {
 /// than going blank, since a fold with no summary reads as an empty form.
 fn sync_summary(store: AppStore) -> SharedString {
     match store.sync_config() {
-        Some(config) => domain::sync_target_summary(provider_form(store), &config).into(),
+        // The summary is assembled in `domain` from our own words (`尚未填写`, `缺 …`), so the
+        // whole line goes through the table; the pieces that are data (a host, a path) survive
+        // the lookup unchanged.
+        Some(config) => {
+            i18n::tr(&domain::sync_target_summary(provider_form(store), &config)).into()
+        }
         None => "正在读取同步设置".into(),
     }
 }
@@ -985,7 +1003,7 @@ fn path_field(store: AppStore) -> impl IntoElement {
             false,
         ))
         .child(
-            text(move || format!("内容写入同级目录 /{}/", bundle_directory(store)))
+            text(move || i18n::fill("内容写入同级目录 {}/", &[&bundle_directory(store)]))
                 .text_xs()
                 .text_color(theme::text_faint()),
         )
@@ -1266,7 +1284,7 @@ fn updates_card(store: AppStore) -> impl IntoElement {
             .child(when(
                 move || release_line(store).is_some(),
                 move || {
-                    text(move || release_line(store).unwrap_or_default())
+                    text(move || i18n::tr(&(release_line(store).unwrap_or_default())))
                         .text_xs()
                         .text_color(theme::text_soft())
                 },
@@ -1314,7 +1332,7 @@ fn updates_card(store: AppStore) -> impl IntoElement {
                     )),
             )
             .child(
-                text(move || check_note(store))
+                text(move || i18n::tr(&(check_note(store))))
                     .text_xs()
                     .text_color(theme::text_faint()),
             ),
@@ -1356,7 +1374,7 @@ fn auto_check_note(store: AppStore) -> String {
         .map_or(0, |held| held.last_check_at)
         .max(status.as_ref().map_or(0, |held| held.last_check_at));
     let server_time = status.map_or(0, |held| held.server_time);
-    domain::auto_check_label(auto_check, last_check_at, server_time)
+    domain::auto_check_label(auto_check, last_check_at, server_time, store.language())
 }
 
 /// The newest release, in one line: its name, and how old the app's knowledge of it is.
@@ -1368,8 +1386,9 @@ fn release_line(store: AppStore) -> Option<String> {
         // Ages are measured by the machine that contacted the feed: it wrote both stamps, and a
         // client with no usable clock would otherwise render 从未检查 for ever.
         status.server_time,
+        store.language(),
     )
-    .unwrap_or_else(|| "刚刚".to_owned());
+    .unwrap_or_else(|| i18n::tr("刚刚"));
     Some(domain::release_subtitle(
         &release.title,
         &release.version,
@@ -1384,10 +1403,10 @@ fn check_note(store: AppStore) -> String {
     let server_time = status.as_ref().map_or(0, |held| held.server_time);
     let age = status
         .as_ref()
-        .and_then(|held| domain::age_label(held.last_check_at, server_time));
+        .and_then(|held| domain::age_label(held.last_check_at, server_time, store.language()));
     match (status, age) {
         (Some(held), Some(age)) if held.state == api::update::AppUpdateState::UpToDate => {
-            format!("当前 v{} · 上次检查 {age}", held.current_version)
+            i18n::fill("当前 v{} · 上次检查 {}", &[&held.current_version, &age])
         }
         (Some(held), _) if held.state == api::update::AppUpdateState::Unsupported => {
             format!("此构建无发布通道（{}）", held.target)

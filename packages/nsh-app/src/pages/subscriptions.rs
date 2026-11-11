@@ -4,6 +4,7 @@
 //! central act is choosing which one that is. Import, refresh and delete all report through
 //! the store, which owns persistence and the notice stack.
 
+use crate::i18n;
 use crate::store::AppStore;
 use crate::ui::{controls, theme, Icon};
 use nsh_base::{alert_dialog, dialog, theme as base_theme};
@@ -85,13 +86,13 @@ fn toolbar(store: AppStore) -> impl IntoElement {
                     .flex_col()
                     .gap_0p5()
                     .child(
-                        text("订阅")
+                        text(move || i18n::tr("订阅"))
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(move || base_theme().card_foreground),
                     )
                     .child(
-                        text(move || count_summary(store))
+                        text(move || i18n::tr(&(count_summary(store))))
                             .text_xs()
                             .text_color(theme::text_faint()),
                     ),
@@ -126,7 +127,7 @@ fn refresh_all_button(store: AppStore) -> impl IntoElement {
         .child(when(
             move || store.refresh_busy().is_some(),
             move || {
-                text("正在刷新")
+                text(move || i18n::tr("正在刷新"))
                     .text_xs()
                     .text_color(move || base_theme().muted_foreground)
             },
@@ -147,15 +148,17 @@ fn empty_state() -> impl IntoElement {
                     .text_color(move || base_theme().muted_foreground),
             )
             .child(
-                text("暂无订阅")
+                text(move || i18n::tr("暂无订阅"))
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(move || base_theme().foreground),
             )
             .child(
-                text("订阅用于导入代理节点；添加后即可在节点页挑选线路、回到概览连接。")
-                    .text_xs()
-                    .text_color(theme::text_faint()),
+                text(move || {
+                    i18n::tr("订阅用于导入代理节点；添加后即可在节点页挑选线路、回到概览连接。")
+                })
+                .text_xs()
+                .text_color(theme::text_faint()),
             ),
     )
 }
@@ -312,7 +315,7 @@ fn import_dialog(store: AppStore) -> impl IntoElement {
                 .bg(move || base_theme().card)
                 .shadow_lg()
                 .child(
-                    text("添加订阅")
+                    text(move || i18n::tr("添加订阅"))
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(move || base_theme().card_foreground),
@@ -328,7 +331,7 @@ fn import_dialog(store: AppStore) -> impl IntoElement {
                 ))
                 .child(controls::field_error(store.import_error()))
                 .child(
-                    text("名称留空时用订阅地址的主机命名。")
+                    text(move || i18n::tr("名称留空时用订阅地址的主机命名。"))
                         .text_xs()
                         .text_color(theme::text_faint()),
                 )

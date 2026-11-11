@@ -13,6 +13,7 @@
 //! keeps state of its own.
 
 use crate::domain;
+use crate::i18n;
 use crate::store::AppStore;
 use crate::ui::{controls, theme, Icon};
 use nsh_base::{button, input, theme as base_theme};
@@ -104,7 +105,7 @@ fn toolbar(store: AppStore) -> impl IntoElement {
             ),
         )
         .child(
-            text(move || toolbar_summary(store))
+            text(move || i18n::tr(&(toolbar_summary(store))))
                 .text_xs()
                 .text_color(theme::text_faint()),
         )
@@ -413,7 +414,7 @@ fn pending_row() -> AnyElement {
         .items_center()
         .justify_center()
         .child(
-            text("正在生成代理组")
+            text(move || i18n::tr("正在生成代理组"))
                 .text_xs()
                 .text_color(theme::text_faint()),
         )
