@@ -21,7 +21,8 @@ KITTY_WEB_DIR=/tmp/site ./target/debug/kitty-pro-web-server --daemon
 | `main.rs` | Process start, the TUN helper, listener, static site, shutdown |
 
 `guard.rs` and `cli.rs` came out of the deleted `packages/web` unchanged apart from
-module paths, and they carry their own 21 tests. Treat edits there as security
+module paths, and they carry their own 27 tests — 19 from the old `main.rs`, 8 from
+the old `cli.rs`. Treat edits there as security
 changes, not refactors: the exact-host matching, the strict same-origin comparison
 and the constant-time token compare each close a hole an earlier revision had, and
 the reason is in the comment above the line that fixes it.

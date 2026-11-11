@@ -1,5 +1,5 @@
 //! The web control surface's request guard, ported verbatim from the deleted
-//! `packages/web/src/main.rs` along with its 21 tests.
+//! `packages/web/src/main.rs` along with its 19 tests.
 //!
 //! This is a security boundary, so it was extracted mechanically rather than
 //! rewritten: the semantics below (exact-host allow-listing, strict same-origin,
