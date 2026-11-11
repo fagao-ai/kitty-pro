@@ -268,10 +268,52 @@ Checked by reading both, not by assumption. What is left:
 | Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. With no tray there is also nowhere for `AppStore::copy_proxy_environment` to live, and no menu-bar quit for `api::shutdown_native_runtime`. |
 | 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
 | Web and mobile shells | **There is no web or phone build today.** NSH supports `--target web`/`android`/`ios`, but this crate is not wired for any of them and the deleted Dioxus shells that used to be the web and Android front ends have no replacement. Measured, not assumed: `nsh package --target web` fails before it reaches this app, in `cc-rs: failed to find tool "llvm-ar"` (NSH's web target wants clang and `llvm-ar`); `api` compiles for `wasm32-unknown-unknown` and `proxy-core` does too, which CI now guards, so the backend is the part that *is* ready; and `singbox` cannot reach the browser or iOS at all, because its `build.rs` panics on any target OS outside `{android, macos, linux, windows}` — note its `if target_os == "wasm" { return }` line is dead code, since `wasm32-unknown-unknown` reports `target_os = "unknown"`. Even before that, a browser could not start a core or touch the system proxy: it would be a viewer, not a control plane. Android additionally needs its Kotlin side rewritten — `packages/singbox/src/android.rs` still exports `Java_com_kitty_pro_KittyVpnService_*` for Kotlin files that were deleted with the shell. |
-| Process entry points in a **packaged** build | The deleted Dioxus `main.rs` owned three things that belong to whichever entry point starts the process: dispatching the privileged TUN helper (`api::run_tun_helper_from_args`, because the helper is this same executable re-launched with a flag), clearing a system proxy left dangling by a crashed run (`api::cleanup_stale_system_proxy_sentinel`), and taking the proxy and core down on exit (`api::shutdown_native_runtime`). `src/main.rs` does all three, so `cargo run --features desktop` is complete. `nsh package` does **not** use that file: it generates and builds its own runner (`.nsh/rust/<target>-app/main.rs`), so a packaged build reaches none of them. TUN is the one that breaks rather than degrades — the authorized helper would skip its dispatch, open a second GUI as root, and the parent's RPC would time out. Either give the packaged runner these calls or keep shipping from `cargo build --features desktop`; verify TUN on a packaged build before the next release. |
+| Process entry points in a **packaged** build | **KNOWN BUG: TUN is broken in every shipped build.** `nsh package` uses a runner of its own and never reaches `src/main.rs`, so the packaged app skips the helper dispatch, the boot cleanup and the exit cleanup. [Details, the hook that fixes two of the three, and what cannot be fixed that way](#known-bug-packaged-build-entry-points). |
 
-Every screen is ported and every settings card has a home here. The rows above are the whole
-distance between the two front ends, and none of them is a decision this crate can make on its own.
+### Known bug: packaged-build entry points
+
+`src/main.rs` owns three calls that belong to whichever entry point starts the process, and
+that the deleted Dioxus `main.rs` used to own: dispatching the privileged TUN helper
+(`api::run_tun_helper_from_args`), clearing a system proxy left dangling by a run that died
+(`api::cleanup_stale_system_proxy_sentinel`), and taking the proxy and the core down on exit
+(`api::shutdown_native_runtime`). `cargo run --features desktop` therefore behaves.
+
+`nsh package` does not, because it generates and builds its own runner
+(`.nsh/rust/<target>-app/main.rs`) instead of using ours. Verified two ways: that file's
+`main` calls only `set_ui_sets(..)` and `nsh_macos_app::main()`, and no string from our
+`main.rs` appears in the packaged `KittyPro` binary.
+
+The one that breaks rather than degrades is the helper. TUN runs the core in *this same
+executable* re-launched with `--kitty-pro-tun-helper` and administrator rights. A helper
+that skips the dispatch opens a second GUI as root and never answers the parent's RPC, so
+the user's TUN start times out. **Do not ship a release that offers TUN without verifying
+it on the packaged build.**
+
+There is a hook, which corrects what this section said when it was first written: every
+generated runner evaluates `set_app_nsh_app_kitty()` → `__nsh_native_module()` → this
+crate's `native()` before its `main` body runs, on macOS, Linux and Windows alike. The
+helper dispatch and the boot cleanup can live there. Two things to get right:
+
+- `nsh test`'s runner calls the same entry (`.nsh/rust/test/main.rs`), and the boot cleanup
+  reads and writes the developer's **real** system proxy, so it must not run under test. The
+  helper dispatch is safe for free — the flag is only ever present in the helper — but the
+  cleanup needs a `KITTY_PROFILE_DIR` guard or an explicit once-flag.
+- The helper dispatch has to `process::exit` from a function whose stated job is registering
+  components. That deserves its own test rather than a comment.
+
+Exit cleanup has **no** hook: `AppOptions` carries no callback field (`trace`, `asset_base`,
+`chunks`, `app_id`, `title`, `size`, `display`, `keep_size`, …). Either the helper's
+lifecycle lease is trusted to cover it — it does stop the core and remove routes when the
+parent dies, but it does not restore a system proxy — or the app owns its binary instead of
+using `nsh package`, which also settles the tray question below.
+
+Every screen is ported and every settings card has a home here. The rows above are what still
+separates this app from what the deleted shells shipped, and none of them is a decision this
+crate can make on its own.
+
+Every screen is ported and every settings card has a home here. The rows above are what still
+separates this app from what the deleted shells shipped, and none of them is a decision this
+crate can make on its own.
 
 One card is distributed rather than copied. The original groups the core's version, its state, the
 unavailable-core diagnosis and its retry under one 内核 heading; here those four things live where
