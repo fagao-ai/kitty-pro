@@ -455,6 +455,7 @@ mod tests {
         assert_eq!(
             next_dns_override_id(&[proxy_core::DnsOverride {
                 id: 4,
+                match_type: CustomRuleMatch::DomainSuffix,
                 enabled: true,
                 domain_suffix: "a.test".to_owned(),
                 server: "1.1.1.1".to_owned(),
@@ -837,6 +838,53 @@ pub fn custom_rule_match_label(match_type: CustomRuleMatch) -> &'static str {
         CustomRuleMatch::IpCidr => "IP CIDR",
         CustomRuleMatch::ProcessName => "进程名",
         CustomRuleMatch::ProcessPath => "进程路径",
+    }
+}
+
+/// A rule's refusal, in the language on screen.
+///
+/// An exhaustive `match` over the variants rather than a lookup of `error.to_string()`, and the
+/// reason is the two variants that interpolate a limit — the byte cap and the rule cap. No table key
+/// can hold a finished sentence with a number inside it, so translating those by lookup would
+/// return Chinese for exactly the two a reader meets when the profile is nearly full, which is the
+/// least likely place to notice. Here the compiler refuses to build until a new variant is named,
+/// and the templated two carry their hole through `fill_at` like any other composed sentence, with
+/// the number taken from the constant that enforces it rather than from a copy of it.
+///
+/// Pure, and taking the language, because `proxy_core` is shared with the Dioxus shell and so
+/// cannot translate anything itself; this is this app's own reading of those words.
+pub fn rule_error_message(
+    error: &proxy_core::CustomRuleValidationError,
+    lang: crate::i18n::Lang,
+) -> String {
+    use proxy_core::CustomRuleValidationError as E;
+    match error {
+        E::Empty => crate::i18n::translate(lang, "规则内容不能为空"),
+        E::TooLong => crate::i18n::fill_at(
+            lang,
+            "规则内容不能超过 {} 字节",
+            &[&proxy_core::MAX_CUSTOM_RULE_VALUE_BYTES],
+        ),
+        E::InvalidDomain => crate::i18n::translate(lang, "域名格式无效"),
+        E::InvalidDomainKeyword => {
+            crate::i18n::translate(lang, "域名关键字不能包含空白、路径或 URL scheme")
+        }
+        E::InvalidCidr => crate::i18n::translate(
+            lang,
+            "CIDR 格式无效，请输入类似 192.168.0.0/16 或 2001:db8::/32",
+        ),
+        E::InvalidProcessName => {
+            crate::i18n::translate(lang, "进程名不能为空或包含控制字符，请直接填进程名（如 Telegram）")
+        }
+        E::InvalidProcessPath => crate::i18n::translate(
+            lang,
+            "进程路径必须是绝对路径，如 /Applications/Telegram.app/Contents/MacOS/Telegram 或 C:\\Program Files\\Telegram\\Telegram.exe",
+        ),
+        E::TooManyRules => {
+            crate::i18n::fill_at(lang, "自定义规则不能超过 {} 条", &[&proxy_core::MAX_CUSTOM_RULES])
+        }
+        E::InvalidId => crate::i18n::translate(lang, "规则 ID 必须唯一且不能为 0"),
+        E::Duplicate => crate::i18n::translate(lang, "已存在相同的匹配规则"),
     }
 }
 

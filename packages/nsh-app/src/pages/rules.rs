@@ -236,7 +236,7 @@ fn summary_row(store: AppStore, tab: Tab) -> impl IntoElement {
             text(move || {
                 let key = match tab {
                     Tab::Routing => routing_summary(store),
-                    Tab::Dns => "命中域名后缀用专用 DNS 解析并直连，任何分流模式都生效".to_owned(),
+                    Tab::Dns => "命中域名用专用 DNS 解析并直连，任何分流模式都生效".to_owned(),
                 };
                 i18n::tr(&key)
             })
@@ -309,6 +309,9 @@ fn rule_draft() -> RuleDraft {
 #[derive(Clone, Copy)]
 struct DnsDraft {
     open: Signal<bool>,
+    /// The kind as a `SelectItem` value, so the picker is the same control the rule form uses.
+    /// Read through `parse_match` when the form is submitted.
+    kind: Signal<SharedString>,
     domain: Signal<String>,
     server: Signal<String>,
     error: Signal<Option<String>>,
@@ -317,6 +320,7 @@ struct DnsDraft {
 fn dns_draft() -> DnsDraft {
     DnsDraft {
         open: signal(false),
+        kind: signal(match_value(CustomRuleMatch::DomainSuffix)),
         domain: signal(String::new()),
         server: signal(String::new()),
         error: signal(None),
@@ -324,8 +328,13 @@ fn dns_draft() -> DnsDraft {
 }
 
 /// Clear the DNS form and close it, the way `reset` does for a rule.
+///
+/// The kind goes back to a suffix as well. Leaving it on `domain_keyword` after an add would mean
+/// the next rule opened silently narrower or wider than the last, which is the one thing a picker
+/// that defaults should not do.
 fn reset_dns(draft: DnsDraft) {
     draft.open.set(false);
+    draft.kind.set(match_value(CustomRuleMatch::DomainSuffix));
     draft.domain.set(String::new());
     draft.server.set(String::new());
     draft.error.set(None);
@@ -718,9 +727,15 @@ fn rule_row(
         )
 }
 
-/// DNS overrides: a suffix, a resolver, and nothing else, so the rows stay one line.
+/// DNS overrides: which names, resolved by which server, and nothing else, so the rows stay one
+/// line.
+///
+/// The kind picker is the routing rule form's own control with three of its six options. The user
+/// asked for exactly that list and excluded the two process kinds; IP CIDR is excluded for a
+/// reason that is not a preference — see [`dns_kind_options`].
 fn dns(store: AppStore, draft: DnsDraft) -> impl IntoElement {
-    let (domain_field, server_field, error) = (draft.domain, draft.server, draft.error);
+    let (kind_field, domain_field, server_field, error) =
+        (draft.kind, draft.domain, draft.server, draft.error);
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -740,10 +755,28 @@ fn dns(store: AppStore, draft: DnsDraft) -> impl IntoElement {
                             .flex_wrap()
                             .items_end()
                             .gap_3()
+                            .child(view().w(px(150.0)).flex_shrink_0().child(
+                                controls::choice_field(
+                                    "匹配类型",
+                                    kind_field,
+                                    dns_kind_options,
+                                    move |next| {
+                                        kind_field.set(next);
+                                        error.set(None);
+                                    },
+                                ),
+                            ))
                             .child(view().flex_1().min_w(px(200.0)).child(controls::text_field(
-                                "域名后缀",
+                                // "Match" rather than the chosen kind's own name: `text_field`
+                                // takes its label as a `&'static str` read once at build time, so
+                                // naming the kind here would leave the field saying 域名后缀 after
+                                // the picker moved to 域名关键字 — the exact frozen-label mistake
+                                // the whole app has to avoid. The routing form above makes the
+                                // same choice, and the placeholder *is* reactive, so the example
+                                // under the cursor does follow the kind.
+                                "匹配内容",
                                 domain_field,
-                                || "example.com",
+                                move || placeholder_for(kind_field.get()),
                             )))
                             .child(view().flex_1().min_w(px(200.0)).child(controls::text_field(
                                 "DNS 服务器",
@@ -760,6 +793,7 @@ fn dns(store: AppStore, draft: DnsDraft) -> impl IntoElement {
                                     let (store, draft) = (store, draft);
                                     move || {
                                         let result = store.add_dns_override(
+                                            parse_match(draft.kind.get_untracked()),
                                             &draft.domain.get_untracked(),
                                             &draft.server.get_untracked(),
                                         );
@@ -795,7 +829,11 @@ fn dns_list(store: AppStore) -> impl IntoElement {
                 move || store.dns_overrides().len(),
                 move |at| {
                     let item = computed(move || store.dns_overrides().get(at.index()).cloned());
-                    dns_row(store, item)
+                    // The row number is the index in the list, read at draw time exactly as the
+                    // routing list does it: a virtualized cell is built once and shown for many
+                    // rows, so the position cannot be baked in when the row was made.
+                    let position = computed(move || at.index());
+                    dns_row(store, item, position)
                 },
             )
             .keys(move || {
@@ -815,16 +853,30 @@ fn dns_list(store: AppStore) -> impl IntoElement {
             })
             .empty(controls::empty_state(
                 "尚未配置专用 DNS",
-                "为指定域名后缀固定 DNS，避免公共 DNS 解析到错误地址。",
+                "为指定域名固定 DNS，避免公共 DNS 解析到错误地址。",
             ))
             .flex_1()
             .min_h(px(0.0)),
         )
 }
 
-fn dns_row(store: AppStore, item: Memo<Option<DnsOverride>>) -> impl IntoElement {
+/// One DNS override, drawn with the routing list's anatomy: number, value over its kind, the
+/// switch, a badge stating what the row does, then delete.
+///
+/// The user asked for the two lists to read as one thing, and they are one thing — a rule that
+/// matches and an effect — so the same column order, sizes and type styles are used rather than a
+/// DNS-flavoured layout. What each slot carries follows the routing row: line 1 is the value,
+/// line 2 is the kind (the routing row's `IP CIDR` / `域名后缀`), and the badge is the effect —
+/// `Direct` there, the resolver here. The kind is always shown now, not only when it is unusual,
+/// because a list where one row has a second line and the next does not reads as a row that is
+/// missing something.
+fn dns_row(
+    store: AppStore,
+    item: Memo<Option<DnsOverride>>,
+    position: Memo<usize>,
+) -> impl IntoElement {
     let id = move || item.with(|item| item.as_ref().map(|item| item.id));
-    let suffix = move || {
+    let value = move || {
         item.with(|item| {
             item.as_ref()
                 .map(|item| item.domain_suffix.clone())
@@ -839,13 +891,21 @@ fn dns_row(store: AppStore, item: Memo<Option<DnsOverride>>) -> impl IntoElement
         .px_5()
         .py_3()
         .child(
+            text(move || (position.get() + 1).to_string())
+                .text_xs()
+                .font_family(theme::font_mono())
+                .w(px(24.0))
+                .flex_shrink_0()
+                .text_color(theme::text_faint()),
+        )
+        .child(
             view()
                 .flex_1()
                 .min_w(px(0.0))
                 .flex_col()
                 .gap_0p5()
                 .child(
-                    text(suffix)
+                    text(value)
                         .text_sm()
                         .font_family(theme::font_mono())
                         .number_of_lines(1)
@@ -855,18 +915,18 @@ fn dns_row(store: AppStore, item: Memo<Option<DnsOverride>>) -> impl IntoElement
                     text(move || {
                         item.with(|item| {
                             item.as_ref()
-                                .map(|item| item.server.clone())
+                                .map(|item| {
+                                    i18n::tr(domain::custom_rule_match_label(item.match_type))
+                                })
                                 .unwrap_or_default()
                         })
                     })
                     .text_xs()
-                    .font_family(theme::font_mono())
-                    .number_of_lines(1)
                     .text_color(theme::text_faint()),
                 ),
         )
         .child(controls::switch_state(
-            move || Some(i18n::fill("启用 {} 的专用 DNS", &[&(suffix())]).into()),
+            move || Some(i18n::fill("启用 {} 的专用 DNS", &[&(value())]).into()),
             move || item.with(|item| item.as_ref().is_some_and(|item| item.enabled)),
             || false,
             move |_: bool| {
@@ -875,9 +935,25 @@ fn dns_row(store: AppStore, item: Memo<Option<DnsOverride>>) -> impl IntoElement
                 }
             },
         ))
+        .child(controls::badge(
+            // The resolver, in the slot the routing row spends on its action: both answer "and
+            // then what?". Not translated — an address is data, not the app's vocabulary.
+            move || {
+                item.with(|item| {
+                    item.as_ref()
+                        .map(|item| item.server.clone())
+                        .unwrap_or_default()
+                })
+            },
+            || theme::Tint::Dns,
+        ))
         .child(controls::icon_button(
             move || Icon::Trash2,
-            move || i18n::fill("删除 {} 的专用 DNS", &[&(suffix())]).into(),
+            // One press, as this row always was. The routing row arms because a rule sits in an
+            // ordered list and deleting one silently reshuffles the rest; a DNS override is an
+            // entry in a set, and the user asked for this list to match in *style*, not to gain a
+            // confirmation step it never had.
+            move || i18n::fill("删除 {} 的专用 DNS", &[&(value())]).into(),
             move || {
                 if let Some(id) = id() {
                     store.delete_dns_override(id);
@@ -1129,6 +1205,30 @@ fn process_hits(store: AppStore, keyword: &str) -> Vec<api::RunningProcess> {
         .processes()
         .into_iter()
         .filter(|process| domain::process_matches(process, keyword))
+        .collect()
+}
+
+/// The kinds a dedicated-DNS rule can be written with.
+///
+/// The user asked for the routing form's list without the two process kinds, and that is what this
+/// is — minus one more, for a reason that is the core's rather than a preference: a DNS rule whose
+/// only condition is an IP CIDR does not scope resolution to that range, it sends *every* forward
+/// lookup to that server. A resolver is chosen before an address exists, so sing-box keeps the CIDR
+/// for afterwards, as a filter on the answer (`dns/router.go` skips such a rule only for non-address
+/// queries, then `DefaultDNSRule::Match` sets `IgnoreDestinationIPCIDRMatch`, which leaves the rule
+/// matching everything). The app already makes the same judgement one file over:
+/// `custom_direct_dns_rule_to_value` returns `None` for `IpCidr` when turning routing rules into DNS
+/// rules. Offering it here would mean a rule that silently breaks DNS, so the picker does not
+/// contain it and `numbered_dns_overrides` refuses to write one if a profile says so anyway.
+fn dns_kind_options() -> Vec<SelectItem> {
+    proxy_core::DNS_OVERRIDE_MATCHES
+        .into_iter()
+        .map(|kind| {
+            SelectItem::new(
+                match_value(kind),
+                i18n::tr(domain::custom_rule_match_label(kind)),
+            )
+        })
         .collect()
 }
 

@@ -445,8 +445,42 @@ const ENGLISH: &[(&str, &str)] = &[
     ("匹配内容", "Match"),
     ("匹配类型", "Match type"),
     ("此处指单条规则的匹配动作，与全局分流模式不同", "The action for this rule, not the global mode"),
-    ("命中域名后缀用专用 DNS 解析并直连，任何分流模式都生效", "Matching domains resolve here and go direct, in every mode"),
-    ("为指定域名后缀固定 DNS，避免公共 DNS 解析到错误地址。", "Pin DNS for a domain suffix when public resolvers answer wrongly."),
+    ("命中域名用专用 DNS 解析并直连，任何分流模式都生效", "Matching domains resolve here and go direct, in every mode"),
+    ("为指定域名固定 DNS，避免公共 DNS 解析到错误地址。", "Pin DNS for a domain when public resolvers answer wrongly."),
+    // The words `proxy_core` answers with when a DNS field is refused. They are listed here rather
+    // than in the crate that writes them because that crate is shared with the Dioxus shell, which
+    // draws them as they are and knows nothing of this table.
+    ("域名无效", "that domain is not valid"),
+    ("域名关键字无效", "that keyword is not valid"),
+    ("域名后缀无效", "that domain suffix is not valid"),
+    ("DNS 服务器必须是 IP 或域名", "the DNS server must be an IP or a domain"),
+    ("专用 DNS 只支持域名类匹配", "dedicated DNS matches on a domain only"),
+    // The routing form's refusals, same reason and same sink. Two of this enum's variants embed a
+    // number in their message and so cannot be keys at all; they are listed by name in
+    // `every_rule_validation_error_translates`, which is what keeps this list honest.
+    ("规则内容不能为空", "the rule needs something to match"),
+    ("域名格式无效", "that is not a valid domain"),
+    ("域名关键字不能包含空白、路径或 URL scheme", "a keyword cannot contain spaces, a path or a scheme"),
+    (
+        "CIDR 格式无效，请输入类似 192.168.0.0/16 或 2001:db8::/32",
+        "not a valid CIDR; try 192.168.0.0/16 or 2001:db8::/32",
+    ),
+    (
+        "进程名不能为空或包含控制字符，请直接填进程名（如 Telegram）",
+        "a process name cannot be empty or hold control characters; give the name alone (Telegram)",
+    ),
+    (
+        "进程路径必须是绝对路径，如 /Applications/Telegram.app/Contents/MacOS/Telegram 或 C:\\Program Files\\Telegram\\Telegram.exe",
+        "a process path must be absolute, e.g. /Applications/Telegram.app/Contents/MacOS/Telegram \
+         or C:\\Program Files\\Telegram\\Telegram.exe",
+    ),
+    ("规则 ID 必须唯一且不能为 0", "a rule id must be unique and not 0"),
+    ("已存在相同的匹配规则", "a rule with that match already exists"),
+    // The two that name a limit, so they are templates and their holes are filled after the
+    // lookup. They live in `ENGLISH` like any other row and are reached through
+    // `domain::rule_error_message`, which is the only place that knows the number.
+    ("规则内容不能超过 {} 字节", "a rule cannot be longer than {} bytes"),
+    ("自定义规则不能超过 {} 条", "no more than {} custom rules"),
     ("添加一条规则，为指定域名或网段固定走向。", "Add a rule to pin a domain or range to one route."),
     ("JavaScript 配置覆写已启用，自定义分流规则暂不可用。", "The JavaScript override is on, so custom routing rules are inactive."),
     ("启用 JavaScript 配置覆写", "Enable the JavaScript config override"),
@@ -869,7 +903,18 @@ mod tests {
                     continue;
                 }
                 drawn += 1;
-                if keys.contains(lit) || searched_not_drawn(lit) || support_text_only(lit) {
+                // Compared after unescaping, because the scan reads source text and the table holds
+                // compiled values. `C:\\Program Files` in a file is `C:\Program Files` in a binary,
+                // so comparing the two raw reports a key that exists as a key that does not. This
+                // is not a hypothetical: the process-path validation message names a Windows path
+                // and was the first string to trip over it.
+                let Some(lit) = unescape(lit) else {
+                    continue;
+                };
+                if keys.contains(lit.as_str())
+                    || searched_not_drawn(&lit)
+                    || support_text_only(&lit)
+                {
                     continue;
                 }
                 missing.push(format!(
@@ -1073,6 +1118,58 @@ mod tests {
     /// Index of the brace closing the `{` at `open`.
     fn matching_brace(src: &str, open: usize) -> Option<usize> {
         matching_pair(src, open, b'{', b'}')
+    }
+
+    /// A literal's text as the compiler would hold it.
+    ///
+    /// The scan reads a file and the table holds values, and the two differ wherever a string
+    /// escapes something: `C:\\Program Files` in a file is `C:\Program Files` in a binary, and a
+    /// backslash at the end of a line swallows the newline and the next line's indent. Unescaping
+    /// only the table's side would leave every escaped key looking absent, so the comparison has to
+    /// resolve the file's side the same way. An escape this does not know is left as written: that
+    /// makes the comparison *fail*, which reports the string for a human to look at, rather than
+    /// silently skipping it — the failure mode this test exists to prevent.
+    fn unescape(lit: &str) -> Option<String> {
+        if !lit.contains('\\') {
+            return Some(lit.to_owned());
+        }
+        let mut out = String::with_capacity(lit.len());
+        let mut rest = lit;
+        while let Some(at) = rest.find('\\') {
+            out.push_str(&rest[..at]);
+            let mut chars = rest[at + 1..].chars();
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('0') => out.push('\0'),
+                Some('\'') => out.push('\''),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                // A line continuation: the newline and the next line's indent both disappear.
+                Some('\n') => {
+                    let tail = chars.as_str();
+                    let kept = tail.trim_start_matches([' ', '\t', '\n', '\r']);
+                    rest = kept;
+                    continue;
+                }
+                // Unknown, or a `\u{…}` this does not attempt: leave it as written so the
+                // comparison cannot pass by accident.
+                other => {
+                    out.push('\\');
+                    if let Some(c) = other {
+                        out.push(c);
+                        rest = chars.as_str();
+                        continue;
+                    }
+                    rest = "";
+                    continue;
+                }
+            }
+            rest = chars.as_str();
+        }
+        out.push_str(rest);
+        Some(out)
     }
 
     /// Index of the closing bracket for the opener at `open`, ignoring brackets inside a string.

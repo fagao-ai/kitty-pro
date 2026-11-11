@@ -4,7 +4,7 @@ use super::{
 };
 use dioxus::prelude::ServerFnError;
 use proxy_core::{
-    normalize_dns_override, sync_bundle_directory as bundle_directory, validate_custom_rules,
+    normalize_dns_override_match, sync_bundle_directory as bundle_directory, validate_custom_rules,
     CustomRule, DnsOverride, SyncConfigScript, SyncSnapshot, SyncSubscription,
     SYNC_SNAPSHOT_FORMAT, SYNC_SNAPSHOT_VERSION,
 };
@@ -468,14 +468,17 @@ pub(super) fn validate_snapshot(snapshot: &SyncSnapshot) -> Result<(), ServerFnE
     if dns_overrides.len() > 256 {
         return Err(redact("远程专用 DNS 规则数量超过 256 条限制"));
     }
-    let mut dns_rule_suffixes = HashSet::with_capacity(dns_overrides.len());
+    let mut dns_rule_keys = HashSet::with_capacity(dns_overrides.len());
     for rule in &dns_overrides {
-        let (domain_suffix, server) = normalize_dns_override(&rule.domain_suffix, &rule.server)
-            .map_err(|error| redact(format!("远程专用 DNS 规则无效: {error}")))?;
-        if !dns_rule_suffixes.insert(domain_suffix.clone()) {
-            return Err(redact(format!(
-                "远程专用 DNS 域名后缀重复: {domain_suffix}"
-            )));
+        // The kind is validated with the value: a remote document from an older build has no
+        // `match_type` and decodes as a suffix, which is exactly what its single field always
+        // meant, so this accepts old snapshots unchanged and refuses only a rule whose kind is one
+        // a DNS rule cannot carry at all (an IP CIDR would take over every lookup on the machine).
+        let (match_type, domain_suffix, server) =
+            normalize_dns_override_match(rule.match_type, &rule.domain_suffix, &rule.server)
+                .map_err(|error| redact(format!("远程专用 DNS 规则无效: {error}")))?;
+        if !dns_rule_keys.insert((match_type, domain_suffix.clone())) {
+            return Err(redact(format!("远程专用 DNS 域名重复: {domain_suffix}")));
         }
         if rule.server != server {
             return Err(redact("远程专用 DNS 服务器与规范化结果不一致"));
@@ -1976,6 +1979,7 @@ mod tests {
             }],
             dns_overrides: vec![proxy_core::DnsOverride {
                 id: 1,
+                match_type: proxy_core::CustomRuleMatch::DomainSuffix,
                 enabled: true,
                 domain_suffix: "example.net".to_string(),
                 server: "192.0.2.53".to_string(),
@@ -2069,6 +2073,7 @@ mod tests {
                 &AppProfile {
                     dns_overrides: vec![proxy_core::DnsOverride {
                         id: 1,
+                        match_type: proxy_core::CustomRuleMatch::DomainSuffix,
                         enabled: true,
                         domain_suffix: "example.net".to_string(),
                         server: "192.0.2.1".to_string(),
@@ -2096,6 +2101,7 @@ mod tests {
                 &AppProfile {
                     dns_overrides: vec![proxy_core::DnsOverride {
                         id: 1,
+                        match_type: proxy_core::CustomRuleMatch::DomainSuffix,
                         enabled: true,
                         domain_suffix: "example.net".to_string(),
                         server: "192.0.2.2".to_string(),
@@ -2219,6 +2225,7 @@ mod tests {
         let mut profile = AppProfile {
             dns_overrides: vec![proxy_core::DnsOverride {
                 id: 1,
+                match_type: proxy_core::CustomRuleMatch::DomainSuffix,
                 enabled: true,
                 domain_suffix: "et.net".to_string(),
                 server: "100.100.100.101".to_string(),
@@ -2240,6 +2247,7 @@ mod tests {
         let source = AppProfile {
             dns_overrides: vec![proxy_core::DnsOverride {
                 id: 2,
+                match_type: proxy_core::CustomRuleMatch::DomainSuffix,
                 enabled: true,
                 domain_suffix: "example.net".to_string(),
                 server: "192.0.2.53".to_string(),

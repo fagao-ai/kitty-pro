@@ -163,6 +163,10 @@ pub(crate) fn commit_dns_override(
             rules.push(DnsOverride {
                 id,
                 enabled: true,
+                // This shell offers one kind, a suffix, and still does. The field exists because
+                // the NSH app offers three; naming it here rather than relying on the serde
+                // default keeps the two shells writing the same value for the same form.
+                match_type: proxy_core::CustomRuleMatch::DomainSuffix,
                 domain_suffix,
                 server: dns_server,
             });

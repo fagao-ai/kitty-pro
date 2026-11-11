@@ -111,14 +111,22 @@ fn toolbar(store: AppStore) -> impl IntoElement {
         )
 }
 
+/// The page's own search box: `controls::search_field` draws a card of its own, and this one sits
+/// inside the toolbar card beside the probe.
+///
+/// Both `placeholder` and `label` are reactive and so can look their words up, but they do not do
+/// it themselves — a field built here rather than through `controls` has to call `tr` by hand, and
+/// this one passed the Chinese key straight through, which is how an English page came to show a
+/// Chinese search hint. Both say the same thing: the placeholder is what the reader sees, and the
+/// label is what the field answers to once text has replaced the placeholder.
 fn field(query: Signal<String>) -> nsh_base::Input {
     input()
         .value(move || query.get())
         .on_change(move |text: &str| query.set(text.to_owned()))
-        .placeholder("搜索节点、地址或协议")
+        .placeholder(move || i18n::tr("搜索节点、地址或协议"))
         .placeholder_color(|| color(base_theme().muted_foreground))
         .caret_color(|| color(base_theme().primary))
-        .label("搜索节点、地址或协议")
+        .label(move || i18n::tr("搜索节点、地址或协议"))
         .flex_1()
         .min_w(px(0.0))
         .text_sm()

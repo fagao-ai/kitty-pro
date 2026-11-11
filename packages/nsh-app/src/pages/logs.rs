@@ -118,15 +118,19 @@ pub fn logs(store: AppStore) -> impl IntoElement {
                                         .text_color(move || base_theme().muted_foreground),
                                 )
                                 .child(
+                                    // `placeholder` and `label` take their words by hand here:
+                                    // they are the two text sinks in this app that a source scan
+                                    // cannot tell are translatable, because the key is a literal
+                                    // with a row and nothing ever asks for it in English.
                                     nsh_base::input()
                                         .value(move || store.log_query.get())
                                         .on_change(move |text: &str| {
                                             store.log_query.set(text.to_owned());
                                         })
-                                        .placeholder("搜索域名、IP、节点")
+                                        .placeholder(move || i18n::tr("搜索域名、IP、节点"))
                                         .placeholder_color(|| color(base_theme().muted_foreground))
                                         .caret_color(|| color(base_theme().primary))
-                                        .label("搜索域名、IP、节点")
+                                        .label(move || i18n::tr("搜索域名、IP、节点"))
                                         .flex_1()
                                         .min_w(px(0.0))
                                         .text_sm()

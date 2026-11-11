@@ -1480,16 +1480,17 @@ impl AppStore {
             action,
         }
         .normalized()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| crate::domain::rule_error_message(&error, self.language()))?;
 
         if let Some(existing) = rules.iter_mut().find(|rule| rule.id == id) {
             *existing = candidate;
         } else if editing_id.is_some() {
-            return Err("要编辑的规则不存在".to_owned());
+            return Err(i18n::tr("要编辑的规则不存在"));
         } else {
             rules.push(candidate);
         }
-        proxy_core::validate_custom_rules(&rules).map_err(|error| error.to_string())?;
+        proxy_core::validate_custom_rules(&rules)
+            .map_err(|error| crate::domain::rule_error_message(&error, self.language()))?;
         self.custom_rules.set(rules);
         self.rule_change();
         Ok(())
@@ -1538,15 +1539,26 @@ impl AppStore {
         self.rule_change();
     }
 
-    /// Validate and add one per-domain DNS override, rejecting a duplicate suffix.
-    pub fn add_dns_override(self, domain: &str, server: &str) -> Result<(), String> {
-        let (domain_suffix, server) = proxy_core::normalize_dns_override(domain, server)?;
+    /// Validate and add one dedicated-DNS override, rejecting a duplicate.
+    ///
+    /// Duplicate means the same kind *and* the same value, which is narrower than the old
+    /// value-alone test now that the kind is chosen: `example.com` as an exact host and as a suffix
+    /// are two different promises about which names go to that resolver, and refusing the second
+    /// because the first exists would make the kind picker useless.
+    pub fn add_dns_override(
+        self,
+        match_type: proxy_core::CustomRuleMatch,
+        value: &str,
+        server: &str,
+    ) -> Result<(), String> {
+        let (match_type, value, server) =
+            proxy_core::normalize_dns_override_match(match_type, value, server)?;
         let mut overrides = self.dns_overrides.get_untracked();
         if overrides
             .iter()
-            .any(|item| item.domain_suffix == domain_suffix)
+            .any(|item| item.match_type == match_type && item.domain_suffix == value)
         {
-            return Err(i18n::fill("已存在 {} 的专用 DNS", &[&domain_suffix]));
+            return Err(i18n::fill("已存在 {} 的专用 DNS", &[&value]));
         }
         if overrides.len() >= proxy_core::MAX_CUSTOM_RULES {
             return Err(i18n::fill(
@@ -1558,7 +1570,8 @@ impl AppStore {
         overrides.push(proxy_core::DnsOverride {
             id,
             enabled: true,
-            domain_suffix,
+            match_type,
+            domain_suffix: value,
             server,
         });
         self.dns_overrides.set(overrides);

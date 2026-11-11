@@ -862,7 +862,7 @@ pub fn text_field_state(
                 .placeholder(move || i18n::tr(placeholder()))
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
-                .label(label)
+                .label(move || i18n::tr(label))
                 .w_full()
                 .min_w(px(0.0))
                 .text_sm()
@@ -910,7 +910,7 @@ pub fn text_field_focus(
                 .placeholder(move || i18n::tr(placeholder()))
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
-                .label(label)
+                .label(move || i18n::tr(label))
                 .element_ref(&focus)
                 .w_full()
                 .min_w(px(0.0))
@@ -939,6 +939,7 @@ pub fn text_editor(
     lines: f32,
 ) -> impl IntoElement {
     let label = label.into();
+    let input_label = label.clone();
     view()
         .w_full()
         .flex_col()
@@ -952,7 +953,7 @@ pub fn text_editor(
                 .placeholder(move || i18n::tr(placeholder))
                 .placeholder_color(|| color(theme().muted_foreground))
                 .caret_color(|| color(theme().primary))
-                .label(label)
+                .label(move || i18n::tr(&input_label))
                 .w_full()
                 .min_w(px(0.0))
                 .h(px(lines * 18.0))
@@ -1052,10 +1053,15 @@ pub fn choice_field(
 
 /// The field's own error line: the message sits under the field it describes rather than
 /// only in a notice, because a notice ages out while the mistake stays.
+///
+/// The lookup is safe for both kinds of message a caller can hand it. A caller that composed its
+/// notice with `i18n::fill` passes finished text, which matches no row and is drawn as it arrived;
+/// a caller whose words come from `proxy_core` — which is shared with the other shell and so
+/// cannot translate anything itself — passes a Chinese key that gets looked up here.
 pub fn field_error(message: Signal<Option<String>>) -> impl IntoElement {
     let shown = move || message.get().is_some();
     when(shown, move || {
-        text(move || message.get().unwrap_or_default())
+        text(move || i18n::tr(&message.get().unwrap_or_default()))
             .text_xs()
             .text_color(move || theme::Tint::Danger.foreground())
     })
@@ -1287,7 +1293,7 @@ pub fn search_field(
                 .caret_color(|| color(theme().primary))
                 // The same words as the placeholder: a field with no visible label still has
                 // to say what it searches.
-                .label(name)
+                .label(move || i18n::tr(name))
                 .flex_1()
                 .min_w(px(0.0))
                 .text_sm()

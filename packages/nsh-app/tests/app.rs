@@ -528,9 +528,29 @@ struct Drawn {
     /// toast, say — need the node that holds it, and the driver's own queries stop at
     /// `Screen::texts`, which reports what is on screen but not where.
     texts: HashMap<u32, String>,
+    /// What each input was told to show while empty. A placeholder is not a text node — the
+    /// platform draws it inside the input's own view — so `Screen::texts` never reports one and a
+    /// sweep over `texts` passes on a field whose hint is still Chinese. That is how two search
+    /// boxes leaked.
+    placeholders: HashMap<u32, String>,
+    /// Every node created and not since destroyed. A hint is only evidence while its field is on
+    /// screen: a page navigated away from cannot be blamed for what it showed, and a field built
+    /// before the language switch and then thrown away is not a field that failed to relabel.
+    /// Deleting the hint instead would discard the evidence the moment the sweep moves on, which is
+    /// precisely how a first version of this check passed on a Chinese placeholder.
+    mounted: std::collections::HashSet<u32>,
 }
 
 impl Drawn {
+    /// The hints of the inputs on screen right now.
+    fn live_placeholders(&self) -> Vec<String> {
+        self.placeholders
+            .iter()
+            .filter(|(id, _)| self.mounted.contains(id))
+            .map(|(_, hint)| hint.clone())
+            .collect()
+    }
+
     /// The node drawing `needle`, if one is in the record.
     fn node_with_text(&self, needle: &str) -> Option<u32> {
         self.texts
@@ -623,6 +643,15 @@ fn observing(mut app: Headless) -> (Headless, Arc<Mutex<Drawn>>) {
                         }
                     }
                 }
+                // A destroyed node stops counting as evidence, but its record is kept: what the
+                // sweep wants is the set of fields on screen *now*, and that is which ids still
+                // exist, not which hints were sent.
+                MountItem::Create { id, .. } => {
+                    drawn.mounted.insert(*id);
+                }
+                MountItem::Delete { id } => {
+                    drawn.mounted.remove(id);
+                }
                 MountItem::Frame { id, frame } => {
                     drawn.frames.insert(*id, *frame);
                 }
@@ -631,6 +660,13 @@ fn observing(mut app: Headless) -> (Headless, Arc<Mutex<Drawn>>) {
                 }
                 MountItem::Text { id, text, .. } => {
                     drawn.texts.insert(*id, text.text.clone());
+                }
+                // Every config the engine sends for an input, so a placeholder left in Chinese is
+                // visible to a test. The last one wins, which is what the platform sees; an input
+                // with no hint is not recorded, because "no hint" is not a hint in the wrong
+                // language and counting it would inflate the guard below.
+                MountItem::Input { id, config } if !config.placeholder.is_empty() => {
+                    drawn.placeholders.insert(*id, config.placeholder.clone());
                 }
                 _ => {}
             }
@@ -1318,6 +1354,13 @@ const SEEDED_PROFILE: &str = include_str!("fixtures/profile-two-nodes.json");
 /// before it can be edited, reordered or deleted.
 const PROFILE_WITH_RULE: &str = include_str!("fixtures/profile-one-rule.json");
 
+/// Two dedicated-DNS rules of two different kinds, with ids that are deliberately *not* 1 and 2.
+///
+/// The row's leading number is its position in the list, and a fixture whose ids were 1 and 2
+/// would pass that assertion whether the app read the index or the id. With 7 and 3, only the
+/// index can produce 1 and 2.
+const PROFILE_TWO_DNS: &str = include_str!("fixtures/profile-two-dns.json");
+
 #[test]
 fn a_seeded_profile_fills_the_shell() {
     let (mut app, _profile) = seeded_test("a_seeded_profile_fills_the_shell", SEEDED_PROFILE);
@@ -1481,7 +1524,7 @@ fn a_dns_override_is_added_and_persisted() {
     app.press("规则").unwrap();
     dns_tab_with_form(&mut app);
 
-    app.type_text("label:域名后缀", "example.com").unwrap();
+    app.type_text("label:匹配内容", "example.com").unwrap();
     app.type_text("label:DNS 服务器", "223.5.5.5").unwrap();
     app.press("添加").unwrap();
 
@@ -1506,6 +1549,127 @@ fn a_dns_override_is_added_and_persisted() {
     again.wait_for("223.5.5.5").unwrap();
 }
 
+/// The DNS kind picker: what it offers, and what choosing one actually stores.
+///
+/// Three separate promises, all of them invisible in a screenshot. The list must hold the three
+/// domain kinds and neither process kind (the user's exclusion) nor IP CIDR (which sing-box applies
+/// to *every* forward lookup rather than to the range, so offering it would break DNS — see
+/// `dns_kind_options`). The stored `match_type` is what the config generator writes its field from,
+/// so a picker that looked right and stored a suffix would silently widen or narrow the rule. And
+/// the same value under two kinds must both save, because that is the only reason the kind exists.
+#[test]
+fn the_dns_kind_picker_offers_the_domain_kinds_and_stores_the_one_chosen() {
+    let (mut app, _profile) =
+        desktop_test("the_dns_kind_picker_offers_the_domain_kinds_and_stores_the_one_chosen");
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("规则").unwrap();
+    dns_tab_with_form(&mut app);
+
+    // Opened, so the items are drawn: a closed picker shows only its current title, and asserting
+    // against that would pass on a list that never renders.
+    app.press("role:combobox[匹配类型]").unwrap();
+    app.wait_for("域名关键字").unwrap();
+    let offered: Vec<String> = app
+        .screen()
+        .texts()
+        .into_iter()
+        .filter(|text| {
+            matches!(
+                *text,
+                "域名后缀" | "精确域名" | "域名关键字" | "IP CIDR" | "进程名" | "进程路径"
+            )
+        })
+        .map(str::to_owned)
+        .collect();
+    for wanted in ["域名后缀", "精确域名", "域名关键字"] {
+        assert!(
+            offered.iter().any(|seen| seen == wanted),
+            "the picker does not offer {wanted}: {offered:?}"
+        );
+    }
+    for refused in ["IP CIDR", "进程名", "进程路径"] {
+        assert!(
+            !offered.iter().any(|seen| seen == refused),
+            "the picker offers {refused}, which must not be choosable for a resolver"
+        );
+    }
+    app.press("role:option[域名关键字]").unwrap();
+
+    app.type_text("label:匹配内容", "example").unwrap();
+    app.type_text("label:DNS 服务器", "223.5.5.5").unwrap();
+    app.press("添加").unwrap();
+    app.wait_for("规则已保存").unwrap();
+    let stored = stored_dns_overrides(&mut app);
+    assert_eq!(
+        stored
+            .iter()
+            .map(|rule| (
+                rule["match_type"].as_str().unwrap_or_default().to_owned(),
+                rule["domain_suffix"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![("domain_keyword".to_owned(), "example".to_owned())],
+        "the profile should hold the kind chosen, not the one the form defaults to"
+    );
+
+    // The same text as a suffix is a different rule, not a duplicate. The form resets to a suffix
+    // after an add, which is what makes this second one a suffix without another press.
+    dns_tab_with_form(&mut app);
+    app.type_text("label:匹配内容", "example").unwrap();
+    app.type_text("label:DNS 服务器", "119.29.29.29").unwrap();
+    app.press("添加").unwrap();
+    app.wait_for("规则已保存").unwrap();
+    wait_until_profile(|stored| stored.contains("119.29.29.29"), &mut app);
+    let pairs = stored_dns_overrides(&mut app)
+        .iter()
+        .map(|rule| {
+            (
+                rule["match_type"].as_str().unwrap_or_default().to_owned(),
+                rule["domain_suffix"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Two rules, one value, two kinds: the whole reason the kind is chosen rather than implied. A
+    // duplicate check keyed on the value alone would have refused this second press.
+    assert!(
+        pairs.contains(&("domain_suffix".to_owned(), "example".to_owned())),
+        "the second rule should be stored as a suffix: {pairs:?}"
+    );
+    // And the keyword rule is still there: an overwrite would look like a successful add.
+    assert!(
+        pairs.contains(&("domain_keyword".to_owned(), "example".to_owned())),
+        "adding a suffix overwrote the keyword rule: {pairs:?}"
+    );
+}
+
+/// The DNS overrides in the scratch profile, parsed.
+///
+/// `save_profile` writes pretty JSON, so a substring like `"match_type":"domain_keyword"` would
+/// fail on spacing alone and read as a broken feature — the same trap the language check notes.
+fn stored_dns_overrides(app: &mut Headless) -> Vec<serde_json::Value> {
+    let dir = std::path::PathBuf::from(
+        std::env::var("KITTY_PROFILE_DIR").expect("the scratch directory"),
+    );
+    for _ in 0..20 {
+        let saved = std::fs::read_to_string(dir.join("profile.json")).unwrap_or_default();
+        if let Ok(rules) = serde_json::from_str::<serde_json::Value>(&saved)
+            .map(|value| value.get("dns_overrides").cloned().unwrap_or_default())
+        {
+            if let Some(rules) = rules.as_array() {
+                return rules.clone();
+            }
+        }
+        app.idle(std::time::Duration::from_millis(100)).unwrap();
+    }
+    panic!("profile.json never held a readable dns_overrides array");
+}
+
 /// A malformed resolver is refused where it was typed, because a notice ages out while the
 /// mistake stays in the field.
 #[test]
@@ -1514,7 +1678,7 @@ fn a_bad_dns_server_is_refused_in_the_field() {
     app.wait_for("Kitty Pro").unwrap();
     app.press("规则").unwrap();
     dns_tab_with_form(&mut app);
-    app.type_text("label:域名后缀", "example.com").unwrap();
+    app.type_text("label:匹配内容", "example.com").unwrap();
     // Spaces survive trim and rule out both an address and a hostname; "not-a-resolver"
     // would not, because that is a legal host name.
     app.type_text("label:DNS 服务器", "not a resolver").unwrap();
@@ -1548,6 +1712,73 @@ fn deleting_a_rule_asks_twice_and_only_the_second_press_removes_it() {
     app.press("role:button[再次点击确认删除这条规则]").unwrap();
     app.wait_for("暂无自定义规则").unwrap();
     app.wait_for("0 条启用 · 0 条规则").unwrap();
+}
+
+/// The DNS list draws like the routing list: numbered, value over its kind, a badge for the effect.
+///
+/// Asked for as a *style* change, and the styling is only half of what is worth a test — the parts
+/// a screenshot cannot tell me are the two that go wrong silently. The row number is the index in
+/// the list rather than the stored id, so a fixture whose ids happen to be 1 and 2 proves nothing
+/// unless the numbers are read as drawn: a cell built once and recycled could number both rows 1.
+/// And the kind line is the only thing that tells two rows apart once the picker offers three kinds
+/// for the same value.
+///
+/// The delete stays one press. The routing row arms because order matters there — removing a rule
+/// shifts every rule below it — and a DNS override is an entry in a set with no order to disturb.
+/// Consistency was asked for in the list's *style*, and inventing a confirmation step for the other
+/// tab would be changing what a press does while pretending to move furniture.
+#[test]
+fn the_dns_list_draws_like_the_routing_list() {
+    let (mut app, _profile) =
+        seeded_test("the_dns_list_draws_like_the_routing_list", PROFILE_TWO_DNS);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("规则").unwrap();
+    app.press("专用 DNS").unwrap();
+    app.wait_for("et.net").unwrap();
+
+    // The tab's own rows and their kind labels, drawn as the routing list draws its pair.
+    app.wait_for("域名后缀").unwrap();
+    app.wait_for("域名关键字").unwrap();
+    // The resolver sits in the badge, in the slot the routing list spends on its action.
+    let shown = |want: &str| app.screen().texts().into_iter().any(|text| text == want);
+    assert!(
+        shown("100.100.100.101"),
+        "no resolver badge on the suffix row"
+    );
+    assert!(shown("8.8.8.8"), "no resolver badge on the keyword row");
+
+    // Numbered in list order. Both rows must carry a number, and they must not be the same number:
+    // a virtualized cell built once would draw whatever it was built with for every row.
+    let numbers: Vec<String> = app
+        .screen()
+        .texts()
+        .into_iter()
+        .filter(|text| matches!(*text, "1" | "2"))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        numbers.contains(&"1".to_owned()) && numbers.contains(&"2".to_owned()),
+        "the rows are not numbered in order: {:?}",
+        app.screen().texts()
+    );
+
+    // And one press deletes, naming the row it is deleting.
+    app.press("role:button[删除 et.net 的专用 DNS]").unwrap();
+    for _ in 0..20 {
+        if !app.shows("et.net") {
+            break;
+        }
+        app.idle(std::time::Duration::from_millis(100)).unwrap();
+    }
+    assert!(
+        !app.shows("et.net"),
+        "the delete press removed nothing: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        app.shows("google"),
+        "deleting one row took the other with it"
+    );
 }
 
 /// A subscription's nodes go with it and cannot be recovered without the provider, so the
@@ -2526,7 +2757,11 @@ fn a_chosen_language_is_written_to_the_profile() {
 /// allowing "any Chinese".
 #[test]
 fn english_leaves_no_chinese_on_any_screen() {
-    let (mut app, _profile) = tall_test("english_leaves_no_chinese_on_any_screen");
+    let (app, _profile) = tall_test("english_leaves_no_chinese_on_any_screen");
+    // Observed, not just queried: a placeholder is drawn inside the input's own view and is not a
+    // text node, so `Screen::texts` never reports one and this sweep would have passed on the two
+    // search boxes that did leak. The engine's item stream is the only place they are visible.
+    let (mut app, drawn) = observing(app);
     app.wait_for("Kitty Pro").unwrap();
     app.press("设置").unwrap();
     app.press("English").unwrap();
@@ -2553,6 +2788,19 @@ fn english_leaves_no_chinese_on_any_screen() {
                 offenders.push((page.to_string(), text.to_string()));
             }
         }
+        // And the placeholders, which no `texts()` sweep can reach because they are not text nodes.
+        // Read per page rather than once at the end: the fields of a page are only on screen while
+        // the sweep is standing on it, and a check run after six navigations would be judging a
+        // set of survivors rather than the six pages it claims to have visited.
+        for hint in drawn
+            .lock()
+            .expect("the observer's record")
+            .live_placeholders()
+        {
+            if hint.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c)) {
+                offenders.push((format!("{page} (placeholder)"), hint));
+            }
+        }
     }
     offenders.sort();
     offenders.dedup();
@@ -2568,6 +2816,20 @@ fn english_leaves_no_chinese_on_any_screen() {
         "{} string(s) still draw Chinese in English: {:?}",
         offenders.len(),
         offenders
+    );
+
+    // The same non-vacuity guard as for text, and for the same reason: `offenders` is empty on an
+    // app that showed no fields at all. Every page's search box reports its hint through the
+    // config, so a sweep over six pages records several.
+    let hints = drawn
+        .lock()
+        .expect("the observer's record")
+        .placeholders
+        .len();
+    assert!(
+        hints >= 3,
+        "only {hints} placeholders were recorded across six pages: the sweep is not seeing the \
+         app's fields"
     );
 }
 
