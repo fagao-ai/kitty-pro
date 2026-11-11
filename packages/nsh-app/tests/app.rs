@@ -2400,26 +2400,160 @@ fn the_settings_page_holds_no_shortcuts_to_the_rail() {
     app.wait_for("没有匹配的设置项").unwrap();
 }
 
-/// The language is stated rather than offered: neither front end can switch it, and a row with
-/// a menu of one would promise a feature the app does not have. It also has to be findable,
-/// since it is the row users look for first.
+/// The language is chosen, and the row that chooses it is findable by search — it is the row
+/// users look for first when the interface is in words they cannot read.
+///
+/// It used to state one language and offer nothing. The picker is a segment of two rather than a
+/// menu, so both names stay on screen: the reader who switched into a language by accident has to
+/// be able to find the way out without reading the words that would describe it.
 #[test]
-fn the_language_is_stated_and_found_by_the_search() {
-    let (mut app, _profile) = desktop_test("the_language_is_stated_and_found_by_the_search");
+fn the_language_is_chosen_and_found_by_the_search() {
+    let (mut app, _profile) = desktop_test("the_language_is_chosen_and_found_by_the_search");
     app.wait_for("Kitty Pro").unwrap();
     app.press("设置").unwrap();
-    app.wait_for("简体中文（暂不支持切换）").unwrap();
-    // Stated, not chosen: nothing on the row takes a press.
-    assert!(
-        !shows_matching(&app, "role:combobox[语言]"),
-        "the language row offers a choice the app cannot honour"
-    );
+    // Each option is named in the language it selects, always.
+    app.wait_for("简体中文").unwrap();
+    app.wait_for("English").unwrap();
 
     app.type_text("搜索设置", "语言").unwrap();
-    app.wait_for("简体中文（暂不支持切换）").unwrap();
+    app.wait_for("界面语言").unwrap();
     assert!(
         !shows_matching(&app, "text:接管方式"),
         "the search left the whole page mounted behind it"
+    );
+}
+
+/// Switching language repaints the screens that are already open.
+///
+/// This is the load-bearing test of the whole feature, and the reason every label reads through a
+/// closure: nothing can rebuild an NSH app from inside (`remount` belongs to the host), so a
+/// language that only took effect on relaunch would be a language switch the user could not see
+/// working. The rail is checked because it never re-renders on navigation, and the settings page
+/// because its labels come from a different builder.
+#[test]
+fn picking_a_language_relabels_the_open_window() {
+    let (mut app, _profile) = desktop_test("picking_a_language_relabels_the_open_window");
+    app.wait_for("Kitty Pro").unwrap();
+    app.wait_for("总览").unwrap();
+    app.press("设置").unwrap();
+    app.wait_for("深色模式").unwrap();
+
+    app.press("English").unwrap();
+
+    // The rail, still mounted from before the press, says its new words.
+    app.wait_for("Overview").unwrap();
+    app.wait_for("Settings").unwrap();
+    assert!(
+        !shows_matching(&app, "text:总览"),
+        "the rail kept Chinese labels after the switch: {:?}",
+        app.screen().texts()
+    );
+    // And so does the page the user is standing on.
+    app.wait_for("Dark mode").unwrap();
+    app.wait_for("Appearance").unwrap();
+    assert!(
+        !shows_matching(&app, "text:深色模式"),
+        "the settings page kept Chinese labels: {:?}",
+        app.screen().texts()
+    );
+    // The header's title follows the screen it names.
+    app.wait_for("Settings").unwrap();
+
+    // And back again — a switch with no way back would trap a reader who cannot read the target
+    // language, which is exactly the reader the picker's naming exists for.
+    app.press("简体中文").unwrap();
+    app.wait_for("总览").unwrap();
+    app.wait_for("深色模式").unwrap();
+}
+
+/// The choice is remembered, in the file the other shell reads too.
+///
+/// Read back from disk rather than from a second engine, because the store's own save is the
+/// thing under test: an engine that relabelled its window and wrote nothing would pass the test
+/// above and lose the language on the next launch.
+#[test]
+fn a_chosen_language_is_written_to_the_profile() {
+    let (mut app, _profile) = desktop_test("a_chosen_language_is_written_to_the_profile");
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.press("English").unwrap();
+    app.wait_for("Overview").unwrap();
+    // Let the save land: it is a background task, and the assertion below reads the file.
+    let mut stored = String::new();
+    for _ in 0..20 {
+        app.idle(std::time::Duration::from_millis(100)).unwrap();
+        let dir = std::path::PathBuf::from(
+            std::env::var("KITTY_PROFILE_DIR").expect("the scratch directory"),
+        );
+        let saved = std::fs::read_to_string(dir.join("profile.json")).unwrap_or_default();
+        // `save_profile` writes pretty JSON, so read the parsed value rather than a substring
+        // whose spacing would silently decide the test's outcome.
+        stored = serde_json::from_str::<serde_json::Value>(&saved)
+            .ok()
+            .and_then(|v| {
+                v.get("language")
+                    .and_then(|l| l.as_str().map(str::to_owned))
+            })
+            .unwrap_or_default();
+        if stored == "en" {
+            return;
+        }
+    }
+    panic!("the chosen language never reached profile.json: language={stored:?}");
+}
+
+/// The chrome — rail, header, and the appearance card the picker sits on — has no Chinese left in
+/// it when English is on.
+///
+/// Scoped deliberately to what is finished. The app holds ~330 strings; the screens behind the
+/// chrome are translated less, and an untranslated one falls back to its Chinese rather than
+/// vanishing, which is the right failure for a reader who needs a working proxy while the table is
+/// being filled in. A test that demanded zero Chinese anywhere would have to be skipped or
+/// loosened until it proved nothing, so this asserts the invariant that holds today — the parts
+/// that are always on screen — and `i18n`'s own fallback test covers what happens to the rest.
+#[test]
+fn the_chrome_is_fully_english_when_english_is_on() {
+    let (mut app, _profile) = desktop_test("the_chrome_is_fully_english_when_english_is_on");
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+    app.press("English").unwrap();
+    app.wait_for("Overview").unwrap();
+
+    let cjk = |c: char| ('\u{3400}'..='\u{9fff}').contains(&c);
+    let shown = app.screen().texts();
+    let chinese: Vec<&str> = shown
+        .iter()
+        .copied()
+        .filter(|t| t.chars().any(cjk))
+        .filter(|t| {
+            // Only the chrome is measured: the rail's rows and groups, the header, and the
+            // appearance card. Everything below it is the partly-translated body.
+            const CHROME: &[&str] = &[
+                "总览",
+                "节点",
+                "订阅",
+                "规则",
+                "日志",
+                "设置",
+                "连接",
+                "配置",
+                "运维",
+                "外观",
+                "深色模式",
+                "语言",
+                "界面语言",
+                "流量走向",
+                "接管方式",
+                "内核已就绪",
+            ];
+            // A page's own text can legitimately contain a chrome word (a rule is about 规则), so
+            // match the whole node, not a substring.
+            CHROME.contains(t)
+        })
+        .collect();
+    assert!(
+        chinese.is_empty(),
+        "the chrome still draws Chinese: {chinese:?}"
     );
 }
 

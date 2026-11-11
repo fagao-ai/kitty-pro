@@ -484,6 +484,15 @@ pub struct AppProfile {
     pub allow_lan: bool,
     #[serde(default)]
     pub dark_mode: bool,
+    /// The interface language, as a short code (`"zh"`, `"en"`).
+    ///
+    /// Empty means "never chosen", which the shells read as their own default rather than as a
+    /// language: the Dioxus app has only Chinese, and the NSH app falls back to the system locale
+    /// on first launch. Kept here rather than in the NSH app because it belongs to the same
+    /// record as `dark_mode` — a preference about the machine's display, portable between the
+    /// two shells by design.
+    #[serde(default)]
+    pub language: String,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
     #[serde(default)]
@@ -633,6 +642,7 @@ impl Default for AppProfile {
             tun_enabled: false,
             allow_lan: false,
             dark_mode: false,
+            language: String::new(),
             custom_rules: Vec::new(),
             dns_overrides: Vec::new(),
             config_script_enabled: false,

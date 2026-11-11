@@ -108,6 +108,38 @@ Three things are worth knowing about how they behave:
   indicator reports the backend's answer rather than the app's wish, so a refusal parks the
   page on 已暂停 instead of claiming a live feed.
 
+### 简体中文 and English, chosen on the settings page
+
+The user asked for both languages ("把 中英文语言页支持了吧, 现在只有中文"). The picker is a segment
+of two on the appearance card, and each option is named **in the language it selects** — 简体中文
+and English, always — because the reader who switched into a language by accident has to find the
+way out without reading the words that would describe it. `AppProfile::language` stores the code,
+read and written beside `dark_mode`.
+
+Four things about the design are load-bearing:
+
+- **The Chinese string is the key** (`tr("总览")`), not an id. The app was written in Chinese and
+  its screens are the product a Chinese reader expects; `nav.overview` would put a second naming
+  system over the code and leave every call site holding two strings, one of which nobody reads.
+  `i18n::ENGLISH` is a `const` array rather than a `match` so the collision test can walk it.
+- **Every label reads through a closure**: `text(move || tr("总览"))`, never `text("总览")`. Nothing
+  can rebuild an NSH app from inside (`remount` belongs to the host), so a language has to
+  propagate as a reactive read like the theme does. The second form translates correctly at
+  startup and then sits there in Chinese forever — and `the_chrome_is_fully_english_when_english_is_on`
+  caught exactly that mistake twice while this was being written, in a label and a heading built
+  outside their closures.
+- **The stored choice outranks the system locale, and an absent choice is Chinese — not the
+  system's.** NSH's own fallback locale is `en-US`, so keying off the platform would have flipped
+  every existing install to English on the update that introduces the switch, for readers who never
+  chose anything.
+- **Coverage is partial and says so.** ~330 strings exist; the chrome (rail, header, page titles,
+  card headings, connect action) is complete and *asserted* complete by
+  `the_chrome_is_fully_english_when_english_is_on`. The page bodies are translated less, and an
+  untranslated string falls back to its Chinese rather than vanishing — the right failure for a
+  reader who still needs a working proxy while the table is filled in. That is why the test is
+  scoped to the chrome: a test demanding zero Chinese anywhere would have to be loosened until it
+  proved nothing. `i18n::translate`'s fallback test pins what happens to the rest.
+
 ### A window with no title bar
 
 The user asked for a borderless window: the native bar across the top was, in their words, 很丑.

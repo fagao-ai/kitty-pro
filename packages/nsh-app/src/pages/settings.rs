@@ -10,6 +10,7 @@
 //! the profile, and the machine's own state.
 
 use crate::domain;
+use crate::i18n;
 use crate::store::{AppStore, SyncAction};
 use crate::ui::{controls, theme, Icon};
 use nsh_base::{button, theme as base_theme};
@@ -159,14 +160,88 @@ fn appearance_card(store: AppStore) -> impl IntoElement {
                 signal(false),
                 move |next| store.set_dark_mode(next),
             ))
-            // The language is stated, not offered: neither front end can switch it, and a row
-            // with a menu of one would promise a feature the app does not have.
-            .child(controls::value_row(
-                "语言",
-                "界面语言",
-                domain::LANGUAGE_LABEL.to_owned(),
-            )),
+            // The language is chosen here. A language is the one setting whose own labels are
+            // what it changes, so each option is written in the language it selects — 简体中文 and
+            // English, always, whichever language is on screen. A picker that said "中文 / 英文" in
+            // English would be unusable by the reader who switched into English by accident and
+            // cannot read the way back.
+            .child(language_row(store)),
     )
+}
+
+/// The two languages, as a segment like the sync card's 存储类型.
+///
+/// A segment rather than a menu of two: both names stay visible, which is the point above, and a
+/// dropdown would hide the way out until the reader worked out what the closed trigger meant.
+fn language_row(store: AppStore) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_0p5()
+                .child(
+                    text(move || i18n::tr("语言"))
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || base_theme().card_foreground),
+                )
+                .child(
+                    text(move || i18n::tr("界面语言"))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                ),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_1()
+                .child(language_pill(store, i18n::Lang::Chinese))
+                .child(language_pill(store, i18n::Lang::English)),
+        )
+}
+
+fn language_pill(store: AppStore, lang: i18n::Lang) -> impl IntoElement {
+    let chosen = move || store.language() == lang;
+    button()
+        .selected(chosen)
+        // Named in the language it selects, plus what it does in the language on screen: two
+        // buttons whose only text is `English` and `简体中文` are indistinguishable to a screen
+        // reader once the current one is also named that way.
+        .accessibility_label(move || {
+            Some(format!("{}：{}", i18n::tr("界面语言"), i18n::tr(lang.native_name())).into())
+        })
+        .on_press(move |_: &()| store.set_language(lang))
+        .h(px(30.0))
+        .px_3()
+        .items_center()
+        .justify_center()
+        .rounded(theme::radius_tile())
+        .border_1()
+        .border_color(move || base_theme().border)
+        .selected_style(|s| {
+            s.bg(move || base_theme().primary)
+                .border_color(move || base_theme().primary)
+        })
+        .hover(|s| s.bg(move || base_theme().muted))
+        .active(|s| s.opacity(0.8))
+        .focus(|s| s.outline(px(2.0)).outline_color(move || base_theme().ring))
+        .child(
+            text(lang.native_name())
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || {
+                    if chosen() {
+                        base_theme().primary_foreground
+                    } else {
+                        base_theme().card_foreground
+                    }
+                }),
+        )
 }
 
 /// How the machine hands traffic over. TUN takes it at the network layer and needs
@@ -291,8 +366,12 @@ fn mode_pill(selected: Memo<bool>, on_press: impl Fn() + 'static) -> impl IntoEl
 }
 
 /// A card's own heading, in the page's voice rather than the rail's.
+///
+/// Every heading on the page goes through here, so this is where the page is translated: one read
+/// of `tr` per card rather than per string, and a heading that missed it would be the only
+/// Chinese row in an otherwise English card.
 fn heading(label: &'static str) -> impl IntoElement {
-    text(label)
+    text(move || i18n::tr(label))
         .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(move || base_theme().card_foreground)
@@ -387,7 +466,9 @@ fn about_facts(store: AppStore) -> impl IntoElement {
         .flex_wrap()
         .gap_4()
         .child(controls::about_fact("内核状态", move || {
-            domain::core_state_label(&store.core_state())
+            // Translated here: `about_fact` draws its value as data (counts, versions, a path),
+            // and translating inside it would run the whole table over a node list.
+            i18n::tr(domain::core_state_label(&store.core_state()))
         }))
         .child(controls::about_fact("节点 / 订阅", move || {
             node_subscription_counts(store)

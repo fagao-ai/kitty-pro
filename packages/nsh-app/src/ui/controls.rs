@@ -3,6 +3,7 @@
 //! `nsh_base` brings behavior and no appearance, so a screen calls these instead of styling a
 //! base control itself. Every color is a token from `theme.json`.
 
+use crate::i18n;
 use crate::ui::{
     theme::{self, Tint},
     Icon,
@@ -57,6 +58,7 @@ pub fn primary_button_state(
     disabled: impl Fn() -> bool + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
+    let label = label.into_reactive();
     button()
         .disabled(disabled)
         .on_press(move |_: &()| on_press())
@@ -72,7 +74,7 @@ pub fn primary_button_state(
         .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
         .disabled_style(|s| s.opacity(0.45))
         .child(
-            text(label)
+            text(move || i18n::tr(&label.get()))
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(move || theme().primary_foreground),
@@ -94,6 +96,7 @@ pub fn secondary_button_state(
     disabled: impl Fn() -> bool + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
+    let label = label.into_reactive();
     button()
         .disabled(disabled)
         .on_press(move |_: &()| on_press())
@@ -111,7 +114,11 @@ pub fn secondary_button_state(
         .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
         .disabled_style(|s| s.opacity(0.45))
         .child(
-            text(label)
+            // Translated here rather than at the ~40 call sites: a button's whole text is one of
+            // our own strings, so the lookup belongs to the control that draws it. A label built
+            // from data — `format!("刷新 {}", name)` — misses the table and stays as it is, which
+            // is the safe direction (see `i18n`), and the completeness test counts those misses.
+            text(move || i18n::tr(&label.get()))
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || theme().card_foreground),
@@ -270,10 +277,14 @@ pub fn switch_row_state(
     on_change: impl Fn(bool) + 'static,
 ) -> impl IntoElement {
     let label = label.into();
+    // Translated in three places from one key: the row's words, the note under them, and the
+    // name the switch itself answers to. A row that read `Dark mode` beside a switch a screen
+    // reader called 深色模式 would be two controls, not one.
+    let note = note.into_reactive();
     let control = switch_state(
         {
             let label = label.clone();
-            move || Some(label.clone())
+            move || Some(i18n::tr(&label).into())
         },
         checked,
         disabled,
@@ -291,12 +302,16 @@ pub fn switch_row_state(
                 .min_w(px(0.0))
                 .gap_0p5()
                 .child(
-                    text(label)
+                    text(move || i18n::tr(&label))
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(move || theme().card_foreground),
                 )
-                .child(text(note).text_xs().text_color(theme::text_faint)),
+                .child(
+                    text(move || i18n::tr(&note.get()))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                ),
         )
         .child(control)
 }
@@ -470,13 +485,14 @@ pub fn section_header(
     title: impl Into<SharedString> + 'static,
     trailing: Option<impl IntoElement>,
 ) -> impl IntoElement {
+    let title: SharedString = title.into();
     view()
         .flex_row()
         .items_center()
         .justify_between()
         .gap_3()
         .child(
-            text(title.into())
+            text(move || i18n::tr(&title))
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(move || theme().card_foreground),
@@ -569,7 +585,9 @@ pub enum NavMark {
 /// translation: the digits are the message, and they are on screen as text.
 pub fn nav_name(label: &str, mark: &NavMark) -> Option<SharedString> {
     match mark {
-        NavMark::Update => Some(format!("{label}（有新版本可更新）").into()),
+        // The `label` arrives already translated (its caller reads `tr`); the mark's own words are
+        // the builder's, so they are translated here.
+        NavMark::Update => Some(format!("{label}{}", i18n::parenthesised("有新版本可更新")).into()),
         NavMark::None | NavMark::Count(_) => None,
     }
 }
@@ -610,6 +628,12 @@ fn nav_mark(mark: impl Fn() -> NavMark + 'static) -> impl IntoElement {
 /// A sidebar destination. `active` is a memo the caller owns, so every binding
 /// here reads one cached answer; `button` supplies role, focus and the selected
 /// state, which is what makes the row reachable by keyboard and screen reader.
+///
+/// `label` is the Chinese key and this is where it is translated, rather than at each call site:
+/// the rail, the tab bar and this row's own accessible name all need the same word, and a caller
+/// that passed an already-translated string would leave the other two behind in the other
+/// language. Reading `tr` inside a binding is also what makes a language switch reach a row that
+/// is already drawn — nothing rebuilds the tree.
 pub fn nav_row(
     label: &'static str,
     glyph: Icon,
@@ -621,7 +645,7 @@ pub fn nav_row(
         .selected(move || active.get())
         .accessibility_label({
             let mark = mark.clone();
-            move || nav_name(label, &mark())
+            move || nav_name(&crate::i18n::tr(label), &mark())
         })
         .on_press(move |_: &()| on_press())
         .h(px(36.0))
@@ -652,7 +676,7 @@ pub fn nav_row(
             }
         }))
         .child(
-            text(label)
+            text(move || i18n::tr(label))
                 .flex_1()
                 .min_w(px(0.0))
                 .number_of_lines(1)
@@ -684,7 +708,7 @@ pub fn nav_tab(
         .selected(move || active.get())
         .accessibility_label({
             let mark = mark.clone();
-            move || nav_name(label, &mark())
+            move || nav_name(&i18n::tr(label), &mark())
         })
         .on_press(move |_: &()| on_press())
         .h(px(52.0))
@@ -709,13 +733,17 @@ pub fn nav_tab(
                 }))
                 .child(nav_mark(mark)),
         )
-        .child(text(label).text_size(px(11.0)).text_color(move || {
-            if active.get() {
-                theme().accent_foreground
-            } else {
-                theme().muted_foreground
-            }
-        }))
+        .child(
+            text(move || i18n::tr(label))
+                .text_size(px(11.0))
+                .text_color(move || {
+                    if active.get() {
+                        theme().accent_foreground
+                    } else {
+                        theme().muted_foreground
+                    }
+                }),
+        )
 }
 
 /// The core's state where the top bar needs it. Connected and idle share one
@@ -732,7 +760,7 @@ pub fn connection_chip(store: crate::store::AppStore) -> impl IntoElement {
         .bg(move || core_tint(store).wash())
         .child(status_dot_tinted(move || core_tint(store)))
         .child(
-            text(move || crate::domain::core_state_label(&store.core_state()))
+            text(move || i18n::tr(crate::domain::core_state_label(&store.core_state())))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || core_tint(store).foreground()),

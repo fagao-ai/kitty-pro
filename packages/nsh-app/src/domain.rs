@@ -21,12 +21,6 @@ pub const PROXY_PORT: u16 = 7890;
 /// serves every window, so the same expression here reports the same kind of fact.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The interface language, said the way the original says it.
-///
-/// A constant rather than a setting: nothing in either front end switches language, and a row
-/// that offered a menu of one would promise a feature the app does not have.
-pub const LANGUAGE_LABEL: &str = "简体中文（暂不支持切换）";
-
 /// Two-letter protocol marks for the node row's badge.
 pub fn protocol_abbreviation(protocol: ProxyProtocol) -> &'static str {
     match protocol {

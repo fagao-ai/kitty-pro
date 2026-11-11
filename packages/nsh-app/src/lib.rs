@@ -7,6 +7,8 @@
 pub(crate) mod autostart;
 mod domain;
 pub mod feedback;
+/// Chinese and English, keyed by the Chinese the app was written in.
+pub mod i18n;
 mod pages;
 pub(crate) mod shell;
 mod store;

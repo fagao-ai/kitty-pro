@@ -616,6 +616,9 @@ impl AppStore {
         // the whole point: setting the signal alone would relabel the switch while the
         // window stayed in the appearance the system asked for.
         self.apply_appearance(profile.dark_mode);
+        // Same rule as the appearance: a stored choice outranks everything else, and applying it
+        // is a write to the global the labels read, not a rebuild.
+        crate::i18n::set_lang(crate::i18n::Lang::from_stored(&profile.language));
     }
 
     /// The DNS servers the active subscription's nodes need to be resolved.
@@ -936,6 +939,36 @@ impl AppStore {
             profile.dark_mode = self.dark_mode.get_untracked();
             let _ = api::save_profile(profile).await;
         });
+    }
+
+    /// Record the language choice, alone, for the same reason `persist_theme` writes alone: the
+    /// language is the only field this path owns, so a concurrent edit to anything else in the
+    /// profile is not overwritten from a copy taken before it.
+    fn persist_language(self) {
+        self.work(async move {
+            let Ok(mut profile) = api::load_profile().await else {
+                return;
+            };
+            profile.language = crate::i18n::lang_untracked().as_str().to_owned();
+            let _ = api::save_profile(profile).await;
+        });
+    }
+
+    /// Draw in `next` and remember it. Returns whether the choice moved, so a repeat press does
+    /// not rewrite the file.
+    ///
+    /// Nothing rebuilds here: the labels read the language reactively, so setting it repaints
+    /// what is on screen, which is the whole mechanism (see `crate::i18n`).
+    pub fn set_language(self, next: crate::i18n::Lang) {
+        if crate::i18n::set_lang(next) {
+            self.persist_language();
+        }
+    }
+
+    /// The language the interface is drawn in, as a signal read so the picker follows a change
+    /// made anywhere — including by a sync pull.
+    pub fn language(&self) -> crate::i18n::Lang {
+        crate::i18n::lang()
     }
 
     /// Point the node list, the selection and the group choice at one tag. The three are one
@@ -1784,6 +1817,7 @@ impl AppStore {
         profile.tun_enabled = self.tun_enabled.get_untracked();
         profile.allow_lan = self.allow_lan.get_untracked();
         profile.dark_mode = self.dark_mode.get_untracked();
+        profile.language = crate::i18n::lang_untracked().as_str().to_owned();
         profile.custom_rules = self.custom_rules.get_untracked();
         profile.dns_overrides = self.dns_overrides.get_untracked();
         profile.config_script_enabled = self.config_script_enabled.get_untracked();
@@ -2403,6 +2437,10 @@ impl AppStore {
             tun_enabled: self.tun_enabled.get_untracked(),
             allow_lan: self.allow_lan.get_untracked(),
             dark_mode: self.dark_mode.get_untracked(),
+            // Travels with the appearance for the same reason: both are how the user wants the
+            // app to look, and a pull that restored one while resetting the other would leave a
+            // machine half-restored.
+            language: crate::i18n::lang_untracked().as_str().to_owned(),
             custom_rules: self.custom_rules.get_untracked(),
             dns_overrides: self.dns_overrides.get_untracked(),
             config_script_enabled: self.config_script_enabled.get_untracked(),

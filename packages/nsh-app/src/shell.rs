@@ -1,6 +1,7 @@
 //! The root layout. A persistent sidebar carries navigation on a desktop; a phone gets a
 //! bottom bar, since a 264pt rail would eat most of its width.
 
+use crate::i18n;
 use crate::pages;
 use crate::store::{store, AppStore, Screen};
 use crate::ui::{controls, theme, Icon};
@@ -156,7 +157,11 @@ fn nav_groups(store: AppStore) -> impl IntoElement {
         view()
             .flex_col()
             .gap_1()
-            .child(text(label).text_xs().text_color(theme::text_faint()))
+            .child(
+                text(move || i18n::tr(label))
+                    .text_xs()
+                    .text_color(theme::text_faint()),
+            )
             .children(screens.iter().map(move |screen| nav_item(store, *screen)))
     };
     view()
@@ -252,14 +257,17 @@ pub fn page_scroll(content: impl IntoElement) -> impl IntoElement {
 }
 
 pub fn connect_label(store: AppStore) -> String {
-    match store.busy() {
-        crate::store::CoreBusy::Toggling if store.connected() => "正在断开".to_owned(),
-        crate::store::CoreBusy::Toggling => "正在启动".to_owned(),
-        crate::store::CoreBusy::Restarting => "正在重启".to_owned(),
-        crate::store::CoreBusy::Tun => "正在申请网络权限".to_owned(),
-        crate::store::CoreBusy::Idle if store.connected() => "断开".to_owned(),
-        crate::store::CoreBusy::Idle => "启动代理".to_owned(),
-    }
+    // Translated here rather than at the two pages that show it: the words are the shell's, and
+    // the disc on 总览 and any later caller must say the same thing in the same language.
+    let key = match store.busy() {
+        crate::store::CoreBusy::Toggling if store.connected() => "正在断开",
+        crate::store::CoreBusy::Toggling => "正在启动",
+        crate::store::CoreBusy::Restarting => "正在重启",
+        crate::store::CoreBusy::Tun => "正在申请网络权限",
+        crate::store::CoreBusy::Idle if store.connected() => "断开",
+        crate::store::CoreBusy::Idle => "启动代理",
+    };
+    i18n::tr(key)
 }
 
 /// The page's own bar: its name and state on the left, the two controls that describe the
@@ -285,7 +293,9 @@ fn page_header(store: AppStore) -> impl IntoElement {
                 .flex_col()
                 .gap_0p5()
                 .child(
-                    text(move || store.screen.get().label())
+                    // The screen's own name is a key; the builder that draws the rail translates
+                    // the same key, so the header and the row that selected it cannot disagree.
+                    text(move || i18n::tr(store.screen.get().label()))
                         .text_size(px(18.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .font_family(theme::font_display())
@@ -325,25 +335,24 @@ fn theme_toggle(store: AppStore) -> impl IntoElement {
 /// Name the action, not the state: a control labelled "深色模式" reads as if dark were
 /// already on. The Settings switch keeps that label because there it names a setting.
 pub fn theme_label(dark: bool) -> String {
-    if dark {
-        "切换浅色外观".to_owned()
+    i18n::tr(if dark {
+        "切换浅色外观"
     } else {
-        "切换深色外观".to_owned()
-    }
+        "切换深色外观"
+    })
 }
 
 /// The one-line summary under a page title: what the screen is about to do.
 fn subtitle(store: AppStore) -> String {
     use crate::domain::{core_state_label, mode_label};
     if store.core_action_busy() {
-        "正在应用设置".to_owned()
-    } else {
-        format!(
-            "{} · {}",
-            core_state_label(&store.core_state()),
-            mode_label(store.tunnel_mode())
-        )
+        return i18n::tr("正在应用设置");
     }
+    format!(
+        "{} · {}",
+        i18n::tr(core_state_label(&store.core_state())),
+        i18n::tr(mode_label(store.tunnel_mode()))
+    )
 }
 
 fn screen_body(store: AppStore) -> impl IntoElement {
