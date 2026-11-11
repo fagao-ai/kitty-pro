@@ -172,11 +172,12 @@ Checked by reading both, not by assumption. What is left:
 
 | Missing | What it means |
 | --- | --- |
-| Tray, close-to-tray | Menu-bar item and the "closing the window keeps the core running" behaviour. These live in `packages/desktop`, not in `packages/ui`, so they are outside this crate's reach. |
+| Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. `packages/desktop` has both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. |
+| 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
 | Web and mobile shells | This crate is native. Under `nsh run --target web` the backend would run in the browser and could not start a core; there is no server mode yet. |
 
-Every screen is ported and every settings card has a home here. The two rows above are the whole
-distance between the two front ends, and neither is a decision this crate can make on its own.
+Every screen is ported and every settings card has a home here. The rows above are the whole
+distance between the two front ends, and none of them is a decision this crate can make on its own.
 
 One card is distributed rather than copied. The original groups the core's version, its state, the
 unavailable-core diagnosis and its retry under one 内核 heading; here those four things live where
@@ -212,13 +213,24 @@ no process table the app may enumerate, the dialog says so and the tests take th
 
 ### Cloud sync, and what its tests can and cannot reach
 
-The card holds the same form as the original: the provider segment, one address field per provider,
-the object path with the bundle directory it implies, the credentials, and the four actions
-(保存, 下载覆盖本机, 上传, 覆盖远端). `domain::SyncProviderForm::fields` is the single list of
-which label edits which stored field, which is what stops the two providers' addresses from ever
+The card holds the same fields as the original: the provider segment, one address field per
+provider, the object path with the bundle directory it implies, the credentials, and the four
+actions (保存, 下载覆盖本机, 上传, 覆盖远端). `domain::SyncProviderForm::fields` is the single list
+of which label edits which stored field, which is what stops the two providers' addresses from ever
 being saved into each other's slot. Conflict handling, the plain-language translation of ETag and
 baseline refusals, the two-step confirm with its expiry, and the pre-pull backup are all the
 backend's, reused as they are.
+
+Six fields for WebDAV and eight for S3 is a wall on a card that also carries a badge, a switch, a
+note and four buttons, so the target's fields sit behind one row — 备份位置 — which the user asked
+for. What makes a fold honest is its closed state, so that row carries
+`domain::sync_target_summary`: the provider, the host, the object path, and the missing field when
+there is one, in the same words `sync_target_incomplete` uses to park the buttons. The two can
+therefore never disagree, and nothing secret is in the line — a host and a path name a server, and
+no credential appears in it. The fold also opens itself when the target holds nothing but the
+defaults the app wrote: 尚未填写 is not a summary of anything, and a closed fold over an empty form
+is a wall with a caret on it. `SyncConfig::default()` ships `path: "kitty-pro-sync.json"`, which is
+why "untouched" is a question about the address and credentials rather than about the path.
 
 Two decisions are this crate's own. Nothing on the card is enabled until `sync.json` has actually
 been read — the config is held as `Option` rather than defaulted, because saving an untouched
@@ -316,12 +328,19 @@ The suite deliberately never presses 启动代理. That call starts the real sin
 hangs a test run and leaves a live proxy behind; the connect path is covered up to the guard
 (`connect_is_off_until_there_is_something_to_connect_to`, `a_refused_press_starts_nothing`)
 and no further. The same rule keeps 测试连通 unpressed (over a running core it is a real
-outbound request), and 登录时启动 and 复制代理环境变量 unpressed too: the first writes a launch
-entry into whoever's account runs the tests, the second overwrites their clipboard. Each is
-asserted as far as it can be without the side effect — present, named, settled, and unreachable
-in the state where a press would cost something. 复制诊断信息 is the exception, and the reason is
-in the section above: NSH's clipboard belongs to the test, so that one can be pressed and read
-back.
+outbound request), and 登录时启动 with it — that press writes a launch entry into whoever's
+account runs the tests. Each is asserted as far as it can be without the side effect — present,
+named, settled, and unreachable in the state where a press would cost something. 复制诊断信息 is
+the exception, and the reason is in the section above: NSH's clipboard belongs to the test, so
+that one can be pressed and read back.
+
+复制代理环境变量 is no longer on that list because it is no longer on screen. The user asked for
+it off the settings page; `AppStore::copy_proxy_environment` stays, waiting for the menu-bar item
+that should own the action (see 托盘 in the gap list). While it was on the page its note claimed
+the copied line pointed at a 局域网可达 address when 允许局域网连接 was on — the backend builds
+that line from `SYSTEM_PROXY_HOST`, a constant `127.0.0.1`, so the note was false in the one case
+it existed to describe. Nothing else in either shell repeats that claim, which is why it left with
+the button rather than being corrected.
 
 A dialog needs `Headless::answer_dialogs_myself` before it is pressed. Left at its default the
 driver answers a dialog on the app's behalf and picks cancel, so a test that means to confirm

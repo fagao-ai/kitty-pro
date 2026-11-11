@@ -1222,11 +1222,14 @@ impl SettingsSection {
             SettingsSection::Appearance => "外观 深色 浅色 主题 语言 配色 appearance 简体中文",
             SettingsSection::Mode => "流量走向 分流 模式 规则模式 全局模式 直连模式 routing",
             SettingsSection::Scope => "接管方式 tun 局域网 允许局域网 系统代理 网络 权限 scope",
-            SettingsSection::Session => {
-                "启动与终端 自动启动 开机 启动 登录 登录项 环境变量 终端 命令行 autostart shell"
-            }
+            // Only what the card still holds. 环境变量 and 命令行 came in with the clipboard
+            // action, which the user asked off the page; leaving the words would surface a card
+            // whose one row is a login switch, answering a question the page can no longer answer.
+            SettingsSection::Session => "启动与终端 自动启动 开机 启动 登录 登录项 终端 autostart",
+            // 备份 is what the user calls it, and 备份位置 is the row the folded form hides —
+            // searchable by the name on the row, or the search would hide the fields twice.
             SettingsSection::Sync => {
-                "同步 云同步 远端 上传 下载 覆盖 webdav s3 bucket 拉取 推送 快照 配置 sync 存储 冲突"
+                "同步 云同步 备份 备份位置 远端 上传 下载 覆盖 webdav s3 bucket 拉取 推送 快照 配置 sync 存储 冲突"
             }
             SettingsSection::Updates => {
                 "更新 升级 版本 检查 下载 发布 发行 忽略 有新版本 update 自动检查 github"
@@ -1617,6 +1620,95 @@ pub fn sync_target_incomplete(
         return Some("用户名 / 密码");
     }
     None
+}
+
+/// What the folded sync form holds, in one line: where it writes, and what is still missing.
+///
+/// The form is six or eight fields, which is a wall on a card that also carries a badge, a
+/// switch, a note and four actions — the user asked for it folded because the whole set showed at
+/// once. A fold is only honest if the closed state still answers "what is in there", and this is
+/// that answer. It says nothing secret: an address and a path name a server, and the password is
+/// not part of it, exactly as the card's badge never quotes the token.
+///
+/// An unfilled target says 尚未填写 rather than showing a bare provider name, because "S3 兼容" over
+/// an empty form reads as a chosen provider and hides that there is nothing to dial. A half-filled
+/// one names the missing field, which is the same words `sync_target_incomplete` uses to park the
+/// remote buttons — so the line under the caret and the parked buttons can never disagree.
+pub fn sync_target_summary(form: SyncProviderForm, config: &api::SyncConfig) -> String {
+    if sync_target_untouched(form, config) {
+        return "尚未填写".to_owned();
+    }
+    let address = match form {
+        SyncProviderForm::WebDav => &config.webdav_endpoint,
+        SyncProviderForm::S3 => &config.s3_endpoint,
+    };
+    let address = address.trim();
+    let path = config.path.trim();
+    let mut line = String::from(form.label());
+    // S3's blank endpoint is AWS — a chosen destination rather than a gap, so it gets named. A
+    // blank WebDAV address is a gap, and the gap is what the missing-field note says.
+    match (form, address.is_empty()) {
+        (SyncProviderForm::S3, true) => line.push_str(" · AWS"),
+        (_, true) => {}
+        (_, false) => {
+            line.push_str(" · ");
+            line.push_str(sync_address_host(address));
+        }
+    }
+    if !path.is_empty() {
+        line.push_str(&format!(" /{path}"));
+    }
+    if let Some(missing) = sync_target_incomplete(form, config) {
+        line.push_str(&format!("（缺 {missing}）"));
+    }
+    line
+}
+
+/// Whether the form holds nothing but the defaults the app wrote itself.
+///
+/// The path is not part of this test: `SyncConfig::default()` names `kitty-pro-sync.json`, so a
+/// path alone proves nothing about whether a user was here. An address or a credential does.
+/// Without this, a brand-new profile's closed fold would read
+/// "WebDAV · /kitty-pro-sync.json（缺 WebDAV 地址）" — a sentence about a target that was never
+/// chosen, where the honest line is that nothing has been filled in.
+pub fn sync_target_untouched(form: SyncProviderForm, config: &api::SyncConfig) -> bool {
+    let address = match form {
+        SyncProviderForm::WebDav => &config.webdav_endpoint,
+        SyncProviderForm::S3 => &config.s3_endpoint,
+    };
+    if !address.trim().is_empty() {
+        return false;
+    }
+    match form {
+        SyncProviderForm::WebDav => {
+            config.username.trim().is_empty() && config.password.trim().is_empty()
+        }
+        // S3 on AWS needs a bucket and keys, so those are what say someone got here.
+        SyncProviderForm::S3 => {
+            config.bucket.trim().is_empty()
+                && config.access_key.trim().is_empty()
+                && config.secret_key.trim().is_empty()
+        }
+    }
+}
+
+/// The host of a stored address: the part that says *which* server, without the scheme and the
+/// directories that make a summary line wrap.
+///
+/// Deliberately not a URL parse. These fields take whatever the user pasted — a bare host, a path
+/// with a trailing slash, a share link — and a parser that rejected them would blank the summary
+/// for exactly the configurations a user most wants to check at a glance.
+pub fn sync_address_host(address: &str) -> &str {
+    let without_scheme = match address.split_once("://") {
+        Some((_, rest)) => rest,
+        None => address,
+    };
+    let host = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if host.is_empty() {
+        address
+    } else {
+        host
+    }
 }
 
 /// What the update card's badge says.
@@ -2460,6 +2552,81 @@ mod sync_tests {
             sync_target_incomplete(SyncProviderForm::S3, &no_keys),
             Some("Access Key / Secret Key")
         );
+    }
+
+    /// The closed fold has to answer "what is in there" without opening. The host and the path
+    /// are the two facts that identify a target, and neither is a secret.
+    #[test]
+    fn a_folded_target_summarises_itself_without_a_secret() {
+        assert_eq!(
+            sync_target_summary(SyncProviderForm::WebDav, &webdav()),
+            "WebDAV · dav.example.test /kitty-pro-sync.json"
+        );
+        // S3's blank endpoint is AWS, which the line says out loud rather than leaving blank.
+        assert_eq!(
+            sync_target_summary(SyncProviderForm::S3, &s3()),
+            "S3 兼容 · AWS /backups/kitty.json"
+        );
+        let with_address = SyncConfig {
+            s3_endpoint: "https://s3.example.com/bucket/prefix".to_owned(),
+            ..s3()
+        };
+        assert_eq!(
+            sync_target_summary(SyncProviderForm::S3, &with_address),
+            "S3 兼容 · s3.example.com /backups/kitty.json"
+        );
+
+        // The password is the value a summary must never quote, and it is set on both fixtures.
+        let with_secrets = SyncConfig {
+            secret_key: "super-secret".to_owned(),
+            password: "app-pass".to_owned(),
+            ..webdav()
+        };
+        let line = sync_target_summary(SyncProviderForm::WebDav, &with_secrets);
+        assert!(
+            !line.contains("super-secret") && !line.contains("app-pass"),
+            "the folded line quoted a credential: {line}"
+        );
+    }
+
+    /// An empty form must not read as a configured one: a bare provider name over nothing typed
+    /// would claim a destination that does not exist, and a half-filled form has to say which
+    /// half — the same words that park the remote buttons, so the two can never disagree.
+    #[test]
+    fn a_folded_target_says_when_there_is_nothing_to_dial() {
+        assert_eq!(
+            sync_target_summary(SyncProviderForm::S3, &SyncConfig::default()),
+            "尚未填写"
+        );
+
+        // S3's blank endpoint means AWS, so it is named as a destination rather than a gap.
+        let mut aws = s3();
+        aws.s3_endpoint = String::new();
+        assert_eq!(
+            sync_target_summary(SyncProviderForm::S3, &aws),
+            "S3 兼容 · AWS /backups/kitty.json"
+        );
+
+        // A WebDAV address with no credentials: the address shows, and the gap is named.
+        let mut no_login = webdav();
+        no_login.password = String::new();
+        assert_eq!(
+            sync_target_summary(SyncProviderForm::WebDav, &no_login),
+            "WebDAV · dav.example.test /kitty-pro-sync.json（缺 用户名 / 密码）"
+        );
+    }
+
+    /// The summary line is one line wide, so it keeps the host and drops the directories a
+    /// pasted URL carries. A bare host still reads, and a malformed paste degrades to the whole
+    /// string rather than to nothing.
+    #[test]
+    fn a_summary_keeps_the_host_and_drops_the_rest_of_the_url() {
+        assert_eq!(
+            sync_address_host("https://dav.example.test/dav/files/user"),
+            "dav.example.test"
+        );
+        assert_eq!(sync_address_host("s3.example.com"), "s3.example.com");
+        assert_eq!(sync_address_host("https://"), "https://");
     }
 
     /// Switching providers shows a different field set, and each set writes a different stored

@@ -377,6 +377,79 @@ pub fn card(content: impl IntoElement) -> impl IntoElement {
         .child(content)
 }
 
+/// A row that opens and closes a block under it, naming what is inside while closed.
+///
+/// The app's form-folds use this: a card whose fields all show at once reads as a wall, and the
+/// user asked for the sync target to be put away until it is wanted. What makes a fold honest is
+/// the summary — closed must still answer "what is in there", so the caller passes words for both
+/// states and only the caret changes.
+///
+/// The whole row is the press target, not just the caret: a 14pt chevron is not a touch target,
+/// and on a phone the row is the only thing anyone can hit reliably.
+pub fn disclosure_row(
+    label: impl Into<SharedString> + 'static,
+    summary: impl IntoReactive<SharedString> + 'static,
+    open: impl Fn() -> bool + 'static,
+    disabled: impl Fn() -> bool + 'static,
+    on_toggle: impl Fn() + 'static,
+) -> impl IntoElement {
+    let name: SharedString = label.into();
+    let label_text = name.clone();
+    let summary_text = summary.into_reactive();
+    button()
+        // Named by what it opens, not by what is inside: the summary is on-screen text the
+        // accessibility tree already reads out, and folding it into the name would make the
+        // control's name change every time an address is typed.
+        .accessibility_label(name)
+        .disabled(disabled)
+        .on_press(move |_: &()| on_toggle())
+        .w_full()
+        .min_w(px(0.0))
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .py_2()
+        .px_3()
+        .rounded(theme::radius_tile())
+        .border_1()
+        .border_color(move || theme().border)
+        .bg(move || theme().muted)
+        .hover(|s| s.border_color(move || theme().ring))
+        .active(|s| s.opacity(0.85))
+        .focus(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
+        .disabled_style(|s| s.opacity(0.45))
+        .child(
+            text(label_text)
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .flex_shrink_0()
+                .text_color(move || theme().card_foreground),
+        )
+        .child(
+            text(move || summary_text.get())
+                .flex_1()
+                .min_w(px(0.0))
+                .text_xs()
+                .number_of_lines(1)
+                .text_right()
+                .text_color(move || theme().muted_foreground),
+        )
+        .child(
+            live_icon(
+                move || {
+                    if open() {
+                        Icon::ChevronDown
+                    } else {
+                        Icon::ChevronRight
+                    }
+                },
+                14.0,
+            )
+            .flex_shrink_0()
+            .text_color(move || theme().muted_foreground),
+        )
+}
+
 /// A card's heading with an optional trailing action.
 pub fn section_header(
     title: impl Into<SharedString> + 'static,

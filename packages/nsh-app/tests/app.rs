@@ -2156,21 +2156,6 @@ fn the_machine_owned_switches_are_present_and_read_settles() {
         app.idle(std::time::Duration::from_millis(300)).unwrap();
     }
     assert!(settled(&app), "the login-item read never settled");
-
-    app.wait_for("复制代理环境变量").unwrap();
-}
-
-/// The copied line names the port the core listens on, and the note is the only place a user
-/// learns that sharing with the network changes who can reach it.
-#[test]
-fn the_copied_line_names_the_port_the_core_listens_on() {
-    let (mut app, _profile) = desktop_test("the_copied_line_names_the_port_the_core_listens_on");
-    app.wait_for("Kitty Pro").unwrap();
-    app.press("设置").unwrap();
-    app.wait_for("text:/指向本机的 7890 端口/").unwrap();
-
-    app.press("role:switch[允许局域网连接]").unwrap();
-    app.wait_for("text:/指向局域网可达的 7890 端口/").unwrap();
 }
 
 /// The preview is a config build, and a broken config script is the realistic way it fails. That
@@ -2580,6 +2565,17 @@ fn write_sync_json(sync_json: &str) {
     std::fs::write(dir.join("sync.json"), sync_json).expect("a seedable sync config");
 }
 
+/// Reach the sync target's fields, which are folded away until asked for.
+///
+/// Every test that types an address or reads a stored one opens the fold first — that is the
+/// point of the fold, and why this is one helper rather than a line in each test: a fold whose
+/// fields a press cannot reach would look exactly like one that hides them from the driver, and
+/// only the press tells the two apart.
+fn open_sync_target(app: &mut Headless) {
+    app.wait_for("备份位置").unwrap();
+    app.press("备份位置").unwrap();
+}
+
 /// The card reads the settings file on disk and says which of three states it found. Off,
 /// never-run and already-synced are different answers to "is my other device current", and a
 /// card that called a disabled sync 已同步 would send the user away believing too much.
@@ -2598,6 +2594,11 @@ fn the_sync_card_reports_the_state_on_disk() {
         !shows_matching(&app, "text:已同步"),
         "a sync that never ran reported itself as done"
     );
+    // Closed, the fold still says where the backup goes — the host and the object, which is what
+    // answers "is this the target I think it is" without opening anything.
+    app.wait_for("WebDAV · dav.example.test /kitty-pro-sync.json")
+        .unwrap();
+    open_sync_target(&mut app);
     // The stored address is what the field shows, not a placeholder. Read from the input rather
     // than from the screen's text: an input's value is not a text node, and a leading `https:`
     // reads as a selector prefix to the driver anyway.
@@ -2613,6 +2614,63 @@ fn the_sync_card_reports_the_state_on_disk() {
         !shows_matching(&app, "text:S3 Endpoint"),
         "the WebDAV form drew S3's address field"
     );
+}
+
+/// A fold has to fold. The fields are gone until the row is pressed, come back whole, and go away
+/// again — and gone means gone, not parked off-screen, which is the difference between a fold and
+/// a layout bug. The summary is on screen the whole time: a closed fold that says nothing is
+/// hiding the target rather than tidying it.
+#[test]
+fn the_sync_target_folds_its_fields_behind_one_line() {
+    let (mut app, _profile) = sync_test(
+        "the_sync_target_folds_its_fields_behind_one_line",
+        COMPLETE_SYNC_JSON,
+    );
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+
+    app.wait_for("备份位置").unwrap();
+    app.wait_for("WebDAV · dav.example.test /kitty-pro-sync.json")
+        .unwrap();
+    for field in ["WebDAV 地址", "远程路径", "用户名", "密码 / 应用密码"] {
+        assert!(
+            !shows_matching(&app, &format!("text:{field}")),
+            "`{field}` was on screen with the fold closed"
+        );
+    }
+
+    open_sync_target(&mut app);
+    for field in ["WebDAV 地址", "远程路径", "用户名", "密码 / 应用密码"] {
+        app.wait_for(field).unwrap();
+    }
+
+    // And closed again by the same press, which is the only way out of a fold a user opened by
+    // accident.
+    app.press("备份位置").unwrap();
+    assert!(
+        !shows_matching(&app, "text:WebDAV 地址"),
+        "the second press did not fold the form away: {:?}",
+        app.screen().texts()
+    );
+    app.wait_for("WebDAV · dav.example.test /kitty-pro-sync.json")
+        .unwrap();
+}
+
+/// An empty target opens itself.
+///
+/// The fold's default is closed because six fields is a wall, and the one thing that would make
+/// that default a trap — a card that looks configured because its summary has nothing to say — is
+/// the state where there is nothing to summarise. So the unfilled form is the one form that shows
+/// itself, and the closed line reads 尚未填写 rather than a provider name over blanks.
+#[test]
+fn a_target_that_was_never_filled_in_shows_its_fields() {
+    let (mut app, _profile) = desktop_test("a_target_that_was_never_filled_in_shows_its_fields");
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("设置").unwrap();
+
+    app.wait_for("尚未填写").unwrap();
+    app.wait_for("WebDAV 地址").unwrap();
+    app.wait_for("密码 / 应用密码").unwrap();
 }
 
 #[test]
@@ -2657,7 +2715,13 @@ fn an_incomplete_target_parks_the_remote_actions() {
         );
     }
 
+    // Closed, the fold names the gap it is hiding. This is what makes hiding the form safe: the
+    // reason the buttons are parked is legible without opening anything.
+    app.wait_for("WebDAV /kitty-pro-sync.json（缺 WebDAV 地址）")
+        .unwrap();
+
     // Typing the address brings them up, which is the proof the field and the guard are wired.
+    open_sync_target(&mut app);
     app.type_text("label:WebDAV 地址", "https://dav.example.test/dav")
         .unwrap();
     app.wait_for("上传").unwrap();
@@ -2678,6 +2742,7 @@ fn switching_provider_swaps_the_fields_it_edits() {
     );
     app.wait_for("Kitty Pro").unwrap();
     app.press("设置").unwrap();
+    open_sync_target(&mut app);
     app.wait_for("WebDAV 地址").unwrap();
 
     app.press("S3 兼容").unwrap();
@@ -2723,6 +2788,7 @@ fn a_stored_secret_never_reaches_the_app_as_plaintext() {
     );
     app.wait_for("Kitty Pro").unwrap();
     app.press("设置").unwrap();
+    open_sync_target(&mut app);
     app.wait_for("密码 / 应用密码").unwrap();
 
     let shown = app
@@ -2758,6 +2824,7 @@ fn saving_the_sync_settings_writes_only_the_settings_file() {
     app.wait_for("Kitty Pro").unwrap();
     app.press("设置").unwrap();
     app.wait_for("规则与订阅同步").unwrap();
+    open_sync_target(&mut app);
 
     app.type_text("label:远程路径", "-v2").unwrap();
     app.press("保存同步设置").unwrap();

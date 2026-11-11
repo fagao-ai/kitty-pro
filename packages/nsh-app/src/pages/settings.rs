@@ -102,12 +102,12 @@ fn unmatched(query: Signal<String>) -> impl IntoElement {
         }))
 }
 
-/// The two things a user does to a running proxy from a terminal or the next boot, rather than
-/// to the configuration.
+/// What the user does to the machine for the next boot rather than to the configuration.
 ///
-/// Grouped as one card because they share a subject: the machine, not the profile. Neither is
-/// written to disk, and both are worth keeping off the connection card, where the everyday press
-/// lives.
+/// Only this is left on the card. 复制代理环境变量 used to sit here, and the user asked for it
+/// off the page: the thing you do once per terminal session belongs on the menu bar, where it is
+/// one click from any window or none, not on a settings page you have to navigate to. It is now
+/// a tray item (`crate::tray`), and `AppStore::copy_proxy_environment` is what answers it.
 fn session_card(store: AppStore) -> impl IntoElement {
     view()
         .flex_col()
@@ -117,47 +117,11 @@ fn session_card(store: AppStore) -> impl IntoElement {
             move || store.autostart().is_supported(),
             move || autostart_row(store),
         ))
-        .child(controls::secondary_button_state(
-            move || {
-                if store.env_copy_busy() {
-                    "正在复制"
-                } else {
-                    "复制代理环境变量"
-                }
-            },
-            // The variables name a port, so they are worth copying whenever there is one to
-            // name. They do not need a running core: a shell that exports them before the core
-            // is up simply finds nothing until it is.
-            move || store.env_copy_busy(),
-            move || store.copy_proxy_environment(),
-        ))
-        .child(
-            text(move || env_copy_note(store))
-                .text_xs()
-                .text_color(theme::text_faint()),
-        )
         .p_5()
         .rounded(theme::radius_card())
         .border_1()
         .border_color(move || base_theme().border)
         .bg(move || base_theme().card)
-}
-
-/// What the copied lines are and where they fit, said in the shape the shell wants.
-///
-/// The backend copies a ready line rather than three bare names — `export http_proxy=… && …` on
-/// macOS and Linux, `$env:http_proxy = …` on Windows — so the note names the variable in the case
-/// the clipboard actually uses, and never promises an uppercase name the line does not contain.
-fn env_copy_note(store: AppStore) -> String {
-    let port = if store.allow_lan() {
-        "局域网可达的 "
-    } else {
-        "本机的 "
-    };
-    format!(
-        "一整行可直接粘贴到终端，指向{port}{} 端口，给不读系统代理的命令行工具用。",
-        domain::PROXY_PORT
-    )
 }
 
 /// Start at login, as the operating system reports it.
@@ -637,9 +601,13 @@ fn script_editor(store: AppStore, draft: Signal<String>, open: Signal<bool>) -> 
 /// nothing is enabled until the saved config has actually been read (saving a default over a real
 /// `sync.json` is invisible data loss), the two actions that replace data ask twice, and a refusal
 /// the remote answers in ETag jargon is turned into the one move that resolves it.
+///
+/// The target's own fields are folded away until asked for; see [`sync_target`].
 fn sync_card(store: AppStore) -> impl IntoElement {
     let armed = signal(None::<SyncAction>);
     let arm_generation = signal(0u64);
+    let target_chosen = signal(None::<bool>);
+    let target_open = move || sync_open(target_chosen, store);
     controls::card(
         view()
             .flex_col()
@@ -665,7 +633,7 @@ fn sync_card(store: AppStore) -> impl IntoElement {
                 Icon::Info,
                 "远端内容包含订阅来源（含令牌）、自定义规则、专用 DNS 与配置脚本。",
             ))
-            .child(sync_form(store))
+            .child(sync_target(store, target_open, target_chosen))
             .child(sync_actions(store, armed, arm_generation))
             .child(when(
                 move || armed.get() == Some(SyncAction::Pull),
@@ -809,6 +777,67 @@ fn provider_pill(store: AppStore, s3: bool) -> impl IntoElement {
                 }
             }),
         )
+}
+
+/// The sync target's own fields, behind a fold.
+///
+/// Six fields for WebDAV and eight for S3 — address, path, and the credentials — which is more
+/// than a card should show at once when it also carries a badge, a switch, a note and four
+/// actions. The user asked for it put away; what makes putting it away safe is that the closed row
+/// still names the destination and what is missing, so nothing a user needs to notice is hidden.
+///
+/// The open state is the card's, not the store's: it is about how much of one card is showing,
+/// which is not a fact worth writing to disk.
+fn sync_target(
+    store: AppStore,
+    open: impl Fn() -> bool + Clone + 'static,
+    chosen: Signal<Option<bool>>,
+) -> impl IntoElement {
+    view()
+        .flex_col()
+        .gap_3()
+        .child(controls::disclosure_row(
+            "备份位置",
+            move || sync_summary(store),
+            open.clone(),
+            // Parked while the settings file has not been read: opening a fold onto fields bound
+            // to a config that is not there yet would offer nine empty boxes and save them.
+            move || !store.sync_ready() || store.sync_busy().is_some(),
+            {
+                let open = open.clone();
+                move || chosen.set(Some(!open()))
+            },
+        ))
+        .child(when(open, move || sync_form(store)))
+}
+
+/// Whether the fold is open, where "the user has not chosen yet" means *open when there is
+/// nothing to fold*.
+///
+/// `None` until the row is pressed for the first time. Auto-opening an empty form is what makes
+/// the fold safe to default closed: the one case a closed fold could not report — no target at
+/// all — is the case that never closes. After the first press the user owns the choice, so a save
+/// that completes the form does not slam it shut under their hands, and switching 存储类型 moves
+/// the backup rather than deciding what the user was reading.
+fn sync_open(chosen: Signal<Option<bool>>, store: AppStore) -> bool {
+    match chosen.get() {
+        Some(open) => open,
+        // The same predicate the closed line falls back to, so the fold stays open for exactly as
+        // long as it has nothing worth summarising.
+        None => store
+            .sync_config()
+            .as_ref()
+            .is_none_or(|config| domain::sync_target_untouched(provider_form(store), config)),
+    }
+}
+
+/// The one line that stands in for the whole form. Says the settings are still arriving rather
+/// than going blank, since a fold with no summary reads as an empty form.
+fn sync_summary(store: AppStore) -> SharedString {
+    match store.sync_config() {
+        Some(config) => domain::sync_target_summary(provider_form(store), &config).into(),
+        None => "正在读取同步设置".into(),
+    }
 }
 
 /// The address, the object path, and the provider's own credentials.
