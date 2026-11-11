@@ -139,11 +139,22 @@ impl Feedback {
     ) {
         match result {
             Ok(message) => self.success(message.to_string()),
-            Err(error) => self.error(crate::i18n::fill(
-                "{}失败：{}",
-                &[&crate::i18n::tr(action), &error],
-            )),
+            Err(error) => self.error(Self::failure(action, &error.to_string())),
         }
+    }
+
+    /// The one shape every failure is announced in.
+    ///
+    /// Both pieces are looked up before being joined, and that ordering is the whole point: a
+    /// notice holds finished text and is translated once as it is drawn, so a sentence composed
+    /// here would reach the table with another sentence inside it and match nothing. Errors from
+    /// `domain` are the app's own words and do have rows; the backend's do not, and a miss keeps
+    /// the string it was handed, which is what the reader needs in a bug report.
+    fn failure(action: &str, error: &str) -> String {
+        crate::i18n::fill(
+            "{}失败：{}",
+            &[&crate::i18n::tr(action), &crate::i18n::tr(error)],
+        )
     }
 
     /// Report the outcome of a backend call, choosing the kind and prefixing the failure
@@ -155,10 +166,8 @@ impl Feedback {
         match result {
             Ok(value) => Some(value),
             Err(error) => {
-                self.error(crate::i18n::fill(
-                    "{}失败：{}",
-                    &[&crate::i18n::tr(action), &error],
-                ));
+                let text = error.to_string();
+                self.error(Self::failure(action, &text));
                 None
             }
         }

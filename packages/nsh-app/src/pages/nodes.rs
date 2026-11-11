@@ -142,9 +142,9 @@ fn toolbar_summary(store: AppStore) -> String {
     if total == 0 {
         "还没有节点，先在订阅页导入".to_owned()
     } else if tested == 0 {
-        format!("{shown} / {total} 个节点 · 尚未测试延迟")
+        i18n::fill("{} / {} 个节点 · 尚未测试延迟", &[&shown, &total])
     } else {
-        format!("{shown} / {total} 个节点 · 已测速 {tested} 个")
+        i18n::fill("{} / {} 个节点 · 已测速 {} 个", &[&shown, &total, &tested])
     }
 }
 
@@ -302,7 +302,7 @@ fn list_rows(store: AppStore, query: &str) -> Vec<ListRow> {
     if let Some(error) = groups.error() {
         // The nodes stay listed under the reason: the derivation failed, the subscription did
         // not, and a page that shows only the error takes the exit picker away over a detail.
-        let mut rows = vec![ListRow::Failed(format!("代理组生成失败：{error}"))];
+        let mut rows = vec![ListRow::Failed(i18n::fill("代理组生成失败：{}", &[&error]))];
         rows.extend(flat_rows(store, &needle));
         return rows;
     }
@@ -462,9 +462,17 @@ fn group_header(
                         .text_color(move || base_theme().card_foreground),
                 )
                 .child(
-                    text(SharedString::from(format!(
-                        "{} · {members} 个成员 · 当前 {selected_label}",
-                        domain::proxy_group_kind_label(kind)
+                    text(SharedString::from(i18n::fill(
+                        "{} · {} 个成员 · 当前 {}",
+                        &[
+                            // Both come from `domain` already in words, so they are looked up
+                            // here. A node's own name has no row and keeps its own characters;
+                            // the engine's `direct` and `block` do have rows, and are the only
+                            // values this slot holds that are the app's vocabulary.
+                            &i18n::tr(domain::proxy_group_kind_label(kind)),
+                            &members,
+                            &i18n::tr(&selected_label),
+                        ],
                     )))
                     .text_xs()
                     .number_of_lines(1)
@@ -589,6 +597,8 @@ fn outbound_row(store: AppStore, row: Memo<Option<ListRow>>) -> impl IntoElement
                 .min_w(px(0.0))
                 .gap_0p5()
                 .child(
+                    // The tag is the engine's name for the outbound and is not the app's
+                    // vocabulary, so it is drawn as it is; the kind beside it is.
                     text(move || {
                         SharedString::from(label().map(|(tag, _)| tag).unwrap_or_default())
                     })
@@ -599,7 +609,9 @@ fn outbound_row(store: AppStore, row: Memo<Option<ListRow>>) -> impl IntoElement
                 )
                 .child(
                     text(move || {
-                        SharedString::from(label().map(|(_, kind)| kind).unwrap_or_default())
+                        SharedString::from(
+                            label().map(|(_, kind)| i18n::tr(kind)).unwrap_or_default(),
+                        )
                     })
                     .text_xs()
                     .number_of_lines(1)

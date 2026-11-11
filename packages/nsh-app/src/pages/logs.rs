@@ -376,7 +376,7 @@ fn jump_to_latest(
             controls::icon(Icon::ArrowUp, 13.0).text_color(move || base_theme().popover_foreground),
         )
         .child(
-            text(move || format!("{} 条新日志", unseen.get()))
+            text(move || i18n::fill("{} 条新日志", &[&(unseen.get())]))
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || base_theme().popover_foreground),
@@ -522,12 +522,12 @@ fn target_note(route: Option<api::RouteLogDetail>) -> String {
     let Some(route) = route else {
         return String::new();
     };
+    // The kind is the app's own word and is looked up; the port is data and the separator is a
+    // typographic one, so neither needs a row.
+    let kind = i18n::tr(domain::route_target_kind_label(route.target_kind));
     match route.port {
-        Some(port) => format!(
-            "{} · {port}",
-            domain::route_target_kind_label(route.target_kind)
-        ),
-        None => domain::route_target_kind_label(route.target_kind).to_owned(),
+        Some(port) => format!("{kind} · {port}"),
+        None => kind,
     }
 }
 

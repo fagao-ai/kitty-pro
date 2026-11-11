@@ -131,7 +131,7 @@ pub fn secondary_button_state(
         .child(
             // Translated here rather than at the ~40 call sites: a button's whole text is one of
             // our own strings, so the lookup belongs to the control that draws it. A label built
-            // from data — `format!("刷新 {}", name)` — misses the table and stays as it is, which
+            // from data — `i18n::fill("刷新 {}", &[&(name)])` — misses the table and stays as it is, which
             // is the safe direction (see `i18n`), and the completeness test counts those misses.
             text(move || i18n::tr(&label.get()))
                 .text_sm()
@@ -1004,7 +1004,7 @@ pub fn choice_field(
                         on_change(next);
                     }
                 })
-                .accessibility_label(label)
+                .accessibility_label(move || Some(i18n::tr(label).into()))
                 .offset(px(4.0))
                 .popup_style(|s| {
                     s.p_1()

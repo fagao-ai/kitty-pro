@@ -183,7 +183,12 @@ pub fn parenthesised(key: &str) -> String {
 /// parts. Both exist because a full-width bracket reads correctly between Chinese glyphs and
 /// wrong around Latin ones.
 pub fn in_parens(words: &str) -> String {
-    if lang() == Lang::Chinese {
+    in_parens_at(lang(), words)
+}
+
+/// [`in_parens`] with the language named, for `domain`'s pure sentence-builders.
+pub fn in_parens_at(lang: Lang, words: &str) -> String {
+    if lang == Lang::Chinese {
         format!("（{words}）")
     } else {
         format!(" ({words})")
@@ -554,6 +559,143 @@ const ENGLISH: &[(&str, &str)] = &[
     ("代理环境变量", "proxy environment variables"),
     ("失败", "failed"),
     ("超时", "timed out"),
+    // Sentences built from parts. Every one of these is a *template*: `i18n::fill` looks the row
+    // up with its holes in place and substitutes afterwards. That is what makes the English able
+    // to move a number or a name to where English puts it, and it is the only way a notice like
+    // `已删除 实验室` can be translated at all — by the time that string exists, no table can hold
+    // it, because it has a user's subscription name inside it.
+    ("{} 切换失败，仍是原来的出口", "{} could not be switched; the old exit is still in use"),
+    ("{} 已切换，无需重新连接", "{} switched; no reconnect needed"),
+    ("{}（未连接，启动后生效）", "{} (not connected; applies once you connect)"),
+    ("{}：订阅已不在列表中", "{}: that subscription is no longer listed"),
+    ("关闭 TUN 失败：{}", "Could not turn TUN off: {}"),
+    ("准备 TUN 权限失败，内核未启动：{}", "Could not get TUN permission; the core did not start: {}"),
+    ("发现新版本 v{}", "A new version is available: v{}"),
+    ("已切换到 {}", "Switched to {}"),
+    ("已删除 {}", "Deleted {}"),
+    ("已删除 {}，重新连接后生效", "Deleted {}; applies after reconnecting"),
+    ("，重新连接后生效", "; applies after reconnecting"),
+    ("已刷新 {} 个订阅，{} 个失败：{}", "Refreshed {} subscriptions, {} failed: {}"),
+    ("已存在 {} 的专用 DNS", "Dedicated DNS for {} already exists"),
+    ("已导入并切换到 {}，共 {} 个节点", "Imported and switched to {}, {} nodes"),
+    ("，{} 个无法解析", ", {} could not be parsed"),
+    ("忽略失败：{}", "Could not ignore the release: {}"),
+    ("更新设置保存失败：{}", "Could not save the update settings: {}"),
+    ("更新设置读取失败：{}", "Could not read the update settings: {}"),
+    ("登录启动项设置失败：{}", "Could not set the login item: {}"),
+    ("系统代理设置失败：{}", "Could not set the system proxy: {}"),
+    ("订阅解析失败：{}", "Could not parse the subscription: {}"),
+    ("远端数据已下载，但保存到本机失败：{}", "Downloaded from the remote, but saving locally failed: {}"),
+    ("配置保存失败：{}", "Could not save the config: {}"),
+    ("main(config) · QuickJS · {} 字符", "main(config) · QuickJS · {} characters"),
+    ("上次检查 {}", "last checked {}"),
+    ("同步配置读取失败：{}。已停用所有同步操作，以免用空配置覆盖已保存的设置。",
+     "Could not read the sync settings: {}. Every sync action is parked so an empty config cannot overwrite the saved one."),
+    ("后端原文：{}", "Backend said: {}"),
+    ("正在保存同步设置", "Saving sync settings"),
+    ("此构建无发布通道（{}）", "This build has no release channel ({})"),
+    ("此构建没有发布通道（{}），请从发布页手动下载。",
+     "This build has no release channel ({}); download it from the releases page."),
+    ("{} 个节点", "{} nodes"),
+    ("{} 个订阅 · 共 {} 个节点", "{} subscriptions · {} nodes"),
+    ("删除 {}", "Delete {}"),
+    ("删除「{}」？", "Delete “{}”?"),
+    ("刷新 {}", "Refresh {}"),
+    ("忽略 {}", "Ignore {}"),
+    ("删除 {} 的专用 DNS", "Delete the dedicated DNS for {}"),
+    ("启用 {} 的专用 DNS", "Enable the dedicated DNS for {}"),
+    ("启用规则 {}", "Enable rule {}"),
+    (
+        "另有 {} 条进程规则在当前平台不可见，但仍计入规则总数并随配置同步。",
+        "{} process rules are hidden on this platform but still counted and synced.",
+    ),
+    ("{} / {} 个节点 · 尚未测试延迟", "{} of {} nodes · latency not measured"),
+    ("{} / {} 个节点 · 已测速 {} 个", "{} of {} nodes · {} measured"),
+    ("{} · {} 个成员 · 当前 {}", "{} · {} members · now {}"),
+    ("代理组生成失败：{}", "Could not build the proxy groups: {}"),
+    ("{} 个活动连接", "{} active connections"),
+    ("出口不可用：{}", "Exit unavailable: {}"),
+    ("连通正常：{}", "Reachable through the proxy: {}"),
+    ("{} 条专用 DNS", "{} dedicated DNS entries"),
+    ("已同步 {} 个订阅、{} 条分流规则、{}", "Synced {} subscriptions, {} routing rules, {}"),
+    ("远端未含专用 DNS（保留本机）", "the remote had no DNS section (local kept)"),
+    (
+        "将用远端 {} 个订阅 / {} 条规则替换本机 {} 个订阅 / {} 条规则",
+        "This replaces {} local subscriptions / {} rules with {} / {} from the remote.",
+    ),
+    (
+        "将用远端配置替换本机 {} 个订阅 / {} 条规则（远端数量需下载后确认）",
+        "This replaces {} local subscriptions / {} rules with the remote's contents (its counts \
+         are only known after a download).",
+    ),
+    ("缺 {}", "missing {}"),
+    ("局域网代理 {}", "LAN proxy {}"),
+    ("本地代理 {}", "Local proxy {}"),
+    ("{} 个成员", "{} members"),
+    ("{} 条新日志", "{} new lines"),
+    ("选择进程", "Choose a process"),
+    ("校验", "Validate"),
+    ("{}失败：{}", "{}: {}"),
+    // The shape every error notice takes: what was attempted, then the reason. `feedback` fills
+    // it once per failure and both sides go in already translated.
+    ("{}：{}", "{}: {}"),
+    // Words the domain layer builds and the pages draw. These have rows for the same reason the
+    // literals above do — a page hands the string to a sink that asks for it in English — and they
+    // are the ones a screen sweep is least likely to see, because they name a state a machine has
+    // to be in: a sync conflict, a platform without a system proxy, a group on `direct`.
+    ("订阅已不存在", "that subscription is gone"),
+    ("本地内容", "pasted content"),
+    ("精确域名", "exact domain"),
+    ("域名关键字", "domain keyword"),
+    ("进程名", "process name"),
+    ("进程路径", "process path"),
+    ("域名", "domain"),
+    ("正在应用到系统网络服务", "applying to the system's network services"),
+    ("正在读取系统代理状态", "reading the system proxy state"),
+    ("当前平台不支持系统代理", "this platform has no system proxy"),
+    ("先启动代理，才能开启系统代理", "start the proxy before turning the system proxy on"),
+    (
+        "Android 由 VPN 接管，无需系统代理",
+        "Android routes everything through the VPN, so no system proxy is needed",
+    ),
+    ("未检测到版本", "no version detected"),
+    ("开启", "on"),
+    ("待同步", "not synced"),
+    ("已同步", "in sync"),
+    (
+        "远端配置已被其它设备更新，请先下载覆盖本机或明确覆盖远端",
+        "another device updated the remote; download it first, or overwrite it deliberately",
+    ),
+    (
+        "远端存储不支持安全上传，请改用「覆盖远端」",
+        "that storage has no safe upload; use Overwrite Remote instead",
+    ),
+    (
+        "本机尚无该远端目标的同步基线，请先下载覆盖本机或覆盖远端",
+        "this machine has no baseline for that target; download it first, or overwrite it",
+    ),
+    (
+        "远端版本校验未通过，请下载覆盖本机或覆盖远端",
+        "the remote's revision check failed; download it first, or overwrite it",
+    ),
+    ("网盘的应用密码比主密码更安全", "an app password is safer than your account password"),
+    ("检查中", "checking"),
+    ("已忽略", "ignored"),
+    ("有更新", "update available"),
+    ("不支持", "unsupported"),
+    ("检查失败", "check failed"),
+    ("尚未检查", "not checked"),
+    // One word inside a line assembled elsewhere: `about_build_label` puts it after `sing-box`,
+    // where both languages want it, so only this word is looked up.
+    ("未就绪", "not ready"),
+    // Two strings the earlier screen sweep and my first scan both excused for having a space in
+    // them: a field's label and a field's hint, both drawn verbatim. A space is not a reason to
+    // skip a string, and the scan no longer treats it as one.
+    ("用户名 / 密码", "username / password"),
+    (
+        "留空使用 AWS，或填写 https://s3.example.com",
+        "leave empty for AWS, or enter https://s3.example.com",
+    ),
 ];
 
 /// The English for one key, if this build has any.
@@ -696,5 +838,369 @@ mod tests {
                 panic!("`{from}` is listed twice, as `{before}` and `{to}`");
             }
         }
+    }
+
+    /// Every Chinese literal the app can draw has an English row.
+    ///
+    /// This is the check a screen sweep cannot be. The sweep sees what is drawn, so it missed 55
+    /// templates and every word behind a state the test machine was not in: a toast that fires
+    /// monthly, a conflict panel needing a second device, a label needing a running core. Here the
+    /// question is what is *written* — every string literal with a Han character in the production
+    /// sources must appear in `ENGLISH` as a key, or the table is incomplete no matter how clean
+    /// the sweep looked.
+    ///
+    /// Written as a source scan rather than a call graph because the two failure modes differ:
+    /// this catches a missing row, `english_leaves_no_chinese_on_any_screen` catches a row that
+    /// exists but is never asked for.
+    ///
+    /// `ENGLISH` is walked rather than `tr` called, because reading the table needs no reactive
+    /// runtime: `global` lives on the engine thread, and this has to run in a plain unit test.
+    #[test]
+    fn every_drawn_string_has_an_english_row() {
+        let keys: std::collections::HashSet<&str> = ENGLISH.iter().map(|(from, _)| *from).collect();
+        let mut missing = Vec::new();
+        let mut drawn = 0usize;
+        for path in crate_sources() {
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for lit in string_literals(&production_code(&src)) {
+                if !lit.chars().any(is_han) {
+                    continue;
+                }
+                drawn += 1;
+                if keys.contains(lit) || searched_not_drawn(lit) || support_text_only(lit) {
+                    continue;
+                }
+                missing.push(format!(
+                    "{lit}  <-  {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        // A scan that read nothing would pass the assertion below by finding nothing to complain
+        // about, which is the failure this whole test exists to prevent. The floor is loose on
+        // purpose — it asks only that sources were opened and test modules were not mistaken for
+        // them.
+        assert!(
+            drawn > 400,
+            "the scan saw only {drawn} Chinese literals across {:?}, so it is not reading the \
+             crate's sources",
+            crate_sources().len()
+        );
+        assert!(
+            missing.is_empty(),
+            "{} Chinese literal(s) reach the app with no English row:\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+    }
+
+    /// Chinese kept because it is *searched*, not drawn: the words a settings card answers to.
+    /// They are matched against what the reader types, so they must hold the Chinese terms even
+    /// on a page drawn in English — translating them would take the search box's own vocabulary
+    /// away from the person using it in Chinese.
+    fn searched_not_drawn(lit: &str) -> bool {
+        [
+            "外观 深色 浅色 主题 语言 配色 appearance 简体中文",
+            "流量走向 分流 模式 规则模式 全局模式 直连模式 routing",
+            "接管方式 tun 局域网 允许局域网 系统代理 网络 权限 scope",
+            "启动与终端 自动启动 开机 启动 登录 登录项 终端 autostart",
+            "同步 云同步 备份 备份位置 远端 上传 下载 覆盖 webdav s3 bucket 拉取 推送 快照 配置 sync 存储 冲突",
+            "更新 升级 版本 检查 下载 发布 发行 忽略 有新版本 update 自动检查 github",
+            "配置脚本 内核 sing-box javascript 配置覆写 脚本 quickjs core",
+            "关于 诊断 内核状态 内核版本 节点 订阅 规则 dns 复制 about 版本",
+        ]
+        .contains(&lit)
+    }
+
+    /// Chinese on purpose, because a reader other than the person using the app sees it.
+    ///
+    /// - the diagnostic report goes into a bug report, where the wording has to match what the
+    ///   issue tracker's other lines and the backend's own logs say;
+    /// - the `contains` queries in [`crate::domain::classify_sync_error`] read the *backend's*
+    ///   sentence, which this app writes in Chinese whatever the interface language is. Matching a
+    ///   translated query would simply stop the match.
+    fn support_text_only(lit: &str) -> bool {
+        [
+            "Kitty Pro 诊断信息",
+            "已被其他设备修改",
+            "已被其它设备修改",
+            "基线",
+        ]
+        .contains(&lit)
+            || DIAGNOSTIC_LINES.iter().any(|line| lit.contains(line))
+    }
+
+    /// The report's lines, each of which reaches the screen as part of one multi-line literal
+    /// rather than on its own — which is why they are matched as fragments.
+    const DIAGNOSTIC_LINES: [&str; 7] = [
+        "界面平台: {platform}",
+        "内核状态: {state_label} ({core_state})",
+        "内核版本: {core_version}",
+        "分流模式: {mode}",
+        "TUN: {tun} · 局域网: {lan} ({endpoint})",
+        "节点: {node_count} · 订阅: {subscription_count}",
+        "自定义规则: {rule_count} · 专用 DNS: {dns_count}",
+    ];
+
+    /// Every `.rs` in this crate's `src`, so a new page is scanned the moment it exists.
+    ///
+    /// Anchored on `CARGO_MANIFEST_DIR` rather than `file!()`: the latter is written relative to
+    /// the workspace root and the test's working directory is the crate's own directory, so the
+    /// obvious spelling resolves to a path that does not exist — which a scan that reports "no
+    /// gaps" would never notice. `i18n.rs` is included: its keys are literals that each have a row
+    /// by construction, so reading it costs nothing and catches a table entry mistyped into a
+    /// string the lookup can never produce.
+    fn crate_sources() -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut queue = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = queue.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                // A packaged build has no sources beside the binary. A development check that
+                // cannot see its inputs says nothing, so it says nothing rather than failing —
+                // and `drawn > 400` below is what stops that from being mistaken for a pass.
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    queue.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The file with every `#[cfg(test)]` item removed, doc comments stripped, and — because the
+    /// offsets are kept — every remaining literal still on its real line.
+    ///
+    /// Cutting the test code out rather than truncating at the first `#[cfg(test)]` matters: in a
+    /// file this size a test module starts a third of the way in and holds most of what the module
+    /// does, so truncating reports a clean file for the lines nobody looked at.
+    fn production_code(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find("#[cfg(test)]") {
+            out.push_str(&strip_comments(&rest[..at]));
+            let after = &rest[at + "#[cfg(test)]".len()..];
+            match item_kind(after) {
+                Some(Item::Braced(start)) => {
+                    let end = matching_brace(after, start).unwrap_or(after.len());
+                    out.extend(
+                        after[..end]
+                            .chars()
+                            .map(|c| if c == '\n' { c } else { ' ' }),
+                    );
+                    rest = &after[end..];
+                }
+                Some(Item::ToSemicolon(start)) => {
+                    let end = after[start..]
+                        .find(';')
+                        .map_or(after.len(), |found| start + found + 1);
+                    out.extend(
+                        after[..end]
+                            .chars()
+                            .map(|c| if c == '\n' { c } else { ' ' }),
+                    );
+                    rest = &after[end..];
+                }
+                None => {
+                    out.push_str("#[cfg(test)]");
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(&strip_comments(rest));
+        out
+    }
+
+    enum Item {
+        /// A `mod`, `fn` or `impl`: ends where its braces balance.
+        Braced(usize),
+        /// A `use`, `const` or `static`: ends at the next semicolon.
+        ToSemicolon(usize),
+    }
+
+    fn item_kind(after: &str) -> Option<Item> {
+        let bytes = after.as_bytes();
+        let mut i = 0;
+        // Past whitespace and any other attributes stacked on the same item, in either form.
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let open = match bytes.get(i) {
+                Some(b'[') => i,
+                Some(b'#')
+                    if bytes.get(i + 1) == Some(&b'!') && bytes.get(i + 2) == Some(&b'[') =>
+                {
+                    i + 2
+                }
+                Some(b'#') if bytes.get(i + 1) == Some(&b'[') => i + 1,
+                _ => break,
+            };
+            i = matching_pair(after, open, b'[', b']')?;
+        }
+        let rest = &after[i..];
+        // A visibility may precede the keyword: `pub fn`, `pub(crate) mod`, `pub(super) const`.
+        let rest = rest.strip_prefix("pub").unwrap_or(rest).trim_start();
+        let rest = match rest.strip_prefix('(') {
+            Some(inner) => matching_pair(after, after.len() - inner.len(), b'(', b')')
+                .map_or(inner, |end| &after[end..])
+                .trim_start(),
+            None => rest,
+        };
+        // What is left must name one of the kinds `#[cfg(test)]` can sit on.
+        for kind in ["mod ", "fn ", "impl ", "struct ", "enum ", "trait "] {
+            if rest.starts_with(kind) {
+                return Some(Item::Braced(after.len() - rest.len()));
+            }
+        }
+        for kind in ["const ", "static ", "use "] {
+            if rest.starts_with(kind) {
+                return Some(Item::ToSemicolon(after.len() - rest.len()));
+            }
+        }
+        None
+    }
+
+    /// Index of the brace closing the `{` at `open`.
+    fn matching_brace(src: &str, open: usize) -> Option<usize> {
+        matching_pair(src, open, b'{', b'}')
+    }
+
+    /// Index of the closing bracket for the opener at `open`, ignoring brackets inside a string.
+    ///
+    /// `char::from` and a test's own `"{"` both appear in this crate, so a depth count that reads
+    /// a brace inside a string drifts and swallows the production code that follows it.
+    fn matching_pair(src: &str, open: usize, left: u8, right: u8) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut index = open;
+        let mut quoted = false;
+        let mut escaped = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else if byte == b'"' {
+                quoted = true;
+            } else if byte == left {
+                depth += 1;
+            } else if byte == right {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Doc and line comments gone, newlines kept.
+    fn strip_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    " ".repeat(line.len())
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every ordinary `"..."` literal in the source, with raw strings and char literals stepped
+    /// over rather than parsed as text.
+    ///
+    /// A linear walk is the point: a regex over the whole file reads the interior of a raw string
+    /// — where this crate keeps JSON fixtures with Chinese in them — as production text, and reads
+    /// a `'{'` as the start of one.
+    fn string_literals(src: &str) -> Vec<&str> {
+        let bytes = src.as_bytes();
+        let mut found = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'r' if bytes
+                    .get(index + 1)
+                    .is_some_and(|b| *b == b'"' || *b == b'#') =>
+                {
+                    let mut hashes = 0;
+                    let mut open = index + 1;
+                    while bytes.get(open) == Some(&b'#') {
+                        hashes += 1;
+                        open += 1;
+                    }
+                    if bytes.get(open) != Some(&b'"') {
+                        index += 1;
+                        continue;
+                    }
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    index = src[open + 1..]
+                        .find(&close)
+                        .map_or(bytes.len(), |at| open + 1 + at + close.len());
+                }
+                b'\'' => index = skip_char(bytes, index),
+                b'"' => {
+                    let end = match string_end(bytes, index + 1) {
+                        Some(end) => end,
+                        None => break,
+                    };
+                    found.push(&src[index + 1..end]);
+                    index = end + 1;
+                }
+                _ => index += 1,
+            }
+        }
+        found
+    }
+
+    /// One past the closing `"` of the literal opened just after `open`.
+    fn string_end(bytes: &[u8], open: usize) -> Option<usize> {
+        let mut index = open;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' => index += 2,
+                b'"' => return Some(index),
+                _ => index += 1,
+            }
+        }
+        None
+    }
+
+    /// One past a char literal, including the awkward ones: a char *is* a quote or a brace, and a
+    /// lifetime `'a` is not a literal at all.
+    fn skip_char(bytes: &[u8], open: usize) -> usize {
+        let mut index = open + 1;
+        if bytes.get(index) == Some(&b'\\') {
+            index += 2;
+        } else {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'\'') {
+            return index + 1;
+        }
+        // Not a char literal: a lifetime. Leave it alone and resume just after the apostrophe, so
+        // `'static str` and `&'a mut` cost nothing.
+        open + 1
+    }
+
+    fn is_han(c: char) -> bool {
+        matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF)
     }
 }

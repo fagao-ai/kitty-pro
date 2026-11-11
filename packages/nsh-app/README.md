@@ -132,13 +132,32 @@ Four things about the design are load-bearing:
   system's.** NSH's own fallback locale is `en-US`, so keying off the platform would have flipped
   every existing install to English on the update that introduces the switch, for readers who never
   chose anything.
-- **One test sweeps the whole app, and it is the reason the table is finished.**
+- **One test sweeps the whole app, and it is not enough.**
   `english_leaves_no_chinese_on_any_screen` switches to English, walks all six pages by their new
   names and fails on any Chinese left on any of them — reporting the page and the string. It also
   asserts it saw over 100 strings, because "nothing I collected is Chinese" passes trivially on an
   empty collection, and `Screen::texts` reports only laid-out text: a page that rendered nothing
   would otherwise satisfy it perfectly. The one allowed string is `简体中文`, a language option's own
-  name, which stays in the language it selects on purpose.
+  name, which stays in the language it selects on purpose. It passed while 59 strings were still
+  untranslated, which is what the next two bullets are about.
+- **What a sweep cannot see, a source scan reads.** A folded form is closed, a toast lasts four
+  seconds, a conflict panel needs a second device and a rule kind needs a core that can report
+  processes. `every_drawn_string_has_an_english_row` reads the crate's own sources instead and
+  requires every Chinese string literal in production code to appear in `ENGLISH`, so the table's
+  completeness is a property of what is *written* rather than of what a test happened to render.
+  Three exceptions are listed by name and reason: the settings search's keyword soup (searched, not
+  drawn, so it must keep the Chinese words even on an English page), the `contains` queries in
+  `classify_sync_error` (they match the *backend's* sentence, which is Chinese whatever the
+  interface says), and the diagnostic report (a support artifact). It also asserts it read over 400
+  Chinese literals, since a scan that found no sources would report no gaps.
+- **A row in the table is only half of it: something has to ask for it in English.** The second
+  class of miss is a string that has a row and never gets looked up — a `domain` label dropped into
+  a raw `text()`, a `SelectItem` title, an icon control's accessibility name, a placeholder. The
+  rule pickers were the clearest case: a closed `choice_field` draws its own title through a
+  lookup, so a form reading `Exact domain` said nothing about the five items behind the trigger.
+  `english_holds_in_the_surfaces_a_page_sweep_cannot_open` opens each hidden surface *by its English
+  name* — the press itself fails if the name stayed Chinese — and waits for a string that only the
+  open popup contains, so a popup that refused to open cannot report itself clean.
 - **A page rebuilds when the language changes, so most labels need no closure.** `screen_body`'s
   `dynamic` closure reads `i18n::lang()` beside the current screen, and a `dynamic` region re-runs
   its closure when a signal read *inside it* changes — which builds the page again in the new

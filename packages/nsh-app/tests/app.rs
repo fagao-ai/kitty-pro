@@ -2610,6 +2610,23 @@ fn english_holds_in_the_surfaces_a_page_sweep_cannot_open() {
     app.press("role:button[Add rule]").unwrap();
     app.wait_for("Match").unwrap();
     look(&mut app, "rule form");
+    // Both rule pickers, opened. A closed `choice_field` draws its title through a lookup of its
+    // own, so a form showing `Exact domain` proves nothing about the list behind the trigger: the
+    // items are the caller's strings, and they are only on screen once the popup is up. The
+    // trigger's accessibility name is checked the same way — `press` resolves a name, so a combobox
+    // still called 匹配类型 cannot be found as `Match type`.
+    //
+    // `marker` is what only the open list contains. Without it, a popup that refused to open would
+    // leave this loop sweeping the form again, finding the Chinese it is supposed to forbid absent,
+    // and reporting the surface clean.
+    for (picker, marker) in [("Match type", "IP CIDR"), ("Action", "Direct")] {
+        app.press(&format!("role:combobox[{picker}]")).unwrap();
+        app.wait_for(marker).unwrap_or_else(|_| {
+            panic!("the {picker} picker did not open: {marker} never appeared")
+        });
+        look(&mut app, "rule picker popup");
+        app.press(&format!("role:combobox[{picker}]")).unwrap();
+    }
     // The DNS tab, its summary line and its own form.
     app.press("Dedicated DNS").unwrap();
     look(&mut app, "DNS tab");

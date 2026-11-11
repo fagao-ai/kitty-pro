@@ -4,6 +4,7 @@
 //! directly, so what a press starts stays in one place and cancels the way the code says.
 
 pub use crate::domain::SystemProxy;
+use crate::i18n;
 use api::{ApiCoreStatus, CoreTraffic};
 use nsh_core::prelude::*;
 use proxy_core::{
@@ -674,7 +675,7 @@ impl AppStore {
                 if let Err(error) = api::prepare_tun_mode(tun_request).await {
                     self.core_busy.set(CoreBusy::Idle);
                     self.feedback
-                        .error(format!("准备 TUN 权限失败，内核未启动：{error}"));
+                        .error(i18n::fill("准备 TUN 权限失败，内核未启动：{}", &[&error]));
                     self.refresh_status();
                     return;
                 }
@@ -750,7 +751,8 @@ impl AppStore {
                     });
                 }
                 Err(error) => {
-                    self.feedback.error(format!("系统代理设置失败：{error}"));
+                    self.feedback
+                        .error(i18n::fill("系统代理设置失败：{}", &[&error]));
                     match api::system_proxy_status().await {
                         Ok(status) => self.system_proxy.set(SystemProxy::Ready(status)),
                         Err(refresh) => self
@@ -1162,11 +1164,13 @@ impl AppStore {
                         .update(|stored| stored.push(subscription));
                     self.activate_nodes(id, nodes);
                     if let Err(error) = self.save().await {
-                        self.feedback.error(format!("配置保存失败：{error}"));
+                        self.feedback
+                            .error(i18n::fill("配置保存失败：{}", &[&error]));
                     }
-                    let mut message = format!("已导入并切换到 {display}，共 {count} 个节点");
+                    let mut message =
+                        i18n::fill("已导入并切换到 {}，共 {} 个节点", &[&display, &count]);
                     if rejected > 0 {
-                        message.push_str(&format!("，{rejected} 个无法解析"));
+                        message.push_str(&i18n::fill("，{} 个无法解析", &[&rejected]));
                     }
                     if self.connected.get_untracked() {
                         message.push_str("，重新连接后生效");
@@ -1191,11 +1195,11 @@ impl AppStore {
                         .map(|issue| issue.reason.clone())
                         .unwrap_or_else(|| "没有找到可用节点".to_owned());
                     self.import_error
-                        .set(Some(format!("订阅解析失败：{reason}")));
+                        .set(Some(i18n::fill("订阅解析失败：{}", &[&reason])));
                 }
                 Err(error) => self
                     .import_error
-                    .set(Some(format!("订阅解析失败：{error}"))),
+                    .set(Some(i18n::fill("订阅解析失败：{}", &[&error]))),
             }
         });
     }
@@ -1266,7 +1270,7 @@ impl AppStore {
             self.feedback.info("已切换订阅，重新连接后生效");
         } else {
             self.feedback
-                .success(format!("已切换到 {}", subscription.name));
+                .success(i18n::fill("已切换到 {}", &[&(subscription.name)]));
         }
     }
 
@@ -1345,7 +1349,7 @@ impl AppStore {
                         match outcome {
                             Some(Ok(_)) => refreshed += 1,
                             Some(Err(reason)) => failures.push(format!("{name}：{reason}")),
-                            None => failures.push(format!("{name}：订阅已不在列表中")),
+                            None => failures.push(i18n::fill("{}：订阅已不在列表中", &[&name])),
                         }
                     }
                     Err(error) => failures.push(format!("{name}：{error}")),
@@ -1355,10 +1359,9 @@ impl AppStore {
             if failures.is_empty() {
                 self.feedback.success("订阅已刷新，可重新连接或启动");
             } else {
-                self.feedback.error(format!(
-                    "已刷新 {refreshed} 个订阅，{} 个失败：{}",
-                    failures.len(),
-                    failures.join("；")
+                self.feedback.error(i18n::fill(
+                    "已刷新 {} 个订阅，{} 个失败：{}",
+                    &[&refreshed, &(failures.len()), &(failures.join("；"))],
                 ));
             }
             self.release_refresh(target);
@@ -1423,9 +1426,10 @@ impl AppStore {
             .update(|stored| stored.retain(|subscription| subscription.id != id));
         self.after_refresh();
         if self.connected.get_untracked() {
-            self.feedback.info(format!("已删除 {name}，重新连接后生效"));
+            self.feedback
+                .info(i18n::fill("已删除 {}，重新连接后生效", &[&name]));
         } else {
-            self.feedback.success(format!("已删除 {name}"));
+            self.feedback.success(i18n::fill("已删除 {}", &[&name]));
         }
     }
 
@@ -1455,7 +1459,10 @@ impl AppStore {
     ) -> Result<(), String> {
         let mut rules = self.custom_rules.get_untracked();
         if editing_id.is_none() && rules.len() >= proxy_core::MAX_CUSTOM_RULES {
-            return Err(format!("最多添加 {} 条规则", proxy_core::MAX_CUSTOM_RULES));
+            return Err(i18n::fill(
+                "最多添加 {} 条规则",
+                &[&(proxy_core::MAX_CUSTOM_RULES)],
+            ));
         }
         let id = editing_id
             .or_else(|| crate::domain::next_custom_rule_id(&rules))
@@ -1539,10 +1546,13 @@ impl AppStore {
             .iter()
             .any(|item| item.domain_suffix == domain_suffix)
         {
-            return Err(format!("已存在 {domain_suffix} 的专用 DNS"));
+            return Err(i18n::fill("已存在 {} 的专用 DNS", &[&domain_suffix]));
         }
         if overrides.len() >= proxy_core::MAX_CUSTOM_RULES {
-            return Err(format!("最多添加 {} 条规则", proxy_core::MAX_CUSTOM_RULES));
+            return Err(i18n::fill(
+                "最多添加 {} 条规则",
+                &[&(proxy_core::MAX_CUSTOM_RULES)],
+            ));
         }
         let id = crate::domain::next_dns_override_id(&overrides);
         overrides.push(proxy_core::DnsOverride {
@@ -1768,7 +1778,8 @@ impl AppStore {
                 match api::release_tun_mode().await {
                     Ok(()) => self.feedback.success("TUN 模式已关闭"),
                     Err(error) => {
-                        self.feedback.error(format!("关闭 TUN 失败：{error}"));
+                        self.feedback
+                            .error(i18n::fill("关闭 TUN 失败：{}", &[&error]));
                         self.refresh_status();
                     }
                 }
@@ -1833,7 +1844,8 @@ impl AppStore {
     fn persist_profile(self) {
         self.work(async move {
             if let Err(error) = self.save().await {
-                self.feedback.error(format!("配置保存失败：{error}"));
+                self.feedback
+                    .error(i18n::fill("配置保存失败：{}", &[&error]));
             }
         });
     }
@@ -1895,7 +1907,7 @@ impl AppStore {
             // next start. Saying 已切换 alone would overstate it, and marking the config pending
             // would be noise: nothing is running to disagree with it.
             self.feedback
-                .success(format!("{label}（未连接，启动后生效）"));
+                .success(i18n::fill("{}（未连接，启动后生效）", &[&label]));
             return;
         }
         let group_for_call = group.clone();
@@ -1906,7 +1918,7 @@ impl AppStore {
                 .is_ok()
             {
                 self.feedback
-                    .success(format!("{label} 已切换，无需重新连接"));
+                    .success(i18n::fill("{} 已切换，无需重新连接", &[&label]));
                 return;
             }
             self.feedback.info("内核未能直接切换，正在重新连接以应用");
@@ -1923,7 +1935,7 @@ impl AppStore {
             // up an exit the user watched the app reject.
             self.persist_profile();
             self.feedback
-                .error(format!("{label} 切换失败，仍是原来的出口"));
+                .error(i18n::fill("{} 切换失败，仍是原来的出口", &[&label]));
         });
     }
 
@@ -2015,7 +2027,8 @@ impl AppStore {
                     });
                 }
                 Err(error) => {
-                    self.feedback.error(format!("登录启动项设置失败：{error}"));
+                    self.feedback
+                        .error(i18n::fill("登录启动项设置失败：{}", &[&error]));
                     match crate::autostart::status().await {
                         Ok(enabled) => self.autostart.set(Autostart::Ready(enabled)),
                         Err(refresh) => self.autostart.set(Autostart::Failed(refresh)),
@@ -2265,8 +2278,13 @@ impl AppStore {
                 // own `redact` before it leaves `packages/api` — so the text is shown as it
                 // arrived, which is also what the Dioxus shell does.
                 let (friendly, is_conflict) = crate::domain::classify_sync_error(&error);
-                self.feedback
-                    .error(format!("{}：{friendly}", sync_action_name(action)));
+                // Both pieces are looked up before being joined. A toast holds finished text and
+                // is translated as it is drawn, so a string assembled here would reach the table
+                // with a sentence inside it and match nothing.
+                self.feedback.error(i18n::fill(
+                    "{}：{}",
+                    &[&i18n::tr(sync_action_name(action)), &i18n::tr(&friendly)],
+                ));
                 if is_conflict {
                     self.sync_conflict.set(Some((friendly, error)));
                 }
@@ -2324,6 +2342,7 @@ impl AppStore {
                         result.subscription_count,
                         result.rule_count,
                         result.dns_rule_count,
+                        crate::i18n::lang(),
                     )
                 })
                 .map_err(|error| error.to_string());
@@ -2373,9 +2392,10 @@ impl AppStore {
                     result.subscription_count,
                     result.rule_count,
                     result.dns_rule_count,
+                    crate::i18n::lang(),
                 )
             })
-            .map_err(|error| format!("远端数据已下载，但保存到本机失败：{error}"));
+            .map_err(|error| i18n::fill("远端数据已下载，但保存到本机失败：{}", &[&error]));
             self.settle_sync(SyncAction::Pull, result);
         });
     }
@@ -2494,7 +2514,7 @@ impl AppStore {
                 Ok(settings) => self.update_settings.set(Some(settings)),
                 Err(error) => self
                     .update_error
-                    .set(Some(format!("更新设置读取失败：{error}"))),
+                    .set(Some(i18n::fill("更新设置读取失败：{}", &[&error]))),
             }
         });
         self.run_update_check(false);
@@ -2538,7 +2558,8 @@ impl AppStore {
                     self.update_status.set(Some(status));
                     if let Some(version) = announce {
                         self.update_announced.set(Some(version.clone()));
-                        self.feedback.info(format!("发现新版本 v{version}"));
+                        self.feedback
+                            .info(i18n::fill("发现新版本 v{}", &[&version]));
                     }
                 }
                 Err(error) => {
@@ -2611,7 +2632,9 @@ impl AppStore {
                         "已改为仅手动检查"
                     });
                 }
-                Err(error) => self.feedback.error(format!("更新设置保存失败：{error}")),
+                Err(error) => self
+                    .feedback
+                    .error(i18n::fill("更新设置保存失败：{}", &[&error])),
             }
         });
     }
@@ -2648,7 +2671,7 @@ impl AppStore {
                     }
                     self.feedback.success("已忽略这个版本，下次有更新再提醒");
                 }
-                Err(error) => self.feedback.error(format!("忽略失败：{error}")),
+                Err(error) => self.feedback.error(i18n::fill("忽略失败：{}", &[&error])),
             }
         });
     }

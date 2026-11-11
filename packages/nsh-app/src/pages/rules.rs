@@ -200,7 +200,7 @@ fn routing(store: AppStore, draft: RuleDraft) -> impl IntoElement {
                 controls::inline_note(
                     theme::Tint::Info,
                     Icon::Info,
-                    move || format!("另有 {} 条进程规则在当前平台不可见，但仍计入规则总数并随配置同步。", hidden_process_rules(store)),
+                    move || i18n::fill("另有 {} 条进程规则在当前平台不可见，但仍计入规则总数并随配置同步。", &[&(hidden_process_rules(store))]),
                 )
             },
         ))
@@ -601,7 +601,7 @@ fn rule_row(
                         rule.with(|rule| {
                             rule.as_ref()
                                 .map(|rule| {
-                                    domain::custom_rule_match_label(rule.match_type).to_owned()
+                                    i18n::tr(domain::custom_rule_match_label(rule.match_type))
                                 })
                                 .unwrap_or_default()
                         })
@@ -617,7 +617,7 @@ fn rule_row(
                         .map(|rule| rule.value.clone())
                         .unwrap_or_default()
                 });
-                Some(format!("启用规则 {value}").into())
+                Some(i18n::fill("启用规则 {}", &[&value]).into())
             },
             move || rule.with(|rule| rule.as_ref().is_some_and(|rule| rule.enabled)),
             || false,
@@ -866,7 +866,7 @@ fn dns_row(store: AppStore, item: Memo<Option<DnsOverride>>) -> impl IntoElement
                 ),
         )
         .child(controls::switch_state(
-            move || Some(format!("启用 {} 的专用 DNS", suffix()).into()),
+            move || Some(i18n::fill("启用 {} 的专用 DNS", &[&(suffix())]).into()),
             move || item.with(|item| item.as_ref().is_some_and(|item| item.enabled)),
             || false,
             move |_: bool| {
@@ -877,7 +877,7 @@ fn dns_row(store: AppStore, item: Memo<Option<DnsOverride>>) -> impl IntoElement
         ))
         .child(controls::icon_button(
             move || Icon::Trash2,
-            move || format!("删除 {} 的专用 DNS", suffix()).into(),
+            move || i18n::fill("删除 {} 的专用 DNS", &[&(suffix())]).into(),
             move || {
                 if let Some(id) = id() {
                     store.delete_dns_override(id);
@@ -1146,7 +1146,12 @@ fn match_options() -> Vec<SelectItem> {
     ]
     .into_iter()
     .filter(|kind| domain::custom_rule_available(*kind, supported))
-    .map(|kind| SelectItem::new(match_value(kind), domain::custom_rule_match_label(kind)))
+    .map(|kind| {
+        SelectItem::new(
+            match_value(kind),
+            i18n::tr(domain::custom_rule_match_label(kind)),
+        )
+    })
     .collect()
 }
 
@@ -1160,7 +1165,7 @@ fn action_options() -> Vec<SelectItem> {
     .map(|action| {
         SelectItem::new(
             action_value(action),
-            domain::custom_rule_action_label(action),
+            i18n::tr(domain::custom_rule_action_label(action)),
         )
     })
     .collect()

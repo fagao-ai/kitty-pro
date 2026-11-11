@@ -462,7 +462,7 @@ fn measure_row(store: AppStore) -> impl IntoElement {
         .justify_between()
         .gap_3()
         .child(
-            text(move || domain::proxy_port_label(store.allow_lan()))
+            text(move || domain::proxy_port_label(store.allow_lan(), store.language()))
                 .text_xs()
                 .font_family(theme::font_mono())
                 .text_color(theme::text_faint()),
@@ -546,13 +546,13 @@ fn probe_result_line(store: AppStore) -> impl IntoElement {
         Some(outcome) if outcome.ok => controls::inline_note(
             theme::Tint::Success,
             Icon::CircleCheck,
-            SharedString::from(format!("连通正常：{}", outcome.detail)),
+            SharedString::from(i18n::fill("连通正常：{}", &[&(outcome.detail)])),
         )
         .into_element(),
         Some(outcome) => controls::inline_note(
             theme::Tint::Danger,
             Icon::CircleAlert,
-            SharedString::from(format!("出口不可用：{}", outcome.detail)),
+            SharedString::from(i18n::fill("出口不可用：{}", &[&(outcome.detail)])),
         )
         .into_element(),
         None => view().into_element(),
@@ -561,7 +561,7 @@ fn probe_result_line(store: AppStore) -> impl IntoElement {
 
 fn chart_status(window: &crate::store::TrafficWindow, connected: bool) -> String {
     if window.active_connections > 0 {
-        format!("{} 个活动连接", window.active_connections)
+        i18n::fill("{} 个活动连接", &[&(window.active_connections)])
     } else if connected {
         "等待代理流量".to_owned()
     } else {

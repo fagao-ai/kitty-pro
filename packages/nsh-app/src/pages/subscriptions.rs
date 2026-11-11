@@ -110,7 +110,10 @@ fn count_summary(store: AppStore) -> String {
     if subscriptions.is_empty() {
         "还没有订阅".to_owned()
     } else {
-        format!("{} 个订阅 · 共 {nodes} 个节点", subscriptions.len())
+        i18n::fill(
+            "{} 个订阅 · 共 {} 个节点",
+            &[&(subscriptions.len()), &nodes],
+        )
     }
 }
 
@@ -216,7 +219,10 @@ fn row(store: AppStore, item: ReadSignal<Subscription>) -> impl IntoElement {
                         crate::domain::source_label(&subscription().source) != subscription().name
                     },
                     move || {
-                        text(move || crate::domain::source_label(&subscription().source))
+                        // Either a host, which is data and has no row, or the app's own
+                        // 本地内容, which does. One lookup covers both because a miss keeps the
+                        // string it was given.
+                        text(move || i18n::tr(&crate::domain::source_label(&subscription().source)))
                             .text_xs()
                             .font_family(theme::font_mono())
                             .number_of_lines(1)
@@ -229,15 +235,19 @@ fn row(store: AppStore, item: ReadSignal<Subscription>) -> impl IntoElement {
                         .items_center()
                         .gap_2()
                         .child(
-                            text(move || format!("{} 个节点", subscription().node_count()))
-                                .text_xs()
-                                .text_color(theme::text_soft()),
+                            text(move || {
+                                i18n::fill("{} 个节点", &[&(subscription().node_count())])
+                            })
+                            .text_xs()
+                            .text_color(theme::text_soft()),
                         )
                         .child(when(
                             move || subscription().rejected_count > 0,
                             move || {
                                 controls::badge(
-                                    move || format!("忽略 {}", subscription().rejected_count),
+                                    move || {
+                                        i18n::fill("忽略 {}", &[&(subscription().rejected_count)])
+                                    },
                                     theme::Tint::Warning,
                                 )
                             },
@@ -254,7 +264,7 @@ fn row(store: AppStore, item: ReadSignal<Subscription>) -> impl IntoElement {
         ))
         .child(controls::icon_button(
             move || Icon::RefreshCw,
-            move || format!("刷新 {}", subscription().name).into(),
+            move || i18n::fill("刷新 {}", &[&(subscription().name)]).into(),
             move || {
                 if busy() {
                     return;
@@ -264,7 +274,7 @@ fn row(store: AppStore, item: ReadSignal<Subscription>) -> impl IntoElement {
         ))
         .child(controls::icon_button(
             move || Icon::Trash2,
-            move || format!("删除 {}", subscription().name).into(),
+            move || i18n::fill("删除 {}", &[&(subscription().name)]).into(),
             move || confirm_delete(store, id(), subscription().name),
         ))
 }
@@ -274,7 +284,7 @@ fn row(store: AppStore, item: ReadSignal<Subscription>) -> impl IntoElement {
 /// exactly where an id alone means nothing.
 fn confirm_delete(store: AppStore, id: u64, name: String) {
     let asking = alert_dialog()
-        .title(format!("删除「{name}」？"))
+        .title(i18n::fill("删除「{}」？", &[&name]))
         .description("该订阅的节点会一并移除，正在使用的节点会改用其他订阅。")
         .cancel("cancel", "取消")
         .destructive("delete", "删除")

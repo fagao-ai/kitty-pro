@@ -463,6 +463,7 @@ fn about_line(store: AppStore) -> String {
         &facts.app_version,
         facts.core_version.as_deref(),
         &facts.platform,
+        store.language(),
     )
 }
 
@@ -573,7 +574,10 @@ fn script_note(store: AppStore) -> String {
     if script.trim().is_empty() {
         "main(config) · 尚未配置".to_owned()
     } else {
-        format!("main(config) · QuickJS · {} 字符", script.chars().count())
+        i18n::fill(
+            "main(config) · QuickJS · {} 字符",
+            &[&(script.chars().count())],
+        )
     }
 }
 
@@ -734,9 +738,9 @@ fn sync_load_error(store: AppStore) -> impl IntoElement {
         // user acts on, and the consequence is what explains the parked buttons. Joined with a
         // full stop because a backend error has no ending punctuation of its own.
         move || {
-            format!(
+            i18n::fill(
                 "同步配置读取失败：{}。已停用所有同步操作，以免用空配置覆盖已保存的设置。",
-                store.sync_load_error().unwrap_or_default()
+                &[&(store.sync_load_error().unwrap_or_default())],
             )
         },
         Some(controls::secondary_button("重试", move || {
@@ -876,7 +880,7 @@ fn sync_summary(store: AppStore) -> SharedString {
         // whole line goes through the table; the pieces that are data (a host, a path) survive
         // the lookup unchanged.
         Some(config) => {
-            i18n::tr(&domain::sync_target_summary(provider_form(store), &config)).into()
+            domain::sync_target_summary(provider_form(store), &config, store.language()).into()
         }
         None => "正在读取同步设置".into(),
     }
@@ -1191,6 +1195,7 @@ fn pull_summary(store: AppStore) -> impl IntoElement {
             counts,
             store.subscriptions().len(),
             store.custom_rule_count(),
+            store.language(),
         )
     })
 }
@@ -1218,7 +1223,7 @@ fn conflict_panel(store: AppStore) -> impl IntoElement {
             text(move || {
                 store
                     .sync_conflict()
-                    .map(|(_, raw)| format!("后端原文：{raw}"))
+                    .map(|(_, raw)| i18n::fill("后端原文：{}", &[&raw]))
                     .unwrap_or_default()
             })
             .text_xs()
@@ -1296,11 +1301,11 @@ fn updates_card(store: AppStore) -> impl IntoElement {
                 move || store.update_display_state() == api::update::AppUpdateState::Unsupported,
                 move || {
                     controls::inline_note(theme::Tint::Info, Icon::Info, move || {
-                        format!(
+                        i18n::fill(
                             "此构建没有发布通道（{}），请从发布页手动下载。",
-                            store
+                            &[&(store
                                 .update_status()
-                                .map_or_else(String::new, |status| status.target)
+                                .map_or_else(String::new, |status| status.target))],
                         )
                     })
                 },
@@ -1409,9 +1414,9 @@ fn check_note(store: AppStore) -> String {
             i18n::fill("当前 v{} · 上次检查 {}", &[&held.current_version, &age])
         }
         (Some(held), _) if held.state == api::update::AppUpdateState::Unsupported => {
-            format!("此构建无发布通道（{}）", held.target)
+            i18n::fill("此构建无发布通道（{}）", &[&(held.target)])
         }
-        (_, Some(age)) => format!("上次检查 {age}"),
+        (_, Some(age)) => i18n::fill("上次检查 {}", &[&age]),
         (_, None) => "尚未检查过更新".to_owned(),
     }
 }

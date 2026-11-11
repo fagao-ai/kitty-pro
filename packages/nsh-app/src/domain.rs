@@ -104,11 +104,11 @@ pub fn format_data_rate(bytes_per_second: u64) -> String {
     format!("{}/s", format_data_amount(bytes_per_second))
 }
 
-pub fn proxy_port_label(allow_lan: bool) -> String {
+pub fn proxy_port_label(allow_lan: bool, lang: crate::i18n::Lang) -> String {
     if allow_lan {
-        format!("局域网代理 {PROXY_PORT}")
+        crate::i18n::fill_at(lang, "局域网代理 {}", &[&PROXY_PORT])
     } else {
-        format!("本地代理 {PROXY_PORT}")
+        crate::i18n::fill_at(lang, "本地代理 {}", &[&PROXY_PORT])
     }
 }
 
@@ -1130,10 +1130,19 @@ pub fn core_version_label(core_version: Option<&str>) -> String {
 /// The line under the app's name: which build of the app, which core, which platform.
 ///
 /// The three facts a bug report opens with, in the order anyone reading it needs them.
-pub fn about_build_label(app_version: &str, core_version: Option<&str>, platform: &str) -> String {
+///
+/// `sing-box` and `v` are the product's and the version's own spellings and stay put; only 未就绪
+/// is this app's word, so it is the one piece looked up. Translating the finished line instead
+/// would miss — no row can hold a version number.
+pub fn about_build_label(
+    app_version: &str,
+    core_version: Option<&str>,
+    platform: &str,
+    lang: crate::i18n::Lang,
+) -> String {
     let core = match core_version {
         Some(version) => format!("sing-box {version}"),
-        None => "sing-box 未就绪".to_owned(),
+        None => format!("sing-box {}", crate::i18n::translate(lang, "未就绪")),
     };
     format!("v{app_version} · {core} · {platform}")
 }
@@ -1185,7 +1194,7 @@ pub fn diagnostic_report(facts: &DiagnosticFacts) -> String {
             "关闭"
         },
         lan = if facts.allow_lan { "开启" } else { "关闭" },
-        endpoint = proxy_port_label(facts.allow_lan),
+        endpoint = proxy_port_label(facts.allow_lan, crate::i18n::Lang::Chinese),
         node_count = facts.node_count,
         subscription_count = facts.subscription_count,
         rule_count = facts.rule_count,
@@ -1388,14 +1397,23 @@ pub fn pull_confirm_summary(
     remote: Option<SyncCounts>,
     local_subscriptions: usize,
     local_rules: usize,
+    lang: crate::i18n::Lang,
 ) -> String {
     match remote {
-        Some(counts) => format!(
-            "将用远端 {} 个订阅 / {} 条规则替换本机 {local_subscriptions} 个订阅 / {local_rules} 条规则",
-            counts.remote_subscriptions, counts.remote_rules
+        Some(counts) => crate::i18n::fill_at(
+            lang,
+            "将用远端 {} 个订阅 / {} 条规则替换本机 {} 个订阅 / {} 条规则",
+            &[
+                &counts.remote_subscriptions,
+                &counts.remote_rules,
+                &local_subscriptions,
+                &local_rules,
+            ],
         ),
-        None => format!(
-            "将用远端配置替换本机 {local_subscriptions} 个订阅 / {local_rules} 条规则（远端数量需下载后确认）"
+        None => crate::i18n::fill_at(
+            lang,
+            "将用远端配置替换本机 {} 个订阅 / {} 条规则（远端数量需下载后确认）",
+            &[&local_subscriptions, &local_rules],
         ),
     }
 }
@@ -1409,12 +1427,17 @@ pub fn sync_result_clause(
     subscription_count: usize,
     rule_count: usize,
     dns_count: Option<usize>,
+    lang: crate::i18n::Lang,
 ) -> String {
     let dns = match dns_count {
-        Some(count) => format!("{count} 条专用 DNS"),
-        None => "远端未含专用 DNS（保留本机）".to_owned(),
+        Some(count) => crate::i18n::fill_at(lang, "{} 条专用 DNS", &[&count]),
+        None => crate::i18n::translate(lang, "远端未含专用 DNS（保留本机）"),
     };
-    format!("已同步 {subscription_count} 个订阅、{rule_count} 条分流规则、{dns}")
+    crate::i18n::fill_at(
+        lang,
+        "已同步 {} 个订阅、{} 条分流规则、{}",
+        &[&subscription_count, &rule_count, &dns],
+    )
 }
 
 /// Turn the backend's optimistic-concurrency wording into a sentence with an action in it.
@@ -1422,6 +1445,12 @@ pub fn sync_result_clause(
 /// The remote answers a rejected push with ETag and baseline jargon. The user cannot act on that,
 /// and the raw text stays available under 详情 for whoever can, so this maps each known shape of
 /// refusal onto the one move that resolves it.
+///
+/// The `contains` tests stay Chinese on purpose: they read the *backend's* sentence, which this
+/// app writes in Chinese whatever the interface says, and translating the query would stop the
+/// match. What comes back is the app's own sentence, kept in Chinese — the canonical form every
+/// string here is stored in. The conflict panel stays up until the user resolves it, and long
+/// enough to switch language over, so the lookup happens where it is drawn.
 pub fn classify_sync_error(raw: &str) -> (String, bool) {
     if raw.contains("已被其他设备修改") || raw.contains("已被其它设备修改") {
         (
@@ -1636,9 +1665,13 @@ pub fn sync_target_incomplete(
 /// an empty form reads as a chosen provider and hides that there is nothing to dial. A half-filled
 /// one names the missing field, which is the same words `sync_target_incomplete` uses to park the
 /// remote buttons — so the line under the caret and the parked buttons can never disagree.
-pub fn sync_target_summary(form: SyncProviderForm, config: &api::SyncConfig) -> String {
+pub fn sync_target_summary(
+    form: SyncProviderForm,
+    config: &api::SyncConfig,
+    lang: crate::i18n::Lang,
+) -> String {
     if sync_target_untouched(form, config) {
-        return "尚未填写".to_owned();
+        return crate::i18n::translate(lang, "尚未填写");
     }
     let address = match form {
         SyncProviderForm::WebDav => &config.webdav_endpoint,
@@ -1646,7 +1679,8 @@ pub fn sync_target_summary(form: SyncProviderForm, config: &api::SyncConfig) -> 
     };
     let address = address.trim();
     let path = config.path.trim();
-    let mut line = String::from(form.label());
+    // `form.label()` is a key (S3 兼容 / WebDAV), and the missing-field word is ours.
+    let mut line = crate::i18n::translate(lang, form.label());
     // S3's blank endpoint is AWS — a chosen destination rather than a gap, so it gets named. A
     // blank WebDAV address is a gap, and the gap is what the missing-field note says.
     match (form, address.is_empty()) {
@@ -1661,7 +1695,10 @@ pub fn sync_target_summary(form: SyncProviderForm, config: &api::SyncConfig) -> 
         line.push_str(&format!(" /{path}"));
     }
     if let Some(missing) = sync_target_incomplete(form, config) {
-        line.push_str(&format!("（缺 {missing}）"));
+        line.push_str(&crate::i18n::in_parens_at(
+            lang,
+            &crate::i18n::fill_at(lang, "缺 {}", &[&missing]),
+        ));
     }
     line
 }
@@ -2379,11 +2416,11 @@ mod diagnostics_tests {
     #[test]
     fn the_build_line_falls_back_when_the_core_is_not_ready() {
         assert_eq!(
-            about_build_label("0.1.0", Some("1.13.14"), "Desktop"),
+            about_build_label("0.1.0", Some("1.13.14"), "Desktop", ZH),
             "v0.1.0 · sing-box 1.13.14 · Desktop"
         );
         assert_eq!(
-            about_build_label("0.1.0", None, "Mobile"),
+            about_build_label("0.1.0", None, "Mobile", ZH),
             "v0.1.0 · sing-box 未就绪 · Mobile"
         );
     }
@@ -2599,12 +2636,12 @@ mod sync_tests {
     #[test]
     fn a_folded_target_summarises_itself_without_a_secret() {
         assert_eq!(
-            sync_target_summary(SyncProviderForm::WebDav, &webdav()),
+            sync_target_summary(SyncProviderForm::WebDav, &webdav(), ZH),
             "WebDAV · dav.example.test /kitty-pro-sync.json"
         );
         // S3's blank endpoint is AWS, which the line says out loud rather than leaving blank.
         assert_eq!(
-            sync_target_summary(SyncProviderForm::S3, &s3()),
+            sync_target_summary(SyncProviderForm::S3, &s3(), ZH),
             "S3 兼容 · AWS /backups/kitty.json"
         );
         let with_address = SyncConfig {
@@ -2612,7 +2649,7 @@ mod sync_tests {
             ..s3()
         };
         assert_eq!(
-            sync_target_summary(SyncProviderForm::S3, &with_address),
+            sync_target_summary(SyncProviderForm::S3, &with_address, ZH),
             "S3 兼容 · s3.example.com /backups/kitty.json"
         );
 
@@ -2622,7 +2659,7 @@ mod sync_tests {
             password: "app-pass".to_owned(),
             ..webdav()
         };
-        let line = sync_target_summary(SyncProviderForm::WebDav, &with_secrets);
+        let line = sync_target_summary(SyncProviderForm::WebDav, &with_secrets, ZH);
         assert!(
             !line.contains("super-secret") && !line.contains("app-pass"),
             "the folded line quoted a credential: {line}"
@@ -2635,7 +2672,7 @@ mod sync_tests {
     #[test]
     fn a_folded_target_says_when_there_is_nothing_to_dial() {
         assert_eq!(
-            sync_target_summary(SyncProviderForm::S3, &SyncConfig::default()),
+            sync_target_summary(SyncProviderForm::S3, &SyncConfig::default(), ZH),
             "尚未填写"
         );
 
@@ -2643,7 +2680,7 @@ mod sync_tests {
         let mut aws = s3();
         aws.s3_endpoint = String::new();
         assert_eq!(
-            sync_target_summary(SyncProviderForm::S3, &aws),
+            sync_target_summary(SyncProviderForm::S3, &aws, ZH),
             "S3 兼容 · AWS /backups/kitty.json"
         );
 
@@ -2651,7 +2688,7 @@ mod sync_tests {
         let mut no_login = webdav();
         no_login.password = String::new();
         assert_eq!(
-            sync_target_summary(SyncProviderForm::WebDav, &no_login),
+            sync_target_summary(SyncProviderForm::WebDav, &no_login, ZH),
             "WebDAV · dav.example.test /kitty-pro-sync.json（缺 用户名 / 密码）"
         );
     }
@@ -2799,7 +2836,7 @@ mod sync_tests {
             remote_rules: 9,
         });
         assert_eq!(
-            pull_confirm_summary(remote, 2, 3),
+            pull_confirm_summary(remote, 2, 3, ZH),
             "将用远端 4 个订阅 / 9 条规则替换本机 2 个订阅 / 3 条规则"
         );
     }
@@ -2808,7 +2845,7 @@ mod sync_tests {
     /// tell the user the remote is empty seconds before overwriting their work with it.
     #[test]
     fn an_unread_remote_says_unknown_rather_than_zero() {
-        let summary = pull_confirm_summary(None, 2, 3);
+        let summary = pull_confirm_summary(None, 2, 3, ZH);
         assert!(summary.contains("需下载后确认"), "{summary}");
         assert!(!summary.contains("远端 0"), "{summary}");
     }
@@ -2819,10 +2856,10 @@ mod sync_tests {
     #[test]
     fn a_remote_without_dns_says_so_rather_than_reporting_zero() {
         assert_eq!(
-            sync_result_clause(3, 5, Some(0)),
+            sync_result_clause(3, 5, Some(0), ZH),
             "已同步 3 个订阅、5 条分流规则、0 条专用 DNS"
         );
-        assert!(sync_result_clause(3, 5, None).contains("远端未含专用 DNS（保留本机）"));
+        assert!(sync_result_clause(3, 5, None, ZH).contains("远端未含专用 DNS（保留本机）"));
     }
 
     /// The backend refuses a stale push in ETag and baseline language. Nobody can act on that, so
