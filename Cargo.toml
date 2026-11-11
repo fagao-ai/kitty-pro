@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "packages/nsh-app",
     "packages/api",
+    "packages/server",
     "packages/proxy-core",
     "packages/singbox",
 ]

@@ -6,10 +6,16 @@ statically linked sing-box Go archive exposed through the `singbox` Rust crate;
 the application does not discover, start, or require a `sing-box` executable at
 runtime.
 
-The interface, the backend and the core all live in one process, so there is no
-server, no WebAssembly and no HTTP hop. The Dioxus shells that used to sit here
-(`packages/ui`, `web`, `desktop`, `mobile`) have been deleted; the interface is
-`packages/nsh-app`.
+The desktop app is one process: interface, backend and core, with no server, no
+WebAssembly and no HTTP hop. The interface is `packages/nsh-app`.
+
+A browser can drive the same core instead. A page cannot load a Go archive or
+raise a TUN interface, so that build is two halves: `packages/server` is a native
+process that owns the proxy and answers `/api/*`, and it serves the NSH site next
+to the API. See [Run as a web control surface](#run-as-a-web-control-surface).
+
+The Dioxus shells that used to sit here (`packages/ui`, `web`, `desktop`,
+`mobile`) have been deleted.
 
 ## Supported subscription inputs
 
@@ -89,6 +95,36 @@ without them.
 
 The app links and calls the same `singbox` Rust API in its own process.
 
+## Run as a web control surface
+
+A browser cannot load a Go archive or raise a TUN interface, so the web build is
+two halves: a native process that owns the proxy and answers `/api/*`, and the
+NSH site served next to it from the same listener. Serving both from one port is
+required, not a preference — the request guard rejects any call whose `Origin`
+does not equal its `Host`.
+
+```sh
+# 1. the interface
+(cd packages/nsh-app && nsh package --target web -o /tmp/kitty-web)
+
+# 2. the process that runs the proxy, pointed at the site just built
+KITTY_WEB_DIR="/tmp/kitty-web/Kitty Pro" ./target/debug/kitty-pro-web-server
+# → Kitty Pro 控制面: http://127.0.0.1:7897
+```
+
+`--port`, `--daemon`, `--log-file` and `--allow-lan` behave as the deleted Dioxus
+web server had them: binding a non-loopback address needs `--allow-lan` (or
+`KITTY_PRO_ALLOW_LAN=1`), and hostnames beyond IP-literal access need
+`KITTY_PRO_ALLOWED_HOSTS` as an exact-match list. The session cookie is generated
+per process, so restarting the server signs out every page.
+
+**Status: this half works; the other half does not yet.** The server answers
+`/api/*` and serves the site — but the page still calls `api` in-process inside
+its own WebAssembly, where every backend function is a stub that refuses. Opening
+the URL shows the interface with no live data until the client grows a transport
+that calls `/api/*` instead. That is the next piece of work, tracked in
+`packages/nsh-app/README.md`.
+
 On desktop systems, enabling TUN performs configuration validation and asks
 for network privileges immediately. Starting the core then reuses that
 authorized helper instead of prompting a second time. The GUI itself remains
@@ -145,10 +181,11 @@ Each archive gets a `.sha256` sidecar. Run the workflow manually from the
 repository's **Actions** page, or push a tag such as `v1.0.14`; a `v*` tag also
 creates a GitHub Release and attaches the archives.
 
-Only the desktop shell is published. The workflow used to build a self-hosted
-web server and an Android APK as well, and both stopped existing when those
-shells were deleted; NSH's own `web` and `android` targets are not ready to
-replace them (see `packages/nsh-app/README.md`).
+Only the desktop app is published. `packages/server` builds and passes its tests
+but the workflow does not package it yet, and the web interface cannot drive it
+from a browser until the client grows a transport that calls `/api/*` — see
+`packages/nsh-app/README.md`. Android and iOS have no build at all, for the
+unrelated reasons recorded in the same table.
 
 The macOS app is ad hoc signed and the Windows and Linux builds are unsigned.
 Apple notarization and Windows Authenticode signing require developer
