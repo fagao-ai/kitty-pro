@@ -61,13 +61,15 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # 只有 `api`：它是唯一还声明了 wasm32 分支的包，也是 NSH 的 web 目标将来唯一
-      # 能复用的后端。没有这一步，删掉 Dioxus server fn 宏就把 wasm 编译整条打断过
-      # 一次（宏原本在 wasm 下不编译函数体），而 workspace 门禁对此毫无察觉。
+      # `api` 与 `proxy-core` 是后端里唯一声明 wasm32 分支的两个包；
+      # `nsh-app-kitty` 是 web 构建的本体，它现在也分了两个臂（`src/backend.rs`
+      # 里原生直调 / 浏览器走 /api/*），所以它同样是只有这个 target 才会编译到的
+      # 代码。没有这一步，删掉 Dioxus server fn 宏就把 wasm 编译整条打断过一次
+      # （宏原本在 wasm 下不编译函数体），而 workspace 门禁对此毫无察觉。
       - name: Backend compiles for the browser target
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo check -p api -p proxy-core --target wasm32-unknown-unknown
+          cargo check -p api -p proxy-core -p nsh-app-kitty --target wasm32-unknown-unknown
 
       - name: Workspace tests
         run: cargo test --workspace
