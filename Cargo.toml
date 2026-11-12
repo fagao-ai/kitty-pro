@@ -14,7 +14,7 @@ members = [
 # manifest because the in-app update check reads `env!("CARGO_PKG_VERSION")` from
 # `api` — the crate that answers it is not the shell that displays it — so a
 # per-package version is a per-package chance to answer with the wrong number.
-version = "1.0.14"
+version = "1.0.15"
 
 [workspace.dependencies]
 # workspace

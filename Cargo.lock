@@ -116,7 +116,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "api"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "auto-launch",
  "directories",
@@ -2729,7 +2729,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kitty-pro"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "api",
  "nsh-base",
@@ -2745,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-server"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "api",
  "axum",
@@ -4218,7 +4218,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "proxy-core"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -5403,7 +5403,7 @@ dependencies = [
 
 [[package]]
 name = "singbox"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "core-foundation 0.9.4",
  "getrandom 0.3.4",
