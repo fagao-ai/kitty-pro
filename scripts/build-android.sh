@@ -171,6 +171,20 @@ ndk_clang_for() {
         *) die "no NDK triple for Rust target $1" ;;
     esac
 }
+# bionic names its per-architecture header directory after the ABI, and 32-bit
+# ARM is the one place where that differs from the compiler's name: the NDK
+# spells the compiler `armv7a-linux-androideabi24-clang` while the headers live
+# in `usr/include/arm-linux-androideabi`.
+ndk_include_dir_for() {
+    case "$1" in
+        aarch64-linux-android) echo aarch64-linux-android ;;
+        armv7-linux-androideabi) echo arm-linux-androideabi ;;
+        x86_64-linux-android) echo x86_64-linux-android ;;
+        *) die "no NDK include directory for Rust target $1" ;;
+    esac
+}
+
+ndk_sysroot="$ndk/toolchains/llvm/prebuilt/$llvm_dir/sysroot"
 for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
     triple="$(ndk_clang_for "$target")"
     compiler="$llvm/${triple}${core_api}-clang"
@@ -181,6 +195,27 @@ for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
     export "CC_${underscored}=$compiler"
     export "CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER=$compiler"
     export "AR_${underscored}=$llvm/llvm-ar"
+
+    # The JS engine in the proxy core generates its bindings at build time for
+    # Android, and bindgen reads headers with the *host* clang unless it is told
+    # otherwise. Left alone it keeps the `-target aarch64-unknown-linux-android`
+    # flag but searches the host's /usr/include, so on Linux the first bionic
+    # header that glibc implements differently — today `stdio.h`, which pulls in
+    # `bits/libc-header-start.h` — ends the build inside a C++ `expect()`. On
+    # macOS it silently reads Apple's headers instead, which is worse: the build
+    # succeeds and proves nothing about what CI will compile. Pointing bindgen at
+    # the NDK sysroot makes both machines compile the same declarations.
+    bindgen_args_variable="BINDGEN_EXTRA_CLANG_ARGS_${underscored}"
+    if [[ -z "${!bindgen_args_variable:-}" ]]; then
+        include_dir="$(ndk_include_dir_for "$target")"
+        [[ -d "$ndk_sysroot/usr/include/$include_dir" ]] ||
+            die "the NDK sysroot has no bionic headers at $ndk_sysroot/usr/include/$include_dir"
+        printf -v "$bindgen_args_variable" '%s' \
+            "--sysroot='$ndk_sysroot' --target=${triple}${core_api} \
+-I'$ndk_sysroot/usr/include' \
+-I'$ndk_sysroot/usr/include/$include_dir'"
+        export "$bindgen_args_variable"
+    fi
 done
 
 rust_target_for() {

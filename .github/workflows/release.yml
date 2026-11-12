@@ -59,7 +59,13 @@ jobs:
         include:
           - name: macOS
             id: macos
-            os: macos-14
+            # GitHub retired the `macos-14` image: jobs on it are cancelled in ~1s
+            # with "The configuration 'macos-14-arm64-us-default' is not supported",
+            # before any step runs. `macos-15` is the same arm64 hardware, so the
+            # `aarch64` that the update check reads out of the asset name still
+            # describes the binary inside. Pinned rather than `macos-latest`, which
+            # already moves on to macOS 26 and would change the SDK under a tag.
+            os: macos-15
             target: macos
           - name: Windows
             id: windows
@@ -75,6 +81,13 @@ jobs:
 
       # NSH's Linux host is GTK 4.14+, which ubuntu-24.04's libgtk-4-dev is.
       # librsvg2 is needed by the `svg` feature the app's icons use.
+      #
+      # NSH 0.5.0's Linux host plays media through GStreamer, so gstreamer-sys
+      # now asks pkg-config for gstreamer-1.0 (and -app, -audio, -base, which
+      # libgstreamer-plugins-base1.0-dev brings). Ubuntu's containers do not
+      # carry those headers by default, and the failure is not a missing crate:
+      # it is one build script that exits before any Rust error, on the runner
+      # only, because a development machine has them from another install.
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -83,6 +96,8 @@ jobs:
           sudo apt-get install -y \
             libgtk-4-dev \
             librsvg2-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
             patchelf \
             pkg-config
 
@@ -351,7 +366,9 @@ jobs:
             archive_name: Kitty-Pro-web-linux-x86_64
           - name: macOS
             id: macos-aarch64
-            os: macos-14
+            # See the desktop job: `macos-14` is retired, `macos-15` is the same
+            # arm64 hardware the `macos-aarch64` archive name promises.
+            os: macos-15
             archive_name: Kitty-Pro-web-macos-aarch64
     steps:
       - name: Checkout source
@@ -370,6 +387,25 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: wasm32-unknown-unknown
+
+      # Building the page compiles zstd's C for wasm32, and NSH asks for that
+      # archive to be made by `llvm-ar` (it sets `AR_wasm32_unknown_unknown` to
+      # the bare name). No runner image has a program by that name on PATH:
+      # Xcode's toolchain ships `ar` and several `llvm-` tools but not `llvm-ar`,
+      # and Ubuntu keeps them under /usr/lib/llvm-18/bin. rustup's `llvm-tools`
+      # component is the one source that exists on every platform rustup runs on,
+      # so the archiver comes from the same pinned toolchain as the compiler.
+      - name: Provide the wasm archiver
+        shell: bash
+        run: |
+          rustup component add llvm-tools
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+          test -x "$bin/llvm-ar" || {
+            echo "llvm-tools did not install llvm-ar into $bin" >&2
+            exit 1
+          }
+          echo "$bin" >> "$GITHUB_PATH"
 
       # The page is WebAssembly whatever machine builds it, so the web runtime is a
       # component here even on the macOS runner — that CLI ships the macOS runtime.
