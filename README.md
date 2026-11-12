@@ -89,9 +89,10 @@ nsh run                                        # hot reload, every target (needs
 cargo test -p nsh-app-kitty                    # the screens, headless under NSH's engine
 ```
 
-`desktop` is a Cargo feature because the Linux host needs GTK 4.14 development
-packages, which CI runners do not carry; `cargo check --workspace` stays green
-without them.
+`desktop` is a Cargo feature because the Linux host needs GTK 4.14 and
+GStreamer development packages. The quality gate runs `cargo check --workspace`
+without them, so it stays green on a plain runner; the release workflow's Linux
+job installs what the shipped binary actually links.
 
 The app links and calls the same `singbox` Rust API in its own process.
 
