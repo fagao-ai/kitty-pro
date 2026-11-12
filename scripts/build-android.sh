@@ -138,8 +138,6 @@ else
     keytool="$(command -v keytool || true)"
 fi
 [[ -n "$javac" && -n "$java_bin" ]] || die "no JDK: install JDK 17 or newer, or set JAVA_HOME"
-command -v nsh >/dev/null ||
-    die "the nsh CLI is not installed: curl -sSL https://nsh.dev/install.sh | sh"
 command -v go >/dev/null || die "go is not installed; the embedded core is a Go archive"
 # `jq` reads nsh.json and `cargo metadata`, and the release workflow already
 # depends on it, so this is not a new requirement — but a missing `jq` fails the
@@ -153,6 +151,13 @@ command -v jq >/dev/null || die "jq is not installed; it reads nsh.json and carg
 # libnsh.so cannot load.
 core_api=24
 ui_api=28
+
+# Resolve the NSH installation, check it against the crates, and make sure the
+# Android runtime is there. The script owns that check because the failure it
+# prevents — a runtime and a libnsh.so from different NSH releases — is one this
+# build cannot see and a phone answers with a crash.
+step "nsh"
+nsh_home="$("$root/scripts/setup-nsh.sh" android)"
 
 # The NDK spells the 32-bit ARM triple `armv7a-linux-androideabi`; the other two
 # end in `-linux-android`. Naming them per target beats deriving the suffix.
@@ -323,10 +328,13 @@ kotlin_stdlib="$kotlin_lib/kotlin-stdlib.jar"
 
 # NSH's classes are the ones the manifest names as the entry point, so they have
 # to be in the package. The runtime directory is the same one `nsh package`
-# compiled libnsh.so against, which is why this is that file rather than the AAR.
+# compiled libnsh.so against, which is why this is that file rather than the AAR —
+# and why it is read out of the installation the `nsh` on PATH belongs to: an APK
+# whose dex comes from a different NSH than its libnsh.so is a JNI mismatch that
+# only shows up as a crash on a device.
 step "dex"
-nsh_classes="$HOME/.nsh/runtime/android/release/classes.dex"
-[[ -f $nsh_classes ]] || die "NSH's runtime is missing $nsh_classes"
+nsh_classes="$nsh_home/runtime/android/release/classes.dex"
+[[ -f $nsh_classes ]] || die "NSH's runtime is missing $nsh_classes (nsh component add android)"
 rm -rf "$work/dex" && mkdir -p "$work/dex"
 "$java_bin" -cp "$bt/lib/d8.jar" com.android.tools.r8.D8 --release --min-api "$ui_api" \
     --lib "$android_jar" --output "$work/dex" \

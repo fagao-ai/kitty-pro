@@ -265,10 +265,14 @@ deleted `packages/web/src/main.rs` dispatched the helper and cleared the sentine
 out the exit cleanup; the server has all three.
 
 The page reaches the server with no `capabilities` entry in `nsh.json`, which is deliberate: an
-app that declares none is treated as unrestricted (`nsh-engine-0.4.0/src/lib.rs:254`, checked at
-`lib.rs:2248`), so the request leaves as the relative `/api/…` the table wrote and the browser
+app that declares none gets NSH's default access, whose `is_unrestricted` (`nsh-core`'s
+`access.rs`) is what lets the engine send the request without parsing the URL at all
+(`nsh-engine`'s `request`), so it leaves as the relative `/api/…` the table wrote and the browser
 resolves it against the origin that served the page. Same origin is also what the server's own
-guard requires.
+guard requires. The symbols are named rather than the line numbers because both files move on
+every NSH release; `scripts/e2e-web.sh` is the check that the behavior is still what this
+paragraph claims — it drives a real Chrome against a real server and fails if a request is
+refused.
 
 Verified in a real headless Chrome, not only by unit test: the overview renders the server's
 answers — the core's `EMBEDDED · 1.13.14`, a `发现新版本 v1.0.13` banner from the update
@@ -397,7 +401,7 @@ Checked by reading both, not by assumption. What is left:
 
 | Missing | What it means |
 | --- | --- |
-| Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. With no tray there is also nowhere for `AppStore::copy_proxy_environment` to live, and no menu-bar quit for `api::shutdown_native_runtime`. |
+| Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither. It is now purely app-side work: NSH 0.5 added `set_tray`/`tray()` (`nsh-core`'s `element::desktop`) with `.icon`, `.tooltip`, `.menu` and `.on_click`, backed by a real `NSStatusItem` in `nsh_platform_macos::tray`, and it binds the menu callbacks to the calling component's `Owner` itself — so the hop this row used to say had to be hand-built (AppKit's main thread into the engine thread, over a reactive graph that is not `Send`) is NSH's problem now, not ours. `AppOptions::keep_alive_on_close` still supplies the other half: it hides the window and keeps the engine, which the Dock restores. What is left is the decisions and the wiring — what the menu offers (it wants `AppStore::copy_proxy_environment`, and a quit that runs `api::shutdown_native_runtime`), whether a close hides or quits by default, and where the tray is declared so it exists for the app's life rather than one screen's. |
 | 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
 | iOS | No build, and nothing to compare the reason against. `packages/singbox/build.rs:30` panics for any target OS outside `{android, macos, linux, windows}`, so the core cannot be compiled, and NetworkExtension — the only way an app that is not a `VpnService` may carry traffic on iOS, since Apple gives third-party apps no TUN — was never implemented. Android got a build without a Gradle shell; iOS needs a Swift one, which is a larger question than a build script. |
 | Exit cleanup in a **packaged** build | `nsh package` uses a runner of its own, and NSH gives that runner no exit hook, so a packaged build never calls `api::shutdown_native_runtime`. The TUN helper's lifecycle lease still stops the core and removes routes when the parent dies; what can be left behind is a system proxy pointing at a dead core. [Why the other two entry-point calls are fixed and this one is not](#process-entry-points-in-a-packaged-build). |

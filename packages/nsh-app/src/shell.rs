@@ -6,8 +6,8 @@ use crate::pages;
 use crate::store::{store, AppStore, Screen};
 use crate::ui::{controls, theme, Icon};
 use nsh_base::theme as base_theme;
-use nsh_core::desktop::TitleBarStyle;
-use nsh_core::element::desktop::set_title_bar;
+use nsh_core::desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes};
+use nsh_core::element::desktop::main_window;
 use nsh_core::prelude::*;
 
 /// How tall the window's top band is once the system's title bar is gone.
@@ -21,7 +21,7 @@ use nsh_core::prelude::*;
 /// What it does not do is move the lights: they float over whatever is at the top-left, so the
 /// rail has to keep this much of its own height empty or the brand sits under them. 44 is the
 /// tallest AppKit still treats as compact chrome, and the same number is handed to
-/// `set_title_bar` so the controls are centred in the band we actually reserved.
+/// the window's `title_bar` height so the controls are centred in the band we actually reserved.
 pub const TITLE_BAR_HEIGHT: f32 = 44.0;
 
 /// The rail's empty top band: where the traffic lights live, and the window's drag handle.
@@ -44,7 +44,17 @@ pub fn root() -> impl IntoElement {
         // body so it is sent once: the root re-renders on navigation, and a command per render
         // would be a command per press for a thing that never changes.
         if is_desktop() {
-            set_title_bar(TitleBarStyle::Hidden, Some(px(TITLE_BAR_HEIGHT)));
+            // 0.5.0 replaced the `set_title_bar` command with a window attribute, so the
+            // hidden bar is now one field of a partial `WindowAttributes`: every other
+            // attribute keeps its value.
+            // Both types are `#[non_exhaustive]`, which forbids a struct literal from
+            // another crate, so they are filled field by field from their defaults.
+            let mut bar = TitleBarOptions::default();
+            bar.style = TitleBarStyle::Hidden;
+            bar.height = Some(px(TITLE_BAR_HEIGHT));
+            let mut attributes = WindowAttributes::default();
+            attributes.title_bar = Some(bar);
+            main_window().set(attributes);
         }
         store.load_profile();
         store.refresh_status();

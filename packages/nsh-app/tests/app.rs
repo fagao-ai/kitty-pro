@@ -3064,6 +3064,12 @@ fn english_holds_in_the_surfaces_a_page_sweep_cannot_open() {
     app.press("Subscriptions").unwrap();
     app.press("role:button[Add subscription]").unwrap();
     look(&mut app, "import dialog");
+    // Close it before navigating: the dialog is a modal overlay, so the rail is under it.
+    // NSH 0.5's engine now refuses a press that lands on a covered control rather than
+    // delivering it to whatever is beneath, which is what the platform does — the press
+    // below this line used to walk past an open dialog into `Settings`.
+    app.press("Cancel").unwrap();
+    app.wait_for("No subscriptions").unwrap();
 
     // The folded sync form.
     app.press("Settings").unwrap();
