@@ -360,6 +360,14 @@ aligned="$work/aligned.apk"
 
 if [[ -n "${KITTY_KEYSTORE:-}" ]]; then
     keystore="$KITTY_KEYSTORE"
+    # `apksigner` without `--ks-key-alias` takes the *first* key it finds. In a
+    # release keystore that has more than one, that is a different key from the one
+    # the last APK was signed with, and Android then refuses the upgrade with
+    # INSTALL_FAILED_UPDATE_INCOMPATIBLE on every installed device. Silent, and it
+    # would ship, because the build itself succeeds — so a release keystore names
+    # its key or the build stops here.
+    [[ -n "${KITTY_KEY_ALIAS:-}" ]] ||
+        die "KITTY_KEYSTORE is set without KITTY_KEY_ALIAS; refusing to guess which key signs a release"
 else
     # The debug keystore in the home directory, which is where `nsh package`
     # keeps its own and where every other Android tool puts one. Minting a
@@ -392,7 +400,7 @@ abi_name="$(IFS=-; echo "${abis[*]}")"
 signed="$out/${app_name// /-}-$abi_name-$version.apk"
 sign_args=(sign --ks "$keystore"
     --ks-pass "pass:${NSH_KEYSTORE_PASSWORD:-android}"
-    --key-pass "pass:${NSH_KEYSTORE_PASSWORD:-android}")
+    --key-pass "pass:${KITTY_KEY_PASSWORD:-${NSH_KEYSTORE_PASSWORD:-android}}")
 [[ -z "${KITTY_KEY_ALIAS:-}" ]] || sign_args+=(--ks-key-alias "$KITTY_KEY_ALIAS")
 "$bt/apksigner" "${sign_args[@]}" --out "$signed" "$aligned"
 
