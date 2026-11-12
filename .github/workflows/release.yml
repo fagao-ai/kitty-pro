@@ -1,14 +1,26 @@
 name: Build release packages
 
-# One shell is published: the NSH desktop app. The Dioxus Web server and the
-# Android APK had their own jobs here and both shells were deleted, so those
-# artifacts and their signing setup are gone with them; NSH's web and Android
-# targets are not ready to publish (see packages/nsh-app/README.md).
+# Three channels are published, all from the one NSH crate: the desktop app, the
+# self-hosted web server (the WebAssembly page beside the native process that runs
+# the core for it), and the Android APK.
 #
-# NOT YET EXERCISED: this file was written when the desktop packaging moved off
-# `dx bundle`. Run it from a throwaway tag before publishing a real release.
+# The asset NAMES are load-bearing, not cosmetics: `proxy_core::update` picks the
+# one asset a user may install out of the file name alone — its kind (`web`,
+# `.apk`, or a named operating system), its OS, and the CPU groups it lists. A name
+# that drops a token silently stops that platform being updatable, so the names here
+# are the ones `packages/proxy-core/src/update.rs` asserts in its tests, and an edit
+# to one must be an edit to the other.
+#
+# NOT YET EXERCISED: this file was rewritten when the desktop packaging moved off
+# `dx bundle`, and the web and Android jobs are new since. Run it from a throwaway
+# tag before publishing a real release.
 on:
   workflow_dispatch:
+    inputs:
+      test_version:
+        description: "Version for a non-release build (e.g. 0.0.0-test.1). Leave empty to fail."
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -112,6 +124,9 @@ jobs:
           echo "$HOME/.nsh/bin" >> "$GITHUB_PATH"
           nsh --version
 
+      # Every package in the workspace takes the tag's version, including `api`,
+      # which is the crate the in-app update check actually answers with. Stamping
+      # only the shell's own crate is what made every desktop release report 0.1.0.
       - name: Set tagged app version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -119,7 +134,25 @@ jobs:
           release_version="$(
             jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
           )"
-          ./scripts/set-package-version.sh nsh-app-kitty "$release_version"
+          ./scripts/set-package-version.sh "$release_version"
+
+      # A `workflow_dispatch` build is not a release, and must not pretend to be
+      # one: an unsigned test archive that reports the newest published version
+      # tells its installer there is nothing to update, forever. Fail loudly
+      # instead, unless the operator names a version deliberately.
+      - name: Reject an unversioned manual build
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        env:
+          KITTY_TEST_VERSION: ${{ inputs.test_version }}
+        run: |
+          if [[ -z "${KITTY_TEST_VERSION:-}" ]]; then
+            echo "This run is not from a v* tag, so nothing here carries a release version." >&2
+            echo "Enter test_version to build a throwaway with that version, or push a tag." >&2
+            exit 1
+          fi
+          ./scripts/set-package-version.sh "$KITTY_TEST_VERSION"
+          echo "Building a NON-RELEASE at $KITTY_TEST_VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cache Rust builds
         if: matrix.id != 'windows'
@@ -288,6 +321,171 @@ jobs:
         with:
           name: kitty-pro-${{ matrix.id }}
           path: dist/${{ matrix.id }}/**
+          if-no-files-found: error
+          retention-days: 14
+
+  # The self-hosted web control surface: the WebAssembly page `nsh package` builds
+  # from the same crate, beside the native process that runs the core on its behalf.
+  # A browser cannot load a Go archive, so both halves ship together and must be
+  # built on the machine that will run them — hence a matrix rather than one archive.
+  web:
+    name: Web | ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            id: linux-x86_64
+            os: ubuntu-24.04
+            # The archive names the CPU as well as the OS, because the server binary
+            # is native and the update check installs what the name promises. An
+            # unlabelled macOS archive would be handed to an Intel Mac.
+            archive_name: Kitty-Pro-web-linux-x86_64
+          - name: macOS
+            id: macos-aarch64
+            os: macos-14
+            archive_name: Kitty-Pro-web-macos-aarch64
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      # The server embeds the core (`singbox`'s `embedded-core` is a default
+      # feature), so this is a Go build as much as a Rust one.
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: packages/singbox/bridge/go.mod
+          cache-dependency-path: packages/singbox/bridge/go.sum
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
+
+      - name: Install the NSH CLI
+        shell: bash
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.nsh/bin" >> "$GITHUB_PATH"
+          nsh --version
+
+      - name: Set tagged app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          release_version="$(
+            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
+          )"
+          ./scripts/set-package-version.sh "$release_version"
+
+      - name: Reject an unversioned manual build
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        env:
+          KITTY_TEST_VERSION: ${{ inputs.test_version }}
+        run: |
+          if [[ -z "${KITTY_TEST_VERSION:-}" ]]; then
+            echo "This run is not from a v* tag, so nothing here carries a release version." >&2
+            echo "Enter test_version to build a throwaway with that version, or push a tag." >&2
+            exit 1
+          fi
+          ./scripts/set-package-version.sh "$KITTY_TEST_VERSION"
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: web-${{ matrix.id }}
+          cache-all-crates: true
+
+      - name: Build the server and the page
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/kitty-pro-web-${{ matrix.id }}.log"
+          if ! {
+              cargo build --locked --release -p kitty-server
+              (cd packages/nsh-app && nsh package --target web \
+                  -o "$GITHUB_WORKSPACE/dist/web/site")
+          } 2>&1 | tee "$log"; then
+            {
+              echo "### Web ${{ matrix.name }} build failure"
+              echo
+              echo '```text'
+              tail -n 120 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      # The two halves are one product: `main.rs` resolves the site as `public/`
+      # beside the executable, so an archive that put them anywhere else serves no
+      # page while still binding the port.
+      - name: Assemble Web archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          server="target/release/kitty-pro-web-server"
+          test -x "$server"
+          # The packaged directory is named after the app, so find it rather than
+          # hard-coding "Kitty Pro": a rename would otherwise ship an archive with
+          # no page in it, which is the failure this job exists to catch.
+          site=""
+          for candidate in dist/web/site/*; do
+              [[ -f "$candidate/index.html" ]] && site="$candidate" && break
+          done
+          test -n "$site"
+          package="dist/web/package"
+          mkdir -p "$package"
+          cp "$server" "$package/kitty-pro-web-server"
+          cp -R "$site" "$package/public"
+          printf '%s\n' \
+            'Kitty Pro web control surface.' \
+            '' \
+            'Run: ./kitty-pro-web-server' \
+            'Then open http://127.0.0.1:7897/ in a browser.' \
+            '' \
+            'Options: --port PORT, --allow-lan, --daemon [--log-file PATH].' \
+            'IP selects the bind address (default 127.0.0.1); a non-loopback' \
+            'address needs --allow-lan and KITTY_PRO_ALLOWED_HOSTS.' \
+            'Stop with kill <PID>; --daemon prints it after readiness.' \
+            > "$package/README.txt"
+          archive="dist/web/${{ matrix.archive_name }}.tar.gz"
+          tar -C "$package" -czf "$archive" .
+
+      # An archive whose page cannot be found by the binary's own rule is worse than
+      # no archive: the server starts, binds, and serves nothing.
+      - name: Verify Web archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          check="$RUNNER_TEMP/kitty-pro-web-verify"
+          mkdir -p "$check"
+          tar -xzf "dist/web/${{ matrix.archive_name }}.tar.gz" -C "$check"
+          test -x "$check/kitty-pro-web-server"
+          test -f "$check/public/index.html"
+          ls "$check/public" | grep -q '\.wasm'
+
+      - name: Create Web checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/web/${{ matrix.archive_name }}.tar.gz"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 "$archive" > "$archive.sha256"
+          else
+            sha256sum "$archive" > "$archive.sha256"
+          fi
+
+      - name: Upload Web artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: kitty-pro-web-${{ matrix.id }}
+          path: |
+            dist/web/${{ matrix.archive_name }}.tar.gz
+            dist/web/${{ matrix.archive_name }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
 
