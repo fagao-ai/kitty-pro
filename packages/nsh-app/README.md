@@ -400,47 +400,49 @@ Checked by reading both, not by assumption. What is left:
 | Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. With no tray there is also nowhere for `AppStore::copy_proxy_environment` to live, and no menu-bar quit for `api::shutdown_native_runtime`. |
 | 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
 | iOS | No build, and nothing to compare the reason against. `packages/singbox/build.rs:30` panics for any target OS outside `{android, macos, linux, windows}`, so the core cannot be compiled, and NetworkExtension — the only way an app that is not a `VpnService` may carry traffic on iOS, since Apple gives third-party apps no TUN — was never implemented. Android got a build without a Gradle shell; iOS needs a Swift one, which is a larger question than a build script. |
-| Process entry points in a **packaged** build | **KNOWN BUG: TUN is broken in every shipped build.** `nsh package` uses a runner of its own and never reaches `src/main.rs`, so the packaged app skips the helper dispatch, the boot cleanup and the exit cleanup. [Details, the hook that fixes two of the three, and what cannot be fixed that way](#known-bug-packaged-build-entry-points). |
+| Exit cleanup in a **packaged** build | `nsh package` uses a runner of its own, and NSH gives that runner no exit hook, so a packaged build never calls `api::shutdown_native_runtime`. The TUN helper's lifecycle lease still stops the core and removes routes when the parent dies; what can be left behind is a system proxy pointing at a dead core. [Why the other two entry-point calls are fixed and this one is not](#process-entry-points-in-a-packaged-build). |
 
-### Known bug: packaged-build entry points
+### Process entry points in a packaged build
 
-`src/main.rs` owns three calls that belong to whichever entry point starts the process, and
-that both deleted shells used to own — `packages/desktop/src/main.rs` and, as it turns out,
-`packages/web/src/main.rs:69,78` too, which is worth remembering when the web server is
-restored, because it means the server was a full privileged entry point, not only a UI host:
-dispatching the privileged TUN helper
+Three calls belong to whichever entry point starts the process, and both deleted shells used
+to own them — `packages/desktop/src/main.rs` and, as it turns out, `packages/web/src/main.rs`
+too, which is worth remembering when the web server is restored, because it means the server
+was a full privileged entry point, not only a UI host: dispatching the privileged TUN helper
 (`api::run_tun_helper_from_args`), clearing a system proxy left dangling by a run that died
 (`api::cleanup_stale_system_proxy_sentinel`), and taking the proxy and the core down on exit
 (`api::shutdown_native_runtime`). `cargo run --features desktop` therefore behaves.
 
-`nsh package` does not, because it generates and builds its own runner
-(`.nsh/rust/<target>-app/main.rs`) instead of using ours. Verified two ways: that file's
-`main` calls only `set_ui_sets(..)` and `nsh_macos_app::main()`, and no string from our
-`main.rs` appears in the packaged `KittyPro` binary.
+They now live in `src/process.rs`, and `native()` — the `#[native_module]` entry every runner
+NSH generates evaluates before its `main` body, on macOS, Linux and Windows alike — calls
+`process::boot` first. So do `src/main.rs`'s own entry points, which is why they no longer
+duplicate the three calls.
 
-The one that breaks rather than degrades is the helper. TUN runs the core in *this same
-executable* re-launched with `--kitty-pro-tun-helper` and administrator rights. A helper
-that skips the dispatch opens a second GUI as root and never answers the parent's RPC, so
-the user's TUN start times out. **Do not ship a release that offers TUN without verifying
-it on the packaged build.**
+That mattered because `nsh package` does not compile our `main.rs`: it generates and builds
+its own runner (`.nsh/rust/<target>-app/main.rs`), whose `main` calls only `set_ui_sets(..)`
+and the platform's `main()`. The one that broke rather than degraded was the helper. TUN runs
+the core in *this same executable* re-launched with `--kitty-pro-tun-helper` and
+administrator rights, so a packaged helper skipped the dispatch, opened a second GUI as root
+and never answered the parent's RPC. Measured before the fix: the packaged binary, launched
+with the helper flag, printed eleven font-fallback warnings — it was drawing the interface.
+Measured after: `invalid TUN helper arguments` and exit 1 with no font line, while an
+ordinary launch still draws.
 
-There is a hook, which corrects what this section said when it was first written: every
-generated runner evaluates `set_app_nsh_app_kitty()` → `__nsh_native_module()` → this
-crate's `native()` before its `main` body runs, on macOS, Linux and Windows alike. The
-helper dispatch and the boot cleanup can live there. Two things to get right:
+Two things the hook forces:
 
 - `nsh test`'s runner calls the same entry (`.nsh/rust/test/main.rs`), and the boot cleanup
-  reads and writes the developer's **real** system proxy, so it must not run under test. The
-  helper dispatch is safe for free — the flag is only ever present in the helper — but the
-  cleanup needs a `KITTY_PROFILE_DIR` guard or an explicit once-flag.
+  reads a sentinel scoped by `KITTY_PROFILE_DIR` but *writes* the machine's **real** system
+  proxy, so `cleanup_is_ours` skips it whenever that variable is set. Pinned by
+  `a_scratch_profile_keeps_the_boot_cleanup_off_the_machine`. The helper dispatch is safe for
+  free — the flag is only ever present in the helper.
 - The helper dispatch has to `process::exit` from a function whose stated job is registering
-  components. That deserves its own test rather than a comment.
+  components, which is why it is `boot()` and not three calls inline in `native()`.
 
 Exit cleanup has **no** hook: `AppOptions` carries no callback field (`trace`, `asset_base`,
 `chunks`, `app_id`, `title`, `size`, `display`, `keep_size`, …). Either the helper's
 lifecycle lease is trusted to cover it — it does stop the core and remove routes when the
 parent dies, but it does not restore a system proxy — or the app owns its binary instead of
-using `nsh package`, which also settles the tray question below.
+using `nsh package`, which also settles the tray question above. `process::shut_down` is
+already public for the day that trade is made.
 
 Every screen is ported and every settings card has a home here. The rows above are what still
 separates this app from what the deleted shells shipped, and none of them is a decision this

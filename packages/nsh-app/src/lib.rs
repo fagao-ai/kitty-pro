@@ -12,6 +12,11 @@ pub mod feedback;
 /// Chinese and English, keyed by the Chinese the app was written in.
 pub mod i18n;
 mod pages;
+/// The calls that belong to whoever starts the process.
+///
+/// Public because `src/main.rs` is the binary target — a separate crate from this
+/// library — and it is the entry point NSH lets us write for `cargo run`.
+pub mod process;
 pub(crate) mod shell;
 mod store;
 pub mod ui;
@@ -41,8 +46,13 @@ pub const FONTS: &[&[u8]] = &[
 ];
 
 /// The component set NSH's hosts and headless tests mount.
+///
+/// NSH's own generated runners call this before their `main` body, on every target,
+/// which makes it the only place a packaged build can be given its process boot. That
+/// is why [`process::boot`] runs here and not only in `main.rs`; see that module.
 #[native_module("kitty/native")]
 fn native(registry: &mut Registry) {
+    process::boot();
     registry.register::<App>();
 }
 
