@@ -77,6 +77,13 @@ jobs:
       - name: Embedded-core feature tests
         run: cargo test -p singbox --features embedded-core
 
+      # versionCode 是唯一没有第二次机会的发布号：低于已装机版本的 APK 装不上，
+      # 而所有 job 依旧全绿 —— 已装设备会静默卡死在当前版本，只能手动重装。
+      # 这条不变量是 shell 脚本里的算术，不是 Rust 类型，工作区测试看不见它，
+      # 所以在这里显式断言（`--self-test` 仅耗时毫秒级）。
+      - name: Build-number mapping
+        run: ./scripts/set-package-version.sh --self-test
+
       # 可选：第三方 advisory 数据库可能临时不可用、或报出与本项目无关的告警，
       # 不能让它阻塞 PR，因此整步 continue-on-error。
       - name: Cargo audit (advisory, non-blocking)

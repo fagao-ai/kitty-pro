@@ -236,10 +236,11 @@ done
 # --- versions --------------------------------------------------------------
 
 # The crate's version, which is what the release workflow stamps from the tag
-# and what the in-app update check compares against. Reading it from cargo
-# rather than nsh.json is deliberate: nsh.json is never stamped, so a release
-# built here would otherwise keep answering 0.1.0 and tell every user a newer
-# version exists forever.
+# and what the in-app update check compares against. Read from cargo rather than
+# from `nsh.json` because cargo is the one manifest this script cannot get wrong:
+# `nsh.json` is stamped by the same hand, but only when a release workflow runs
+# it, and a build from a tree nobody stamped should answer with the version the
+# code actually carries.
 version="$(cargo metadata --locked --no-deps --format-version 1 |
     jq -er '.packages[] | select(.name == "kitty-pro") | .version')"
 # The integer Android compares on upgrade. Derived from the version rather than
@@ -253,8 +254,13 @@ version="$(cargo metadata --locked --no-deps --format-version 1 |
 # version is the release's, so bumping it is not an option, and this is the one
 # number that has to move.
 if [[ -n "${KITTY_VERSION_CODE:-}" ]]; then
-    build_number="$KITTY_VERSION_CODE"
-    [[ "$build_number" =~ ^[0-9]+$ ]] || die "KITTY_VERSION_CODE must be an integer"
+    # Through the same bounds the derived number obeys. An override is exactly the
+    # moment someone is reaching past the mapping, and the failure it would cause —
+    # a lower versionCode, refused on every installed phone — is the one those
+    # bounds exist to prevent.
+    build_number="$("$root/scripts/set-package-version.sh" \
+        --check-build-number "$KITTY_VERSION_CODE")" ||
+        die "KITTY_VERSION_CODE=$KITTY_VERSION_CODE is not a usable versionCode"
 else
     build_number="$("$root/scripts/set-package-version.sh" --build-number "$version")"
 fi
