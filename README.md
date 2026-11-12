@@ -123,12 +123,42 @@ of endpoints with two arms, so a native build calls `api` directly and a browser
 build posts to `/api/*`. No screen knows which side it is on — the signatures,
 including the error type, are the same on both.
 
-Verified in a real headless Chrome rather than only by unit test: the overview
-renders the server's own answers (the core's `EMBEDDED · 1.13.14` version, a
-`发现新版本 v1.0.13` banner from the update check, this machine's actual
-system-proxy setting), and a write made from inside the page — `POST /api/profile`,
-read back, `profile.json` on disk — round-trips with the session cookie attached.
-No console errors.
+`scripts/e2e-web.sh` proves it in a real browser rather than only by unit test:
+it packages the site, starts a server on a scratch `KITTY_PROFILE_DIR`, drives
+Chrome over the DevTools protocol (Node's own `WebSocket`, so nothing to
+install), and fails unless the overview shows the server's own answers — the
+core's `EMBEDDED · 1.13.14`, this machine's actual system-proxy setting — unless
+a write made inside the page round-trips through `POST /api/profile` with the
+session cookie attached, and unless the resulting `profile.json` on disk holds
+what the page saved. No console errors.
+
+## Run on a phone
+
+```sh
+scripts/build-android.sh   # → dist/android/Kitty-Pro-arm64-v8a-armeabi-v7a-<version>.apk
+```
+
+The ABIs are in the file name because that is all the in-app update check has to
+go on: it reads the CPU groups out of the asset name and declines one whose
+groups do not include the device's.
+
+The phone runs the whole proxy on the device, in one process, the same as the
+desktop: no server, no `/api/*`, no `backend.rs` HTTP. It reaches the core
+through Android's `VpnService` rather than through a TUN device or the system
+proxy, so the overview's 系统代理 switch is parked with the reason
+(`Android 由 VPN 接管，无需系统代理`) instead of offering a setting the platform
+has no way to honour.
+
+The script wraps `nsh package --target android` rather than replacing it: NSH
+builds this crate into `libnsh.so` and assembles a signed APK with `aapt2` and
+`apksigner`, no Gradle. What it adds is the `VpnService` NSH's manifest template
+cannot declare, and the Go core — `libkitty_singbox.so`, which `libnsh.so` needs
+and which `nsh package` does not copy, so its own APK fails at startup. See
+`packages/nsh-app/README.md` for what was verified on an emulator and what was
+not.
+
+Needs the Android SDK, an NDK, a JDK 17+, Rust's android targets, and a Kotlin
+compiler; the script names the `sdkmanager` packages when one is missing.
 
 On desktop systems, enabling TUN performs configuration validation and asks
 for network privileges immediately. Starting the core then reuses that
@@ -186,10 +216,15 @@ Each archive gets a `.sha256` sidecar. Run the workflow manually from the
 repository's **Actions** page, or push a tag such as `v1.0.14`; a `v*` tag also
 creates a GitHub Release and attaches the archives.
 
-Only the desktop app is published. `packages/server` builds, is tested and drives a
-browser, but the workflow does not package it into a release archive yet. Android
-and iOS have no build at all, for the unrelated reasons recorded in
-`packages/nsh-app/README.md`.
+Only the three desktop apps are published. Two other targets build and are tested
+but are not attached to a release: `packages/server`, and the APK
+`scripts/build-android.sh` produces — which needs a release keystore before it
+could be published anyway, since the script signs with the debug key. iOS has no
+build at all, for the reason recorded in `packages/nsh-app/README.md`.
+
+An unpublished APK is not a broken update check: a phone that asks simply gets
+"nothing to install", because `proxy_core::update` declines an asset list that
+holds no `.apk` rather than offering the desktop's.
 
 The macOS app is ad hoc signed and the Windows and Linux builds are unsigned.
 Apple notarization and Windows Authenticode signing require developer
@@ -239,6 +274,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p singbox --features embedded-core
+cargo check -p api -p proxy-core -p nsh-app-kitty --target wasm32-unknown-unknown
 ```
 
 The embedded-core test starts a VLESS configuration through the static bridge
@@ -252,8 +288,22 @@ cargo test -p nsh-app-kitty
 ```
 
 `nsh test` does the same from the app's directory and adds NSH's own build
-diagnostics. There is no browser suite: the UI is compiled native views, so
-there is no page for one to drive.
+diagnostics.
+
+The last check is the one no host build covers: `nsh-app-kitty` splits into two
+arms per backend call, and only the wasm target compiles the browser's. Deleting
+the Dioxus server-function macro once broke exactly that while every other gate
+stayed green.
+
+```sh
+scripts/e2e-web.sh      # a real Chrome drives a real server, on a scratch profile
+```
+
+The screens themselves are compiled native views, so there is no page for a suite
+to drive — what this covers is the transport between the wasm build and
+`packages/server`. Android's equivalent is `scripts/build-android.sh`, which
+produces an installable APK; what was checked on an emulator, and what was not,
+is in `packages/nsh-app/README.md`.
 
 ## Platform boundary
 

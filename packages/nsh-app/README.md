@@ -280,6 +280,94 @@ What this does *not* cover: the 测试连通 route is exercised against a server
 running, and the suite still never starts a core, so `measure_node_latency` has no test on either
 arm. A page-driven connect has never been clicked.
 
+### The same screens on a phone
+
+`scripts/build-android.sh` builds the APK. It is a shell script rather than a Gradle project
+because NSH already assembles APKs — `nsh package --target android` compiles this crate into
+`libnsh.so` and signs a package with `aapt2`, `zipalign` and `apksigner`, no Gradle in sight —
+and all that was missing was the two things that script cannot know about:
+
+- **Our `VpnService`.** NSH's manifest template has one activity and no service, and its runtime
+  is a prebuilt AAR whose manifest is pinned to `com.longbridge.nsh`, so there is no supported way
+  to add a service, a permission, or `BIND_VPN_SERVICE`. The script takes `libnsh.so` out of the
+  package NSH made and builds the real APK from `packages/mobile/android/AndroidManifest.xml`.
+- **`libkitty_singbox.so`.** `packages/singbox/build.rs` builds the Go core `-buildmode
+  c-shared` for Android, so `libnsh.so` names it in its `NEEDED` entries — and NSH copies only the
+  one library it built. An APK from `nsh package` alone does not start, which was checked by
+  installing one: `java.lang.UnsatisfiedLinkError: dlopen failed: library "libkitty_singbox.so"
+  not found: needed by …/libnsh.so`, thrown out of `Native.<clinit>` the first time a view is
+  built. That is why the script builds `-p singbox` per ABI and stores both libraries.
+
+The app is the *same* Rust. `api`, `proxy-core` and `singbox` already carried 74
+`target_os = "android"` branches from the Dioxus mobile shell, and they compile unchanged;
+`backend.rs` is not involved, because a phone is a native process and calls `api` directly exactly
+as the desktop does. No screen changed. `store.rs` does not know it is on a phone.
+
+Three things about the Java half are worth knowing before touching it:
+
+- **The core's callbacks go through the application, not the activity.**
+  `packages/singbox/src/android.rs` reaches Java through `ndk_context`, which `ndk-glue` normally
+  fills in before `main` — and nothing runs `ndk-glue` here, because this is a `cdylib` an ordinary
+  activity loads. `KittyApplication.attachBaseContext` calls `KittyVpnBridge.attach`, which hands
+  the application context to Rust once. It has to be the application: `ndk-context` holds one
+  object for the life of the process and cannot be re-pointed, while the activity changes on every
+  rotation.
+- **The VPN consent dialog has an activity of its own.** It is a result an activity must receive,
+  and the activity on screen is `com.longbridge.nsh.AppActivity`, which is `final` and does not
+  forward `onActivityResult`. A prebuilt runtime cannot be subclassed, so
+  `KittyVpnPermissionActivity` is an invisible window that launches the system intent, owns the
+  result, and starts the service. The config travels in its intent rather than in a static, so a
+  process Android killed while the dialog was up resumes with it.
+- **Fonts need nothing.** The three woff2 faces `app_root()` embeds are unwrapped by
+  `nsh_core::text::font_data` before any platform sees them (`core/mod.rs:1683`), so Android's
+  `ttf_parser`, which cannot read woff2, is handed a TrueType collection it can.
+
+`extractNativeLibs` is true and the libraries are stored uncompressed and page-aligned. That is
+what lets the loader resolve `libkitty_singbox.so` out of the archive; NSH's own template turns it
+off, and can, because it ships a single library loaded by name.
+
+**Verified on an Android 15 emulator** (API 35, `google_apis/arm64-v8a`, installed with
+`adb install -g` and driven with `adb shell input`): the app launches, `libnsh.so` loads
+(`nativeloader: Load …/libnsh.so … : ok`, which also proves `libkitty_singbox.so` resolved), and the
+screens render — 总览, 节点 and 订阅 all read from a real profile. Importing a `ss://` link
+parse-checks through `proxy-core` (it rejected a mistyped port with 订阅解析失败：链接格式无效:
+invalid port number, then accepted a correct one), the node appears on 节点 with its address and
+protocol, and 启动代理 reaches the system VPN dialog: `com.android.vpndialogs/.ConfirmDialog` came up
+over `KittyVpnPermissionActivity`, and approving it created `tun0` at `172.19.0.1/30`, after which
+the overview read 已连接 / 11 个活动连接 正在转发 with traffic in the graph. `KittyDnsBridge` logged
+its adapter listening on a loopback port.
+
+Building it that way found three defects, each fixed here rather than worked around:
+
+- **The app would not have started at all.** `KittyApplication` attached the core's Java context
+  from `attachBaseContext`, where `getApplicationContext()` is still null — `LoadedApk` sets
+  `mApplication` *after* `Application.attach` returns — so the process died in
+  `Unable to instantiate application … getApplicationContext(...) must not be null`. It attaches in
+  `onCreate` now, which is still before NSH's activity builds its view.
+- **A blank window, silently, from this repository's own manifest.** `AppActivity.rustApp()` reads
+  `com.longbridge.nsh.RUST` through `getApplicationInfo().metaData`, which carries application-level
+  meta-data only. The hand-written `AndroidManifest.xml` declared it on the `<activity>`, the read
+  found nothing, and the app fell back to loading a JS bundle: `cannot read the app bundle:
+  java.io.FileNotFoundException: nsh/bundle.nshc`, on an empty screen. NSH's generated manifest gets
+  this right — checked against the one `nsh package` built for this app — and the hand-written one
+  now matches it. The failure mode is what makes it worth writing down: nothing throws, no test
+  covers a manifest, and the only symptom is a window with nothing in it.
+- **The header sat under the status bar**, and the first card began a status bar's height too low,
+  because the top safe-area inset was being spent in the body rather than the header. And the
+  添加订阅 sheet kept 取消 and 导入 under the keyboard, so importing one needed the keyboard
+  dismissed first. `the_status_bar_inset_is_spent_once` pins the first; the 添加订阅 sheet pads
+  itself by `pb_keyboard()` for the second. The process picker's sheet is *not* padded, because
+  nothing can raise a keyboard over it: its entry point is behind `process_rules_supported`, false
+  on Android and iOS, while a desktop sets `keyboard_height` to 0 (`system.rs:279`) and the web
+  runtime initialises it to 0 and never updates it.
+
+**Not verified:** a physical phone, and `armeabi-v7a` at runtime — the 32-bit ABI compiles and its
+library satisfies every symbol `libnsh.so` asks for, but the emulator image is arm64. Not verified
+either: DNS resolution *through* the tunnel (the adapter started and the core reported forwarding;
+no query was captured on the other side), latency measurement, cloud sync, and the traffic the core
+forwards was the emulator's own, not a proxied request to a reachable node — the test node is
+`198.51.100.10`, a documentation address.
+
 ## The visual language
 
 It is carried over rather than redesigned. `theme.json` defines 45 roles
@@ -311,7 +399,7 @@ Checked by reading both, not by assumption. What is left:
 | --- | --- |
 | Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither yet. Not for the reason first written here — NSH 0.4.0 has no tray API (no `NSStatusItem` wrapper in `nsh-core` or `nsh-base`), but it is reachable: `nsh_platform_macos` re-exports `objc2_app_kit`, `objc2-app-kit`'s `NSStatusBar`/`NSStatusItem` features are in the tree, and `AppOptions::keep_alive_on_close` is close-to-tray already implemented by the host — it hides the window and keeps the engine, which the Dock restores. What has to be written is the status item itself and the route from its menu into the store: menu callbacks arrive on AppKit's main thread and the store's signals belong to the `nsh-engine` thread, and NSH's reactive graph is not `Send`, so that hop needs a channel and an owner, not a direct call. With no tray there is also nowhere for `AppStore::copy_proxy_environment` to live, and no menu-bar quit for `api::shutdown_native_runtime`. |
 | 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
-| Mobile shells (Android, iOS) | No build today, for two unrelated reasons. **Android:** `nsh package --target android` cannot host our `VpnService` — NSH ships a prebuilt `~/.nsh/embed/android/nsh.aar` whose manifest is pinned to `com.longbridge.nsh` with only the `INTERNET` permission and whose classes are just `AppActivity`/`DevActivity`, so there is no documented way to add a service, a second package, or `BIND_VPN_SERVICE`. A phone that *runs* the proxy needs a Gradle shell of our own; a phone that *remote-controls* a machine that runs it needs only the transport described under "The same screens in a browser". The Kotlin bridge is restored under `packages/mobile/android/` as a reference, and it is incomplete: `AndroidManifest.xml` references `@xml/network_security_config`, a file the deleted package never carried (`dx` supplied it from its own template), and the service reads `dev.dioxus.main.R` and `System.loadLibrary("main")`, which are wry's resource package and library name, not NSH's `com.longbridge.nsh`/`libnsh.so`. **iOS:** the core cannot be built at all — `packages/singbox/build.rs:31` panics for any target OS outside `{android, macos, linux, windows}` — and NetworkExtension was never implemented. |
+| iOS | No build, and nothing to compare the reason against. `packages/singbox/build.rs:30` panics for any target OS outside `{android, macos, linux, windows}`, so the core cannot be compiled, and NetworkExtension — the only way an app that is not a `VpnService` may carry traffic on iOS, since Apple gives third-party apps no TUN — was never implemented. Android got a build without a Gradle shell; iOS needs a Swift one, which is a larger question than a build script. |
 | Process entry points in a **packaged** build | **KNOWN BUG: TUN is broken in every shipped build.** `nsh package` uses a runner of its own and never reaches `src/main.rs`, so the packaged app skips the helper dispatch, the boot cleanup and the exit cleanup. [Details, the hook that fixes two of the three, and what cannot be fixed that way](#known-bug-packaged-build-entry-points). |
 
 ### Known bug: packaged-build entry points
