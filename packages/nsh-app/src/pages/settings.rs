@@ -75,8 +75,14 @@ type Section = domain::SettingsSection;
 
 /// Whether a card survives the query. The signal is read here so one binding decides it for
 /// the card, and the card is either built whole or not at all.
+///
+/// `visible` rather than `matches` so a card with no row on this platform is not drawn for
+/// anybody: an empty query passes the search half, and the card's own heading would then sit
+/// over nothing. `no_match` needs no matching change — it asks
+/// `visible_settings_sections`, which reads the same predicate, so the page and the search
+/// cannot disagree about what is on it.
 fn shows(query: Signal<String>, section: Section) -> bool {
-    section.matches(&domain::search_keyword(&query.get()))
+    section.visible(&domain::search_keyword(&query.get()))
 }
 
 /// Whether the query found nothing at all. Said once rather than per card, because seven
@@ -256,12 +262,24 @@ fn scope_card(store: AppStore) -> impl IntoElement {
             .flex_col()
             .gap_4()
             .child(heading("接管方式"))
-            .child(controls::switch_row_state(
-                "TUN 模式",
-                move || tun_note(store.tun_enabled()),
-                move || store.tun_enabled(),
-                move || store.core_action_busy(),
-                move |next| store.set_tun_enabled(next),
+            // A phone is always TUN and never by choice: `VpnService` hands the core its
+            // interface the moment the tunnel is approved, and `toggle_native_core` sets the
+            // request's own flag regardless of this setting. A switch that reads off while the
+            // tunnel is carrying everything would be a lie, and one that wrote the preference
+            // would be worse — see `domain::asks_for_tun_helper` for what that preference used
+            // to do to 启动代理. 允许局域网连接 stays, because on a phone it is the listener's
+            // bind address, which is a real choice.
+            .child(when(
+                || !domain::is_phone(),
+                move || {
+                    controls::switch_row_state(
+                        "TUN 模式",
+                        move || tun_note(store.tun_enabled()),
+                        move || store.tun_enabled(),
+                        move || store.core_action_busy(),
+                        move |next| store.set_tun_enabled(next),
+                    )
+                },
             ))
             .child(controls::switch_row_state(
                 "允许局域网连接",

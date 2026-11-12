@@ -670,7 +670,16 @@ impl AppStore {
             // user cannot act on, so the prompt happens here and the switch stays a
             // preference rather than a one-shot setup. Only when TUN is on: the backend
             // rejects a pre-flight for a plain proxy config.
-            let tun_requested = request.as_ref().is_some_and(|request| request.tun);
+            //
+            // `asks_for_tun_helper` also refuses it on a phone, which is the difference
+            // between a prompt and a dead end: the helper is a desktop thing, the backend says
+            // so in as many words, and a phone raises its interface through `VpnService`
+            // instead. Without that, a profile that once switched TUN on — on this phone or on
+            // a desktop that synced it across — made 启动代理 fail with an error naming a
+            // switch the screen no longer shows.
+            let tun_requested = request.as_ref().is_some_and(|request| {
+                crate::domain::asks_for_tun_helper(request.tun, crate::domain::is_phone())
+            });
             if let Some(tun_request) = request.clone().filter(|_| enable && tun_requested) {
                 if let Err(error) = backend::prepare_tun_mode(tun_request).await {
                     self.core_busy.set(CoreBusy::Idle);
@@ -1786,6 +1795,13 @@ impl AppStore {
             return;
         }
         if !enable {
+            // The desktop's helper teardown. On a phone there is no helper to stand down —
+            // `release_tun_mode` answers `Ok` there today, so this is not a fix for a live
+            // failure but for the shape of the rule: the same predicate guards both halves of
+            // a desktop-only exchange, and a phone asks for neither.
+            if crate::domain::is_phone() {
+                return;
+            }
             self.core_busy.set(CoreBusy::Tun);
             self.work(async move {
                 match backend::release_tun_mode().await {

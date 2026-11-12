@@ -1209,6 +1209,28 @@ pub const fn is_phone() -> bool {
     cfg!(any(target_os = "android", target_os = "ios"))
 }
 
+/// Whether a stored "use TUN" preference should make this build run the desktop's privileged
+/// pre-flight before starting the core.
+///
+/// On a phone TUN is not a preference the user holds. `VpnService` hands the app its one
+/// interface the moment the tunnel is approved, and `toggle_native_core` sets `request.tun`
+/// itself because a loopback listener alone would route nothing on Android. Asking is
+/// therefore not merely pointless there, it is fatal: the pre-flight exists to raise a
+/// privileged helper that no phone has, so `prepare_native_tun_mode` answers that platform with
+/// an error, and a press of 启动代理 then fails with 准备 TUN 权限失败，内核未启动 — a message
+/// naming a switch whose state the phone's interface would have ignored regardless. The core
+/// never starts, from a preference the screen no longer even shows.
+///
+/// A profile carried in from a desktop reaches the same code, which is why this is decided
+/// where the decision is made rather than by hiding the row: a synced `tun_enabled: true`
+/// would otherwise strand the phone the same way with nothing on screen to blame.
+///
+/// `is_phone` arrives as an argument for the reason [`update_channel_label`] gives: `cfg!` is
+/// fixed by the binary that runs the test, so a phone's answer could never be asserted here.
+pub const fn asks_for_tun_helper(requested: bool, is_phone: bool) -> bool {
+    requested && !is_phone
+}
+
 /// Whether 总览 should draw the system-proxy switch.
 ///
 /// A phone has no per-app proxy setting for the app to point at the core: its routes belong
@@ -1402,16 +1424,64 @@ impl SettingsSection {
         SettingsSection::About,
     ];
 
+    /// Whether this card has any row on a platform that can or cannot offer a login item.
+    ///
+    /// A card is a heading over rows, and a heading over nothing is what a phone was being
+    /// shown: 启动与终端 drew its title above a login-item switch that `is_supported` had
+    /// correctly refused to draw, because a phone has no login item to write. Withholding the
+    /// card follows the rule that row already states — a control that cannot be acted on is
+    /// worse than no control — and a title that cannot be honoured is worse than no title.
+    ///
+    /// The login item arrives as an argument rather than being read from
+    /// `crate::autostart::SUPPORTED` here, for the reason [`update_channel_label`] gives for
+    /// the same shape: `cfg!` is fixed by the binary that runs the test, so another platform's
+    /// page could never be asserted. [`SettingsSection::visible`] is the entry point that
+    /// supplies it.
+    pub const fn available(self, login_item_supported: bool) -> bool {
+        match self {
+            // `autostart::SUPPORTED` rather than `!is_phone()`: this card holds the login item
+            // and nothing else, and that flag is what the row itself already obeys. The two are
+            // not the same set — the web build is no phone and has no login item either — and
+            // gating on the platform would have rebuilt this bug one target over, as an empty
+            // card on the page a browser shows.
+            SettingsSection::Session => login_item_supported,
+            SettingsSection::Appearance
+            | SettingsSection::Mode
+            | SettingsSection::Scope
+            | SettingsSection::Sync
+            | SettingsSection::Updates
+            | SettingsSection::Script
+            | SettingsSection::About => true,
+        }
+    }
+
     /// The words this card answers to, in the page's own vocabulary plus the English a user
     /// may type when the Chinese term is on the tip of their tongue.
     ///
-    /// A substring table rather than a search index: the page has seven cards, and the
+    /// A substring table rather than a search index: the page has eight cards, and the
     /// cheapest honest rule is whether the typed word appears among the card's names.
-    fn keywords(self) -> &'static str {
+    const fn keywords(self, is_phone: bool) -> &'static str {
         match self {
             SettingsSection::Appearance => "外观 深色 浅色 主题 语言 配色 appearance 简体中文",
             SettingsSection::Mode => "流量走向 分流 模式 规则模式 全局模式 直连模式 routing",
-            SettingsSection::Scope => "接管方式 tun 局域网 允许局域网 系统代理 网络 权限 scope",
+            // A phone keeps this card — 允许局域网连接 means something there, it is the
+            // listener's own bind address — but loses the words for the two things it has no
+            // control for anywhere: TUN, which it always runs and never chooses, and the system
+            // proxy, for which a phone has no setting (see `system_proxy_offered`). 权限 goes
+            // with TUN, whose administrator prompt is where that word came from. Surfacing a
+            // card for a control the card does not draw is the mistake this rule prevents.
+            //
+            // On a desktop those last two words have never named a row *in this card* either —
+            // 系统代理 is drawn on 总览 — so the desktop list was already looser than the page.
+            // Narrowing the phone's is one-sided on purpose: it removes only what no phone can
+            // act on, and changes no desktop behaviour.
+            SettingsSection::Scope => {
+                if is_phone {
+                    "接管方式 局域网 允许局域网 网络 scope"
+                } else {
+                    "接管方式 tun 局域网 允许局域网 系统代理 网络 权限 scope"
+                }
+            }
             // Only what the card still holds. 环境变量 and 命令行 came in with the clipboard
             // action, which the user asked off the page; leaving the words would surface a card
             // whose one row is a login switch, answering a question the page can no longer answer.
@@ -1433,13 +1503,24 @@ impl SettingsSection {
         }
     }
 
-    /// Whether a card shows for this query. An empty query shows everything, and matching is
-    /// on the lowercased string both sides, so `TUN` and `tun` behave the same.
+    /// Whether this card is on the page for this query, on this platform.
     ///
-    /// The direction matters: the *query* must appear inside the card's words, so typing a
-    /// whole sentence finds nothing rather than matching its first word.
-    pub fn matches(self, keyword: &str) -> bool {
-        keyword.is_empty() || self.keywords().contains(keyword)
+    /// Availability and matching are one question because they have one answer: a card the
+    /// platform cannot fill is not searchable either, and a search that offers a card the page
+    /// then refuses to draw is the same bug wearing the search box's clothes.
+    pub fn visible(self, keyword: &str) -> bool {
+        self.visible_on(keyword, is_phone(), crate::autostart::SUPPORTED)
+    }
+
+    /// [`SettingsSection::visible`] with both platform facts passed in, for the same reason
+    /// [`SettingsSection::available`] takes one.
+    pub fn visible_on(self, keyword: &str, is_phone: bool, login_item_supported: bool) -> bool {
+        // An empty query matches everything, and matching is lowercased on both sides, so
+        // `TUN` and `tun` behave the same. The direction matters: the *query* must appear
+        // inside the card's words, so typing a whole sentence finds nothing rather than
+        // matching its first word.
+        self.available(login_item_supported)
+            && (keyword.is_empty() || self.keywords(is_phone).contains(keyword))
     }
 }
 
@@ -1461,7 +1542,7 @@ pub fn visible_settings_sections(query: &str) -> Vec<SettingsSection> {
     let keyword = search_keyword(query);
     SettingsSection::ALL
         .into_iter()
-        .filter(|section| section.matches(&keyword))
+        .filter(|section| section.visible(&keyword))
         .collect()
 }
 
@@ -2636,12 +2717,12 @@ mod diagnostics_tests {
 
     #[test]
     fn a_card_answers_to_its_own_words_and_to_english() {
-        assert!(SettingsSection::Scope.matches("tun"));
-        assert!(SettingsSection::Scope.matches("TUN".to_lowercase().as_str()));
-        assert!(SettingsSection::About.matches("诊断"));
-        assert!(SettingsSection::About.matches("dns"));
-        assert!(!SettingsSection::About.matches("tun"));
-        assert!(!SettingsSection::Appearance.matches("诊断"));
+        assert!(SettingsSection::Scope.visible("tun"));
+        assert!(SettingsSection::Scope.visible("TUN".to_lowercase().as_str()));
+        assert!(SettingsSection::About.visible("诊断"));
+        assert!(SettingsSection::About.visible("dns"));
+        assert!(!SettingsSection::About.visible("tun"));
+        assert!(!SettingsSection::Appearance.visible("诊断"));
     }
 
     /// An empty query is not a filter: it has to leave the page as it was.
@@ -2651,13 +2732,23 @@ mod diagnostics_tests {
     /// or cannot be shown.
     #[test]
     fn an_empty_query_keeps_the_whole_page() {
+        // Compared against the cards this platform can actually show, not against `ALL`:
+        // a phone draws no 启动与终端, so the literal would make this test disagree with the
+        // page it exists to guard. The invariant is unchanged — the search's list is the
+        // page's list — it is just no longer pinned to a number that moves with the platform.
+        let available = SettingsSection::ALL
+            .iter()
+            .filter(|section| section.available(crate::autostart::SUPPORTED))
+            .count();
         assert_eq!(
             visible_settings_sections("").len(),
-            SettingsSection::ALL.len()
+            available,
+            "an empty query does not show every card this platform has"
         );
         assert_eq!(
             visible_settings_sections("   ").len(),
-            SettingsSection::ALL.len()
+            available,
+            "a query of spaces is not a filter"
         );
     }
 
@@ -2670,11 +2761,11 @@ mod diagnostics_tests {
         assert!(
             SettingsSection::ALL
                 .iter()
-                .all(|section| !section.matches("管理")),
+                .all(|section| !section.visible("管理")),
             "something still answers to 管理: {:?}",
             SettingsSection::ALL
                 .iter()
-                .filter(|section| section.matches("管理"))
+                .filter(|section| section.visible("管理"))
                 .collect::<Vec<_>>()
         );
     }
@@ -2693,7 +2784,7 @@ mod diagnostics_tests {
     #[test]
     fn a_query_is_compared_trimmed_and_lowercased() {
         assert_eq!(search_keyword("  TUN "), "tun");
-        assert!(SettingsSection::Scope.matches(&search_keyword("  TUN ")));
+        assert!(SettingsSection::Scope.visible(&search_keyword("  TUN ")));
     }
 
     /// Everything the search cannot find empties the page, which is the state the page has to
@@ -2701,6 +2792,81 @@ mod diagnostics_tests {
     #[test]
     fn a_word_no_card_claims_shows_nothing() {
         assert!(visible_settings_sections("打印机").is_empty());
+    }
+
+    /// 启动与终端 holds the login item and nothing else, so on a platform with no login item
+    /// the card is a heading over an empty box. That is what a phone was being shown: the row
+    /// was correctly withheld by `is_supported` and the heading was drawn regardless.
+    ///
+    /// The web channel is the case that makes this more than a phone bug. A browser build is
+    /// `!is_phone()` and has no login item either, so gating the card on the platform would
+    /// have left the empty card on screen there. It is gated on `autostart::SUPPORTED`, which
+    /// is the flag the row obeys, so card and row cannot disagree on any target.
+    #[test]
+    fn a_card_with_no_row_is_not_drawn() {
+        // Desktop: login item exists, card exists.
+        assert!(SettingsSection::Session.available(true));
+        // Phone and web: no login item, so no card — and no search hit for its words either.
+        assert!(!SettingsSection::Session.available(false));
+        assert!(!SettingsSection::Session.visible_on("启动与终端", true, false));
+        assert!(!SettingsSection::Session.visible_on("", true, false));
+        assert!(!SettingsSection::Session.visible_on("登录项", false, false));
+        // Every other card survives everywhere: they hold rows no platform withholds.
+        for section in SettingsSection::ALL {
+            if section == SettingsSection::Session {
+                continue;
+            }
+            assert!(
+                section.available(false),
+                "{section:?} vanished with no login item"
+            );
+            assert!(section.available(true), "{section:?} missing on a desktop");
+        }
+    }
+
+    /// A phone's 接管方式 holds 允许局域网连接 and nothing else, so it must stop answering to
+    /// the two words whose rows a phone does not draw. Search finding a card for a control the
+    /// card does not contain is the same defect as the empty card above, one level down.
+    #[test]
+    fn a_phone_searches_the_controls_it_actually_draws() {
+        let scope = SettingsSection::Scope;
+        // A desktop answers to all of it, as it always has.
+        for word in ["tun", "系统代理", "权限", "局域网"] {
+            assert!(scope.visible_on(word, false, true), "a desktop lost {word}");
+        }
+        // A phone keeps the row it still draws, and drops the words for the rows it does not.
+        assert!(scope.visible_on("局域网", true, false));
+        assert!(scope.visible_on("接管方式", true, false));
+        for word in ["tun", "系统代理", "权限"] {
+            assert!(
+                !scope.visible_on(word, true, false),
+                "a phone offered {word}, which it has no control for"
+            );
+        }
+        // And it keeps the card: 允许局域网连接 is the listener's bind address, which a phone
+        // genuinely chooses.
+        assert!(scope.available(false));
+    }
+
+    /// A phone never runs the desktop's TUN pre-flight, whatever its profile says.
+    ///
+    /// This is the one that actually stopped a phone connecting. The pre-flight raises a
+    /// privileged helper that exists only on desktops, and the backend says so on Android; a
+    /// profile holding `tun_enabled: true` — set here before the row was withheld, or synced in
+    /// from a desktop — made 启动代理 fail with 准备 TUN 权限失败，内核未启动 and start nothing.
+    /// Hiding the switch alone would not have fixed that, because the flag is persisted.
+    #[test]
+    fn a_phone_never_asks_for_the_tun_helper() {
+        assert!(
+            asks_for_tun_helper(true, false),
+            "a desktop lost its TUN prompt"
+        );
+        assert!(!asks_for_tun_helper(false, false));
+        assert!(
+            !asks_for_tun_helper(true, true),
+            "a phone was sent to the desktop helper"
+        );
+        assert!(!asks_for_tun_helper(false, true));
     }
 
     fn process(name: &str, path: Option<&str>) -> api::RunningProcess {
@@ -3115,7 +3281,7 @@ mod sync_tests {
             visible_settings_sections("webdav"),
             vec![SettingsSection::Sync]
         );
-        assert!(SettingsSection::Sync.matches("冲突"));
+        assert!(SettingsSection::Sync.visible("冲突"));
     }
 }
 
@@ -3336,8 +3502,8 @@ mod update_tests {
             visible_settings_sections("github"),
             vec![SettingsSection::Updates]
         );
-        assert!(SettingsSection::Updates.matches("忽略"));
-        assert!(!SettingsSection::Updates.matches("webdav"));
+        assert!(SettingsSection::Updates.visible("忽略"));
+        assert!(!SettingsSection::Updates.visible("webdav"));
         assert!(visible_settings_sections("关于").contains(&SettingsSection::About));
     }
 }

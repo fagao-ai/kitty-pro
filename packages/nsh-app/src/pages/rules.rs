@@ -205,7 +205,16 @@ fn routing(store: AppStore, draft: RuleDraft) -> impl IntoElement {
             },
         ))
         .child(when(
-            move || store.custom_rules().iter().any(process_rule) && !store.tun_enabled(),
+            // The note's whole premise is the desktop's choice between TUN and the system
+            // proxy. A phone has no such choice — its tunnel is TUN and always is — so the
+            // sentence would tell a reader to turn on a switch that no longer exists, about a
+            // mode that cannot be reached. The row above already says the true thing on a
+            // phone: that process rules are held but not evaluated here.
+            move || {
+                !domain::is_phone()
+                    && store.custom_rules().iter().any(process_rule)
+                    && !store.tun_enabled()
+            },
             move || {
                 controls::inline_note(
                     theme::Tint::Info,

@@ -52,7 +52,7 @@ archive.
 | `src/shell.rs` | The rail, the header, the phone tab bar, and screen routing |
 | `src/ui/` | The styled layer: `theme.rs` token accessors, `controls.rs`, `icons.rs` |
 | `src/pages/` | One module per screen |
-| `src/domain.rs` | Copy and units, free of the engine so `cargo test` can reach them |
+| `src/domain.rs` | Copy and units, and the platform's rules — each one a free function taking the platform as an argument, so a desktop test asserts a phone's answer |
 | `src/autostart.rs` | The one platform gate a login item needs, in the shape `packages/api` uses |
 
 `nsh_base` supplies behavior and no appearance, so nothing styles a base control at a call
@@ -69,7 +69,7 @@ All six destinations are ported: Overview, Nodes, Subscriptions, Rules, Logs and
 | 订阅 | Import from a URL or pasted links, refresh one or all, switch the active one, delete |
 | 规则 | Custom routing rules and per-domain DNS, on two tabs, with the process picker, plus the QuickJS override on Settings |
 | 日志 | The routed connections and the core's own lines, filtered by tally and search |
-| 设置 | Appearance and language, where traffic goes, how the machine hands it over, login item, proxy env vars, cloud sync, app updates, the config script, the diagnostic report |
+| 设置 | Appearance and language, where traffic goes, how the machine hands it over, login item, cloud sync, app updates, the config script, the diagnostic report — the last of those cards' rows belong to a desktop, so the cards are withheld elsewhere (see [The same screens on a phone](#the-same-screens-on-a-phone)) |
 
 The overview carries the switch that points the operating system at the core. Connecting
 opens a listener on 7890; that switch is what makes anything use it, so it stays on 总览 beside
@@ -325,7 +325,38 @@ and all that was missing was the two things that script cannot know about:
 The app is the *same* Rust. `api`, `proxy-core` and `singbox` already carried 74
 `target_os = "android"` branches from the Dioxus mobile shell, and they compile unchanged;
 `backend.rs` is not involved, because a phone is a native process and calls `api` directly exactly
-as the desktop does. No screen changed. `store.rs` does not know it is on a phone.
+as the desktop does.
+
+That last sentence used to be followed by "no screen changed, and `store.rs` does not know it is on
+a phone". It was true of the port and it stopped being true with the three phone-only rules below,
+so it is recorded here as the exception rather than as the rule. What `store.rs` does *not* do is
+keep a second copy of any state for a phone: it asks one predicate, and every one of those
+predicates is a free function in `domain.rs` that takes the platform as an argument, so a desktop
+test binary asserts a phone's answer. That is the shape `update_channel_label` already used, and
+the reason has not changed — `cfg!` is fixed by the binary that runs the test.
+
+**A phone owns its TUN, and the interface has to stop pretending otherwise.** `VpnService` hands
+the core its interface the moment the tunnel is approved, and `api::toggle_native_core` sets
+`request.tun` itself, because a loopback listener alone would route nothing on a phone. So the TUN
+row is not drawn there, and — the part that was a bug rather than a wart — neither is its
+pre-flight: `store::toggle_core` asked the desktop's privileged helper on a phone whenever the
+profile held `tun_enabled: true`, and `prepare_native_tun_mode` answers that platform with an
+error, so 启动代理 failed with 准备 TUN 权限失败，内核未启动 and started nothing. The preference is
+persisted and synced, which is why `domain::asks_for_tun_helper` decides it where the decision is
+made: hiding the row alone would have left every phone that syncs from a desktop broken by a switch
+it could not see. The rules page's 进程分流需开启 TUN note follows the same reasoning — on a phone
+it would order the reader to enable a mode that is always on, through a switch that no longer
+exists.
+
+**A card is withheld when the platform can fill none of it.** 启动与终端 drew its heading above a
+login-item switch that `Autostart::is_supported` had already (correctly) refused to draw, because a
+phone has no login item to write — an empty box with a title. `SettingsSection::available` gates
+the card on `autostart::SUPPORTED`, the same flag the row obeys, so the two cannot disagree; it is
+not `!is_phone()`, because a web build is no phone and has no login item either, and gating on the
+platform would have left the empty card on that page instead. `SettingsSection::visible` is the one
+question the page and the search both ask, which is what keeps the search box from offering a
+control the page will not draw — the reason 接管方式 loses the words `tun`, `系统代理` and `权限`
+on a phone, where none of those three has a control any more.
 
 Three things about the Java half are worth knowing before touching it:
 

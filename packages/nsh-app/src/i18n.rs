@@ -952,6 +952,9 @@ mod tests {
         [
             "外观 深色 浅色 主题 语言 配色 appearance 简体中文",
             "流量走向 分流 模式 规则模式 全局模式 直连模式 routing",
+            // The phone's narrower form of the same card: it draws no TUN row and no system
+            // proxy row, so it is not searchable by the words those two are named by.
+            "接管方式 局域网 允许局域网 网络 scope",
             "接管方式 tun 局域网 允许局域网 系统代理 网络 权限 scope",
             "启动与终端 自动启动 开机 启动 登录 登录项 终端 autostart",
             "同步 云同步 备份 备份位置 远端 上传 下载 覆盖 webdav s3 bucket 拉取 推送 快照 配置 sync 存储 冲突",
