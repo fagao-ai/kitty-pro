@@ -1,5 +1,6 @@
 package com.kitty.pro
 
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -10,8 +11,6 @@ import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Log
-import androidx.core.app.NotificationCompat
-import dev.dioxus.main.R
 import java.util.concurrent.atomic.AtomicBoolean
 
 class KittyVpnService : VpnService() {
@@ -25,7 +24,10 @@ class KittyVpnService : VpnService() {
         private var activeService: KittyVpnService? = null
 
         init {
-            System.loadLibrary("main")
+            // NSH's runtime is the library its Java side loads, and our core is
+            // linked into it: one library, `libnsh.so`, holds the app, the engine
+            // and the Go sing-box core.
+            System.loadLibrary("nsh")
         }
 
         @JvmStatic
@@ -162,7 +164,10 @@ class KittyVpnService : VpnService() {
     }
 
     private fun startVpnForeground() {
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        // The platform builder rather than androidx's: the APK is assembled with
+        // aapt2 and d8, which have no androidx dependency to resolve, and
+        // NSH's own minimum is API 28, two levels past the constructor this needs.
+        val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Kitty Pro")
             .setContentText("VPN connection is active")
             .setSmallIcon(R.drawable.kitty_notification)

@@ -1,9 +1,21 @@
 # Kitty Pro
 
-Kitty Pro is a Dioxus 0.7 proxy client with a shared Rust subscription and
-configuration layer. The native core is a statically linked sing-box Go
-archive exposed through the `singbox` Rust crate; the application does not
-discover, start, or require a `sing-box` executable at runtime.
+Kitty Pro is a native proxy client: an [NSH](https://nsh.dev) app in Rust,
+with a shared subscription and configuration layer. The native core is a
+statically linked sing-box Go archive exposed through the `singbox` Rust crate;
+the application does not discover, start, or require a `sing-box` executable at
+runtime.
+
+The desktop app is one process: interface, backend and core, with no server, no
+WebAssembly and no HTTP hop. The interface is `packages/nsh-app`.
+
+A browser can drive the same core instead. A page cannot load a Go archive or
+raise a TUN interface, so that build is two halves: `packages/server` is a native
+process that owns the proxy and answers `/api/*`, and it serves the NSH site next
+to the API. See [Run as a web control surface](#run-as-a-web-control-surface).
+
+The Dioxus shells that used to sit here (`packages/ui`, `web`, `desktop`,
+`mobile`) have been deleted.
 
 ## Supported subscription inputs
 
@@ -47,8 +59,8 @@ domain before dialing through the proxy tunnel, so no real IPv6 packets leave
 the host on the proxied path either. IPv6-only destinations remain reachable
 because the remote proxy server performs the IPv6 dial.
 
-`proxy-core` owns parsing and sing-box JSON generation, so every Dioxus shell
-uses the same Rust types and configuration logic.
+`proxy-core` owns parsing and sing-box JSON generation, so the interface and
+the engine work from the same Rust types and configuration logic.
 
 ## Go toolchain
 
@@ -69,102 +81,84 @@ one proxy to the Go build when those three are unset.
 
 ## Run locally
 
-From the repository root, run the Web control surface:
+From the repository root:
 
 ```sh
-dx serve --package web --web --fullstack true --port 7897 --open false --interactive false
+cargo run -p nsh-app-kitty --features desktop   # a real window
+nsh run                                        # hot reload, every target (needs the nsh CLI)
+cargo test -p nsh-app-kitty                    # the screens, headless under NSH's engine
 ```
 
-Open <http://127.0.0.1:7897>. The Web UI controls the native sing-box archive
-inside the local fullstack server. A browser cannot load a Go/C archive or
-create a system TUN interface directly, so its role is intentionally control
-plane only.
+`desktop` is a Cargo feature because the Linux host needs GTK 4.14 development
+packages, which CI runners do not carry; `cargo check --workspace` stays green
+without them.
 
-Keep both web flags: `dx serve --package web` without them fails right after
-asset finalization with "Failed to re-sign the binary with codesign ...
-server-dev/web: No such file or directory". Re-run with both flags before
-suspecting a signing identity or keychain problem. The dev server also binds
-loopback by default and its payload is far too large for another device; see
-"Viewing the Web UI from a phone" before serving it anywhere else.
+The app links and calls the same `singbox` Rust API in its own process.
 
-### Released Web server
+## Run as a web control surface
 
-Run these commands from the extracted release directory (keep `public/` next
-to the executable):
+A browser cannot load a Go archive or raise a TUN interface, so the web build is
+two halves: a native process that owns the proxy and answers `/api/*`, and the
+NSH site served next to it from the same listener. Serving both from one port is
+required, not a preference — the request guard rejects any call whose `Origin`
+does not equal its `Host`.
 
 ```sh
-./kitty-pro-web-server                         # foreground, 127.0.0.1:7897
-./kitty-pro-web-server --port 9000              # custom port
-PORT=9000 ./kitty-pro-web-server                # environment variable also supported
-./kitty-pro-web-server --daemon                # background, default port
-./kitty-pro-web-server --daemon --port 9000 --log-file ./web.log
-./kitty-pro-web-server --help
+# 1. the interface
+(cd packages/nsh-app && nsh package --target web -o /tmp/kitty-web)
+
+# 2. the process that runs the proxy, pointed at the site just built
+KITTY_WEB_DIR="/tmp/kitty-web/Kitty Pro" ./target/debug/kitty-pro-web-server
+# → Kitty Pro 控制面: http://127.0.0.1:7897
 ```
 
-Port priority is `--port` > `PORT` > `7897`. `IP` defaults to `127.0.0.1`; a
-non-loopback address is rejected unless `--allow-lan` (or `KITTY_PRO_ALLOW_LAN=1`)
-is also given, because this is a local control surface.
-`--daemon` detaches from the terminal on macOS/Linux and Windows, appends
-stdout/stderr to `kitty-pro-web.log` (or `--log-file`), and prints the PID
-only after the new server is ready. A failed startup returns a nonzero exit
-code. Stop the background process with `kill <PID>` on macOS/Linux or
-`taskkill /PID <PID>` on Windows. This is not an autostart service or a
-crash-restart supervisor; use the OS service manager for those requirements.
-Do not use `--daemon` with `dx serve`; the development server still runs in
-the foreground and owns its listener configuration.
+`--port`, `--daemon`, `--log-file` and `--allow-lan` behave as the deleted Dioxus
+web server had them: binding a non-loopback address needs `--allow-lan` (or
+`KITTY_PRO_ALLOW_LAN=1`), and hostnames beyond IP-literal access need
+`KITTY_PRO_ALLOWED_HOSTS` as an exact-match list. The session cookie is generated
+per process, so restarting the server signs out every page.
 
-### Viewing the Web UI from a phone
+The page reaches this process through `packages/nsh-app/src/backend.rs`: one table
+of endpoints with two arms, so a native build calls `api` directly and a browser
+build posts to `/api/*`. No screen knows which side it is on — the signatures,
+including the error type, are the same on both.
 
-Never point a phone or a remote machine at `dx serve`. The dev server ships a
-debug WebAssembly binary: ~84 MB in
-`target/dx/web/debug/web/public/wasm/web_bg.wasm`, against ~2 MB for the same
-file from a `--release` build. Dioxus fullstack still server-renders the first
-frame, so the page *looks* alive and then freezes - the overview stays on
-"checking sing-box" / "reading" with a permanent spinner and the bottom tabs stop
-responding, because no `onclick` handler exists until the wasm finishes
-downloading and hydrates. On a VPN or remote link that never completes. Two
-symptoms confirm it: the payload size, and a server log full of `[200] /` with no
-`/api/...` lines at all, which means the app never booted while the API is fine.
+`scripts/e2e-web.sh` proves it in a real browser rather than only by unit test:
+it packages the site, starts a server on a scratch `KITTY_PROFILE_DIR`, drives
+Chrome over the DevTools protocol (Node's own `WebSocket`, so nothing to
+install), and fails unless the overview shows the server's own answers — the
+core's `EMBEDDED · 1.13.14`, this machine's actual system-proxy setting — unless
+a write made inside the page round-trips through `POST /api/profile` with the
+session cookie attached, and unless the resulting `profile.json` on disk holds
+what the page saved. No console errors.
 
-Build for release and run the standalone server instead (keep `public/` next to
-the executable):
+## Run on a phone
 
 ```sh
-dx build --package web --web --fullstack true --release --debug-symbols false
-
-stage=target/dx/web/release/web
-mkdir -p /tmp/kitty-web && cp "$stage/server" /tmp/kitty-web/kitty-pro-web-server \
-  && cp -R "$stage/public" /tmp/kitty-web/public
-
-cd /tmp/kitty-web
-IP=0.0.0.0 KITTY_PRO_ALLOW_LAN=1 KITTY_PRO_ALLOWED_HOSTS=phone.example.net \
-  ./kitty-pro-web-server --port 8123 --daemon --log-file ./web.log
+scripts/build-android.sh   # → dist/android/Kitty-Pro-arm64-v8a-armeabi-v7a-<version>.apk
 ```
 
-The Go toolchain note above applies to this build too: pass `SINGBOX_GO` when
-Homebrew's `go@1.24` is not the default `go`.
+The ABIs are in the file name because that is all the in-app update check has to
+go on: it reads the CPU groups out of the asset name and declines one whose
+groups do not include the device's.
 
-Prefer a tunnel address (Tailscale, etc.) over a hostname for phone access. An
-overlay-network name may resolve correctly on the server while its public DNS
-record points somewhere else, so a phone whose overlay virtual DNS is not active
-connects to the wrong host. A literal IP needs no allow-list entry and cannot be
-misresolved.
+The phone runs the whole proxy on the device, in one process, the same as the
+desktop: no server, no `/api/*`, no `backend.rs` HTTP. It reaches the core
+through Android's `VpnService` rather than through a TUN device or the system
+proxy, so the overview's 系统代理 switch is parked with the reason
+(`Android 由 VPN 接管，无需系统代理`) instead of offering a setting the platform
+has no way to honour.
 
-`KITTY_PRO_ALLOWED_HOSTS` only takes effect on a listener that sees the browser's
-real `Host`. `kitty-pro-web-server` does, so unlisted hosts get `421` and
-cross-site writes get `403`. The `dx serve` proxy rewrites `Host` to its own
-internal upstream address before the guard runs, and an IP literal is always
-allowed, so the allow-list is inert behind the dev server and only the
-`SameSite=Strict` session cookie still blocks cross-site calls. That is another
-reason not to expose a dev server.
+The script wraps `nsh package --target android` rather than replacing it: NSH
+builds this crate into `libnsh.so` and assembles a signed APK with `aapt2` and
+`apksigner`, no Gradle. What it adds is the `VpnService` NSH's manifest template
+cannot declare, and the Go core — `libkitty_singbox.so`, which `libnsh.so` needs
+and which `nsh package` does not copy, so its own APK fails at startup. See
+`packages/nsh-app/README.md` for what was verified on an emulator and what was
+not.
 
-Run the macOS desktop shell:
-
-```sh
-dx serve --package desktop --desktop --open false --interactive false
-```
-
-The desktop shell links and calls the same `singbox` Rust API locally.
+Needs the Android SDK, an NDK, a JDK 17+, Rust's android targets, and a Kotlin
+compiler; the script names the `sdkmanager` packages when one is missing.
 
 On desktop systems, enabling TUN performs configuration validation and asks
 for network privileges immediately. Starting the core then reuses that
@@ -208,61 +202,40 @@ Remote snapshots contain subscription URLs and proxy credentials. Use a
 trusted server and HTTPS. Storage credentials stay in Kitty Pro's private
 local `sync.json` and are never included in the remote snapshot.
 
-## Build an Android APK
-
-On macOS, install Go 1.24, OpenJDK 17, the Android SDK command-line tools,
-and Android NDK. The build script uses the Homebrew defaults, but honors
-`JAVA_HOME`, `ANDROID_SDK_ROOT`, and `ANDROID_NDK_HOME` when they are set.
-
-```sh
-./scripts/build-android-apk.sh
-```
-
-The result is an arm64-v8a APK for Android 7.0 and later at
-`dist/android/Kitty-Pro-arm64-v8a.apk`. It contains both the Dioxus JNI
-library and the embedded sing-box Go library. The release build is aligned and
-signed with `~/.android/kitty-pro-release.jks` when that permanent key exists.
-On macOS, its password can be read from the `com.kitty.pro.android.release`
-Keychain item. Otherwise local builds reuse `~/.android/debug.keystore`. Set
-`ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and
-optionally `ANDROID_KEY_PASSWORD` to use a permanent release certificate.
-`ANDROID_VERSION_CODE` can override the automatically increasing version code.
-
-Android upgrades require the same application ID, the same signing key, and a
-non-decreasing version code. Keep the release keystore private and backed up:
-losing it makes it impossible to update existing installations. Uninstalling
-the app clears its subscriptions and settings.
-
 ## GitHub Actions packages
 
-The `Build release packages` workflow runs Dioxus `dx bundle` on each operating
-system's native GitHub runner and produces:
+The `Build release packages` workflow publishes three channels, all from the one
+NSH crate, each with a `.sha256` sidecar:
 
-- macOS: `.app` and `.dmg`
-- Windows: an `.msi` installer and a portable `.zip` containing
-  `Kitty-Pro.exe` and `WebView2Loader.dll`
-- Linux: `.AppImage` and `.deb`
-- Web: macOS and Linux x86_64 fullstack servers, each with its `public` assets
-- Android: an arm64-v8a `.apk`
+- **Desktop**, built on that operating system's own runner:
+  `Kitty-Pro-macos-aarch64.zip` (the ad hoc signed `Kitty Pro.app`),
+  `Kitty-Pro-windows-x86_64.zip`, `Kitty-Pro-linux-x86_64.tar.gz`
+- **Android**: `Kitty-Pro-arm64-v8a-armeabi-v7a-<version>.apk`, one archive
+  carrying both ARM ABIs, built by `scripts/build-android.sh` and signed with the
+  release keystore in the repository's `ANDROID_KEYSTORE_*` secrets
+- **Web server**: `Kitty-Pro-web-linux-x86_64.tar.gz` and
+  `Kitty-Pro-web-macos-aarch64.tar.gz`, each holding the browser page beside the
+  native process that runs the core for it — a browser cannot load a Go archive,
+  so the two halves ship together and are built on the machine that runs them
 
-Run it manually from the repository's **Actions** page, or push a tag such as
-`v0.1.0`. Manual runs retain downloadable workflow artifacts for 14 days. A
-`v*` tag also creates a GitHub Release and attaches the distributable files.
+Run the workflow manually from the repository's **Actions** page, or push a tag
+such as `v1.0.14`; a `v*` tag also creates the GitHub Release and attaches the
+archives. A manual run is not a release, so it has to be given a `test_version`
+rather than inheriting the newest published one: an unsigned throwaway that
+reports a real version tells its installer there is nothing to update, forever.
 
-Android release builds require a permanent signing key. The workflow fails
-when signing secrets are absent instead of generating a new certificate that
-would conflict with earlier installations. Add these GitHub Actions secrets:
+Every asset name is load-bearing. `proxy_core::update` chooses the one archive a
+device may install out of the file name alone — its channel, its operating system,
+and the CPU groups it lists — so a name that drops a token silently stops that
+platform being updatable. `the_published_asset_set_answers_every_platform` in
+`packages/proxy-core/src/update.rs` pins the whole set against that matcher; an
+edit to a name in the workflow is an edit to that test.
 
-- `ANDROID_KEYSTORE_BASE64`: Base64-encoded JKS or PKCS12 keystore
-- `ANDROID_KEYSTORE_PASSWORD`: Keystore password
-- `ANDROID_KEY_ALIAS`: Signing key alias
-- `ANDROID_KEY_PASSWORD`: Key password; may be omitted when it matches the
-  keystore password
+iOS has no build, for the reason recorded in `packages/nsh-app/README.md`.
 
-The macOS app uses ad-hoc signing and the Windows packages are unsigned.
+The macOS app is ad hoc signed and the Windows and Linux builds are unsigned.
 Apple notarization and Windows Authenticode signing require developer
-certificates and should be added before public distribution. iOS packaging is
-intentionally deferred until its NetworkExtension and signing setup are ready.
+certificates and should be added before public distribution.
 
 ## Checking for updates
 
@@ -273,9 +246,9 @@ in `<data dir>/update.json` beside `profile.json`, and can be switched off; the
 button on the card ignores the throttle.
 
 The check reads only GitHub's own API and never downloads or installs anything.
-Each platform ships a signed installer with its own privilege requirements - a
-`.dmg`, an MSI, Android's installer - so the last step is a link, which is also
-where the `.sha256` files published next to every asset stay useful.
+Each platform ships an archive that the user opens themselves, so the last step
+is a link - which is also where the `.sha256` file published next to every
+asset stays useful.
 
 Which asset belongs to which install is decided from the file names the release
 workflow produces, so a renamed package breaks the match and shows up in the
@@ -304,31 +277,40 @@ install someone else's binaries.
 ## Verification
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p singbox --features embedded-core
-cargo test -p desktop --features desktop
+cargo check -p api -p proxy-core -p nsh-app-kitty --target wasm32-unknown-unknown
 ```
 
 The embedded-core test starts a VLESS configuration through the static bridge
 and proves that no external executable is required.
 
-`desktop` needs its feature enabled: without it the shell compiles down to
-`dioxus::launch` and every tray and menu-bar test compiles away, so
-`cargo test --workspace` reports those 0 tests as a pass.
-
-Resize and dialog behaviour needs a real layout engine, so it is covered
-separately by a headless Chromium suite in `tests/ui-smoke`. It runs on a
-release web bundle (the debug wasm is ~84 MB and never finishes hydrating) and
-checks horizontal overflow across 320-1620px, that card pages never scroll onto
-background, that no content falls past the scroll height, and that Escape, the
-Tab ring and focus return hold in every dialog. See
-[`tests/ui-smoke/README.md`](tests/ui-smoke/README.md).
+Layout and dialog behaviour are covered by the crate's own headless tests,
+which run the real NSH engine:
 
 ```sh
-cd tests/ui-smoke
-npm ci && npx playwright install chromium
-KITTY_WEB_URL=http://127.0.0.1:7897 npm test
+cargo test -p nsh-app-kitty
 ```
+
+`nsh test` does the same from the app's directory and adds NSH's own build
+diagnostics.
+
+The last check is the one no host build covers: `nsh-app-kitty` splits into two
+arms per backend call, and only the wasm target compiles the browser's. Deleting
+the Dioxus server-function macro once broke exactly that while every other gate
+stayed green.
+
+```sh
+scripts/e2e-web.sh      # a real Chrome drives a real server, on a scratch profile
+```
+
+The screens themselves are compiled native views, so there is no page for a suite
+to drive — what this covers is the transport between the wasm build and
+`packages/server`. Android's equivalent is `scripts/build-android.sh`, which
+produces an installable APK; what was checked on an emulator, and what was not,
+is in `packages/nsh-app/README.md`.
 
 ## Platform boundary
 

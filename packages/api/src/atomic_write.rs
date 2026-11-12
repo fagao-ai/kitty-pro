@@ -195,7 +195,7 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<(
 pub(crate) fn atomic_write_json<T: serde::Serialize + ?Sized>(
     path: &Path,
     value: &T,
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| api_err(ApiErrorCode::Storage, format!("序列化配置失败: {error}")))?;
     atomic_write_bytes(path, &bytes)
@@ -270,7 +270,7 @@ pub(crate) fn cleanup_atomic_residue_in(directory: &Path) -> std::io::Result<()>
 /// install_rule_set_cache 的竞争。单测通过 `recover_interrupted_writes_in`
 /// 注入临时目录，不经过这里，也不会碰用户真实配置目录。
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn recover_interrupted_writes() -> Result<(), ServerFnError> {
+pub(crate) fn recover_interrupted_writes() -> Result<(), ApiError> {
     use std::sync::OnceLock;
 
     static RECOVERED: OnceLock<()> = OnceLock::new();
@@ -284,7 +284,7 @@ pub(crate) fn recover_interrupted_writes() -> Result<(), ServerFnError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn recover_interrupted_writes_once() -> Result<(), ServerFnError> {
+fn recover_interrupted_writes_once() -> Result<(), ApiError> {
     let paths = native_rule_set_cache_paths()?;
     let config_directory = profile_path()?
         .parent()
@@ -302,7 +302,7 @@ fn recover_interrupted_writes_once() -> Result<(), ServerFnError> {
 pub(crate) fn recover_interrupted_writes_in(
     config_directory: &Path,
     rules_directory: &Path,
-) -> Result<(), ServerFnError> {
+) -> Result<(), ApiError> {
     // 规则集事务沿用 rule_set_cache.rs 的崩溃恢复（按其现有签名传参）。
     let geosite = rules_directory.join("geosite-cn.srs");
     let geoip = rules_directory.join("geoip-cn.srs");

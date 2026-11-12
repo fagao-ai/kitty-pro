@@ -1,7 +1,26 @@
 name: Build release packages
 
+# Three channels are published, all from the one NSH crate: the desktop app, the
+# self-hosted web server (the WebAssembly page beside the native process that runs
+# the core for it), and the Android APK.
+#
+# The asset NAMES are load-bearing, not cosmetics: `proxy_core::update` picks the
+# one asset a user may install out of the file name alone — its kind (`web`,
+# `.apk`, or a named operating system), its OS, and the CPU groups it lists. A name
+# that drops a token silently stops that platform being updatable, so the names here
+# are the ones `packages/proxy-core/src/update.rs` asserts in its tests, and an edit
+# to one must be an edit to the other.
+#
+# NOT YET EXERCISED: this file was rewritten when the desktop packaging moved off
+# `dx bundle`, and the web and Android jobs are new since. Run it from a throwaway
+# tag before publishing a real release.
 on:
   workflow_dispatch:
+    inputs:
+      test_version:
+        description: "Version for a non-release build (e.g. 0.0.0-test.1). Leave empty to fail."
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -16,19 +35,24 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
-  DIOXUS_CLI_VERSION: "0.7.9"
   # Keep Cargo away from the Git-based crates.io index and libgit2. Windows
   # runners can otherwise crash while reading a restored registry index.
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   RUST_BACKTRACE: "1"
   RUST_VERSION: "1.97.1"
+  # The NSH CLI every job installs, pinned to the release the crates in
+  # `packages/nsh-app` are at. Unpinned, a fresh upstream release silently changes
+  # what a tag builds: `scripts/setup-nsh.sh` compares the two versions and fails
+  # the job rather than publishing an artifact whose runtime and Rust half disagree.
+  # Bumping this means bumping the crates in the same commit.
+  NSH_VERSION: "v0.5.0"
 
 jobs:
   desktop:
     name: Desktop | ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -36,40 +60,29 @@ jobs:
           - name: macOS
             id: macos
             os: macos-14
-            platform_flag: --macos
-            target_args: ""
-            bundle_args: --package-types macos --package-types dmg
+            target: macos
           - name: Windows
             id: windows
             os: windows-latest
-            platform_flag: --windows
-            target_args: --target x86_64-pc-windows-msvc
-            bundle_args: --package-types msi
+            target: windows
           - name: Linux
             id: linux
             os: ubuntu-24.04
-            platform_flag: --linux
-            target_args: ""
-            bundle_args: --package-types appimage --package-types deb
+            target: linux
     steps:
       - name: Checkout source
         uses: actions/checkout@v5
 
+      # NSH's Linux host is GTK 4.14+, which ubuntu-24.04's libgtk-4-dev is.
+      # librsvg2 is needed by the `svg` feature the app's icons use.
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            desktop-file-utils \
-            libayatana-appindicator3-dev \
-            libglib2.0-dev \
-            libgtk-3-dev \
+            libgtk-4-dev \
             librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
             patchelf \
             pkg-config
 
@@ -99,27 +112,6 @@ jobs:
         shell: bash
         run: rustup target add x86_64-pc-windows-msvc
 
-      - name: Set tagged desktop version
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          release_version="$(
-            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
-          )"
-          ./scripts/set-package-version.sh desktop "$release_version"
-
-      - name: Cache Rust builds
-        if: matrix.id != 'windows'
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: desktop-${{ matrix.id }}
-          cache-all-crates: true
-
-      - name: Install Dioxus CLI
-        uses: taiki-e/install-action@v2
-        with:
-          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
-
       - name: Add MinGW to PATH
         if: runner.os == 'Windows'
         shell: bash
@@ -131,10 +123,53 @@ jobs:
           echo "SINGBOX_CC=$mingw_bin/gcc.exe" >> "$GITHUB_ENV"
           echo 'CGO_ENABLED=1' >> "$GITHUB_ENV"
 
-      # Diagnostics matter here: this step's raw output is only visible to
-      # signed-in users, but the ::error annotation below renders on the
-      # public job page. The 2026-11-05 v1.0.12 failure produced nothing but
-      # "exit code 101" for the maintainer to work from.
+      # The desktop job needs no component: it packages for the machine it runs on,
+      # whose runtime ships inside the CLI's own archive.
+      - name: Set up NSH
+        uses: ./.github/actions/setup-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+
+      # Every package in the workspace takes the tag's version, including `api`,
+      # which is the crate the in-app update check actually answers with. Stamping
+      # only the shell's own crate is what made every desktop release report 0.1.0.
+      - name: Set tagged app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          release_version="$(
+            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
+          )"
+          ./scripts/set-package-version.sh "$release_version"
+
+      # A `workflow_dispatch` build is not a release, and must not pretend to be
+      # one: an unsigned test archive that reports the newest published version
+      # tells its installer there is nothing to update, forever. Fail loudly
+      # instead, unless the operator names a version deliberately.
+      - name: Reject an unversioned manual build
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        env:
+          KITTY_TEST_VERSION: ${{ inputs.test_version }}
+        run: |
+          if [[ -z "${KITTY_TEST_VERSION:-}" ]]; then
+            echo "This run is not from a v* tag, so nothing here carries a release version." >&2
+            echo "Enter test_version to build a throwaway with that version, or push a tag." >&2
+            exit 1
+          fi
+          ./scripts/set-package-version.sh "$KITTY_TEST_VERSION"
+          echo "Building a NON-RELEASE at $KITTY_TEST_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache Rust builds
+        if: matrix.id != 'windows'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.id }}
+          cache-all-crates: true
+
+      # The embedded sing-box core is a Go archive; on Windows it is a DLL built
+      # by the bridge. This gate is independent of which front end ships, so it
+      # stayed after the Dioxus shells were removed.
       - name: Test Windows embedded core bridge
         if: matrix.id == 'windows'
         shell: bash
@@ -168,162 +203,27 @@ jobs:
           echo "::error title=Windows bridge test output::$failure_tail"
           exit 1
 
-      - name: Build ${{ matrix.name }} packages
+      - name: Package ${{ matrix.name }}
         shell: bash
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           set -o pipefail
           log="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-build.log"
-          if [[ "${{ matrix.id }}" == "windows" ]]; then
-            # Pre-build so Cargo emits the Go bridge DLL that Dioxus picks up
-            # through bundle.external_bin. MSVC links WebView2Loader statically.
-            if cargo build \
-                --package desktop \
-                --features desktop \
-                --target x86_64-pc-windows-msvc \
-                --release \
-                --locked \
-                2>&1 | tee "$log"; then
-              singbox_bridge="$(find \
-                target/x86_64-pc-windows-msvc/release/build \
-                -type f \
-                -path '*/singbox-*/out/kitty_singbox.dll' \
-                -print -quit)"
-              if [[ -z "$singbox_bridge" ]]; then
-                echo 'Unable to locate the Windows sing-box bridge DLL' >&2
-                exit 1
-              fi
-
-              mkdir -p target/windows-bundle
-              cp "$singbox_bridge" \
-                target/windows-bundle/kitty_singbox.dll-x86_64-pc-windows-msvc
-
-              bundle_output="$RUNNER_TEMP/kitty-pro-windows-bundle.jsonl"
-              if dx bundle \
-                  --package desktop \
-                  ${{ matrix.platform_flag }} \
-                  ${{ matrix.target_args }} \
-                  --fullstack false \
-                  --release \
-                  --verbose \
-                  --json-output \
-                  --locked \
-                  --out-dir dist/windows \
-                  ${{ matrix.bundle_args }} \
-                  2>&1 | tee -a "$log" "$bundle_output"; then
-                build_status=0
-                # Dioxus guarantees that the final JSON line contains the
-                # structured BundleOutput with the generated artifact paths.
-                mapfile -t msi_paths < <(
-                  tail -n 1 "$bundle_output" \
-                    | jq -er \
-                      '.json | fromjson | .BundleOutput.bundles[] | select(ascii_downcase | endswith(".msi"))'
-                )
-                if [[ "${#msi_paths[@]}" -ne 1 ]]; then
-                  echo 'Dioxus did not report exactly one Windows MSI output' >&2
-                  exit 1
-                fi
-
-                # BundleOutput uses a native Windows path, while this step
-                # runs in Git Bash and needs its POSIX representation.
-                msi_path="$(cygpath -u "${msi_paths[0]}")"
-                installer="$(pwd -P)/dist/windows/Kitty-Pro-windows-x86_64.msi"
-                test -f "$msi_path"
-                if [[ "$msi_path" != "$installer" ]]; then
-                  mv "$msi_path" "$installer"
-                fi
-
-                extracted_dir="$RUNNER_TEMP/kitty-pro-windows-msi-package"
-                package_dir="$RUNNER_TEMP/kitty-pro-windows-package"
-                mkdir -p "$extracted_dir"
-                mkdir -p "$package_dir"
-                installer_windows="$(cygpath -w "$installer")"
-                extracted_dir_windows="$(cygpath -w "$extracted_dir")"
-                MSYS2_ARG_CONV_EXCL='*' msiexec.exe \
-                  /a "$installer_windows" \
-                  /qn \
-                  TARGETDIR="$extracted_dir_windows"
-                msi_executable="$(find "$extracted_dir" \
-                  -type f -iname 'kitty-pro.exe' -print -quit)"
-                msi_singbox_bridge="$(find "$extracted_dir" \
-                  -type f -name 'kitty_singbox.dll' -print -quit)"
-                if [[ -z "$msi_executable" || -z "$msi_singbox_bridge" ]]; then
-                  echo 'Dioxus MSI is missing Kitty Pro or kitty_singbox.dll' >&2
-                  exit 1
-                fi
-                cp "$msi_executable" "$package_dir/Kitty-Pro.exe"
-                cp "$msi_singbox_bridge" "$package_dir/"
-                (
-                  cd "$package_dir"
-                  7z a -tzip -mx=9 Kitty-Pro-windows-x86_64.zip \
-                    Kitty-Pro.exe kitty_singbox.dll >/dev/null
-                )
-                mv "$package_dir/Kitty-Pro-windows-x86_64.zip" \
-                  "$(dirname "$installer")/"
-                (
-                  cd "$(dirname "$installer")"
-                  sha256sum Kitty-Pro-windows-x86_64.zip \
-                    > Kitty-Pro-windows-x86_64.zip.sha256
-                  sha256sum "$(basename "$installer")" \
-                    > Kitty-Pro-windows-x86_64.msi.sha256
-                )
-              else
-                build_status=${PIPESTATUS[0]}
-              fi
-            else
-              build_status=${PIPESTATUS[0]}
-            fi
-          elif [[ "${{ matrix.id }}" == "macos" ]]; then
-            # hdiutil occasionally reports "Resource busy" on hosted macOS
-            # runners even though the .app bundle was created successfully.
-            # Retry only that transient failure; preserve all other failures.
-            build_status=1
-            for attempt in 1 2 3; do
-              attempt_log="$RUNNER_TEMP/kitty-pro-macos-build-attempt-$attempt.log"
-              echo "macOS bundle attempt $attempt/3" | tee -a "$log"
-              if dx bundle \
-                  --package desktop \
-                  ${{ matrix.platform_flag }} \
-                  ${{ matrix.target_args }} \
-                  --fullstack false \
-                  --release \
-                  --verbose \
-                  --locked \
-                  --out-dir "dist/${{ matrix.id }}" \
-                  ${{ matrix.bundle_args }} 2>&1 | tee -a "$log" "$attempt_log"; then
-                build_status=0
-                break
-              else
-                build_status=${PIPESTATUS[0]}
-              fi
-              if [[ "$attempt" -ge 3 ]] || \
-                  ! grep -Eqi 'hdiutil:.*Resource busy' "$attempt_log"; then
-                break
-              fi
-              rm -f target/dx/kitty-pro/bundle/macos/macos/*.dmg || true
-              sleep $((attempt * 5))
-            done
-          elif dx bundle \
-              --package desktop \
-              ${{ matrix.platform_flag }} \
-              ${{ matrix.target_args }} \
-              --fullstack false \
-              --release \
-              --verbose \
-              --locked \
-              --out-dir "dist/${{ matrix.id }}" \
-              ${{ matrix.bundle_args }} 2>&1 | tee "$log"; then
-            build_status=0
-          else
-            build_status=${PIPESTATUS[0]}
-          fi
-          if [[ "$build_status" -ne 0 ]]; then
+          app_version="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -er '.packages[] | select(.name == "nsh-app-kitty") | .version'
+          )"
+          mkdir -p "dist/${{ matrix.id }}"
+          if ! (cd packages/nsh-app && nsh package \
+              --target "${{ matrix.target }}" \
+              --app-version "$app_version" \
+              -o "$GITHUB_WORKSPACE/dist/${{ matrix.id }}" \
+              2>&1 | tee "$log"); then
             {
-              echo "### ${{ matrix.name }} build failure"
+              echo "### ${{ matrix.name }} packaging failure"
               echo
               echo '```text'
-              grep -Ein 'error|failed|panic|undefined reference|cannot find|not found|go:' "$log" | head -n 120 || true
+              grep -Ein 'error|failed|panic|undefined reference|cannot find|not found|go:' "$log" \
+                | head -n 120 || true
               tail -n 120 "$log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
@@ -333,102 +233,88 @@ jobs:
                 tail -n 40 "$log"
               } | tr '\r\n' ' ' | cut -c1-8000
             )"
-            echo "::error title=${{ matrix.name }} build output::$failure_tail"
+            echo "::error title=${{ matrix.name }} packaging output::$failure_tail"
             exit 1
           fi
+
+      - name: Publish ${{ matrix.name }} archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "dist/${{ matrix.id }}"
+          # The architecture has to come from the machine that built the binary:
+          # the in-app update check reads the CPU out of the asset name, so a name
+          # that disagreed with the contents would install the wrong build.
+          case "$(uname -m)" in
+            arm64) arch="aarch64" ;;
+            *) arch="$(uname -m)" ;;
+          esac
+          archive="Kitty-Pro-${{ matrix.id }}-${arch}"
+          case "${{ matrix.id }}" in
+            macos)
+              # NSH leaves an ad hoc signed `.app` here; zip it, keeping the
+              # bundle's own top-level entry so `ditto`/Finder restore it whole.
+              bundle="$(find . -maxdepth 1 -type d -name '*.app' -print -quit)"
+              test -n "$bundle"
+              ditto -c -k --keepParent "$bundle" "$archive.zip"
+              rm -rf "$bundle"
+              ;;
+            windows)
+              # `nsh package` writes `<Name>.zip` beside `<Name>/`.
+              produced="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+              test -n "$produced"
+              mv "$produced" "$archive.zip"
+              rm -rf -- "$(basename "$produced" .zip)"
+              ;;
+            linux)
+              produced="$(find . -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+              test -n "$produced"
+              mv "$produced" "$archive.tar.gz"
+              ;;
+          esac
+          archive="$(find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -quit)"
+          test -n "$archive"
 
       - name: Verify desktop packages
         shell: bash
         run: |
-          case "${{ matrix.id }}" in
-            macos)
-              test -n "$(find dist/macos -type d -name '*.app' -print -quit)"
-              test -n "$(find dist/macos -type f -name '*.dmg' -print -quit)"
+          set -euo pipefail
+          cd "dist/${{ matrix.id }}"
+          archive="$(find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -quit)"
+          check_dir="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-verify"
+          mkdir -p "$check_dir"
+          case "$archive" in
+            *.zip)
+              if command -v unzip >/dev/null 2>&1; then
+                unzip -qq "$archive" -d "$check_dir"
+              else
+                7z x -y -o"$check_dir" "$archive" >/dev/null
+              fi
               ;;
-            windows)
-              archive=dist/windows/Kitty-Pro-windows-x86_64.zip
-              installer=dist/windows/Kitty-Pro-windows-x86_64.msi
-              verify_dir="$RUNNER_TEMP/kitty-pro-windows-verify"
-              msi_verify_dir="$RUNNER_TEMP/kitty-pro-windows-msi-verify"
-              test -f "$archive"
-              test -f "$archive.sha256"
-              test -f "$installer"
-              test -f "$installer.sha256"
-              mkdir -p "$verify_dir"
-              7z x -y -o"$verify_dir" "$archive" >/dev/null
-              test -f "$verify_dir/Kitty-Pro.exe"
-              test -f "$verify_dir/kitty_singbox.dll"
-              objdump -p "$verify_dir/Kitty-Pro.exe" \
-                | grep -Eq 'Subsystem.*Windows GUI'
-              objdump -h "$verify_dir/Kitty-Pro.exe" \
-                | grep -Eq '\.rsrc'
-              objdump -f "$verify_dir/kitty_singbox.dll" \
-                | grep -Eq 'architecture: i386:x86-64'
-              objdump -p "$verify_dir/kitty_singbox.dll" \
-                | grep -Eq 'kitty_singbox_version'
-              if objdump -p "$verify_dir/Kitty-Pro.exe" \
-                  | grep -Eqi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)[^ ]*\.dll'; then
-                echo 'Windows package depends on an unbundled MinGW runtime DLL' >&2
-                exit 1
-              fi
-              if objdump -p "$verify_dir/Kitty-Pro.exe" \
-                  | grep -Eqi 'DLL Name: (VCRUNTIME|MSVCP)[^ ]*\.dll'; then
-                echo 'Windows package depends on an unbundled Visual C++ runtime DLL' >&2
-                exit 1
-              fi
-              if objdump -p "$verify_dir/kitty_singbox.dll" \
-                  | grep -Eqi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)[^ ]*\.dll'; then
-                echo 'sing-box bridge depends on an unbundled MinGW runtime DLL' >&2
-                exit 1
-              fi
-              grep -aFq '.proxy-app' "$verify_dir/Kitty-Pro.exe"
-              if grep -aFq \
-                  'This should be replaced by dx as part of the build process' \
-                  "$verify_dir/Kitty-Pro.exe"; then
-                echo 'Windows executable still contains unresolved Dioxus asset paths' >&2
-                exit 1
-              fi
-
-              mkdir -p "$msi_verify_dir"
-              installer_windows="$(cygpath -w "$installer")"
-              msi_verify_dir_windows="$(cygpath -w "$msi_verify_dir")"
-              MSYS2_ARG_CONV_EXCL='*' msiexec.exe \
-                /a "$installer_windows" \
-                /qn \
-                TARGETDIR="$msi_verify_dir_windows"
-              msi_executable="$(find "$msi_verify_dir" \
-                -type f -iname 'kitty-pro.exe' -print -quit)"
-              msi_singbox_bridge="$(find "$msi_verify_dir" \
-                -type f -name 'kitty_singbox.dll' -print -quit)"
-              test -n "$msi_executable"
-              test -n "$msi_singbox_bridge"
-              cmp "$verify_dir/Kitty-Pro.exe" "$msi_executable"
-              cmp "$verify_dir/kitty_singbox.dll" "$msi_singbox_bridge"
-              (cd dist/windows && sha256sum -c *.sha256)
-              ;;
-            linux)
-              test -n "$(find dist/linux -type f -name '*.AppImage' -print -quit)"
-              test -n "$(find dist/linux -type f -name '*.deb' -print -quit)"
-              ;;
+            *.tar.gz) tar -xzf "$archive" -C "$check_dir" ;;
           esac
+          # The executable is what carries the engine: an archive without it is an
+          # empty shell, which is the failure mode worth failing the build on. The
+          # name is matched loosely, and the mode bit not at all, because NSH derives
+          # the runner's name from `nsh.json` per platform and a zip written on
+          # Windows carries no Unix execute bit.
+          test -n "$(
+            find "$check_dir" -type f \
+              \( -iname 'kittypro*' -o -iname 'kitty-pro*' -o -name '*.exe' \) \
+              -print -quit
+          )"
 
-      # The release notes promise a .sha256 sidecar for every installer;
-      # Windows already wrote theirs during packaging, and the Web and
-      # Android jobs have their own steps. This covers the remaining
-      # desktop formats (dmg, AppImage, deb) without duplicating anything.
+      # The macOS runner is the only one without GNU sha256sum.
       - name: Create desktop checksums
         shell: bash
         run: |
-          # macOS runners are the only ones without GNU sha256sum; the web
-          # job below already switches on this (v1.0.13: this step shipped
-          # without the branch and failed the macOS desktop job).
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             checksum() { shasum -a 256 "$1"; }
           else
             checksum() { sha256sum "$1"; }
           fi
           find "dist/${{ matrix.id }}" -maxdepth 1 -type f \
-              \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \) \
+              \( -name '*.zip' -o -name '*.tar.gz' \) \
             -print0 | while IFS= read -r -d '' artifact; do
               if [[ -f "$artifact.sha256" ]]; then continue; fi
               name="$(basename "$artifact")"
@@ -444,10 +330,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The self-hosted web control surface: the WebAssembly page `nsh package` builds
+  # from the same crate, beside the native process that runs the core on its behalf.
+  # A browser cannot load a Go archive, so both halves ship together and must be
+  # built on the machine that will run them — hence a matrix rather than one archive.
   web:
     name: Web | ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -455,22 +345,20 @@ jobs:
           - name: Linux x86_64
             id: linux-x86_64
             os: ubuntu-24.04
+            # The archive names the CPU as well as the OS, because the server binary
+            # is native and the update check installs what the name promises. An
+            # unlabelled macOS archive would be handed to an Intel Mac.
             archive_name: Kitty-Pro-web-linux-x86_64
           - name: macOS
-            id: macos
+            id: macos-aarch64
             os: macos-14
-            archive_name: Kitty-Pro-web-macos
+            archive_name: Kitty-Pro-web-macos-aarch64
     steps:
       - name: Checkout source
         uses: actions/checkout@v5
 
-      - name: Install Web build dependencies
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen build-essential pkg-config
-
+      # The server embeds the core (`singbox`'s `embedded-core` is a default
+      # feature), so this is a Go build as much as a Rust one.
       - name: Install Go
         uses: actions/setup-go@v6
         with:
@@ -483,62 +371,123 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: wasm32-unknown-unknown
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@v2
+      # The page is WebAssembly whatever machine builds it, so the web runtime is a
+      # component here even on the macOS runner — that CLI ships the macOS runtime.
+      - name: Set up NSH
+        uses: ./.github/actions/setup-nsh
         with:
-          key: web-${{ matrix.id }}
-          cache-all-crates: true
+          version: ${{ env.NSH_VERSION }}
+          components: web
 
-      - name: Install Dioxus CLI
-        uses: taiki-e/install-action@v2
-        with:
-          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
-
-      # The Web server answers the in-app update check with its own package
-      # version, so a tagged build has to carry the tag. Without this the shipped
-      # server reports `0.1.0` forever and every user is told to update on every
-      # launch, to a version no install of theirs can ever reach.
-      - name: Set tagged Web version
+      - name: Set tagged app version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           release_version="$(
             jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
           )"
-          ./scripts/set-package-version.sh web "$release_version"
+          ./scripts/set-package-version.sh "$release_version"
 
-      - name: Build fullstack Web package
+      - name: Reject an unversioned manual build
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        env:
+          KITTY_TEST_VERSION: ${{ inputs.test_version }}
+        run: |
+          if [[ -z "${KITTY_TEST_VERSION:-}" ]]; then
+            echo "This run is not from a v* tag, so nothing here carries a release version." >&2
+            echo "Enter test_version to build a throwaway with that version, or push a tag." >&2
+            exit 1
+          fi
+          ./scripts/set-package-version.sh "$KITTY_TEST_VERSION"
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: web-${{ matrix.id }}
+          cache-all-crates: true
+
+      - name: Build the server and the page
         shell: bash
         run: |
-          dx build \
-            --package web \
-            --web \
-            --fullstack true \
-            --release \
-            --debug-symbols false \
-            --locked
+          set -o pipefail
+          log="$RUNNER_TEMP/kitty-pro-web-${{ matrix.id }}.log"
+          if ! {
+              cargo build --locked --release -p kitty-server
+              (cd packages/nsh-app && nsh package --target web \
+                  -o "$GITHUB_WORKSPACE/dist/web/site")
+          } 2>&1 | tee "$log"; then
+            {
+              echo "### Web ${{ matrix.name }} build failure"
+              echo
+              echo '```text'
+              tail -n 120 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
+      # The two halves are one product: `main.rs` resolves the site as `public/`
+      # beside the executable, so an archive that put them anywhere else serves no
+      # page while still binding the port.
       - name: Assemble Web archive
         shell: bash
         run: |
-          web_output="target/dx/web/release/web"
-          test -x "$web_output/server"
-          test -f "$web_output/public/index.html"
-
-          mkdir -p dist/web/package
-          cp "$web_output/server" dist/web/package/kitty-pro-web-server
-          cp -R "$web_output/public" dist/web/package/public
+          set -euo pipefail
+          server="target/release/kitty-pro-web-server"
+          test -x "$server"
+          # The packaged directory is named after the app, so find it rather than
+          # hard-coding "Kitty Pro": a rename would otherwise ship an archive with
+          # no page in it, which is the failure this job exists to catch.
+          site=""
+          for candidate in dist/web/site/*; do
+              [[ -f "$candidate/index.html" ]] && site="$candidate" && break
+          done
+          test -n "$site"
+          package="dist/web/package"
+          mkdir -p "$package"
+          cp "$server" "$package/kitty-pro-web-server"
+          cp -R "$site" "$package/public"
           printf '%s\n' \
+            'Kitty Pro web control surface.' \
+            '' \
             'Run: ./kitty-pro-web-server' \
-            'Default address: http://127.0.0.1:7897' \
-            'Use --port PORT or PORT=... to change the listen port.' \
-            'Background: ./kitty-pro-web-server --daemon --port 7897' \
-            'Use --log-file PATH with --daemon; default: kitty-pro-web.log.' \
-            'Startup prints the PID after readiness; stop with kill <PID>.' \
-            'IP defaults to 127.0.0.1 and must be a loopback address.' \
-            > dist/web/package/README.txt
+            'Then open http://127.0.0.1:7897/ in a browser.' \
+            '' \
+            'Options: --port PORT, --allow-lan, --daemon [--log-file PATH].' \
+            'IP selects the bind address (default 127.0.0.1); a non-loopback' \
+            'address needs --allow-lan and KITTY_PRO_ALLOWED_HOSTS.' \
+            'Stop with kill <PID>; --daemon prints it after readiness.' \
+            > "$package/README.txt"
           archive="dist/web/${{ matrix.archive_name }}.tar.gz"
-          tar -C dist/web/package -czf "$archive" .
+          tar -C "$package" -czf "$archive" .
+
+      # An archive whose page cannot be found by the binary's own rule is worse than
+      # no archive: the server starts, binds, and serves nothing.
+      - name: Verify Web archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          check="$RUNNER_TEMP/kitty-pro-web-verify"
+          mkdir -p "$check"
+          tar -xzf "dist/web/${{ matrix.archive_name }}.tar.gz" -C "$check"
+          test -x "$check/kitty-pro-web-server"
+          test -f "$check/public/index.html"
+          # `find -quit`, not `ls | grep -q`: grep stops at its first match and
+          # leaves `ls` writing into a closed pipe, and under `pipefail` that
+          # SIGPIPE fails the step on the exact archive this step exists to approve.
+          wasm="$(find "$check/public" -maxdepth 1 -type f -name '*.wasm' -print -quit)"
+          [[ -n $wasm ]] || {
+            echo "the page carries no WebAssembly, so it can never render" >&2
+            exit 1
+          }
+          echo "site: $(basename "$wasm")"
+
+      - name: Create Web checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/web/${{ matrix.archive_name }}.tar.gz"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             shasum -a 256 "$archive" > "$archive.sha256"
           else
@@ -556,16 +505,29 @@ jobs:
           retention-days: 14
 
   android:
-    name: Android | arm64-v8a
+    name: Android
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    env:
-      ANDROID_BUILD_TOOLS_VERSION: "35.0.0"
-      ANDROID_NATIVE_API_LEVEL: "24"
-      ANDROID_NDK_VERSION: "27.2.12479018"
+    timeout-minutes: 120
     steps:
       - name: Checkout source
         uses: actions/checkout@v5
+
+      # One archive carries every ABI it was built for, because the update check
+      # reads the CPU groups out of the file name and declines an asset that does not
+      # list the device's — a 32-bit phone offered an arm64-only APK is a phone told
+      # there is no build for it, forever. So a release builds both. A manual
+      # throwaway builds one: each ABI is a full cross-build of the Go core and of
+      # NSH's runtime, which is the difference between a check that finishes and one
+      # that hits its timeout.
+      - name: Choose the ABIs
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            echo "KITTY_ABIS=arm64-v8a,armeabi-v7a" >> "$GITHUB_ENV"
+          else
+            echo "KITTY_ABIS=arm64-v8a" >> "$GITHUB_ENV"
+            echo "Non-release build: packaging arm64-v8a only." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -573,21 +535,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Android SDK tools
+      # The SDK's own manager installs the three packages the build names. They are
+      # pinned because `build-android.sh` reads `android.jar` and the NDK's clang out
+      # of a specific revision, and it prefers that revision when it is present.
+      - name: Install the Android SDK and NDK
         uses: android-actions/setup-android@v3
         with:
-          packages: ""
-
-      - name: Install Android SDK and NDK packages
-        shell: bash
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
-            "platforms;android-35" \
-            "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
-            "ndk;${ANDROID_NDK_VERSION}"
-          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          packages: "platforms;android-35 build-tools;35.0.1 ndk;27.0.12077973"
 
       - name: Install Go
         uses: actions/setup-go@v6
@@ -599,23 +553,56 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
 
-      - name: Cache Rust and Gradle builds
+      - name: Set up NSH
+        uses: ./.github/actions/setup-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+          components: android
+
+      # The VPN bridge is Kotlin and nothing else in this build has a Kotlin step, so
+      # the compiler comes from Maven Central through the script the repository
+      # tested. It prints the directory to point KOTLIN_HOME at, and nothing else.
+      - name: Install the Kotlin compiler
+        shell: bash
+        run: echo "KOTLIN_HOME=$(./scripts/install-kotlinc.sh)" >> "$GITHUB_ENV"
+
+      - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
         with:
-          key: android-arm64-v8a
+          key: android
           cache-all-crates: true
 
-      - name: Cache Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Set tagged app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          release_version="$(
+            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
+          )"
+          ./scripts/set-package-version.sh "$release_version"
 
-      - name: Install Dioxus CLI
-        uses: taiki-e/install-action@v2
-        with:
-          tool: dioxus-cli@${{ env.DIOXUS_CLI_VERSION }}
+      - name: Reject an unversioned manual build
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        env:
+          KITTY_TEST_VERSION: ${{ inputs.test_version }}
+        run: |
+          if [[ -z "${KITTY_TEST_VERSION:-}" ]]; then
+            echo "This run is not from a v* tag, so nothing here carries a release version." >&2
+            echo "Enter test_version to build a throwaway with that version, or push a tag." >&2
+            exit 1
+          fi
+          ./scripts/set-package-version.sh "$KITTY_TEST_VERSION"
 
-      - name: Configure Android release signing
+      # Signed with the same key every published APK has been signed with. Android
+      # refuses an update whose signer differs, so a release whose secrets went
+      # missing must stop here rather than fall back to a debug key: that builds an
+      # APK that installs on a fresh phone and on nothing else, silently stranding
+      # every device that already runs the app.
+      - name: Configure the release keystore
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -623,51 +610,48 @@ jobs:
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          if [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" || -z "$KEY_ALIAS" ]]; then
-            echo "Android release signing secrets are required so every APK remains upgrade-compatible." >&2
-            echo "Configure ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, and ANDROID_KEY_ALIAS." >&2
+          missing=()
+          [[ -n "${KEYSTORE_BASE64:-}" ]] || missing+=(ANDROID_KEYSTORE_BASE64)
+          [[ -n "${KEYSTORE_PASSWORD:-}" ]] || missing+=(ANDROID_KEYSTORE_PASSWORD)
+          [[ -n "${KEY_ALIAS:-}" ]] || missing+=(ANDROID_KEY_ALIAS)
+          if (( ${#missing[@]} )); then
+            echo "::error title=Missing release signing secrets::${missing[*]}"
+            echo "A tagged build cannot sign with the published key without them, and" >&2
+            echo "signing with anything else strands every installed device." >&2
             exit 1
           fi
-
           keystore="$RUNNER_TEMP/kitty-pro-release.jks"
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
-          if [[ ! -s "$keystore" ]]; then
+          [[ -s $keystore ]] || {
             echo "ANDROID_KEYSTORE_BASE64 decoded to an empty keystore." >&2
             exit 1
-          fi
-          echo "ANDROID_KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
-          echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+          }
+          # The names `build-android.sh` reads. Its own guard refuses a keystore
+          # without an alias, which is the same mistake this step would otherwise
+          # make for it.
+          {
+            echo "KITTY_KEYSTORE=$keystore"
+            echo "KITTY_KEY_ALIAS=$KEY_ALIAS"
+            echo "NSH_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "KITTY_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          } >> "$GITHUB_ENV"
 
-      # Same reason as the Web job: the APK answers the update check with its own
-      # package version. `versionCode` is already monotonic, but it is not a
-      # version a human or this comparison reads.
-      - name: Set tagged Android version
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          release_version="$(
-            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
-          )"
-          ./scripts/set-package-version.sh kitty-pro "$release_version"
-
-      - name: Build Android APK
+      - name: Build the APK
         shell: bash
         run: |
           set -o pipefail
-          log="$RUNNER_TEMP/kitty-pro-android-build.log"
-          if ! ./scripts/build-android-apk.sh 2>&1 | tee "$log"; then
+          log="$RUNNER_TEMP/kitty-pro-android.log"
+          if ! ./scripts/build-android.sh --abi "$KITTY_ABIS" 2>&1 | tee "$log"; then
             {
               echo '### Android build failure'
               echo
               echo '```text'
-              tail -n 120 "$log"
+              tail -n 150 "$log"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
             failure_tail="$(
               {
-                (grep -Ei 'error|failed|undefined reference|cannot find|not found' "$log" || true) | tail -n 60
+                (grep -Ei 'error|failed|undefined reference|cannot find|not found|go:' "$log" || true) | tail -n 60
                 tail -n 40 "$log"
               } | tr '\r\n' ' ' | cut -c1-8000
             )"
@@ -675,19 +659,24 @@ jobs:
             exit 1
           fi
 
-      - name: Create APK checksum
+      # The name is decided here rather than fixed: it carries the version and every
+      # ABI inside, and `proxy_core::update` picks what a device installs out of it.
+      - name: Checksum the APK
         shell: bash
         run: |
-          sha256sum dist/android/Kitty-Pro-arm64-v8a.apk \
-            > dist/android/Kitty-Pro-arm64-v8a.apk.sha256
+          set -euo pipefail
+          ls dist/android/*.apk >/dev/null || {
+            echo "build-android.sh left no APK in dist/android" >&2
+            exit 1
+          }
+          (cd dist/android && for apk in *.apk; do sha256sum "$apk" > "$apk.sha256"; done)
+          ls -la dist/android
 
       - name: Upload Android artifact
         uses: actions/upload-artifact@v6
         with:
-          name: kitty-pro-android-arm64-v8a
-          path: |
-            dist/android/Kitty-Pro-arm64-v8a.apk
-            dist/android/Kitty-Pro-arm64-v8a.apk.sha256
+          name: kitty-pro-android
+          path: dist/android/*
           if-no-files-found: error
           retention-days: 14
 
@@ -725,12 +714,14 @@ jobs:
         with:
           body_path: release-body.md
           fail_on_unmatched_files: true
+          # One glob per channel the workflow builds. A channel missing from here
+          # still reports a green run: the artifact is simply absent from the release
+          # page, and `proxy_core::update` reads that page's asset list, so a release
+          # without its `.apk` tells every phone there is nothing to install. The
+          # desktop's `.dmg`/`.msi`/`.deb`/`.AppImage` globs went with the shells that
+          # produced them; NSH ships one archive per platform.
           files: |
-            release-assets/**/*.dmg
             release-assets/**/*.zip
-            release-assets/**/*.msi
-            release-assets/**/*.AppImage
-            release-assets/**/*.deb
             release-assets/**/*.tar.gz
-            release-assets/**/*.sha256
             release-assets/**/*.apk
+            release-assets/**/*.sha256

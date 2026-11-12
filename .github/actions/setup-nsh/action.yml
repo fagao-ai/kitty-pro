@@ -1,0 +1,49 @@
+name: Set up NSH
+description: >
+  Install the pinned NSH CLI for this runner's platform, then prove it is the NSH the app's
+  crates are at and add the platform runtimes the job needs.
+inputs:
+  version:
+    description: The NSH release to install, such as v0.5.0
+    required: true
+  components:
+    description: >
+      Space-separated runtimes this job packages that are not this machine's own
+      (`android`, `web`, `ios`); NSH 0.5 downloads them separately from the CLI.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    # Two installers, not one script: NSH ships a POSIX `install.sh` and a
+    # PowerShell `install.ps1`, and `install.sh` refuses every non-Linux/macOS
+    # `uname`, so piping it on a Windows runner fails the step before it builds
+    # anything. Each puts the distribution where its own platform keeps it, and
+    # each publishes `bin` through GITHUB_PATH so later steps find `nsh` —
+    # `install.ps1` edits the *user* PATH, which a running job does not re-read.
+    - name: Install the NSH CLI
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        NSH_VERSION: ${{ inputs.version }}
+      run: |
+        curl -fsSL https://nsh.dev/install.sh | sh
+        echo "$HOME/.nsh/bin" >> "$GITHUB_PATH"
+
+    - name: Install the NSH CLI
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        NSH_VERSION: ${{ inputs.version }}
+      run: |
+        & ([scriptblock]::Create((iwr https://nsh.dev/install.ps1 -UseBasicParsing).Content))
+        $dir = if ($env:NSH_INSTALL_DIR) { $env:NSH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'nsh' }
+        $bin = Join-Path $dir 'bin'
+        Add-Content -Path $env:GITHUB_PATH -Value $bin
+
+    # The version and the components are checked by the script the repository
+    # tests locally, so CI and a laptop cannot disagree about what a valid NSH is.
+    # Cargo has to be installed first: the check reads the crates it resolves.
+    - name: Check the NSH version and install its runtimes
+      shell: bash
+      run: ./scripts/setup-nsh.sh ${{ inputs.components }}

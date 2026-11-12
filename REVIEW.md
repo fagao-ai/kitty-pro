@@ -1,5 +1,10 @@
 # Kitty Pro 全项目审查报告
 
+> **本文件是历史归档，不是当前状态的描述。** 报告中的 `packages/ui`、`packages/web`、
+> `packages/desktop`、`packages/mobile`、`Dioxus.toml`、`tests/ui-smoke` 与 server function
+> 相关内容，随 2026-11-11 删除 Dioxus 前端一并失效（界面改为 `packages/nsh-app`）。其中的结论、
+> 严重度与修复记录照原文保留，供追溯；行号已不可跳转。
+
 > 审查日期：2026-11-04 ｜ 范围：仓库全部自研代码（约 3.9 万行，不含 `target/` 与 `node_modules/`）
 > 方法：三路独立只读审查（前端 UI / 后端与安全 / 业务流程）+ 主审对最高危结论的源码复核
 > 本次为**只读审查，未修改任何代码**

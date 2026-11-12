@@ -1,0 +1,11 @@
+{
+  "name": "Kitty Pro",
+  "id": "com.kitty.pro",
+  "version": "1.0.14",
+  "build": 1000014,
+  "rust": ".",
+  "root": "App",
+  "theme": "theme.json",
+  "appearance": "system",
+  "icon": "assets/icon-1024.png"
+}

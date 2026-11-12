@@ -56,17 +56,14 @@ pub(crate) fn redact_secrets(text: &str) -> String {
 /// IPs and local-looking domains, plus any embedded userinfo. `allow_private`
 /// is the documented exception for explicitly configured storage endpoints.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn validate_outbound_url(url: &str) -> Result<(), ServerFnError> {
+pub(crate) fn validate_outbound_url(url: &str) -> Result<(), ApiError> {
     validate_outbound_url_inner(url, false)
 }
 
 /// Parameterised core of the outbound validator. `allow_private = true` is used
 /// by `sync.rs::validate_storage_outbound` for user-configured LAN NAS / MinIO.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn validate_outbound_url_inner(
-    url: &str,
-    allow_private: bool,
-) -> Result<(), ServerFnError> {
+pub(crate) fn validate_outbound_url_inner(url: &str, allow_private: bool) -> Result<(), ApiError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| api_err(ApiErrorCode::InvalidInput, "出站地址无效"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -180,7 +177,7 @@ pub(crate) fn ip_is_forbidden(ip: std::net::IpAddr, allow_private: bool) -> bool
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) async fn download_subscription(url: &str) -> Result<String, ServerFnError> {
+pub(crate) async fn download_subscription(url: &str) -> Result<String, ApiError> {
     use std::time::Duration;
 
     // S4: validate the entry URL and every redirect hop before any request.
@@ -238,7 +235,7 @@ pub(crate) async fn download_subscription(url: &str) -> Result<String, ServerFnE
 
 #[allow(dead_code)]
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn download_subscription(_url: &str) -> Result<String, ServerFnError> {
+pub(crate) async fn download_subscription(_url: &str) -> Result<String, ApiError> {
     Err(api_err(
         ApiErrorCode::Internal,
         "订阅下载只能由原生服务端执行",

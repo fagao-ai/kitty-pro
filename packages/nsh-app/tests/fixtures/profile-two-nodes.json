@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "subscriptions": [
+    {
+      "id": 1,
+      "name": "实验室",
+      "source": "https://example.test/sub",
+      "nodes": [
+        {
+          "tag": "a",
+          "name": "东京 01",
+          "protocol": "vmess",
+          "server": "tokyo.example.test",
+          "port": 443,
+          "auth": {
+            "kind": "uuid",
+            "uuid": "11111111-1111-1111-1111-111111111111"
+          },
+          "transport": {
+            "kind": ""
+          },
+          "tls": {
+            "enabled": false,
+            "insecure": false
+          }
+        },
+        {
+          "tag": "b",
+          "name": "大阪 02",
+          "protocol": "shadowsocks",
+          "server": "osaka.example.test",
+          "port": 8443,
+          "auth": {
+            "kind": "password",
+            "password": "hunter2"
+          },
+          "transport": {
+            "kind": ""
+          },
+          "tls": {
+            "enabled": false,
+            "insecure": false
+          }
+        }
+      ],
+      "proxy_server_nameservers": [],
+      "rejected_count": 0
+    }
+  ],
+  "active_subscription_id": 1,
+  "selected_tag": "a",
+  "tunnel_mode": "rule",
+  "tun_enabled": false,
+  "allow_lan": false,
+  "dark_mode": false,
+  "custom_rules": [],
+  "dns_overrides": [],
+  "config_script_enabled": false,
+  "config_script": "",
+  "group_selections": {}
+}

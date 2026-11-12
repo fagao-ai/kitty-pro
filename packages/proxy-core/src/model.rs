@@ -21,7 +21,10 @@ pub fn sync_bundle_directory(path: &str) -> String {
         _ => trimmed.to_string(),
     }
 }
-const MAX_CUSTOM_RULE_VALUE_BYTES: usize = 512;
+/// The cap on one rule's value, in bytes. Public because a message about exceeding it is
+/// shown to the reader, and the app that shows it has to fill the number into its own
+/// translation rather than guess it.
+pub const MAX_CUSTOM_RULE_VALUE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -380,23 +383,113 @@ pub struct DnsOverride {
     pub id: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// How `domain_suffix` is matched. One of the three domain kinds — see
+    /// [`dns_override_match_supported`].
+    ///
+    /// Defaults to [`CustomRuleMatch::DomainSuffix`] rather than being required, because every
+    /// stored rule predates the choice: a profile written last week holds a suffix and nothing
+    /// else, and reading it as anything else would change which hosts it matches.
+    #[serde(default = "default_dns_override_match")]
+    pub match_type: CustomRuleMatch,
+    /// The thing to match, in the form `match_type` describes.
+    ///
+    /// The field keeps its original name so an existing `profile.json`, and an existing remote
+    /// sync snapshot, load unchanged: it only ever held domain suffixes, so the name was
+    /// accurate until per-kind matching was added. Renaming it to `value` would have been
+    /// tidier and would have broken both files.
     pub domain_suffix: String,
     pub server: String,
 }
 
-pub fn normalize_dns_override(
-    domain_suffix: &str,
+const fn default_dns_override_match() -> CustomRuleMatch {
+    CustomRuleMatch::DomainSuffix
+}
+
+/// Whether this kind can be used by a per-domain DNS rule.
+///
+/// The three domain kinds, and no others. A resolver is chosen *before* an address is known, so
+/// an `ip_cidr` condition cannot pick one: sing-box treats it as an address limit applied to the
+/// answer rather than as a condition on the query, and a rule carrying only one matches every A
+/// and AAAA lookup made (see `dns_override_match_supported`'s test and the note in
+/// `singbox_config`). Process kinds are excluded for the plain reason that the screen does not
+/// offer them.
+pub fn dns_override_match_supported(match_type: CustomRuleMatch) -> bool {
+    matches!(
+        match_type,
+        CustomRuleMatch::Domain | CustomRuleMatch::DomainSuffix | CustomRuleMatch::DomainKeyword
+    )
+}
+
+/// The kinds the DNS screen offers, in the order it lists them.
+///
+/// Suffix first because it is what a per-domain override is usually for and what every existing
+/// rule is.
+pub const DNS_OVERRIDE_MATCHES: [CustomRuleMatch; 3] = [
+    CustomRuleMatch::DomainSuffix,
+    CustomRuleMatch::Domain,
+    CustomRuleMatch::DomainKeyword,
+];
+
+/// Whether this override matches `host`, which is already lowercase and dot-trimmed.
+///
+/// One function because three places ask the question — the route rule, the DNS rule, and the
+/// outbound whose resolver should be pinned — and a fourth reading of "does this rule cover this
+/// host" would mean a host resolved by one server and dialled through another.
+///
+/// A keyword is a substring, which is what sing-box's `domain_keyword` means and is wider than a
+/// suffix: the rule `google` covers `accounts.google.cn` as well as `google.com`. That breadth is
+/// the point of the kind, not an accident of this function.
+pub fn dns_override_matches(rule: &DnsOverride, host: &str) -> bool {
+    match rule.match_type {
+        CustomRuleMatch::Domain => host == rule.domain_suffix,
+        CustomRuleMatch::DomainSuffix => {
+            host == rule.domain_suffix
+                || host
+                    .strip_suffix(&format!(".{}", rule.domain_suffix))
+                    .is_some()
+        }
+        CustomRuleMatch::DomainKeyword => host.contains(&rule.domain_suffix),
+        // Unrepresentable in a DNS override; see [`dns_override_match_supported`]. Treated as
+        // matching nothing rather than panicking, because a stored file can say anything.
+        _ => false,
+    }
+}
+
+/// Validate one DNS override, normalising the value the same way a routing rule of the same kind
+/// is normalised so the two screens cannot disagree about what `*.example.com` means.
+pub fn normalize_dns_override_match(
+    match_type: CustomRuleMatch,
+    value: &str,
     server: &str,
-) -> Result<(String, String), String> {
-    let domain = normalize_custom_rule_value(CustomRuleMatch::DomainSuffix, domain_suffix)
-        .map_err(|_| "域名后缀无效".to_string())?;
+) -> Result<(CustomRuleMatch, String, String), String> {
+    if !dns_override_match_supported(match_type) {
+        return Err("专用 DNS 只支持域名类匹配".to_string());
+    }
+    let value = normalize_custom_rule_value(match_type, value)
+        .map_err(|_| dns_value_invalid_message(match_type))?;
     let server = server.trim();
     let valid_server = server.parse::<std::net::IpAddr>().is_ok()
         || normalize_custom_rule_value(CustomRuleMatch::Domain, server).is_ok();
     if !valid_server {
         return Err("DNS 服务器必须是 IP 或域名".to_string());
     }
-    Ok((domain, server.to_string()))
+    Ok((match_type, value, server.to_string()))
+}
+
+/// The whole message per kind, not a kind's name interpolated into a sentence.
+///
+/// These strings travel to a toast, which looks the finished text up in one piece. A
+/// `format!("{}无效", name)` would arrive as `域名关键字无效` only by luck of the two words
+/// concatenating, and the table could never hold a sentence with a value inside it — so the
+/// variants are written out. Three short keys is the cost of messages that translate.
+fn dns_value_invalid_message(match_type: CustomRuleMatch) -> String {
+    match match_type {
+        CustomRuleMatch::Domain => "域名无效".to_string(),
+        CustomRuleMatch::DomainKeyword => "域名关键字无效".to_string(),
+        // The words this app has always used for a bad suffix, unchanged so an existing test and
+        // an existing muscle memory both still read the same thing.
+        _ => "域名后缀无效".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +577,16 @@ pub struct AppProfile {
     pub allow_lan: bool,
     #[serde(default)]
     pub dark_mode: bool,
+    /// The interface language, as a short code (`"zh"`, `"en"`).
+    ///
+    /// Empty means "never chosen", which the app reads as its own default rather than as a
+    /// language. Every profile written before the language switch existed, and every profile
+    /// written by the Dioxus shell that this app replaced, is empty and was Chinese-only, so an
+    /// empty value has to keep meaning Chinese rather than the system locale. Kept here rather
+    /// than in the interface crate because it belongs to the same record as `dark_mode` — a
+    /// preference about the machine's display, and one that travels through a sync snapshot.
+    #[serde(default)]
+    pub language: String,
     #[serde(default)]
     pub custom_rules: Vec<CustomRule>,
     #[serde(default)]
@@ -633,6 +736,7 @@ impl Default for AppProfile {
             tun_enabled: false,
             allow_lan: false,
             dark_mode: false,
+            language: String::new(),
             custom_rules: Vec::new(),
             dns_overrides: Vec::new(),
             config_script_enabled: false,
@@ -809,6 +913,7 @@ mod tests {
             }],
             dns_overrides: vec![DnsOverride {
                 id: 1,
+                match_type: CustomRuleMatch::DomainSuffix,
                 enabled: true,
                 domain_suffix: "example.net".to_string(),
                 server: "192.0.2.53".to_string(),
@@ -880,6 +985,7 @@ mod tests {
         let mut profile = AppProfile::default();
         profile.dns_overrides.push(DnsOverride {
             id: 1,
+            match_type: CustomRuleMatch::DomainSuffix,
             enabled: true,
             domain_suffix: "example.net".to_string(),
             server: "192.0.2.53".to_string(),
@@ -909,6 +1015,7 @@ mod tests {
         let mut profile = AppProfile {
             dns_overrides: vec![DnsOverride {
                 id: 1,
+                match_type: CustomRuleMatch::DomainSuffix,
                 enabled: true,
                 domain_suffix: "example.net".to_string(),
                 server: "192.0.2.53".to_string(),
@@ -928,6 +1035,7 @@ mod tests {
         let source = AppProfile {
             dns_overrides: vec![DnsOverride {
                 id: 4,
+                match_type: CustomRuleMatch::DomainSuffix,
                 enabled: false,
                 domain_suffix: "example.net".to_string(),
                 server: "192.0.2.53".to_string(),
@@ -1287,6 +1395,7 @@ mod tests {
             } else {
                 vec![DnsOverride {
                     id: 1,
+                    match_type: CustomRuleMatch::DomainSuffix,
                     enabled: true,
                     domain_suffix: lcg.text(8),
                     server: lcg.text(8),

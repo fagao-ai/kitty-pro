@@ -1,8 +1,7 @@
-await-holding-invalid-types = [
-  "generational_box::GenerationalRef",
-  { path = "generational_box::GenerationalRef", reason = "Reads should not be held over an await point. This will cause any writes to fail while the await is pending since the read borrow is still active." },
-  "generational_box::GenerationalRefMut",
-  { path = "generational_box::GenerationalRefMut", reason = "Write should not be held over an await point. This will cause any reads or writes to fail while the await is pending since the write borrow is still active." },
-  "dioxus_signals::WriteLock",
-  { path = "dioxus_signals::WriteLock", reason = "Write should not be held over an await point. This will cause any reads or writes to fail while the await is pending since the write borrow is still active." },
-]
+# `await-holding-invalid-types` used to list `generational_box::*` and
+# `dioxus_signals::WriteLock`: the borrow types the Dioxus shells left hanging over
+# an `.await`. Neither crate is in the tree now, and NSH has no replacement to name,
+# because its signals borrow only inside `Signal::with(..)` / `modify(..)` and return
+# the value, so there is no guard to hold. The hazard moved to plain `Rc<RefCell<_>>`
+# borrows, which rustc already reports as a borrow that must be `Send`.
+await-holding-invalid-types = []

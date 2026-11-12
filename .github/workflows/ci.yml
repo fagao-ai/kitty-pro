@@ -1,12 +1,12 @@
 name: CI quality gate
 
 # 全量 Rust 门禁：PR 与手动触发跑 fmt / clippy / workspace 测试。
-# 此前 release.yml 只在 Windows job 里跑 go test ./... + cargo test --package singbox，
-# ui-smoke.yml 只跑 Playwright，没有任何 workflow 覆盖 cargo test --workspace、
+# 增设这条门禁的原因是 release.yml 只在 Windows job 里跑 go test ./... +
+# cargo test --package singbox，没有任何 workflow 覆盖 cargo test --workspace、
 # rustfmt 与 clippy —— 格式/静态检查回归可以完全绕开门禁。
 #
 # 不再监听 push main：本仓库以直接推 main 为主，每次推送都拉一条全量门禁太吵，
-# 发版时还会和 release 并行出现三条 run。发 tag 前如需保险，可在 Actions 页面
+# 发版时还会和 release 并行出现两条 run。发 tag 前如需保险，可在 Actions 页面
 # 手动 Run workflow 跑一次，或为改动开 PR。
 #
 # 事件键带引号写成 "on"：YAML 1.1 解析器会把裸 on 折叠成布尔 true，引号保证
@@ -44,24 +44,6 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # 「Desktop feature tests」这一步与 packages/desktop 的默认 feature 都要链接 wry 的
-      # WebView，GitHub 的 ubuntu 镜像不带 webkit2gtk/GTK 开发包（镜像的 apt 清单里没有），
-      # 所以这里装 release.yml 同一套。少了它们，pkg-config 在编译期就会报
-      # `webkit2gtk-4.1 not found`，整条门禁红在依赖上而不是代码上。
-      - name: Install Linux desktop dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            libayatana-appindicator3-dev \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            pkg-config
-
       # README「Go toolchain」章节：sing-box 1.13.14 的构建脚本要求 Go 1.24，
       # 且当前无法与 Go 1.26 链接；cargo test --workspace 会编译 singbox 的 Go
       # bridge，缺了 Go 1.24 会在 build.rs 阶段直接失败，所以这里显式安装。
@@ -79,11 +61,18 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `api` 与 `proxy-core` 是后端里唯一声明 wasm32 分支的两个包；
+      # `nsh-app-kitty` 是 web 构建的本体，它现在也分了两个臂（`src/backend.rs`
+      # 里原生直调 / 浏览器走 /api/*），所以它同样是只有这个 target 才会编译到的
+      # 代码。没有这一步，删掉 Dioxus server fn 宏就把 wasm 编译整条打断过一次
+      # （宏原本在 wasm 下不编译函数体），而 workspace 门禁对此毫无察觉。
+      - name: Backend compiles for the browser target
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check -p api -p proxy-core -p nsh-app-kitty --target wasm32-unknown-unknown
+
       - name: Workspace tests
         run: cargo test --workspace
-
-      - name: Desktop feature tests
-        run: cargo test -p desktop --features desktop
 
       - name: Embedded-core feature tests
         run: cargo test -p singbox --features embedded-core
@@ -94,7 +83,6 @@ jobs:
         continue-on-error: true
         uses: rustsec/audit-check@v2
 
-# 注意：Playwright UI smoke 套件依赖 release wasm 产物 —— debug wasm ~84MB 在
-# CI 里永远无法完成 hydrate，必须先 dx build --release 再起 web server，成本高，
-# 因此不塞进 PR 门禁；它继续由 .github/workflows/ui-smoke.yml 负责（UI 路径的
-# PR、main 推送与 workflow_dispatch 触发）。
+# 注意：NSH 的界面回归跑在 `cargo test -p nsh-app-kitty` 里（headless 引擎 +
+# nsh-testing），已经包含在上面的 workspace 测试中，不需要浏览器驱动的第二套
+# 门禁。原先针对 Dioxus wasm 产物的 Playwright 套件随那些包一起删除了。

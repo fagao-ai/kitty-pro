@@ -1,6 +1,7 @@
 use crate::{
-    normalize_custom_rule_value, ConnectionRequest, CustomRule, CustomRuleAction, CustomRuleMatch,
-    DnsOverride, ProxyAuth, ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol, TunnelMode,
+    dns_override_match_supported, dns_override_matches, normalize_custom_rule_value,
+    ConnectionRequest, CustomRule, CustomRuleAction, CustomRuleMatch, DnsOverride, ProxyAuth,
+    ProxyGroup, ProxyGroupKind, ProxyNode, ProxyProtocol, TunnelMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -115,22 +116,22 @@ pub fn build_singbox_config(request: &ConnectionRequest, options: &SingBoxOption
         TunnelMode::Rule | TunnelMode::Global => "proxy",
     };
     let mut rules = vec![json!({ "port": 53, "action": "hijack-dns" })];
-    for (index, rule) in request
-        .dns_overrides
-        .iter()
-        .filter(|rule| rule.enabled)
-        .enumerate()
-    {
+    for (index, rule) in numbered_dns_overrides(&request.dns_overrides) {
+        // The field is the kind's own — `domain`, `domain_suffix` or `domain_keyword` — so the
+        // rule means on the road what the screen said it means. Hardcoding `domain_suffix` here
+        // would quietly narrow an exact-domain rule to a suffix one: `example.com` would then also
+        // cover `a.example.com`, which is a different promise and an unasked-for one.
+        let field = rule.match_type.singbox_field();
         // `resolve` pre-resolves matching hosts with the dedicated server and
         // leaves matching to continue. Once DestinationAddresses is populated,
         // the eventual dial skips `default_domain_resolver` entirely.
         rules.push(json!({
-            "domain_suffix": [rule.domain_suffix],
+            (field): [rule.domain_suffix.clone()],
             "action": "resolve",
             "server": format!("dns-override-{index}"),
         }));
         rules.push(json!({
-            "domain_suffix": [rule.domain_suffix],
+            (field): [rule.domain_suffix.clone()],
             "action": "route",
             "outbound": "direct",
         }));
@@ -245,16 +246,11 @@ fn build_dns_config(request: &ConnectionRequest) -> (Value, bool) {
         "tag": "dns-direct",
     })];
     let mut rules = Vec::new();
-    for (index, rule) in request
-        .dns_overrides
-        .iter()
-        .filter(|rule| rule.enabled)
-        .enumerate()
-    {
+    for (index, rule) in numbered_dns_overrides(&request.dns_overrides) {
         let tag = format!("dns-override-{index}");
         servers.push(dns_override_server(rule, &tag));
         rules.push(json!({
-            "domain_suffix": [rule.domain_suffix],
+            (rule.match_type.singbox_field()): [rule.domain_suffix.clone()],
             "action": "route",
             "server": tag,
         }));
@@ -373,24 +369,50 @@ fn dns_override_server(rule: &DnsOverride, tag: &str) -> Value {
     server
 }
 
-/// Mirrors the tag assignment in `build_dns_config`: enabled overrides are
-/// tagged `dns-override-{index}` in order. Returns the tag whose domain
-/// suffix matches an outbound server hostname.
+/// The overrides that reach the config, each with the number its resolver is tagged with.
+///
+/// One function rather than three copies of the same `filter().enumerate()`, because the DNS
+/// servers, the DNS routing rules and the route rules all name a resolver `dns-override-{index}`
+/// by its position in this list. Three independent filters can drift apart — one gaining a check
+/// the others do not — and the result is not an error but a renumbering: a host resolved by one
+/// dedicated server and dialled under the rule written for another.
+fn numbered_dns_overrides(
+    overrides: &[DnsOverride],
+) -> impl Iterator<Item = (usize, &DnsOverride)> {
+    overrides
+        .iter()
+        .filter(|rule| rule.enabled && dns_override_representable(rule))
+        .enumerate()
+}
+
+/// Whether this rule can be written at all.
+///
+/// The screen cannot produce an unusable kind and `normalize_dns_override_match` rejects one, but a
+/// profile is a file and a synced snapshot is a document, so the config builder is the last place
+/// that can refuse. What it refuses matters: a rule carrying only an `ip_cidr` condition is not
+/// merely meaningless to a DNS lookup, it is applied to *every* forward lookup, because sing-box
+/// treats the CIDR as a filter on the answer rather than a condition on the query
+/// (`dns/router.go` skips it only for non-address queries, and `DefaultDNSRule::Match` sets
+/// `IgnoreDestinationIPCIDRMatch`). Emitting one would send every name on the machine to this
+/// rule's server. Skipping it costs one override; emitting it costs DNS.
+fn dns_override_representable(rule: &DnsOverride) -> bool {
+    dns_override_match_supported(rule.match_type)
+}
+
+/// Mirrors the numbering in [`numbered_dns_overrides`]. Returns the tag of the first override whose
+/// rule covers an outbound server's hostname.
+///
+/// Uses the shared numbering rather than its own `filter().enumerate()`: the tag it returns is the
+/// one `build_dns_config` wrote, and a filter kept here alone — as this one used to carry only
+/// `enabled`, while the servers skipped unrepresentable rules — renumbers every override after the
+/// first skipped one, pinning an outbound to a resolver that belongs to a different rule.
 fn dns_override_tag_for_server(dns_overrides: &[DnsOverride], server: &str) -> Option<String> {
     if server.parse::<IpAddr>().is_ok() {
         return None;
     }
     let host = server.trim_end_matches('.').to_ascii_lowercase();
-    dns_overrides
-        .iter()
-        .filter(|rule| rule.enabled)
-        .enumerate()
-        .find(|(_, rule)| {
-            host == rule.domain_suffix
-                || host
-                    .strip_suffix(&format!(".{}", rule.domain_suffix))
-                    .is_some()
-        })
+    numbered_dns_overrides(dns_overrides)
+        .find(|(_, rule)| dns_override_matches(rule, &host))
         .map(|(index, _)| format!("dns-override-{index}"))
 }
 
@@ -672,6 +694,29 @@ mod tests {
     use super::*;
     use crate::parse_subscription;
 
+    /// A request carrying `overrides` and nothing else that could interfere.
+    ///
+    /// Rule mode with TUN off: the DNS rules and the route rules both carry an override, and this
+    /// is the one mode in which both are written, so a test that means to check both can.
+    fn dns_request(overrides: Vec<DnsOverride>) -> ConnectionRequest {
+        let nodes = parse_subscription(
+            "vless://11111111-1111-1111-1111-111111111111@gpu.example.net:3080#GPU",
+        )
+        .nodes;
+        ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: false,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            dns_overrides: overrides,
+            config_script: None,
+            group_selections: HashMap::new(),
+        }
+    }
+
     #[test]
     fn builds_anytls_outbound() {
         let nodes = parse_subscription(
@@ -718,6 +763,7 @@ vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
             custom_rules: Vec::new(),
             dns_overrides: vec![DnsOverride {
                 id: 1,
+                match_type: CustomRuleMatch::DomainSuffix,
                 enabled: true,
                 domain_suffix: "example.net".to_string(),
                 server: "192.0.2.53".to_string(),
@@ -744,6 +790,136 @@ vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
         assert_eq!(override_server["server"], "192.0.2.53");
     }
 
+    /// Each kind writes *its own* field, and `dns_override-0` numbering is shared.
+    ///
+    /// Worth its weight in tests because the failure is silent in both directions. Hardcoding
+    /// `domain_suffix` here would write a rule that matches more hosts than the user chose —
+    /// `example.com` covering `a.example.com` — and a bare `field:` key in the macro would emit the
+    /// literal string `"field"`, a rule sing-box ignores. Neither is a panic; both are a proxy
+    /// quietly resolving things it should not.
+    #[test]
+    fn each_dns_override_kind_writes_its_own_match_field() {
+        for (kind, field) in [
+            (CustomRuleMatch::Domain, "domain"),
+            (CustomRuleMatch::DomainSuffix, "domain_suffix"),
+            (CustomRuleMatch::DomainKeyword, "domain_keyword"),
+        ] {
+            let config = build_singbox_config(
+                &dns_request(vec![DnsOverride {
+                    id: 1,
+                    enabled: true,
+                    match_type: kind,
+                    domain_suffix: "example.net".to_string(),
+                    server: "192.0.2.53".to_string(),
+                }]),
+                &SingBoxOptions::default(),
+            );
+            let route_rules = config["route"]["rules"].as_array().unwrap();
+            assert_eq!(
+                route_rules[1][field][0], "example.net",
+                "{kind:?} route rule"
+            );
+            assert_eq!(
+                route_rules[2][field][0], "example.net",
+                "{kind:?} direct rule"
+            );
+            // The resolver selection is the same rule, or a host could be looked up by one
+            // server and dialled under a rule written for another.
+            let dns_rules = config["dns"]["rules"].as_array().unwrap();
+            assert_eq!(dns_rules[0][field][0], "example.net", "{kind:?} dns rule");
+            assert_eq!(dns_rules[0]["server"], "dns-override-0");
+        }
+    }
+
+    /// An exact-domain rule must not become a suffix rule. This is the difference the user is
+    /// paying for by choosing the kind, so it is asserted on matching rather than on JSON.
+    #[test]
+    fn an_exact_dns_override_covers_only_the_host_it_names() {
+        let exact = DnsOverride {
+            id: 1,
+            enabled: true,
+            match_type: CustomRuleMatch::Domain,
+            domain_suffix: "example.net".to_string(),
+            server: "192.0.2.53".to_string(),
+        };
+        let suffix = DnsOverride {
+            match_type: CustomRuleMatch::DomainSuffix,
+            ..exact.clone()
+        };
+        let keyword = DnsOverride {
+            id: 3,
+            enabled: true,
+            match_type: CustomRuleMatch::DomainKeyword,
+            domain_suffix: "example".to_string(),
+            server: "192.0.2.53".to_string(),
+        };
+
+        assert!(dns_override_matches(&exact, "example.net"));
+        assert!(
+            !dns_override_matches(&exact, "gpu.example.net"),
+            "an exact-domain override must not reach into subdomains"
+        );
+        assert!(dns_override_matches(&suffix, "example.net"));
+        assert!(dns_override_matches(&suffix, "gpu.example.net"));
+        assert!(
+            !dns_override_matches(&suffix, "notexample.net"),
+            "a suffix must be a whole label, not a substring"
+        );
+        // The keyword is a substring and so is wider than the suffix by design — `example` catches
+        // `notexample.net`, which the suffix rule above refuses. That breadth is why the kind
+        // exists, so it is asserted rather than tidied away.
+        assert!(dns_override_matches(&keyword, "example.net"));
+        assert!(dns_override_matches(&keyword, "notexample.net"));
+        assert!(!dns_override_matches(&keyword, "apple.com"));
+    }
+
+    /// The one skip that protects DNS rather than tidying it up.
+    ///
+    /// A rule carrying only an `ip_cidr` condition is applied by sing-box to *every* forward
+    /// lookup, because the address the CIDR would test does not exist yet at query time — it is
+    /// used afterwards to filter the answer. Writing one out would route all of the machine's
+    /// name resolution to this override's server. See the note on
+    /// [`crate::model::dns_override_match_supported`].
+    #[test]
+    fn an_unrepresentable_dns_override_is_skipped_and_does_not_renumber_the_rest() {
+        let usable = DnsOverride {
+            id: 2,
+            enabled: true,
+            match_type: CustomRuleMatch::DomainSuffix,
+            domain_suffix: "example.net".to_string(),
+            server: "192.0.2.53".to_string(),
+        };
+        let config = build_singbox_config(
+            &dns_request(vec![
+                DnsOverride {
+                    id: 1,
+                    enabled: true,
+                    match_type: CustomRuleMatch::IpCidr,
+                    domain_suffix: "198.51.100.0/24".to_string(),
+                    server: "203.0.113.9".to_string(),
+                },
+                usable,
+            ]),
+            &SingBoxOptions::default(),
+        );
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert!(
+            !servers
+                .iter()
+                .any(|server| server["server"] == "203.0.113.9"),
+            "an ip_cidr override reached the config and would take over every lookup"
+        );
+        // And the survivor keeps the number its rules refer to: the skipped rule must not shift
+        // it, because both the DNS rule and the route rule name the tag by position.
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        assert_eq!(dns_rules[0]["domain_suffix"][0], "example.net");
+        assert_eq!(dns_rules[0]["server"], "dns-override-0");
+        assert!(servers
+            .iter()
+            .any(|server| server["tag"] == "dns-override-0"));
+    }
+
     #[test]
     fn disabled_dns_override_does_not_pin_domain_resolver() {
         let nodes = parse_subscription(
@@ -760,6 +936,7 @@ vless://22222222-2222-2222-2222-222222222222@other.example.com:443#Other",
             custom_rules: Vec::new(),
             dns_overrides: vec![DnsOverride {
                 id: 1,
+                match_type: CustomRuleMatch::DomainSuffix,
                 enabled: false,
                 domain_suffix: "example.net".to_string(),
                 server: "192.0.2.53".to_string(),

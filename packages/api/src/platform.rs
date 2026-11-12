@@ -67,19 +67,18 @@ pub(crate) fn pipe_text_to_command(program: &str, args: &[&str], text: &str) -> 
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ApiError> {
     pipe_text_to_command("/usr/bin/pbcopy", &[], &proxy_environment_variables())
-        .map_err(ServerFnError::new)
+        .map_err(ApiError::new)
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
-    pipe_text_to_command("clip.exe", &[], &proxy_environment_variables())
-        .map_err(ServerFnError::new)
+pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ApiError> {
+    pipe_text_to_command("clip.exe", &[], &proxy_environment_variables()).map_err(ApiError::new)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
+pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ApiError> {
     let text = proxy_environment_variables();
     let commands: [(&str, &[&str]); 3] = [
         ("wl-copy", &[]),
@@ -93,7 +92,7 @@ pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ServerFnEr
             Err(error) => errors.push(error),
         }
     }
-    Err(ServerFnError::new(format!(
+    Err(ApiError::new(format!(
         "未找到可用的系统剪贴板工具: {}",
         errors.join("；")
     )))
@@ -103,13 +102,13 @@ pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ServerFnEr
     not(target_arch = "wasm32"),
     not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
 ))]
-pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
-    Err(ServerFnError::new("当前平台尚未实现系统剪贴板适配"))
+pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ApiError> {
+    Err(ApiError::new("当前平台尚未实现系统剪贴板适配"))
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ServerFnError> {
-    Err(ServerFnError::new("浏览器目标不能直接写入系统剪贴板"))
+pub(crate) fn native_copy_proxy_environment_variables() -> Result<(), ApiError> {
+    Err(ApiError::new("浏览器目标不能直接写入系统剪贴板"))
 }
 
 #[cfg(target_os = "windows")]
@@ -122,32 +121,32 @@ pub(crate) const SYSTEM_PROXY_BYPASS: &str =
     "127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,*.local,<local>";
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn system_proxy_operation_lock(
-) -> Result<std::sync::MutexGuard<'static, ()>, ServerFnError> {
+pub(crate) fn system_proxy_operation_lock() -> Result<std::sync::MutexGuard<'static, ()>, ApiError>
+{
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .map_err(|_| ServerFnError::new("系统代理操作锁已损坏"))
+        .map_err(|_| ApiError::new("系统代理操作锁已损坏"))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn read_native_system_proxy() -> Result<sysproxy::Sysproxy, ServerFnError> {
+pub(crate) fn read_native_system_proxy() -> Result<sysproxy::Sysproxy, ApiError> {
     sysproxy::Sysproxy::get_system_proxy()
-        .map_err(|error| ServerFnError::new(format!("读取系统代理失败: {error}")))
+        .map_err(|error| ApiError::new(format!("读取系统代理失败: {error}")))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn apply_native_system_proxy(proxy: &sysproxy::Sysproxy) -> Result<(), ServerFnError> {
+pub(crate) fn apply_native_system_proxy(proxy: &sysproxy::Sysproxy) -> Result<(), ApiError> {
     proxy
         .set_system_proxy()
-        .map_err(|error| ServerFnError::new(format!("设置系统代理失败: {error}")))
+        .map_err(|error| ApiError::new(format!("设置系统代理失败: {error}")))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn apply_native_auto_proxy(proxy: &sysproxy::Autoproxy) -> Result<(), ServerFnError> {
+pub(crate) fn apply_native_auto_proxy(proxy: &sysproxy::Autoproxy) -> Result<(), ApiError> {
     proxy
         .set_auto_proxy()
-        .map_err(|error| ServerFnError::new(format!("设置自动代理失败: {error}")))
+        .map_err(|error| ApiError::new(format!("设置自动代理失败: {error}")))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -158,7 +157,7 @@ pub(crate) fn is_kitty_system_proxy(proxy: &sysproxy::Sysproxy) -> bool {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn native_system_proxy_status_unlocked() -> Result<SystemProxyStatus, ServerFnError> {
+pub(crate) fn native_system_proxy_status_unlocked() -> Result<SystemProxyStatus, ApiError> {
     let proxy = read_native_system_proxy()?;
     let enabled = is_kitty_system_proxy(&proxy);
     let detail = if enabled {
@@ -179,7 +178,7 @@ pub(crate) fn native_system_proxy_status_unlocked() -> Result<SystemProxyStatus,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
+pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ApiError> {
     let _operation = system_proxy_operation_lock()?;
     native_system_proxy_status_unlocked()
 }
@@ -203,7 +202,7 @@ pub(crate) const fn system_proxy_platform_name() -> &'static str {
     not(target_arch = "wasm32"),
     not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
 ))]
-pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
+pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ApiError> {
     Ok(SystemProxyStatus {
         supported: false,
         enabled: false,
@@ -213,7 +212,7 @@ pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFn
 
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)]
-pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFnError> {
+pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ApiError> {
     Ok(SystemProxyStatus {
         supported: false,
         enabled: false,
@@ -225,7 +224,7 @@ pub(crate) fn native_system_proxy_status() -> Result<SystemProxyStatus, ServerFn
 /// dies (kill -9, crash, power loss) before it can restore the settings, the
 /// next startup notices the leftover and clears the now-dangling proxy.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn system_proxy_sentinel_path() -> Result<std::path::PathBuf, ServerFnError> {
+pub(crate) fn system_proxy_sentinel_path() -> Result<std::path::PathBuf, ApiError> {
     // Follow the profile directory override (see core.rs::profile_path): the
     // overview page renders the sentinel's "system proxy enabled" state, so
     // an isolated test server must not observe the developer machine's live
@@ -234,7 +233,7 @@ pub(crate) fn system_proxy_sentinel_path() -> Result<std::path::PathBuf, ServerF
         return Ok(std::path::PathBuf::from(dir).join("system-proxy.pending"));
     }
     let directories = directories::ProjectDirs::from("com", "kitty", "kitty-pro")
-        .ok_or_else(|| ServerFnError::new("无法确定本地配置目录"))?;
+        .ok_or_else(|| ApiError::new("无法确定本地配置目录"))?;
     Ok(directories.data_local_dir().join("system-proxy.pending"))
 }
 
@@ -295,7 +294,7 @@ pub fn cleanup_stale_system_proxy_sentinel() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
+pub(crate) fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus, ApiError> {
     let _operation = system_proxy_operation_lock()?;
 
     if enabled {
@@ -332,18 +331,18 @@ pub(crate) fn set_native_system_proxy(enabled: bool) -> Result<SystemProxyStatus
     not(target_arch = "wasm32"),
     not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
 ))]
-pub(crate) fn set_native_system_proxy(_enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
-    Err(ServerFnError::new("当前平台尚未实现系统代理适配"))
+pub(crate) fn set_native_system_proxy(_enabled: bool) -> Result<SystemProxyStatus, ApiError> {
+    Err(ApiError::new("当前平台尚未实现系统代理适配"))
 }
 
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)]
-pub(crate) fn set_native_system_proxy(_enabled: bool) -> Result<SystemProxyStatus, ServerFnError> {
-    Err(ServerFnError::new("浏览器目标不能直接修改系统代理"))
+pub(crate) fn set_native_system_proxy(_enabled: bool) -> Result<SystemProxyStatus, ApiError> {
+    Err(ApiError::new("浏览器目标不能直接修改系统代理"))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn native_list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
+pub(crate) fn native_list_running_processes() -> Result<Vec<RunningProcess>, ApiError> {
     use std::collections::BTreeMap;
 
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -407,30 +406,30 @@ pub(crate) fn insert_running_process(
     not(target_arch = "wasm32"),
     not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
 ))]
-pub(crate) fn native_list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
+pub(crate) fn native_list_running_processes() -> Result<Vec<RunningProcess>, ApiError> {
     Ok(Vec::new())
 }
 
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)]
-pub(crate) fn native_list_running_processes() -> Result<Vec<RunningProcess>, ServerFnError> {
+pub(crate) fn native_list_running_processes() -> Result<Vec<RunningProcess>, ApiError> {
     Ok(Vec::new())
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn ensure_core_is_running() -> Result<(), ServerFnError> {
+pub(crate) fn ensure_core_is_running() -> Result<(), ApiError> {
     use singbox::CoreState;
 
     // B12：只读状态检查不排队到长事务后面，锁忙时直接给中文提示。
     let Some(guard) = try_lock_core_slot()? else {
-        return Err(ServerFnError::new("内核正在切换，请稍后重试"));
+        return Err(ApiError::new("内核正在切换，请稍后重试"));
     };
     let Some(core) = guard.as_ref() else {
-        return Err(ServerFnError::new("请先建立连接，再启用系统代理"));
+        return Err(ApiError::new("请先建立连接，再启用系统代理"));
     };
     let status = core.engine.status();
     if status.state != CoreState::Running {
-        return Err(ServerFnError::new("请先建立连接，再启用系统代理"));
+        return Err(ApiError::new("请先建立连接，再启用系统代理"));
     }
     Ok(())
 }
@@ -490,13 +489,11 @@ pub(crate) fn core_slot() -> &'static std::sync::Mutex<Option<NativeCore>> {
 /// running operation. Returns `None` when the slot is busy.
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 pub(crate) fn try_lock_core_slot(
-) -> Result<Option<std::sync::MutexGuard<'static, Option<NativeCore>>>, ServerFnError> {
+) -> Result<Option<std::sync::MutexGuard<'static, Option<NativeCore>>>, ApiError> {
     match core_slot().try_lock() {
         Ok(guard) => Ok(Some(guard)),
         Err(std::sync::TryLockError::WouldBlock) => Ok(None),
-        Err(std::sync::TryLockError::Poisoned(_)) => {
-            Err(ServerFnError::new("sing-box 状态锁已损坏"))
-        }
+        Err(std::sync::TryLockError::Poisoned(_)) => Err(ApiError::new("sing-box 状态锁已损坏")),
     }
 }
 
@@ -540,4 +537,23 @@ impl NativeCore {
             config: None,
         }
     }
+}
+
+/// Run the privileged TUN helper if these are its arguments, and report its exit code.
+///
+/// TUN is served by a second copy of this executable, re-launched with administrator
+/// rights and one flag that identifies it as the helper. Every process entry point has to
+/// make that call before it starts a window: an authorized helper that skips it opens a
+/// second GUI as root and never answers the parent's RPC, which then times out.
+///
+/// `None` means these are ordinary GUI arguments and the caller should carry on.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+pub fn run_tun_helper_from_args() -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    return singbox::macos::run_helper_from_args();
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    return singbox::desktop_helper::run_helper_from_args();
 }

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "subscriptions": [],
+  "active_subscription_id": null,
+  "selected_tag": "",
+  "tunnel_mode": "rule",
+  "tun_enabled": false,
+  "allow_lan": false,
+  "dark_mode": false,
+  "custom_rules": [],
+  "dns_overrides": [
+    {
+      "id": 7,
+      "enabled": true,
+      "match_type": "domain_suffix",
+      "domain_suffix": "et.net",
+      "server": "100.100.100.101"
+    },
+    {
+      "id": 3,
+      "enabled": true,
+      "match_type": "domain_keyword",
+      "domain_suffix": "google",
+      "server": "8.8.8.8"
+    }
+  ],
+  "config_script_enabled": false,
+  "config_script": "",
+  "group_selections": {}
+}

@@ -1,0 +1,36 @@
+[package]
+name = "nsh-app-kitty"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+# `svg` is off by default and only the macOS host turns it on. Asking for it here is what
+# makes `svg()` draw shapes on a canvas, where NSH resolves `currentColor` to the element's
+# text color. Without the feature the glyphs become ordinary image sources, and the web
+# runtime draws an image's `currentColor` as black: every icon would lose its tint.
+nsh-core = { version = "0.5.0", features = ["svg"] }
+nsh-base = "0.5.0"
+# `native-desktop` is what publishes `api::autostart`; every other api function is available
+# either way. An NSH app is a native process, so the login-item API is one it can genuinely
+# offer — see `src/autostart.rs` for how a target without one is handled.
+api = { path = "../api", default-features = false, features = ["native-desktop"] }
+proxy-core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The windowing backends are opt-in: `nsh-platform-linux` needs GTK 4.14 development
+# packages, which the CI runners do not carry. The library, its headless tests and
+# `cargo check --workspace` build everywhere; `--features desktop` adds a runnable window.
+[features]
+desktop = ["dep:nsh-platform-macos", "dep:nsh-platform-linux"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.5.0", default-features = false, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { version = "0.5.0", optional = true }
+
+[dev-dependencies]
+proxy-core = { workspace = true }
+nsh-engine = { version = "0.5.0", default-features = false }
+nsh-testing = { version = "0.5.0", default-features = false }

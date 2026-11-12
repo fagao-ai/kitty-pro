@@ -103,25 +103,36 @@ fi
 install_en="$(cat <<EOF
 ### Install
 
-- **macOS (Apple Silicon):** \`KittyPro_${version}_aarch64.dmg\`
-- **Windows (x86_64):** \`Kitty-Pro-windows-x86_64.msi\` (portable: \`Kitty-Pro-windows-x86_64.zip\`)
-- **Linux (x86_64):** \`kitty-pro_${version}_x86_64.AppImage\` or \`kitty-pro_${version}_amd64.deb\`
-- **Android (arm64):** \`Kitty-Pro-arm64-v8a.apk\`
-- **Self-hosted web server:** \`Kitty-Pro-web-linux-x86_64.tar.gz\` (macOS: \`Kitty-Pro-web-macos.tar.gz\`)
+- **macOS (Apple Silicon):** \`Kitty-Pro-macos-aarch64.zip\` — unzip and move
+  \`Kitty Pro.app\` to Applications
+- **Windows (x86_64):** \`Kitty-Pro-windows-x86_64.zip\`
+- **Linux (x86_64):** \`Kitty-Pro-linux-x86_64.tar.gz\`
+- **Android (arm64 + armv7):** \`Kitty-Pro-arm64-v8a-armeabi-v7a-${version}.apk\`
+- **Web server (Linux x86_64):** \`Kitty-Pro-web-linux-x86_64.tar.gz\` — the
+  browser page plus the process that runs the core for it; unzip, run
+  \`./kitty-pro-web-server\`, open \`http://127.0.0.1:7897/\`
+- **Web server (macOS Apple Silicon):** \`Kitty-Pro-web-macos-aarch64.tar.gz\`
 
-Every installer has a matching \`.sha256\` sidecar; verify it before the first run.
+Every archive has a matching \`.sha256\` sidecar; verify it before the first run.
+Unzip and run the app from wherever you keep it: macOS builds are ad hoc signed
+and not notarized, so the first launch needs a right-click → Open.
 EOF
 )"
 install_zh="$(cat <<EOF
 ### 安装
 
-- **macOS（Apple 芯片）：** \`KittyPro_${version}_aarch64.dmg\`
-- **Windows（x86_64）：** \`Kitty-Pro-windows-x86_64.msi\`（便携版：\`Kitty-Pro-windows-x86_64.zip\`）
-- **Linux（x86_64）：** \`kitty-pro_${version}_x86_64.AppImage\` 或 \`kitty-pro_${version}_amd64.deb\`
-- **Android（arm64）：** \`Kitty-Pro-arm64-v8a.apk\`
-- **自托管 Web 服务：** \`Kitty-Pro-web-linux-x86_64.tar.gz\`（macOS 使用 \`Kitty-Pro-web-macos.tar.gz\`）
+- **macOS（Apple 芯片）：** \`Kitty-Pro-macos-aarch64.zip\` —— 解压后把
+  \`Kitty Pro.app\` 拖进「应用程序」
+- **Windows（x86_64）：** \`Kitty-Pro-windows-x86_64.zip\`
+- **Linux（x86_64）：** \`Kitty-Pro-linux-x86_64.tar.gz\`
+- **Android（arm64 + armv7）：** \`Kitty-Pro-arm64-v8a-armeabi-v7a-${version}.apk\`
+- **Web 服务端（Linux x86_64）：** \`Kitty-Pro-web-linux-x86_64.tar.gz\` ——
+  浏览器页面与替它运行核心的进程一起打包；解压后执行 \`./kitty-pro-web-server\`，
+  浏览器打开 \`http://127.0.0.1:7897/\`
+- **Web 服务端（macOS Apple 芯片）：** \`Kitty-Pro-web-macos-aarch64.tar.gz\`
 
-每个安装包都附带同名 \`.sha256\` 校验文件，首次运行前请先校验。
+每个压缩包都附带同名 \`.sha256\` 校验文件，首次运行前请先校验。macOS 构建仅做
+ad-hoc 签名、未公证，首次打开请右键选择「打开」。
 EOF
 )"
 

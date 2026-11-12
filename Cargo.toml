@@ -1,43 +1,23 @@
 [workspace]
 resolver = "2"
 members = [
-    "packages/ui",
-    "packages/web",
-    "packages/desktop",
-    "packages/mobile",
+    "packages/nsh-app",
     "packages/api",
+    "packages/server",
     "packages/proxy-core",
     "packages/singbox",
-    "packages/server-fn-macro",
 ]
 
-# `packages/mobile` is *named* `kitty-pro`, which is also the name of the desktop package's one
-# binary, so both write `target/debug/kitty-pro` and whichever Cargo visits last wins. A plain
-# `cargo build` at the root therefore produced an app at random: neither mobile's nor web's
-# no-feature main is a window — `api` depends on `dioxus` with `fullstack`, so a binary built
-# without `desktop` launches a *web server*, and dies on
-# `Couldn't read public directory at target/debug/public`. Exit 101, no window, and a message
-# about a folder nobody was asked to build.
-#
-# The two shell packages stay members, and both are still built and tested by `--workspace`; the
-# desktop release, the web server and the Android APK each name what they want
-# (`--package desktop`, `dx build --package web`, `dx bundle --package kitty-pro --android`).
-# Leaving them out of the *default* set only decides what a bare `cargo build` or `cargo run` at
-# the root means, and that should be the app.
-default-members = [
-    "packages/ui",
-    "packages/desktop",
-    "packages/api",
-    "packages/proxy-core",
-    "packages/singbox",
-    "packages/server-fn-macro",
-]
+[workspace.package]
+# The one version every package in this workspace carries, and the number the
+# release workflow stamps from the tag. It belongs here rather than in each
+# manifest because the in-app update check reads `env!("CARGO_PKG_VERSION")` from
+# `api` — the crate that answers it is not the shell that displays it — so a
+# per-package version is a per-package chance to answer with the wrong number.
+version = "1.0.14"
 
 [workspace.dependencies]
-dioxus = { version = "0.7.1" }
-
 # workspace
-ui = { path = "packages/ui" }
 api = { path = "packages/api" }
 proxy-core = { path = "packages/proxy-core" }
 singbox = { path = "packages/singbox" }

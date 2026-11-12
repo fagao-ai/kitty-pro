@@ -12,3 +12,8 @@
 # 运行日志与本地工作数据
 *.log
 .workbuddy/
+
+# `nsh check|build|package` 生成的 runner 源码、类型与产物（见 skills/nsh/references/tooling.md）。
+# 在 crate 目录里跑 Cargo 还会生成嵌套的 target/，`/target` 只忽略仓库根那一个。
+.nsh/
+packages/*/target/

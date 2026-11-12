@@ -1,27 +1,57 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<!-- The package is the app's identity and where it keeps its data, and it has
+     to match `nsh.json`'s `id` and the `app_id` the root component sets,
+     because all three name the same thing. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.kitty.pro">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- extractNativeLibs is on because the core runs in this process: the
+         dynamic loader finds `libkitty_singbox.so`, which `libnsh.so` names in
+         its NEEDED entries, in the unpacked `lib/` directory. NSH's own
+         template turns it off, and can — it ships one library and loads that
+         by name through `System.loadLibrary`, which works either way. -->
+    <!-- Android 9 turned cleartext HTTP off by default. `api` accepts an
+         `http://` subscription URL (packages/api/src/lib.rs), and plain HTTP is
+         common for panel and airport links, so importing one would fail here
+         with a network error and no reason attached. The deleted Dioxus APK
+         allowed this through a network_security_config file that was never in
+         the repository — the build tool supplied one — so the attribute spells
+         it out instead of waiting for that file to reappear. Scoped to the whole
+         app rather than a domain list because the hosts a user may name are
+         whatever they paste. -->
     <application
+        android:name="com.kitty.pro.KittyApplication"
         android:allowNativeHeapPointerTagging="false"
-        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="true"
         android:icon="@mipmap/kitty_launcher"
         android:label="@string/kitty_app_name"
-        android:networkSecurityConfig="@xml/network_security_config"
+        android:extractNativeLibs="true"
+        android:enableOnBackInvokedCallback="true"
         android:roundIcon="@mipmap/kitty_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/AppTheme">
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <!-- Tells NSH's AppActivity to run the Rust root compiled into `libnsh.so`
+             rather than load a JS bundle. It has to sit here, on the application:
+             `AppActivity.rustApp()` reads it through `getApplicationInfo().metaData`,
+             which carries application-level meta-data only. Declared on the activity
+             instead it is invisible to that call, and the app comes up on a blank
+             screen logging `cannot read the app bundle:
+             java.io.FileNotFoundException: nsh/bundle.nshc` — which is what the first
+             run of this APK on an emulator did. -->
+        <meta-data
+            android:name="com.longbridge.nsh.RUST"
+            android:value="true" />
+
+        <!-- NSH's own entry point. -->
         <activity
-            android:configChanges="orientation|screenLayout|screenSize|keyboardHidden"
+            android:name="com.longbridge.nsh.AppActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection"
             android:exported="true"
-            android:label="@string/kitty_app_name"
-            android:name="dev.dioxus.main.MainActivity">
-            <meta-data android:name="android.app.lib_name" android:value="main" />
-            <meta-data android:name="android.app.func_name" android:value="ANativeActivity_onCreate" />
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -40,5 +70,17 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Proxy traffic through the user-approved Kitty Pro VPN." />
         </service>
+
+        <!-- Owns the result of the system's allow-VPN dialog, because the activity
+             the user is looking at is NSH's and is final. Theme.Translucent.NoTitleBar
+             is what keeps it invisible: the default theme would flash an empty
+             window in front of the dialog. Not exported — nothing outside this app
+             starts it, and it takes a config in its intent. -->
+        <activity
+            android:name="com.kitty.pro.KittyVpnPermissionActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
 </manifest>

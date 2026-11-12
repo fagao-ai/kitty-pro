@@ -9,14 +9,14 @@ use super::*;
 pub(crate) async fn run_native_blocking<T, F>(
     failure_message: &'static str,
     operation: F,
-) -> Result<T, ServerFnError>
+) -> Result<T, ApiError>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T, ServerFnError> + Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
 {
     tokio::task::spawn_blocking(operation)
         .await
-        .map_err(|error| ServerFnError::new(format!("{failure_message}: {error}")))?
+        .map_err(|error| ApiError::new(format!("{failure_message}: {error}")))?
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -24,9 +24,9 @@ where
 pub(crate) async fn run_native_blocking<T, F>(
     _failure_message: &'static str,
     operation: F,
-) -> Result<T, ServerFnError>
+) -> Result<T, ApiError>
 where
-    F: FnOnce() -> Result<T, ServerFnError>,
+    F: FnOnce() -> Result<T, ApiError>,
 {
     operation()
 }
@@ -36,12 +36,12 @@ where
 pub(crate) async fn measure_native_latency(
     nodes: Vec<ProxyNode>,
     proxy_server_nameservers: Vec<String>,
-) -> Result<Vec<NodeLatency>, ServerFnError> {
+) -> Result<Vec<NodeLatency>, ApiError> {
     if nodes.is_empty() {
-        return Err(ServerFnError::new("没有可探测的节点"));
+        return Err(ApiError::new("没有可探测的节点"));
     }
     if nodes.len() > MAX_LATENCY_NODES {
-        return Err(ServerFnError::new(format!(
+        return Err(ApiError::new(format!(
             "单次最多探测 {MAX_LATENCY_NODES} 个节点"
         )));
     }
@@ -81,10 +81,10 @@ pub(crate) async fn measure_native_latency(
                     })
                     .collect()
             })
-            .map_err(|error| ServerFnError::new(error.to_string()))
+            .map_err(|error| ApiError::new(error.to_string()))
     })
     .await
-    .map_err(|error| ServerFnError::new(format!("节点探测任务失败: {error}")))?
+    .map_err(|error| ApiError::new(format!("节点探测任务失败: {error}")))?
 }
 
 #[allow(dead_code)]
@@ -92,12 +92,12 @@ pub(crate) async fn measure_native_latency(
 pub(crate) async fn measure_native_latency(
     nodes: Vec<ProxyNode>,
     proxy_server_nameservers: Vec<String>,
-) -> Result<Vec<NodeLatency>, ServerFnError> {
+) -> Result<Vec<NodeLatency>, ApiError> {
     if nodes.is_empty() {
-        return Err(ServerFnError::new("没有可探测的节点"));
+        return Err(ApiError::new("没有可探测的节点"));
     }
     if nodes.len() > MAX_LATENCY_NODES {
-        return Err(ServerFnError::new(format!(
+        return Err(ApiError::new(format!(
             "单次最多探测 {MAX_LATENCY_NODES} 个节点"
         )));
     }
@@ -126,7 +126,7 @@ pub(crate) async fn measure_native_latency(
     config["inbounds"] = serde_json::json!([]);
     config["route"]["auto_detect_interface"] = serde_json::Value::Bool(false);
     let config = serde_json::to_string(&config)
-        .map_err(|error| ServerFnError::new(format!("序列化探测配置失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("序列化探测配置失败: {error}")))?;
     tokio::task::spawn_blocking(move || {
         singbox::probe_outbounds(&config, &node_tags, LATENCY_CHECK_URL)
             .map(|results| {
@@ -139,10 +139,10 @@ pub(crate) async fn measure_native_latency(
                     })
                     .collect()
             })
-            .map_err(|error| ServerFnError::new(error.to_string()))
+            .map_err(|error| ApiError::new(error.to_string()))
     })
     .await
-    .map_err(|error| ServerFnError::new(format!("节点探测任务失败: {error}")))?
+    .map_err(|error| ApiError::new(format!("节点探测任务失败: {error}")))?
 }
 
 #[allow(dead_code)]
@@ -150,15 +150,15 @@ pub(crate) async fn measure_native_latency(
 pub(crate) async fn measure_native_latency(
     _nodes: Vec<ProxyNode>,
     _proxy_server_nameservers: Vec<String>,
-) -> Result<Vec<NodeLatency>, ServerFnError> {
-    Err(ServerFnError::new("浏览器目标不能直接运行节点延迟探测"))
+) -> Result<Vec<NodeLatency>, ApiError> {
+    Err(ApiError::new("浏览器目标不能直接运行节点延迟探测"))
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 pub(crate) async fn start_native_latency_session(
     nodes: Vec<ProxyNode>,
     proxy_server_nameservers: Vec<String>,
-) -> Result<u64, ServerFnError> {
+) -> Result<u64, ApiError> {
     validate_latency_nodes(&nodes)?;
     let node_tags = nodes
         .iter()
@@ -190,8 +190,8 @@ pub(crate) async fn start_native_latency_session(
         Ok::<_, String>(core)
     })
     .await
-    .map_err(|error| ServerFnError::new(format!("启动节点探测任务失败: {error}")))?
-    .map_err(ServerFnError::new)?;
+    .map_err(|error| ApiError::new(format!("启动节点探测任务失败: {error}")))?
+    .map_err(ApiError::new)?;
 
     let (session_id, session) = register_latency_session(node_tags.len())?;
     let core = std::sync::Arc::new(core);
@@ -260,7 +260,7 @@ pub(crate) async fn start_native_latency_session(
 pub(crate) async fn start_native_latency_session(
     nodes: Vec<ProxyNode>,
     proxy_server_nameservers: Vec<String>,
-) -> Result<u64, ServerFnError> {
+) -> Result<u64, ApiError> {
     validate_latency_nodes(&nodes)?;
     let total = nodes.len();
     let fallback_tags = nodes
@@ -299,17 +299,17 @@ pub(crate) async fn start_native_latency_session(
 pub(crate) async fn start_native_latency_session(
     _nodes: Vec<ProxyNode>,
     _proxy_server_nameservers: Vec<String>,
-) -> Result<u64, ServerFnError> {
-    Err(ServerFnError::new("浏览器目标不能直接启动节点探测"))
+) -> Result<u64, ApiError> {
+    Err(ApiError::new("浏览器目标不能直接启动节点探测"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn validate_latency_nodes(nodes: &[ProxyNode]) -> Result<(), ServerFnError> {
+pub(crate) fn validate_latency_nodes(nodes: &[ProxyNode]) -> Result<(), ApiError> {
     if nodes.is_empty() {
-        return Err(ServerFnError::new("没有可探测的节点"));
+        return Err(ApiError::new("没有可探测的节点"));
     }
     if nodes.len() > MAX_LATENCY_NODES {
-        return Err(ServerFnError::new(format!(
+        return Err(ApiError::new(format!(
             "单次最多探测 {MAX_LATENCY_NODES} 个节点"
         )));
     }
@@ -361,7 +361,7 @@ impl Drop for FinishOnDrop {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn register_latency_session(
     total: usize,
-) -> Result<(u64, std::sync::Arc<LatencySession>), ServerFnError> {
+) -> Result<(u64, std::sync::Arc<LatencySession>), ApiError> {
     let session_id = random_session_id()?;
     let session = std::sync::Arc::new(LatencySession {
         results: std::sync::Mutex::new(Vec::new()),
@@ -372,7 +372,7 @@ pub(crate) fn register_latency_session(
     });
     let mut sessions = latency_sessions()
         .lock()
-        .map_err(|_| ServerFnError::new("节点探测会话锁已损坏"))?;
+        .map_err(|_| ApiError::new("节点探测会话锁已损坏"))?;
     // Reap expired sessions before enforcing the concurrency cap so an
     // abandoned session cannot permanently occupy a slot.
     let now = std::time::Instant::now();
@@ -380,7 +380,7 @@ pub(crate) fn register_latency_session(
         now.saturating_duration_since(existing.created_at) < LATENCY_SESSION_TTL
     });
     if sessions.len() >= MAX_LATENCY_SESSIONS {
-        return Err(ServerFnError::new("节点探测任务过多，请稍后重试"));
+        return Err(ApiError::new("节点探测任务过多，请稍后重试"));
     }
     sessions.insert(session_id, std::sync::Arc::clone(&session));
     Ok((session_id, session))
@@ -388,28 +388,28 @@ pub(crate) fn register_latency_session(
 
 /// B10: session ids are random u64 values, not enumerable counters.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn random_session_id() -> Result<u64, ServerFnError> {
+pub(crate) fn random_session_id() -> Result<u64, ApiError> {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes)
-        .map_err(|error| ServerFnError::new(format!("生成节点探测会话 ID 失败: {error}")))?;
+        .map_err(|error| ApiError::new(format!("生成节点探测会话 ID 失败: {error}")))?;
     Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn poll_native_latency_session(
     session_id: u64,
-) -> Result<LatencyProbeSnapshot, ServerFnError> {
+) -> Result<LatencyProbeSnapshot, ApiError> {
     let session = latency_sessions()
         .lock()
-        .map_err(|_| ServerFnError::new("节点探测会话锁已损坏"))?
+        .map_err(|_| ApiError::new("节点探测会话锁已损坏"))?
         .get(&session_id)
         .cloned()
-        .ok_or_else(|| ServerFnError::new("节点探测会话不存在或已结束"))?;
+        .ok_or_else(|| ApiError::new("节点探测会话不存在或已结束"))?;
     let results = {
         let mut results = session
             .results
             .lock()
-            .map_err(|_| ServerFnError::new("节点探测结果锁已损坏"))?;
+            .map_err(|_| ApiError::new("节点探测结果锁已损坏"))?;
         std::mem::take(&mut *results)
     };
     let done = session.done.load(std::sync::atomic::Ordering::Acquire);
@@ -422,7 +422,7 @@ pub(crate) fn poll_native_latency_session(
     if done {
         latency_sessions()
             .lock()
-            .map_err(|_| ServerFnError::new("节点探测会话锁已损坏"))?
+            .map_err(|_| ApiError::new("节点探测会话锁已损坏"))?
             .remove(&session_id);
     }
     Ok(snapshot)
@@ -431,8 +431,8 @@ pub(crate) fn poll_native_latency_session(
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn poll_native_latency_session(
     _session_id: u64,
-) -> Result<LatencyProbeSnapshot, ServerFnError> {
-    Err(ServerFnError::new("浏览器目标不能直接读取节点探测"))
+) -> Result<LatencyProbeSnapshot, ApiError> {
+    Err(ApiError::new("浏览器目标不能直接读取节点探测"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
