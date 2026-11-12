@@ -203,13 +203,11 @@ done
 version="$(cargo metadata --locked --no-deps --format-version 1 |
     jq -er '.packages[] | select(.name == "nsh-app-kitty") | .version')"
 # The integer Android compares on upgrade. Derived from the version rather than
-# read from `nsh.json`'s `build`, because that field is never stamped:
-# `set-package-version.sh` rewrites the crate, and the release workflow passes the
-# tag as `--app-version`, so a `build` of 1 would ship as versionCode 1 at v1.0.14,
-# at v1.1.0, and forever after — and Android refuses to install an update whose
-# versionCode is not higher, so the first user would never be able to leave the
-# first release. The weights keep it monotonic for any version the release
-# workflow accepts (major < 1000, minor and patch < 1000).
+# read from `nsh.json`'s `build` directly: that field is only correct after
+# `set-package-version.sh` has run, and this script has to build on a machine where
+# it has not. Asking the same script for the number keeps one definition of the
+# mapping — `--build-number` — between the manifest NSH stamps and the APK
+# assembled here, which is the pair that must agree on which build is newer.
 #
 # KITTY_VERSION_CODE overrides, for a rebuild of a version already published: the
 # version is the release's, so bumping it is not an option, and this is the one
@@ -218,13 +216,7 @@ if [[ -n "${KITTY_VERSION_CODE:-}" ]]; then
     build_number="$KITTY_VERSION_CODE"
     [[ "$build_number" =~ ^[0-9]+$ ]] || die "KITTY_VERSION_CODE must be an integer"
 else
-    version_number="$(printf '%s' "$version" | sed 's/[-+].*//')"
-    IFS=. read -r v_major v_minor v_patch <<<"$version_number"
-    for part in "${v_major:-0}" "${v_minor:-0}" "${v_patch:-0}"; do
-        [[ "$part" =~ ^[0-9]{1,3}$ ]] ||
-            die "version $version does not fit the 1.2.3 shape versionCode is derived from"
-    done
-    build_number=$((10#${v_major:-0} * 1000000 + 10#${v_minor:-0} * 1000 + 10#${v_patch:-0}))
+    build_number="$("$root/scripts/set-package-version.sh" --build-number "$version")"
 fi
 app_name="$(jq -er '.name' "$app/nsh.json")"
 application_id="$(jq -er '.id' "$app/nsh.json")"
