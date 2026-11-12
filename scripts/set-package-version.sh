@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
-# Stamp one workspace package with the version a release tag names.
+# Stamp the workspace with the version a release tag names.
 #
-# Each release shell reports its own `CARGO_PKG_VERSION` to the in-app update
-# check, which compares it against the newest published release. Only the
-# desktop package used to be stamped from the tag, so the Web server and the APK
-# kept answering `0.1.0`: every one of their users was told a newer release
-# existed on every launch, forever, with no installable version that would stop
-# it.
+# Every shell reports `CARGO_PKG_VERSION` to the in-app update check, which
+# compares it against the newest published release. One tag is one release of one
+# product, so every package takes the tag's version rather than the release job
+# picking a winner per artifact: the desktop job used to stamp only its own crate,
+# and the version the check actually answers with is read from `api`, not from the
+# shell that displays it, so even a correctly stamped desktop kept reporting 0.1.0.
 #
-# Usage: set-package-version.sh <package> <version>
+# Usage: set-package-version.sh <version>
 set -euo pipefail
 
-package="${1:-}"
-version="${2:-}"
+version="${1:-}"
 
-if [[ -z "$package" || -z "$version" ]]; then
-    echo "usage: $0 <package> <version>" >&2
+if [[ -z "$version" ]]; then
+    echo "usage: $0 <version>" >&2
     exit 2
 fi
 
@@ -26,48 +25,56 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
     exit 1
 fi
 
-if ! manifest="$(
-    cargo metadata --locked --no-deps --format-version 1 \
-        | jq -er --arg package "$package" \
-            '.packages[] | select(.name == $package) | .manifest_path'
-)"; then
-    # `jq -e` exits quietly when it selected nothing, which would otherwise look
-    # like an unexplained failure of the whole release job.
-    echo "no workspace package named $package" >&2
-    exit 1
-fi
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+manifest="$root/Cargo.toml"
 
 temporary="${manifest}.version.tmp"
 trap 'rm -f "$temporary"' EXIT
 
-# Rewrite only the version line inside this manifest's [package] table, leaving
-# dependencies and every other package alone.
+# The one line to rewrite: `version` inside `[workspace.package]`, which every
+# member inherits through `version.workspace = true`. Scoped by the table header
+# so a dependency's own `version = ` line can never be the one that moves.
 awk -v version="$version" '
-    /^\[package\][[:space:]]*$/ { in_package = 1 }
-    /^\[/ && !/^\[package\][[:space:]]*$/ { in_package = 0 }
-    in_package && /^version[[:space:]]*=/ {
+    /^\[/ { in_workspace_package = ($0 ~ /^\[workspace\.package\][[:space:]]*$/) }
+    in_workspace_package && /^version[[:space:]]*=/ {
         print "version = \"" version "\""
         replaced = 1
         next
     }
     { print }
-    END { if (!replaced) { print "no [package] version line found" > "/dev/stderr"; exit 1 } }
+    END {
+        if (!replaced) {
+            print "no [workspace.package] version line found" > "/dev/stderr"
+            exit 1
+        }
+    }
 ' "$manifest" >"$temporary"
 mv "$temporary" "$manifest"
 trap - EXIT
 
-# Cargo.lock records workspace package versions. Update exactly this entry
-# without upgrading anything else, so later --locked builds see the new version.
-cargo update --package "$package" --precise "$version"
+# Cargo.lock records the workspace members' versions. `--offline` because this
+# only re-derives what the manifests already say: a release job must not be able to
+# move a registry dependency while it is moving a version number.
+cargo update --offline --workspace
 
-actual="$(
-    cargo metadata --locked --no-deps --format-version 1 \
-        | jq -er --arg package "$package" \
-            '.packages[] | select(.name == $package) | .version'
-)"
-if [[ "$actual" != "$version" ]]; then
-    echo "$package package version $actual does not match $version" >&2
+# Check every member rather than the one the caller named, which is the point:
+# a member left behind by an edit to `[workspace.package]` is the bug this whole
+# script exists to prevent, and it is silent — the shell just reports an old
+# version, forever, and no build fails.
+if ! cargo metadata --locked --no-deps --format-version 1 \
+    | jq -er --arg version "$version" '
+        .packages
+        | map(select(.source == null))
+        | (map(.name) | join(" ")) as $names
+        | if all(.[]; .version == $version)
+          then .[0].name
+          else error("packages not at \($version): " +
+                     (map(select(.version != $version) | "\(.name) \(.version)") | join(", ")) +
+                     " (workspace members: \($names))")
+          end
+' >/dev/null; then
+    echo "stamping $manifest did not put every package at $version" >&2
     exit 1
 fi
 
-echo "$package version set to $version"
+echo "workspace version set to $version"
