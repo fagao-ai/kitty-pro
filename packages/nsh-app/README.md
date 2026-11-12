@@ -446,10 +446,6 @@ Every screen is ported and every settings card has a home here. The rows above a
 separates this app from what the deleted shells shipped, and none of them is a decision this
 crate can make on its own.
 
-Every screen is ported and every settings card has a home here. The rows above are what still
-separates this app from what the deleted shells shipped, and none of them is a decision this
-crate can make on its own.
-
 One card is distributed rather than copied. The original groups the core's version, its state, the
 unavailable-core diagnosis and its retry under one 内核 heading; here those four things live where
 each is acted on — the state in the header chip and the about card, the diagnosis and 重新检测内核
