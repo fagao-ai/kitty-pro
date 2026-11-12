@@ -6,22 +6,95 @@ use jni::{
     sys::{jint, jstring},
     JNIEnv, JavaVM,
 };
-use std::{path::PathBuf, ptr};
+use std::{
+    ffi::{c_char, c_void},
+    path::PathBuf,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 const BRIDGE_CLASS: &str = "com.kitty.pro.KittyVpnBridge";
 const DNS_BRIDGE_CLASS: &str = "com.kitty.pro.AndroidDnsBridge";
 
+/// Teach `ndk-context` where the process's `JavaVM` and `Context` are.
+///
+/// Every function here reaches Java through `ndk_context::android_context`,
+/// which `ndk-glue` normally fills in before `main` — but an NSH app is a
+/// `cdylib` that an ordinary `Activity` loads, so nothing runs that glue and the
+/// lookup would panic. The Application calls this once with itself, before the
+/// core can be asked for anything; both pointers come from `JNIEnv`, which is
+/// the only place they are genuinely available, so Kotlin passes no addresses.
+///
+/// The reference it makes is deliberately never released: it names the
+/// Application, which lives as long as the process, and `ndk-context` has no way
+/// to replace one context with another.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_kitty_pro_KittyVpnBridge_nativeInit(
+    env: JNIEnv,
+    _class: JClass,
+    context: JObject,
+) {
+    if context.is_null() || ANDROID_CONTEXT_INITIALIZED.swap(true, Ordering::SeqCst) {
+        // A second call would abort inside `initialize_android_context`, which
+        // asserts it is the first. The first registration is the one that counts.
+        return;
+    }
+    let initialized = (|| -> Result<(), CoreError> {
+        let vm = env.get_java_vm().map_err(jni_error)?;
+        let global = env.new_global_ref(&context).map_err(jni_error)?;
+        let vm_pointer = vm.get_java_vm_pointer() as *mut c_void;
+        let context_pointer = global.as_raw() as *mut c_void;
+        // Leak the global reference on purpose: dropping it here would leave
+        // `ndk-context` holding an address the VM has already reclaimed.
+        std::mem::forget(global);
+        // SAFETY: both come from a live `JNIEnv` in this call, and the context is
+        // the Application, which outlives every later use.
+        unsafe { ndk_context::initialize_android_context(vm_pointer, context_pointer) };
+        Ok(())
+    })();
+    if let Err(error) = initialized {
+        ANDROID_CONTEXT_INITIALIZED.store(false, Ordering::SeqCst);
+        android_log(&format!("failed to attach the Android runtime: {error}"));
+    }
+}
+
+static ANDROID_CONTEXT_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Write to logcat under the tag the Kotlin half already uses.
+fn android_log(message: &str) {
+    // `__android_log_print` is in liblog, which `build.rs` links on Android.
+    unsafe extern "C" {
+        fn __android_log_print(prio: i32, tag: *const c_char, fmt: *const c_char, ...) -> i32;
+    }
+    let tag = match std::ffi::CString::new("KittyVpnBridge") {
+        Ok(tag) => tag,
+        Err(_) => return,
+    };
+    let message = message.replace('%', "%%");
+    let Ok(message) = std::ffi::CString::new(message) else {
+        return;
+    };
+    // SAFETY: three NUL-terminated strings, and varargs matching the format.
+    unsafe { __android_log_print(4, tag.as_ptr(), c"%s".as_ptr(), message.as_ptr()) };
+}
+
 pub fn start(config: &str) -> Result<(), CoreError> {
     let config = prepare_android_config(config)?;
-    let result = with_env(|env, activity| {
+    let result = with_env(|env, context| {
         let config = env.new_string(&config).map_err(jni_error)?;
-        let bridge = bridge_class(env, &activity)?;
+        let bridge = bridge_class(env, &context)?;
         env.call_static_method(
             &bridge,
             "start",
-            "(Landroid/app/Activity;Ljava/lang/String;)I",
+            // `Context`, not `Activity`: the object this is called with is the
+            // application, registered once at startup (see `nativeInit`), and the
+            // Kotlin `start` asks only what an application can answer —
+            // `VpnService.prepare` and `startActivity` with NEW_TASK. An activity
+            // would be wrong here as well as unavailable: the one on screen belongs
+            // to NSH and can outlive, or predate, this call.
+            "(Landroid/content/Context;Ljava/lang/String;)I",
             &[
-                JValue::Object(&activity),
+                JValue::Object(&context),
                 JValue::Object(&JObject::from(config)),
             ],
         )
@@ -38,13 +111,13 @@ pub fn start(config: &str) -> Result<(), CoreError> {
 }
 
 pub fn stop() -> Result<(), CoreError> {
-    with_env(|env, activity| {
-        let bridge = bridge_class(env, &activity)?;
+    with_env(|env, context| {
+        let bridge = bridge_class(env, &context)?;
         env.call_static_method(
             &bridge,
             "stop",
             "(Landroid/content/Context;)V",
-            &[JValue::Object(&activity)],
+            &[JValue::Object(&context)],
         )
         .map_err(jni_error)
         .map(|_| ())
@@ -121,9 +194,9 @@ pub fn probe(
 }
 
 pub fn files_dir() -> Result<PathBuf, CoreError> {
-    with_env(|env, activity| {
+    with_env(|env, context| {
         let directory = env
-            .call_method(&activity, "getFilesDir", "()Ljava/io/File;", &[])
+            .call_method(&context, "getFilesDir", "()Ljava/io/File;", &[])
             .and_then(|value| value.l())
             .map_err(jni_error)?;
         let path = env
@@ -176,8 +249,8 @@ pub extern "system" fn Java_com_kitty_pro_KittyVpnService_nativeTraffic(
 }
 
 fn call_string(method: &str) -> Result<String, CoreError> {
-    with_env(|env, activity| {
-        let bridge = bridge_class(env, &activity)?;
+    with_env(|env, context| {
+        let bridge = bridge_class(env, &context)?;
         let value = env
             .call_static_method(&bridge, method, "()Ljava/lang/String;", &[])
             .and_then(|value| value.l())
@@ -191,18 +264,18 @@ fn call_string(method: &str) -> Result<String, CoreError> {
 
 fn bridge_class<'local>(
     env: &mut JNIEnv<'local>,
-    activity: &JObject<'local>,
+    context: &JObject<'local>,
 ) -> Result<JClass<'local>, CoreError> {
-    load_class(env, activity, BRIDGE_CLASS)
+    load_class(env, context, BRIDGE_CLASS)
 }
 
 fn load_class<'local>(
     env: &mut JNIEnv<'local>,
-    activity: &JObject<'local>,
+    context: &JObject<'local>,
     class_name: &str,
 ) -> Result<JClass<'local>, CoreError> {
     let loader = env
-        .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
         .and_then(|value| value.l())
         .map_err(jni_error)?;
     let class_name = env.new_string(class_name).map_err(jni_error)?;
@@ -255,14 +328,14 @@ fn prepare_android_config(config: &str) -> Result<String, CoreError> {
 }
 
 fn android_local_dns_port() -> Result<u16, CoreError> {
-    with_env(|env, activity| {
-        let dns_bridge = load_class(env, &activity, DNS_BRIDGE_CLASS)?;
+    with_env(|env, context| {
+        let dns_bridge = load_class(env, &context, DNS_BRIDGE_CLASS)?;
         let port = env
             .call_static_method(
                 &dns_bridge,
                 "localDnsPort",
                 "(Landroid/content/Context;)I",
-                &[JValue::Object(&activity)],
+                &[JValue::Object(&context)],
             )
             .and_then(|value| value.i())
             .map_err(jni_error)?;
@@ -296,8 +369,12 @@ fn with_env<T>(
     vm.attach_current_thread()
         .map_err(jni_error)
         .and_then(|mut env| {
-            let activity = unsafe { JObject::from_raw(context.context().cast()) };
-            operation(&mut env, activity)
+            // The application context, registered by `KittyVpnBridge.attach`. It is
+            // only ever used as a `Context` — a class loader, `getFilesDir`, an
+            // argument to the bridge — and nothing here may treat it as an
+            // `Activity`, because it is not one and would fail the call.
+            let app_context = unsafe { JObject::from_raw(context.context().cast()) };
+            operation(&mut env, app_context)
         })
 }
 
