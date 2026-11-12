@@ -616,6 +616,87 @@ mod tests {
         assert_eq!(ReleaseKind::from_asset_name("Kitty Pro.app"), None);
     }
 
+    /// Every name `.github/workflows/release.yml` publishes, and what each platform
+    /// is handed. The workflow's header says an edit to a name there must be an edit
+    /// here too: these are the names, so the pairing has one place to fail. It is not
+    /// the frozen `RELEASE_ASSETS` fixture above, which records what v1.0.9 really
+    /// shipped and must keep doing that — a matcher that still serves an old release
+    /// is a property worth testing on its own.
+    ///
+    /// Written from the workflow's own `archive_name`s, the desktop job's
+    /// `Kitty-Pro-<id>-<arch>` template and `build-android.sh`'s
+    /// `<app>-<abis>-<version>.apk`, so a rename that only touches one of the three
+    /// breaks here rather than on a user's device.
+    #[test]
+    fn the_published_asset_set_answers_every_platform() {
+        let names = [
+            "Kitty-Pro-macos-aarch64.zip",
+            "Kitty-Pro-windows-x86_64.zip",
+            "Kitty-Pro-linux-x86_64.tar.gz",
+            "Kitty-Pro-web-linux-x86_64.tar.gz",
+            "Kitty-Pro-web-macos-aarch64.tar.gz",
+            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.14.apk",
+            // The sidecars ride along on the release page and must never be chosen.
+            "Kitty-Pro-macos-aarch64.zip.sha256",
+            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.14.apk.sha256",
+        ];
+        for (kind, os, arch, expected) in [
+            (
+                ReleaseKind::Desktop,
+                "macos",
+                "aarch64",
+                "Kitty-Pro-macos-aarch64.zip",
+            ),
+            (
+                ReleaseKind::Desktop,
+                "windows",
+                "x86_64",
+                "Kitty-Pro-windows-x86_64.zip",
+            ),
+            (
+                ReleaseKind::Desktop,
+                "linux",
+                "x86_64",
+                "Kitty-Pro-linux-x86_64.tar.gz",
+            ),
+            (
+                ReleaseKind::WebServer,
+                "linux",
+                "x86_64",
+                "Kitty-Pro-web-linux-x86_64.tar.gz",
+            ),
+            (
+                ReleaseKind::WebServer,
+                "macos",
+                "aarch64",
+                "Kitty-Pro-web-macos-aarch64.tar.gz",
+            ),
+            (
+                ReleaseKind::Android,
+                "android",
+                "aarch64",
+                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.14.apk",
+            ),
+            // `std::env::consts::ARCH` on a 32-bit Android build is `arm`, which is
+            // why ARCH_ALIASES exists at all.
+            (
+                ReleaseKind::Android,
+                "android",
+                "arm",
+                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.14.apk",
+            ),
+        ] {
+            assert_eq!(
+                select_from(kind, os, arch, &names).as_deref(),
+                Some(expected),
+                "{os}/{arch} running the {} channel",
+                kind.label()
+            );
+        }
+        // That each name answers only its own channel is `kinds_do_not_cross_contaminate`'s
+        // job; this test pins the set, not the boundaries.
+    }
+
     /// `scripts/build-android.sh` names the APK after the ABIs it carries, and this is
     /// the check that the name means what it says. One fat APK serves both CPUs, so
     /// each has to match; the point of the test is the third case, because an APK

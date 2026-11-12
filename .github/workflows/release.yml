@@ -41,6 +41,12 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   RUST_BACKTRACE: "1"
   RUST_VERSION: "1.97.1"
+  # The NSH CLI every job installs, pinned to the release the crates in
+  # `packages/nsh-app` are at. Unpinned, a fresh upstream release silently changes
+  # what a tag builds: `scripts/setup-nsh.sh` compares the two versions and fails
+  # the job rather than publishing an artifact whose runtime and Rust half disagree.
+  # Bumping this means bumping the crates in the same commit.
+  NSH_VERSION: "v0.5.0"
 
 jobs:
   desktop:
@@ -117,12 +123,12 @@ jobs:
           echo "SINGBOX_CC=$mingw_bin/gcc.exe" >> "$GITHUB_ENV"
           echo 'CGO_ENABLED=1' >> "$GITHUB_ENV"
 
-      - name: Install the NSH CLI
-        shell: bash
-        run: |
-          curl -fsSL https://nsh.dev/install.sh | sh
-          echo "$HOME/.nsh/bin" >> "$GITHUB_PATH"
-          nsh --version
+      # The desktop job needs no component: it packages for the machine it runs on,
+      # whose runtime ships inside the CLI's own archive.
+      - name: Set up NSH
+        uses: ./.github/actions/setup-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
 
       # Every package in the workspace takes the tag's version, including `api`,
       # which is the crate the in-app update check actually answers with. Stamping
@@ -365,12 +371,13 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: wasm32-unknown-unknown
 
-      - name: Install the NSH CLI
-        shell: bash
-        run: |
-          curl -fsSL https://nsh.dev/install.sh | sh
-          echo "$HOME/.nsh/bin" >> "$GITHUB_PATH"
-          nsh --version
+      # The page is WebAssembly whatever machine builds it, so the web runtime is a
+      # component here even on the macOS runner — that CLI ships the macOS runtime.
+      - name: Set up NSH
+        uses: ./.github/actions/setup-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+          components: web
 
       - name: Set tagged app version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -466,7 +473,15 @@ jobs:
           tar -xzf "dist/web/${{ matrix.archive_name }}.tar.gz" -C "$check"
           test -x "$check/kitty-pro-web-server"
           test -f "$check/public/index.html"
-          ls "$check/public" | grep -q '\.wasm'
+          # `find -quit`, not `ls | grep -q`: grep stops at its first match and
+          # leaves `ls` writing into a closed pipe, and under `pipefail` that
+          # SIGPIPE fails the step on the exact archive this step exists to approve.
+          wasm="$(find "$check/public" -maxdepth 1 -type f -name '*.wasm' -print -quit)"
+          [[ -n $wasm ]] || {
+            echo "the page carries no WebAssembly, so it can never render" >&2
+            exit 1
+          }
+          echo "site: $(basename "$wasm")"
 
       - name: Create Web checksum
         shell: bash
@@ -489,11 +504,189 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  android:
+    name: Android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      # One archive carries every ABI it was built for, because the update check
+      # reads the CPU groups out of the file name and declines an asset that does not
+      # list the device's — a 32-bit phone offered an arm64-only APK is a phone told
+      # there is no build for it, forever. So a release builds both. A manual
+      # throwaway builds one: each ABI is a full cross-build of the Go core and of
+      # NSH's runtime, which is the difference between a check that finishes and one
+      # that hits its timeout.
+      - name: Choose the ABIs
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            echo "KITTY_ABIS=arm64-v8a,armeabi-v7a" >> "$GITHUB_ENV"
+          else
+            echo "KITTY_ABIS=arm64-v8a" >> "$GITHUB_ENV"
+            echo "Non-release build: packaging arm64-v8a only." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The SDK's own manager installs the three packages the build names. They are
+      # pinned because `build-android.sh` reads `android.jar` and the NDK's clang out
+      # of a specific revision, and it prefers that revision when it is present.
+      - name: Install the Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-35 build-tools;35.0.1 ndk;27.0.12077973"
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: packages/singbox/bridge/go.mod
+          cache-dependency-path: packages/singbox/bridge/go.sum
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Set up NSH
+        uses: ./.github/actions/setup-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+          components: android
+
+      # The VPN bridge is Kotlin and nothing else in this build has a Kotlin step, so
+      # the compiler comes from Maven Central through the script the repository
+      # tested. It prints the directory to point KOTLIN_HOME at, and nothing else.
+      - name: Install the Kotlin compiler
+        shell: bash
+        run: echo "KOTLIN_HOME=$(./scripts/install-kotlinc.sh)" >> "$GITHUB_ENV"
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+          cache-all-crates: true
+
+      - name: Set tagged app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          release_version="$(
+            jq -nr --arg tag "$GITHUB_REF_NAME" '$tag | ltrimstr("v")'
+          )"
+          ./scripts/set-package-version.sh "$release_version"
+
+      - name: Reject an unversioned manual build
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        env:
+          KITTY_TEST_VERSION: ${{ inputs.test_version }}
+        run: |
+          if [[ -z "${KITTY_TEST_VERSION:-}" ]]; then
+            echo "This run is not from a v* tag, so nothing here carries a release version." >&2
+            echo "Enter test_version to build a throwaway with that version, or push a tag." >&2
+            exit 1
+          fi
+          ./scripts/set-package-version.sh "$KITTY_TEST_VERSION"
+
+      # Signed with the same key every published APK has been signed with. Android
+      # refuses an update whose signer differs, so a release whose secrets went
+      # missing must stop here rather than fall back to a debug key: that builds an
+      # APK that installs on a fresh phone and on nothing else, silently stranding
+      # every device that already runs the app.
+      - name: Configure the release keystore
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=()
+          [[ -n "${KEYSTORE_BASE64:-}" ]] || missing+=(ANDROID_KEYSTORE_BASE64)
+          [[ -n "${KEYSTORE_PASSWORD:-}" ]] || missing+=(ANDROID_KEYSTORE_PASSWORD)
+          [[ -n "${KEY_ALIAS:-}" ]] || missing+=(ANDROID_KEY_ALIAS)
+          if (( ${#missing[@]} )); then
+            echo "::error title=Missing release signing secrets::${missing[*]}"
+            echo "A tagged build cannot sign with the published key without them, and" >&2
+            echo "signing with anything else strands every installed device." >&2
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/kitty-pro-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          [[ -s $keystore ]] || {
+            echo "ANDROID_KEYSTORE_BASE64 decoded to an empty keystore." >&2
+            exit 1
+          }
+          # The names `build-android.sh` reads. Its own guard refuses a keystore
+          # without an alias, which is the same mistake this step would otherwise
+          # make for it.
+          {
+            echo "KITTY_KEYSTORE=$keystore"
+            echo "KITTY_KEY_ALIAS=$KEY_ALIAS"
+            echo "NSH_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "KITTY_KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the APK
+        shell: bash
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/kitty-pro-android.log"
+          if ! ./scripts/build-android.sh --abi "$KITTY_ABIS" 2>&1 | tee "$log"; then
+            {
+              echo '### Android build failure'
+              echo
+              echo '```text'
+              tail -n 150 "$log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            failure_tail="$(
+              {
+                (grep -Ei 'error|failed|undefined reference|cannot find|not found|go:' "$log" || true) | tail -n 60
+                tail -n 40 "$log"
+              } | tr '\r\n' ' ' | cut -c1-8000
+            )"
+            echo "::error title=Android build output::$failure_tail"
+            exit 1
+          fi
+
+      # The name is decided here rather than fixed: it carries the version and every
+      # ABI inside, and `proxy_core::update` picks what a device installs out of it.
+      - name: Checksum the APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls dist/android/*.apk >/dev/null || {
+            echo "build-android.sh left no APK in dist/android" >&2
+            exit 1
+          }
+          (cd dist/android && for apk in *.apk; do sha256sum "$apk" > "$apk.sha256"; done)
+          ls -la dist/android
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: kitty-pro-android
+          path: dist/android/*
+          if-no-files-found: error
+          retention-days: 14
+
   github-release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - desktop
+      - web
+      - android
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -521,7 +714,14 @@ jobs:
         with:
           body_path: release-body.md
           fail_on_unmatched_files: true
+          # One glob per channel the workflow builds. A channel missing from here
+          # still reports a green run: the artifact is simply absent from the release
+          # page, and `proxy_core::update` reads that page's asset list, so a release
+          # without its `.apk` tells every phone there is nothing to install. The
+          # desktop's `.dmg`/`.msi`/`.deb`/`.AppImage` globs went with the shells that
+          # produced them; NSH ships one archive per platform.
           files: |
             release-assets/**/*.zip
             release-assets/**/*.tar.gz
+            release-assets/**/*.apk
             release-assets/**/*.sha256

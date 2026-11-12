@@ -107,6 +107,11 @@ install_en="$(cat <<EOF
   \`Kitty Pro.app\` to Applications
 - **Windows (x86_64):** \`Kitty-Pro-windows-x86_64.zip\`
 - **Linux (x86_64):** \`Kitty-Pro-linux-x86_64.tar.gz\`
+- **Android (arm64 + armv7):** \`Kitty-Pro-arm64-v8a-armeabi-v7a-${version}.apk\`
+- **Web server (Linux x86_64):** \`Kitty-Pro-web-linux-x86_64.tar.gz\` — the
+  browser page plus the process that runs the core for it; unzip, run
+  \`./kitty-pro-web-server\`, open \`http://127.0.0.1:7897/\`
+- **Web server (macOS Apple Silicon):** \`Kitty-Pro-web-macos-aarch64.tar.gz\`
 
 Every archive has a matching \`.sha256\` sidecar; verify it before the first run.
 Unzip and run the app from wherever you keep it: macOS builds are ad hoc signed
@@ -120,6 +125,11 @@ install_zh="$(cat <<EOF
   \`Kitty Pro.app\` 拖进「应用程序」
 - **Windows（x86_64）：** \`Kitty-Pro-windows-x86_64.zip\`
 - **Linux（x86_64）：** \`Kitty-Pro-linux-x86_64.tar.gz\`
+- **Android（arm64 + armv7）：** \`Kitty-Pro-arm64-v8a-armeabi-v7a-${version}.apk\`
+- **Web 服务端（Linux x86_64）：** \`Kitty-Pro-web-linux-x86_64.tar.gz\` ——
+  浏览器页面与替它运行核心的进程一起打包；解压后执行 \`./kitty-pro-web-server\`，
+  浏览器打开 \`http://127.0.0.1:7897/\`
+- **Web 服务端（macOS Apple 芯片）：** \`Kitty-Pro-web-macos-aarch64.tar.gz\`
 
 每个压缩包都附带同名 \`.sha256\` 校验文件，首次运行前请先校验。macOS 构建仅做
 ad-hoc 签名、未公证，首次打开请右键选择「打开」。
