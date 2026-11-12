@@ -239,10 +239,15 @@ fn content_column(store: AppStore) -> impl IntoElement {
             // The shell bounds the page but does not scroll it. Each screen owns its scroll
             // region: wrapping everything here leaves a virtual list with unbounded height,
             // which lays out no rows at all, and gives a list page two bars on one axis.
+            //
+            // The bottom inset only. The top one belongs to `page_header`, which is what sits
+            // under the status bar; asking for it here too spent the same inset twice — once
+            // as a gap below the header and once as the header's own clearance, which was then
+            // missing and left the badge under the clock.
             view()
                 .flex_1()
                 .min_h(px(0.0))
-                .py_safe_area()
+                .pb_safe_area()
                 .child(screen_body(store)),
         )
         .child(when(move || !is_desktop(), move || tab_bar(store)))
@@ -288,6 +293,15 @@ pub fn connect_label(store: AppStore) -> String {
 /// handle and a 264pt strip is a poor thing to grab. The press handlers inside it stay
 /// interactive — NSH keeps buttons working inside a drag region — so this is a title bar in
 /// behaviour as well as in position.
+///
+/// Its top padding is the safe area's inset *plus* the 16pt the desktop uses, not the 16pt
+/// alone. On a phone NSH's `AppActivity` draws edge to edge, so the window's top edge is under
+/// the status bar and the inset is the only thing that keeps 总览 and 内核已就绪 out of the
+/// clock; `py_4` by itself put the header's text at 16pt from the top of the screen and let the
+/// badge sit under the status bar icons. The body below applies the same inset as its *own* top
+/// padding (`content_column`), which is why the gap existed and simply was in the wrong place:
+/// the header overlapped the status bar and the first card began a status bar's height below
+/// where it should.
 fn page_header(store: AppStore) -> impl IntoElement {
     view()
         .flex_row()
@@ -296,6 +310,7 @@ fn page_header(store: AppStore) -> impl IntoElement {
         .gap_3()
         .px_5()
         .py_4()
+        .pt_safe_area_plus(px(16.0))
         .window_drag(is_desktop)
         .border_b_1()
         .border_color(move || base_theme().border)

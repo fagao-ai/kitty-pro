@@ -310,6 +310,12 @@ fn import_dialog(store: AppStore) -> impl IntoElement {
         .flex_1()
         .items_center()
         .justify_center()
+        // The keyboard takes the bottom of the surface, and this layer is what centres the
+        // card — so padding it by the keyboard's height moves the card up with the keyboard
+        // and keeps 导入 reachable while a field is focused. Without it the buttons sat under
+        // the keys on a phone, and importing a subscription meant dismissing the keyboard
+        // first to find them. Zero on a desktop, where nothing is typing itself.
+        .pb_keyboard()
         .bg(move || base_theme().background.opacity(0.6))
         .child(
             view()

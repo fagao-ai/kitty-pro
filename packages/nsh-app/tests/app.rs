@@ -9,6 +9,7 @@
 //! What these cannot show is whether the result looks right: rhythm, alignment, whether a
 //! part that draws nothing is styled. Run the app for that.
 
+use nsh_core::geometry::Edges;
 use nsh_core::geometry::{px, Size};
 use nsh_core::MountItem;
 use nsh_engine::{ColorScheme, EngineConfig, Environment, Idiom, Os};
@@ -164,6 +165,42 @@ fn phone_test(test: &str) -> (Headless, Profile) {
     let profile = Profile::claim(test);
     let app = phone(&profile);
     (app, profile)
+}
+
+/// The status bar's height, as a surface reports it in `safe_area.top`.
+///
+/// 28pt is the emulator this was found on: its `StatusBar` window is 74px tall at a
+/// density of 420dpi, and 74 / 2.625 is 28.2. The value is only load-bearing as
+/// *something* non-zero — every assertion below is written against `STATUS_BAR`
+/// rather than a fixed y, so the test proves the header clears the inset whatever
+/// the inset is, and a device with a taller notch fails the same test for the same
+/// reason.
+const STATUS_BAR: f32 = 28.0;
+
+/// A phone surface whose top edge runs under `inset` points of status bar, which is what
+/// Android's edge-to-edge window means in practice.
+///
+/// Worth its own launcher because [`phone`] cannot show this bug at all: its environment
+/// reports a zero safe area, so a header that ignores the inset still lands at the top of
+/// the screen and reads as correct.
+fn phoned(profile: &Profile, inset: f32) -> Headless {
+    let _ = profile;
+    Headless::start(EngineConfig {
+        viewport: Size::new(px(412.0), px(1800.0)),
+        environment: Environment {
+            window: Size::new(px(412.0), px(1800.0)),
+            os: Os::Android,
+            idiom: Idiom::Phone,
+            color_scheme: ColorScheme::Light,
+            safe_area: Edges {
+                top: px(inset),
+                ..Default::default()
+            },
+            ..Environment::default()
+        },
+        ..EngineConfig::new(nsh_app_kitty::app_root())
+    })
+    .expect("the app starts on a phone with a status bar")
 }
 
 /// The same, from a seeded profile.
@@ -933,6 +970,87 @@ fn the_rail_leaves_room_for_the_window_buttons() {
         "`{nearest}` is the rail's highest text at {top:.1}pt: the window buttons own the top \
          {band}pt and would sit on it"
     );
+}
+
+/// The status bar's inset is spent exactly once, on the header.
+///
+/// Found on the emulator rather than written from here: NSH's Android host draws edge to
+/// edge, so `safe_area.top` is the status bar's height, and the header — the topmost view
+/// on a phone — padded itself by a flat 16pt instead. 总览 drew under the clock and the
+/// 内核已就绪 badge under the signal icons, while the first card sat a whole status bar
+/// lower than it should, because the body under the header was spending the same inset as
+/// its own top padding.
+///
+/// Asserted by launching twice, at inset 0 and at inset `STATUS_BAR`, and requiring every
+/// text to move down by exactly the difference. That is the whole rule in one sentence —
+/// the inset enters the layout once, from the top — and it catches both halves at once: a
+/// header that ignores the inset leaves 总览 where it was, and a body that spends it a
+/// second time moves 未连接 too far. Measuring against a second run rather than against
+/// fixed numbers is also what keeps this honest about *where* the 16pt of header padding
+/// and the card's own insets go, which is not what this test is about and would otherwise
+/// have to be asserted anyway.
+///
+/// Frames, not text: the words are identical at 16pt from the top and at 44pt.
+#[test]
+fn the_status_bar_inset_is_spent_once() {
+    let profile = Profile::claim("the_status_bar_inset_is_spent_once");
+    let flat = header_heights(&profile, 0.0);
+    let inset = header_heights(&profile, STATUS_BAR);
+
+    for (name, without, with) in [
+        ("总览 (the header's title)", flat.title, inset.title),
+        ("内核已就绪 (the header's badge)", flat.badge, inset.badge),
+        ("未连接 (the body's first text)", flat.card, inset.card),
+    ] {
+        assert!(
+            (with - without - STATUS_BAR).abs() < 0.5,
+            "`{name}` moved from {without:.1}pt to {with:.1}pt when a {STATUS_BAR}pt status bar \
+             appeared: the whole layout is supposed to shift down by exactly the inset, so \
+             either the header is not clearing it or something below spends it again",
+        );
+    }
+    // The two must stay in the order a reader expects, whatever the padding inside each is.
+    assert!(
+        inset.card > inset.badge,
+        "with a status bar the body's first text ({:.1}pt) is above the header's badge \
+         ({:.1}pt)",
+        inset.card,
+        inset.badge
+    );
+}
+
+/// Where the three texts that straddle the header's bottom edge land, on a phone with a
+/// `inset`-point status bar.
+fn header_heights(profile: &Profile, inset: f32) -> DrawnHeights {
+    let (mut app, sink) = observing(phoned(profile, inset));
+    app.wait_for("总览").unwrap();
+    app.wait_for("内核已就绪").unwrap();
+    let drawn = sink.lock().unwrap();
+    // The *highest* node holding the text: 总览 is drawn twice, once as the header's title
+    // and once as the tab bar's label at the bottom of the screen, and the first one
+    // mounted is the tab bar. Picking the highest is what names the header without having
+    // to know the id of any view.
+    let top = |needle: &str| -> f32 {
+        drawn
+            .texts
+            .iter()
+            .filter(|(_, text)| text.contains(needle))
+            .map(|(id, _)| drawn.origin_in_root(*id).1)
+            .reduce(f32::min)
+            .unwrap_or_else(|| panic!("`{needle}` drew nothing, so there is nothing to measure"))
+    };
+    DrawnHeights {
+        title: top("总览"),
+        badge: top("内核已就绪"),
+        card: top("未连接"),
+    }
+}
+
+/// The three reads [`header_heights`] takes, grouped so the comparison above can iterate.
+struct DrawnHeights {
+    title: f32,
+    badge: f32,
+    card: f32,
 }
 
 /// The tally strip on the log page is five pills whose only difference when chosen is a
