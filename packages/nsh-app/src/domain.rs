@@ -433,6 +433,50 @@ mod tests {
         assert!(ready(true, true).is_enabled());
     }
 
+    /// The switch is withheld on a phone and offered wherever there is a setting to change —
+    /// including in a browser, which is the case a build flag would have got wrong.
+    ///
+    /// `is_phone` is an argument precisely so this can run here: `cfg!` in the assertion would
+    /// read the test binary's platform, and a desktop suite could never see a phone's answer.
+    #[test]
+    fn the_proxy_switch_is_offered_where_a_proxy_can_be_set() {
+        let ready = |supported: bool| {
+            SystemProxy::Ready(api::SystemProxyStatus {
+                supported,
+                enabled: false,
+                detail: "未启用系统代理".to_owned(),
+            })
+        };
+        // A phone: no per-app proxy exists, so no row, whatever the read says. Withheld while
+        // `Loading` too — that is the state at boot, and a row drawn then removed one read
+        // later is a card that reshapes itself for no reason.
+        for status in [
+            SystemProxy::Loading,
+            SystemProxy::Failed("读取失败".to_owned()),
+            ready(true),
+            ready(false),
+        ] {
+            assert!(
+                !system_proxy_offered(&status, true),
+                "a phone was offered a system proxy it cannot set: {status:?}"
+            );
+        }
+        // A desktop that can: drawn, and drawn while the read is still outstanding, so the
+        // row arrives with the card rather than a frame later.
+        assert!(system_proxy_offered(&SystemProxy::Loading, false));
+        assert!(system_proxy_offered(&ready(true), false));
+        // A failure still draws, because the row's content *is* the failure.
+        assert!(system_proxy_offered(
+            &SystemProxy::Failed("读取失败".to_owned()),
+            false
+        ));
+        // And a platform that answers honestly that it has no such setting is not shown a
+        // switch. This is the arm the web channel relies on: the page is wasm, but the answer
+        // comes from the server it drives, so a desktop's server says yes here and the row is
+        // kept, while a phone's own build never reaches the question at all.
+        assert!(!system_proxy_offered(&ready(false), false));
+    }
+
     #[test]
     fn rule_ids_reuse_a_gap_rather_than_growing_forever() {
         let rules = vec![
@@ -1104,14 +1148,13 @@ pub enum SystemProxy {
 impl SystemProxy {
     /// The line under the switch: what the setting is, and when it cannot be changed, why
     /// not. A parked switch with no reason reads as a broken control.
+    ///
+    /// No phone reaches this: `is_offered` withholds the row there, so this never has to
+    /// explain a platform that has no setting to change. It used to carry an Android line for
+    /// a row that was drawn and parked, which is the design this replaced.
     pub fn note(&self, core_running: bool, core_action_busy: bool, setting_busy: bool) -> String {
         if setting_busy {
             return "正在应用到系统网络服务".to_owned();
-        }
-        if cfg!(target_os = "android") {
-            // Android's VPN owns every route, so the backend's "not implemented" would read
-            // as a broken feature rather than a platform that does not need the switch.
-            return "Android 由 VPN 接管，无需系统代理".to_owned();
         }
         match self {
             SystemProxy::Loading => "正在读取系统代理状态".to_owned(),
@@ -1144,6 +1187,58 @@ impl SystemProxy {
     /// Whether the platform can be pointed at the port at all.
     pub fn is_supported(&self) -> bool {
         matches!(self, SystemProxy::Ready(status) if status.supported)
+    }
+
+    /// Whether to draw the switch, on this binary's own platform. See
+    /// [`system_proxy_offered`], which holds the reasoning and takes the platform as an
+    /// argument so a desktop test binary can assert the phone's answer too.
+    pub fn is_offered(&self) -> bool {
+        system_proxy_offered(self, is_phone())
+    }
+}
+
+/// Whether this build runs where the operating system hands traffic to the app that asked for
+/// it, rather than to a setting the app can edit.
+///
+/// Named for the platform rather than for either rule that reads it, but deliberately *not*
+/// shared between them: `process_rules_supported` keeps its own `cfg!` because it is about a
+/// phone's inability to report a process, which is a different fact from a phone having no
+/// per-app proxy. They happen to hold of the same two systems; neither should move when the
+/// other is corrected.
+pub const fn is_phone() -> bool {
+    cfg!(any(target_os = "android", target_os = "ios"))
+}
+
+/// Whether 总览 should draw the system-proxy switch.
+///
+/// A phone has no per-app proxy setting for the app to point at the core: its routes belong
+/// to whichever `VpnService` is up, and that is this app's own tunnel. The row would have
+/// nothing to change and nothing to report, so it is withheld rather than drawn parked with a
+/// line explaining why it cannot be used — the same choice [`process_rules_supported`] makes
+/// about a match kind a phone cannot evaluate. Withheld before the read rather than after it:
+/// the answer about a phone is known the moment the binary starts, and waiting for the read
+/// would draw the row for a frame at boot and then take it away.
+///
+/// Everywhere else the backend's answer decides, which is what keeps the web channel working.
+/// Its page is wasm, where the native half reports `supported: false` because a browser
+/// cannot set a proxy — but the proxy this switch changes belongs to the machine running the
+/// *server*, which is usually a desktop. So the page asks rather than assumes, and a `cfg!`
+/// on the wasm target would be the wrong check: it would hide a working control from a
+/// browser driving a Linux box, including one opened on a phone.
+///
+/// A `Failed` read still draws, because there the failure is the information the row carries.
+///
+/// `is_phone` arrives as an argument rather than being read here for the reason
+/// [`update_channel_label`] gives for the same shape: `cfg!` is fixed by the binary that runs
+/// the test, so a phone's answer could otherwise never be asserted.
+pub fn system_proxy_offered(status: &SystemProxy, is_phone: bool) -> bool {
+    if is_phone {
+        return false;
+    }
+    match status {
+        SystemProxy::Loading => true,
+        SystemProxy::Failed(_) => true,
+        SystemProxy::Ready(status) => status.supported,
     }
 }
 

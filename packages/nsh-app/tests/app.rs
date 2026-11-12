@@ -3992,3 +3992,69 @@ fn a_phone_window_asks_the_release_feed_like_any_other() {
     // which build this is.
     app.wait_for("text:/· Mobile$/").unwrap();
 }
+
+/// The probe row has to survive a phone's width: the hint and the button share one row, and
+/// a hint that keeps its intrinsic width lays the button off the right edge of the screen.
+///
+/// Measured on the drawn frames rather than asserted from the source, because the failure is a
+/// position and no text check can see one — every word is present in the broken layout too,
+/// which is exactly why this row shipped broken: the suite asserted the words.
+#[test]
+fn the_probe_row_fits_a_phone() {
+    let profile = Profile::claim("the_probe_row_fits_a_phone");
+    profile.seed(SEEDED_PROFILE);
+    let width = 390.0f32;
+    let (mut app, sink) = observing(
+        Headless::start(EngineConfig {
+            viewport: Size::new(px(width), px(2400.0)),
+            environment: Environment {
+                window: Size::new(px(width), px(2400.0)),
+                ..Environment::default()
+            },
+            ..EngineConfig::new(kitty_pro::app_root())
+        })
+        .expect("the app starts"),
+    );
+
+    app.wait_for("测试连通").unwrap();
+    app.idle(std::time::Duration::from_millis(400)).unwrap();
+    let drawn = sink.lock().unwrap();
+
+    // Both halves of the row measured by the text they draw. The button's own frame is a
+    // parent several levels up depending on how `button()` wraps its label, and walking to it
+    // guessed wrong once already; these two nodes are leaves, so their frames are their own.
+    let hint = drawn
+        .node_with_text("先启动代理，才能探测出口")
+        .expect("the probe hint drew nothing to measure");
+    let button = drawn
+        .node_with_text("测试连通")
+        .expect("the probe button drew nothing to measure");
+
+    let (hint_x, hint_y) = drawn.origin_in_root(hint);
+    let hint_width = drawn.frame(hint).size.width.0;
+    let (button_x, button_y) = drawn.origin_in_root(button);
+    let button_right = button_x + drawn.frame(button).size.width.0;
+
+    // The sentence the user is meant to read before pressing. Without `min_w(px(0.0))` a flex
+    // item keeps its content as its floor *and* gets clamped to whatever its sibling leaves,
+    // which measured 80pt here — the hint broken into a fragment. It asks for ~239pt.
+    assert!(
+        hint_width > 200.0,
+        "the probe hint was squeezed to {hint_width}pt at x {hint_x}: it cannot read as one line"
+    );
+    // The button stays on the screen, which is the shape of the complaint on a real phone.
+    assert!(
+        button_right <= width,
+        "the probe button reaches x {button_right} of a {width}pt phone screen"
+    );
+    // And the pair is still one row: side by side, not stacked, not overlapping.
+    assert!(
+        button_x >= hint_x + hint_width,
+        "the hint ends at {} while the button starts at {button_x}",
+        hint_x + hint_width
+    );
+    assert!(
+        (button_y - hint_y).abs() < 20.0,
+        "the hint sits at y {hint_y} and the button at y {button_y}: they are no longer one row"
+    );
+}

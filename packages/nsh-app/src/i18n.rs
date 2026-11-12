@@ -692,10 +692,6 @@ const ENGLISH: &[(&str, &str)] = &[
     ("正在读取系统代理状态", "reading the system proxy state"),
     ("当前平台不支持系统代理", "this platform has no system proxy"),
     ("先启动代理，才能开启系统代理", "start the proxy before turning the system proxy on"),
-    (
-        "Android 由 VPN 接管，无需系统代理",
-        "Android routes everything through the VPN, so no system proxy is needed",
-    ),
     ("未检测到版本", "no version detected"),
     ("开启", "on"),
     ("待同步", "not synced"),

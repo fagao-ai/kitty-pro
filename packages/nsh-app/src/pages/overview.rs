@@ -88,7 +88,12 @@ fn connection_panel(store: AppStore) -> impl IntoElement {
         // Connecting is not in this card any more: it is the dock's primary control, so it is
         // reachable from 节点 or 设置 without walking back here first. What stays is everything
         // that reads as an attribute of the connection rather than an act on it.
-        .child(system_proxy_toggle(store))
+        // Gated on what the platform answered rather than on a build flag, so a browser
+        // driving a desktop server keeps the switch it needs. See `SystemProxy::is_offered`.
+        .child(when(
+            move || store.system_proxy().is_offered(),
+            move || system_proxy_toggle(store),
+        ))
         .child(probe_row(store))
         .child(when(
             move || store.config_pending(),
@@ -499,9 +504,18 @@ fn probe_row(store: AppStore) -> impl IntoElement {
                 .justify_between()
                 .gap_3()
                 .child(
-                    text(move || i18n::tr(probe_hint(store)))
-                        .text_xs()
-                        .text_color(theme::text_faint()),
+                    // `flex_1` with a zero floor, exactly as the switch row above does it:
+                    // without both, this label keeps its intrinsic width and the row lays the
+                    // button off the right edge of a phone. `min_w(px(0.0))` is the part that
+                    // matters — a flex item's floor is its content size, so `flex_1` alone
+                    // cannot shrink a line below the text's own width. The label wraps rather
+                    // than truncates because there is no tooltip here to recover what an
+                    // ellipsis took, and the sentence is the reason the button is parked.
+                    view().flex_1().min_w(px(0.0)).child(
+                        text(move || i18n::tr(probe_hint(store)))
+                            .text_xs()
+                            .text_color(theme::text_faint()),
+                    ),
                 )
                 .child(controls::secondary_button_state(
                     move || {

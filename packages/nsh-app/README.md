@@ -64,7 +64,7 @@ All six destinations are ported: Overview, Nodes, Subscriptions, Rules, Logs and
 
 | Screen | Holds |
 | --- | --- |
-| 总览 | The system-proxy switch, the exit probe, four figures, the last minute of traffic |
+| 总览 | The system-proxy switch (desktops only), the exit probe, four figures, the last minute of traffic |
 | 节点 | The core's proxy groups and their members, searchable, with latency and one chosen exit |
 | 订阅 | Import from a URL or pasted links, refresh one or all, switch the active one, delete |
 | 规则 | Custom routing rules and per-domain DNS, on two tabs, with the process picker, plus the QuickJS override on Settings |
@@ -77,6 +77,26 @@ where the connection is made rather than among preferences, and it is parked wit
 there is no core running. Its state is read from the OS at boot and re-read after any stop,
 since the setting changes underneath the app and a remembered value would overstate what is
 connected.
+
+**Phones do not draw it at all** — `SystemProxy::is_offered`. A phone has no per-app proxy
+setting for the app to point at the port: its routes belong to whichever `VpnService` is up,
+and that is this app's own tunnel, so the row could only ever be drawn parked beside a line
+explaining that it does nothing. Withholding it follows `process_rules_supported`, which hides
+a match kind for the same reason. The decision is *not* a `cfg!` on the wasm target: the web
+channel's page is wasm, yet the proxy it changes belongs to the machine running the server, so
+everywhere that is not a phone the row follows the backend's `supported` answer, so a browser
+driving a Linux box keeps the control it needs. A desktop does not wait for that read either:
+`Loading` draws, the row arrives with the card, and only a platform that answers "no such
+setting" takes it back out.
+
+The probe row is the one row in the card whose label is a sentence, and the row is a
+`justify_between` with a button: without `flex_1` *and* `min_w(px(0.0))` on the label — the
+pair the switch row above already used — the hint keeps its intrinsic width and the button is
+laid off the right edge of a phone. `min_w(px(0.0))` is the part that carries it, because a
+flex item's floor is its content size, so `flex_1` alone cannot shrink a line below the text
+itself. `the_probe_row_fits_a_phone` measures both halves on the drawn frames at 390pt: the
+old layout still drew every word, which is what let it ship — the suite had been asserting the
+words.
 
 The 登录时启动 switch follows the same rule for the same reason, and reads the operating system
 rather than the profile: a login item is a file an installer or a cleanup tool can delete while
