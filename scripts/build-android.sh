@@ -243,27 +243,25 @@ done
 # code actually carries.
 version="$(cargo metadata --locked --no-deps --format-version 1 |
     jq -er '.packages[] | select(.name == "kitty-pro") | .version')"
-# The integer Android compares on upgrade. Derived from the version rather than
-# read from `nsh.json`'s `build` directly: that field is only correct after
-# `set-package-version.sh` has run, and this script has to build on a machine where
-# it has not. Asking the same script for the number keeps one definition of the
-# mapping — `--build-number` — between the manifest NSH stamps and the APK
-# assembled here, which is the pair that must agree on which build is newer.
+# The integer Android compares on upgrade, and it has to be higher than the one on
+# the phone or the package manager refuses the update: no error a user would
+# recognise, and nothing fails in CI to say so.
 #
-# KITTY_VERSION_CODE overrides, for a rebuild of a version already published: the
-# version is the release's, so bumping it is not an option, and this is the one
-# number that has to move.
-if [[ -n "${KITTY_VERSION_CODE:-}" ]]; then
-    # Through the same bounds the derived number obeys. An override is exactly the
-    # moment someone is reaching past the mapping, and the failure it would cause —
-    # a lower versionCode, refused on every installed phone — is the one those
-    # bounds exist to prevent.
-    build_number="$("$root/scripts/set-package-version.sh" \
-        --check-build-number "$KITTY_VERSION_CODE")" ||
-        die "KITTY_VERSION_CODE=$KITTY_VERSION_CODE is not a usable versionCode"
-else
-    build_number="$("$root/scripts/set-package-version.sh" --build-number "$version")"
-fi
+# Epoch minutes, as `0e51542` chose them and as every APK up to v1.0.13 shipped
+# with them (v1.0.13 carries 29897976). A clock is monotonic by construction, so
+# this needs no floor to compare against and no release can be stamped lower than
+# the last; the version-derived number this script used for a while put 1.0.14 at
+# 1000014, below every APK already installed, which is the bug the clock exists to
+# avoid. It is not reproducible -- two builds of one version differ -- which is
+# what `KITTY_VERSION_CODE` is for: the value goes in the manifest NSH stamps and
+# in the `aapt2 link` below from one variable, so the two cannot disagree about
+# which build is newer.
+#
+# Bounded below Android's own ceiling, as the original was: past it the package
+# manager declines the APK at install time.
+build_number="${KITTY_VERSION_CODE:-$(($(date -u +%s) / 60))}"
+[[ "$build_number" =~ ^[1-9][0-9]*$ ]] && ((build_number <= 2100000000)) ||
+    die "the Android versionCode must be an integer from 1 to 2100000000, got '$build_number'"
 app_name="$(jq -er '.name' "$app/nsh.json")"
 application_id="$(jq -er '.id' "$app/nsh.json")"
 
