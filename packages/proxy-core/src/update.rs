@@ -123,11 +123,20 @@ fn declared_os_tokens(name: &str) -> Option<Vec<&'static str>> {
 }
 
 /// CPU groups an asset name can declare, with every spelling each goes by.
+///
+/// Matched as substrings, which is why none of these may be a substring of
+/// another group's spelling: `arm` is missing from the `armv7` row for exactly
+/// that reason, and [`arch_group`] maps the bare `arm` a running 32-bit process
+/// reports to this group instead.
 const ARCH_GROUPS: &[(&str, &[&str])] = &[
     ("aarch64", &["aarch64", "arm64", "armv8", "v8a"]),
     ("x86_64", &["x86_64", "amd64", "x64"]),
     ("armv7", &["armv7", "armeabi", "arm32"]),
 ];
+
+/// Spellings a running process uses for a CPU no asset name would use, mapped to
+/// the group they belong to. `std::env::consts::ARCH` is the only input here.
+const ARCH_ALIASES: &[(&str, &str)] = &[("arm", "armv7")];
 
 /// The installation being checked: what the running shell is, per compile-time
 /// constants rather than anything the network can influence.
@@ -187,6 +196,20 @@ fn is_installable_name(name: &str) -> bool {
 /// Normalize a `std::env::consts::ARCH`-style string to a group name.
 pub fn arch_group(arch: &str) -> Option<&'static str> {
     let arch = arch.trim().to_ascii_lowercase();
+    // Rust spells 32-bit ARM `arm`, which is deliberately not a token in
+    // `ARCH_GROUPS`: it is a substring of both `arm64` and `aarch64`, so adding it
+    // there would make every 64-bit package claim to fit an armv7 device. The two
+    // sides therefore spell one CPU differently, and this is where they are
+    // reconciled. Without it `arch_group("arm")` answers `None`, and
+    // `asset_matches_target` treats an unknown CPU as "matches nothing" — so an
+    // armv7 phone is quietly told there is no build for it, forever, however the
+    // asset is named.
+    if let Some(group) = ARCH_ALIASES
+        .iter()
+        .find_map(|(spelling, group)| (*spelling == arch.as_str()).then_some(*group))
+    {
+        return Some(group);
+    }
     ARCH_GROUPS.iter().find_map(|(group, tokens)| {
         (*group == arch.as_str() || tokens.contains(&arch.as_str())).then_some(*group)
     })
@@ -591,6 +614,70 @@ mod tests {
         // NSH emits `Kitty Pro.app` next to its zip. Publishing the directory's
         // name would hand a user something no installer can open.
         assert_eq!(ReleaseKind::from_asset_name("Kitty Pro.app"), None);
+    }
+
+    /// `scripts/build-android.sh` names the APK after the ABIs it carries, and this is
+    /// the check that the name means what it says. One fat APK serves both CPUs, so
+    /// each has to match; the point of the test is the third case, because an APK
+    /// without ARM libraries must never be offered to an ARM device — the file
+    /// downloads, the package manager refuses it, and the card that promised an update
+    /// has left the user with nothing.
+    #[test]
+    fn a_multi_abi_apk_names_every_cpu_it_carries() {
+        let fat = "Kitty-Pro-arm64-v8a-armeabi-v7a-0.1.0.apk";
+        assert!(
+            asset_matches_target(fat, &target(ReleaseKind::Android, "android", "aarch64")),
+            "an arm64-v8a device must accept the APK that carries its library"
+        );
+        assert!(
+            asset_matches_target(fat, &target(ReleaseKind::Android, "android", "arm")),
+            "an armv7 device must accept the APK that carries armeabi-v7a"
+        );
+        assert!(
+            !asset_matches_target(fat, &target(ReleaseKind::Android, "android", "x86_64")),
+            "an x86_64 device must not be offered an APK with no library for it"
+        );
+        // The single-ABI spelling the script also produces, e.g. `--abi arm64-v8a`.
+        let one = "Kitty-Pro-arm64-v8a-0.1.0.apk";
+        assert!(asset_matches_target(
+            one,
+            &target(ReleaseKind::Android, "android", "aarch64")
+        ));
+        assert!(!asset_matches_target(
+            one,
+            &target(ReleaseKind::Android, "android", "arm")
+        ));
+        // No CPU token at all reads as "fits anything", which is exactly why the
+        // script does not emit such a name. Recorded so the behaviour is not
+        // mistaken for a bug later.
+        let unnamed = "Kitty-Pro-0.1.0.apk";
+        for arch in ["aarch64", "arm", "x86_64"] {
+            assert!(
+                asset_matches_target(unnamed, &target(ReleaseKind::Android, "android", arch)),
+                "an unlabelled APK matches every CPU, which is {arch}'s problem too"
+            );
+        }
+    }
+
+    /// What a phone sees while the release workflow publishes only desktops, which is
+    /// the state this repository is in. Worth a test because the answer has to be
+    /// *nothing*, not the nearest thing: offering a `.zip` of a macOS app to a phone
+    /// is worse than saying there is no build, and the settings card's
+    /// "nothing to install" depends on this rather than on any filter upstream.
+    #[test]
+    fn a_release_without_an_apk_offers_a_phone_nothing() {
+        let desktop_only = [
+            "Kitty-Pro-macos-aarch64.zip",
+            "Kitty-Pro-windows-x86_64.zip",
+            "Kitty-Pro-linux-x86_64.tar.gz",
+        ];
+        for arch in ["aarch64", "arm", "x86_64"] {
+            assert_eq!(
+                select_from(ReleaseKind::Android, "android", arch, &desktop_only),
+                None,
+                "{arch} must not be offered a desktop archive"
+            );
+        }
     }
 
     #[test]
