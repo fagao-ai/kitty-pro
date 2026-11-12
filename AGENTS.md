@@ -40,8 +40,8 @@ user-facing message, and `Display` renders `[Exxxx] message`.
 ## Commands
 
 ```sh
-cargo run -p nsh-app-kitty --features desktop   # a real window
-cargo test -p nsh-app-kitty                     # the screens, headless
+cargo run -p kitty-pro --features desktop   # a real window
+cargo test -p kitty-pro                     # the screens, headless
 nsh run                                         # hot reload (needs the nsh CLI)
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings

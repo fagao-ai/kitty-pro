@@ -5,8 +5,8 @@ This is the app's interface. The Dioxus front end that was here first — `packa
 shipped UI rather than a port in progress.
 
 ```sh
-cargo run -p nsh-app-kitty --features desktop   # a real window, no NSH CLI needed
-cargo test -p nsh-app-kitty                     # the screens under NSH's engine, headless
+cargo run -p kitty-pro --features desktop   # a real window, no NSH CLI needed
+cargo test -p kitty-pro                     # the screens under NSH's engine, headless
 nsh run                                         # every target, with hot updates (needs the nsh CLI)
 nsh package --target macos                      # a distributable .app
 ```
@@ -576,7 +576,7 @@ and icons correctly without flags.
 
 ## Tests
 
-`cargo test -p nsh-app-kitty` runs the screens under NSH's real engine. Three things are
+`cargo test -p kitty-pro` runs the screens under NSH's real engine. Three things are
 worth knowing about them:
 
 - `Screen::texts` reports only what a user can see, so a text in a view that measures
@@ -643,7 +643,7 @@ switch fix — the frames, fills, alpha and transforms a platform is actually to
 one control read that way. That is still not a looked-at result: rhythm, alignment and whether
 something *looks* right remain unseen, and only one control is covered by the stream assertions.
 Before trusting the visual result, run
-`cargo run -p nsh-app-kitty --features desktop` and check both appearances and a phone-width
+`cargo run -p kitty-pro --features desktop` and check both appearances and a phone-width
 window. The user's screenshot of a broken toggle is what started this: the suite was green at the
 time, so "green" means "no test looked at it".
 

@@ -1,5 +1,5 @@
 [package]
-name = "nsh-app-kitty"
+name = "kitty-pro"
 version.workspace = true
 edition = "2021"
 

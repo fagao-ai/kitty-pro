@@ -225,7 +225,7 @@ jobs:
           log="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-build.log"
           app_version="$(
             cargo metadata --locked --no-deps --format-version 1 \
-              | jq -er '.packages[] | select(.name == "nsh-app-kitty") | .version'
+              | jq -er '.packages[] | select(.name == "kitty-pro") | .version'
           )"
           mkdir -p "dist/${{ matrix.id }}"
           if ! (cd packages/nsh-app && nsh package \

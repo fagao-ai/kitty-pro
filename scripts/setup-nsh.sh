@@ -65,7 +65,7 @@ for crate in nsh-core nsh-base; do
     req="$(cargo metadata --manifest-path "$root/Cargo.toml" --locked --no-deps \
         --format-version 1 |
         jq -er --arg crate "$crate" '
-            .packages[] | select(.name == "nsh-app-kitty") |
+            .packages[] | select(.name == "kitty-pro") |
             .dependencies[] | select(.name == $crate) | .req' |
         tr -d '^~=')"
     [[ "${req%.*}" == "${nsh_cli%.*}" ]] ||

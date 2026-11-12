@@ -241,7 +241,7 @@ done
 # built here would otherwise keep answering 0.1.0 and tell every user a newer
 # version exists forever.
 version="$(cargo metadata --locked --no-deps --format-version 1 |
-    jq -er '.packages[] | select(.name == "nsh-app-kitty") | .version')"
+    jq -er '.packages[] | select(.name == "kitty-pro") | .version')"
 # The integer Android compares on upgrade. Derived from the version rather than
 # read from `nsh.json`'s `build` directly: that field is only correct after
 # `set-package-version.sh` has run, and this script has to build on a machine where

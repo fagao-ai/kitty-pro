@@ -92,7 +92,7 @@ fn desktop(profile: &Profile) -> Headless {
     Headless::start(EngineConfig {
         viewport: Size::new(px(1280.0), px(840.0)),
         environment: environment(),
-        ..EngineConfig::new(nsh_app_kitty::app_root())
+        ..EngineConfig::new(kitty_pro::app_root())
     })
     .expect("the app starts")
 }
@@ -118,7 +118,7 @@ fn windowed(profile: &Profile, height: f32) -> Headless {
             window: Size::new(px(1280.0), px(height)),
             ..environment()
         },
-        ..EngineConfig::new(nsh_app_kitty::app_root())
+        ..EngineConfig::new(kitty_pro::app_root())
     })
     .expect("the app starts")
 }
@@ -126,7 +126,7 @@ fn windowed(profile: &Profile, height: f32) -> Headless {
 /// A phone surface, to prove the layout survives a narrow width.
 fn phone(profile: &Profile) -> Headless {
     let _ = profile;
-    Headless::start(EngineConfig::new(nsh_app_kitty::app_root())).expect("the app starts")
+    Headless::start(EngineConfig::new(kitty_pro::app_root())).expect("the app starts")
 }
 
 /// Whether any view on screen matches a selector.
@@ -198,7 +198,7 @@ fn phoned(profile: &Profile, inset: f32) -> Headless {
             },
             ..Environment::default()
         },
-        ..EngineConfig::new(nsh_app_kitty::app_root())
+        ..EngineConfig::new(kitty_pro::app_root())
     })
     .expect("the app starts on a phone with a status bar")
 }
@@ -213,7 +213,7 @@ fn seeded_test(test: &str, profile_json: &str) -> (Headless, Profile) {
 
 #[test]
 fn theme_json_parses() {
-    nsh_app_kitty::tokens().expect("theme.json must parse as shadcn cssVars");
+    kitty_pro::tokens().expect("theme.json must parse as shadcn cssVars");
 }
 
 #[test]
@@ -944,7 +944,7 @@ fn the_rail_leaves_room_for_the_window_buttons() {
     app.wait_for("Kitty Pro").unwrap();
     app.wait_for("总览").unwrap();
 
-    let band = nsh_app_kitty::TITLE_BAR_HEIGHT;
+    let band = kitty_pro::TITLE_BAR_HEIGHT;
     let drawn = sink.lock().unwrap();
     // Everything drawn in the rail's own column, by how high it sits. The rail is 264pt wide and
     // is the thing under the lights, so "the highest text in the rail clears the band" is the
@@ -1187,7 +1187,7 @@ fn the_floating_action_is_a_disc_at_the_bottom_right() {
     let size = drawn.frame(button).size;
 
     // A circle: equal sides, the width of the glyph rather than of a sentence.
-    let disc = nsh_app_kitty::ui::controls::ACTION_DISC;
+    let disc = kitty_pro::ui::controls::ACTION_DISC;
     assert_eq!(
         (size.width.0, size.height.0),
         (disc, disc),
@@ -1203,7 +1203,7 @@ fn the_floating_action_is_a_disc_at_the_bottom_right() {
     // passed while the disc was flush with the border, which is what the user reported; the
     // distance is what matters, and `p_5`'s own padding was being overwritten by the safe-area
     // inset (0 on a desktop), so the gap had to be asserted to be defended.
-    let edge = nsh_app_kitty::ui::controls::ACTION_EDGE;
+    let edge = kitty_pro::ui::controls::ACTION_EDGE;
     let bottom_gap = 900.0 - (center_y + size.height.0 / 2.0);
     assert!(
         bottom_gap >= edge - 1.0,
@@ -1335,7 +1335,7 @@ fn hex(color: nsh_core::Color) -> String {
 #[test]
 fn every_status_pair_clears_aa_contrast() {
     let theme: serde_json::Value =
-        serde_json::from_str(nsh_app_kitty::THEME_JSON).expect("theme.json is JSON");
+        serde_json::from_str(kitty_pro::THEME_JSON).expect("theme.json is JSON");
     let vars = theme.get("cssVars").expect("cssVars");
 
     for mode in ["light", "dark"] {
@@ -3244,7 +3244,7 @@ fn the_about_card_holds_its_figures_on_a_phone() {
             window: Size::new(px(390.0), px(2400.0)),
             ..Environment::default()
         },
-        ..EngineConfig::new(nsh_app_kitty::app_root())
+        ..EngineConfig::new(kitty_pro::app_root())
     })
     .expect("the app starts");
 
@@ -3395,7 +3395,7 @@ fn the_sync_actions_are_one_row_of_equal_height() {
         tops.push(drawn.origin_in_root(id).1);
     }
 
-    let want = nsh_app_kitty::ui::controls::ACTION_HEIGHT;
+    let want = kitty_pro::ui::controls::ACTION_HEIGHT;
     for (label, (height, top)) in row.iter().zip(heights.iter().zip(tops.iter())) {
         assert!(
             (height - want).abs() < 0.6,
@@ -3433,7 +3433,7 @@ fn a_row_of_icon_buttons_matches_the_button_beside_it() {
     // and `press_target` refuses an unpressable match, so the row is measured through its two
     // glyph actions, which is where the 32pt height used to live anyway.
     let row = ["刷新 实验室", "删除 实验室"];
-    let want = nsh_app_kitty::ui::controls::ACTION_HEIGHT;
+    let want = kitty_pro::ui::controls::ACTION_HEIGHT;
     let mut heights = Vec::new();
     for label in row {
         let id = app
@@ -3976,7 +3976,7 @@ fn a_phone_window_asks_the_release_feed_like_any_other() {
             window: Size::new(px(390.0), px(2400.0)),
             ..Environment::default()
         },
-        ..EngineConfig::new(nsh_app_kitty::app_root())
+        ..EngineConfig::new(kitty_pro::app_root())
     })
     .expect("the app starts");
 

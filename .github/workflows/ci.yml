@@ -62,14 +62,14 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # `api` 与 `proxy-core` 是后端里唯一声明 wasm32 分支的两个包；
-      # `nsh-app-kitty` 是 web 构建的本体，它现在也分了两个臂（`src/backend.rs`
+      # `kitty-pro` 是 web 构建的本体，它现在也分了两个臂（`src/backend.rs`
       # 里原生直调 / 浏览器走 /api/*），所以它同样是只有这个 target 才会编译到的
       # 代码。没有这一步，删掉 Dioxus server fn 宏就把 wasm 编译整条打断过一次
       # （宏原本在 wasm 下不编译函数体），而 workspace 门禁对此毫无察觉。
       - name: Backend compiles for the browser target
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo check -p api -p proxy-core -p nsh-app-kitty --target wasm32-unknown-unknown
+          cargo check -p api -p proxy-core -p kitty-pro --target wasm32-unknown-unknown
 
       - name: Workspace tests
         run: cargo test --workspace
@@ -83,6 +83,6 @@ jobs:
         continue-on-error: true
         uses: rustsec/audit-check@v2
 
-# 注意：NSH 的界面回归跑在 `cargo test -p nsh-app-kitty` 里（headless 引擎 +
+# 注意：NSH 的界面回归跑在 `cargo test -p kitty-pro` 里（headless 引擎 +
 # nsh-testing），已经包含在上面的 workspace 测试中，不需要浏览器驱动的第二套
 # 门禁。原先针对 Dioxus wasm 产物的 Playwright 套件随那些包一起删除了。

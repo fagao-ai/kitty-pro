@@ -84,9 +84,9 @@ one proxy to the Go build when those three are unset.
 From the repository root:
 
 ```sh
-cargo run -p nsh-app-kitty --features desktop   # a real window
+cargo run -p kitty-pro --features desktop   # a real window
 nsh run                                        # hot reload, every target (needs the nsh CLI)
-cargo test -p nsh-app-kitty                    # the screens, headless under NSH's engine
+cargo test -p kitty-pro                    # the screens, headless under NSH's engine
 ```
 
 `desktop` is a Cargo feature because the Linux host needs GTK 4.14 and
@@ -282,7 +282,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p singbox --features embedded-core
-cargo check -p api -p proxy-core -p nsh-app-kitty --target wasm32-unknown-unknown
+cargo check -p api -p proxy-core -p kitty-pro --target wasm32-unknown-unknown
 ```
 
 The embedded-core test starts a VLESS configuration through the static bridge
@@ -292,13 +292,13 @@ Layout and dialog behaviour are covered by the crate's own headless tests,
 which run the real NSH engine:
 
 ```sh
-cargo test -p nsh-app-kitty
+cargo test -p kitty-pro
 ```
 
 `nsh test` does the same from the app's directory and adds NSH's own build
 diagnostics.
 
-The last check is the one no host build covers: `nsh-app-kitty` splits into two
+The last check is the one no host build covers: `kitty-pro` splits into two
 arms per backend call, and only the wasm target compiles the browser's. Deleting
 the Dioxus server-function macro once broke exactly that while every other gate
 stayed green.
