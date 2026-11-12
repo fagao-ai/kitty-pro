@@ -388,16 +388,30 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: wasm32-unknown-unknown
 
-      # Building the page compiles zstd's C for wasm32, and NSH asks for that
-      # archive to be made by `llvm-ar` (it sets `AR_wasm32_unknown_unknown` to
-      # the bare name). No runner image has a program by that name on PATH:
-      # Xcode's toolchain ships `ar` and several `llvm-` tools but not `llvm-ar`,
-      # and Ubuntu keeps them under /usr/lib/llvm-18/bin. rustup's `llvm-tools`
-      # component is the one source that exists on every platform rustup runs on,
-      # so the archiver comes from the same pinned toolchain as the compiler.
-      - name: Provide the wasm archiver
+      # Building the page compiles zstd's C for wasm32, which needs two tools a
+      # runner is not guaranteed to have on PATH, and one of them is not the same
+      # problem on each machine.
+      #
+      # The archiver: NSH asks for it by the bare name `llvm-ar` (it sets
+      # `AR_wasm32_unknown_unknown`). Xcode's toolchain ships `ar` and several
+      # `llvm-` tools but not `llvm-ar`; Ubuntu keeps it under
+      # /usr/lib/llvm-18/bin. rustup's `llvm-tools` component exists on every
+      # platform rustup runs on and installs it beside the compiler, so the
+      # archiver and the compiler come from one pinned toolchain.
+      #
+      # The compiler is macOS-only: Apple's clang is built without the
+      # WebAssembly backend, so it fails every translation unit with "unable to
+      # create target: No available targets are compatible with triple
+      # wasm32-unknown-unknown". Ubuntu's clang has the backend, which is why
+      # only the macOS half of the web job ever saw this. A development machine
+      # does not see it either — a current Xcode toolchain does have the backend
+      # — so this is probed rather than assumed, and the probe compiles a file
+      # for wasm32 instead of asking for a version: the last release was built by
+      # a compiler that existed and could not do the job.
+      - name: Provide the wasm toolchain
         shell: bash
         run: |
+          set -euo pipefail
           rustup component add llvm-tools
           host="$(rustc -vV | sed -n 's/^host: //p')"
           bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
@@ -406,6 +420,59 @@ jobs:
             exit 1
           }
           echo "$bin" >> "$GITHUB_PATH"
+
+          compiles_wasm() {
+            printf 'int kitty_probe(void) { return 1; }\n' |
+              "$1" --target=wasm32-unknown-unknown -x c -c - -o /dev/null \
+              >/dev/null 2>&1
+          }
+
+          if [[ "$(uname -s)" != "Darwin" ]]; then
+            command -v clang >/dev/null || {
+              echo "no clang on PATH to build zstd's C for wasm32" >&2
+              exit 1
+            }
+            compiles_wasm "$(command -v clang)" || {
+              echo "clang on PATH cannot target wasm32-unknown-unknown" >&2
+              exit 1
+            }
+            echo "WebAssembly C compiler: $(command -v clang)" >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Homebrew's LLVM is a versioned keg, so it is on no PATH; the runner
+          # image documents llvm@18 as preinstalled. Each candidate has to earn
+          # the job by compiling.
+          candidates=()
+          for prefix in $(brew --prefix llvm@18 llvm 2>/dev/null || true); do
+            if [[ -n "$prefix" ]]; then
+              candidates+=("$prefix/bin/clang")
+            fi
+          done
+          wasm_cc=""
+          for candidate in "${candidates[@]+"${candidates[@]}"}"; do
+            if [[ -x $candidate ]] && compiles_wasm "$candidate"; then
+              wasm_cc="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$wasm_cc" ]]; then
+            echo "No preinstalled clang can target wasm32; installing llvm@18."
+            brew install llvm@18
+            prefix="$(brew --prefix llvm@18)"
+            if [[ -x "$prefix/bin/clang" ]] && compiles_wasm "$prefix/bin/clang"; then
+              wasm_cc="$prefix/bin/clang"
+            fi
+          fi
+          if [[ -z "$wasm_cc" ]]; then
+            echo "No clang on this runner can target wasm32-unknown-unknown." >&2
+            echo "$(clang --version | head -n 1) is the default and it cannot." >&2
+            exit 1
+          fi
+          # The variable name is the one cc-rs consults for this target, so the
+          # host build of everything else keeps the system compiler.
+          echo "CC_wasm32_unknown_unknown=$wasm_cc" >> "$GITHUB_ENV"
+          echo "WebAssembly C compiler: $wasm_cc" >> "$GITHUB_STEP_SUMMARY"
 
       # The page is WebAssembly whatever machine builds it, so the web runtime is a
       # component here even on the macOS runner — that CLI ships the macOS runtime.
