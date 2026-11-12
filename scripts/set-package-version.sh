@@ -117,10 +117,22 @@ jq --arg version "$version" --argjson build "$build_number" \
     '.version = $version | .build = $build' "$nsh_manifest" >"${nsh_manifest}.tmp"
 mv "${nsh_manifest}.tmp" "$nsh_manifest"
 
-# Cargo.lock records the workspace members' versions. `--offline` because this
-# only re-derives what the manifests already say: a release job must not be able to
-# move a registry dependency while it is moving a version number.
-cargo update --offline --workspace
+# Cargo.lock records the workspace members' versions. `--workspace` restricts it to
+# the members: a release job must not move a registry dependency while it is moving
+# a version number, and this is what keeps the lock in step with the manifest so the
+# `--locked` check below - and every later `--locked` build - agrees.
+#
+# It is NOT run `--offline`, which is what every release before this one did. Cargo
+# still resolves the whole graph to rewrite five versions, and this workspace has one
+# git dependency (`sysproxy`, through `api`), whose checkout a cold runner has never
+# fetched: `--offline` then dies with "can't checkout from
+# 'https://github.com/clash-verge-rev/sysproxy-rs': you are in the offline mode",
+# before a single artifact is built. It passed on a development machine because
+# `~/.cargo/git` is warm there, so the mistake only ever showed up in CI. What
+# actually keeps registry dependencies still is `--workspace`, not `--offline`;
+# measured against a cold CARGO_HOME, the pair moves exactly the five members'
+# versions and no other line of Cargo.lock.
+cargo update --workspace
 
 # Check every member rather than the one the caller named, which is the point:
 # a member left behind by an edit to `[workspace.package]` is the bug this whole

@@ -36,9 +36,30 @@ runs:
       env:
         NSH_VERSION: ${{ inputs.version }}
       run: |
-        & ([scriptblock]::Create((iwr https://nsh.dev/install.ps1 -UseBasicParsing).Content))
+        # Saved to a file and run from there, rather than `iwr | iex` as NSH's own
+        # docs show. `nsh.dev/install.ps1` is served as
+        # `content-type: application/octet-stream`, so PowerShell hands back
+        # `.Content` as a *byte array*, and `[scriptblock]::Create` on one stringifies
+        # it element by element: the script it tries to parse begins
+        # `35 32 73 110 115 116 97 108 108 115` ("# Installs N") and dies with a
+        # parse error before installing anything. `-OutFile` writes the bytes to disk
+        # untouched, which is what an installer of any content-type needs anyway. The
+        # script reads no $PSScriptRoot or $MyInvocation path, so running it from a
+        # temporary file is equivalent to running it inline.
+        $installer = Join-Path $env:RUNNER_TEMP 'install-nsh.ps1'
+        iwr https://nsh.dev/install.ps1 -UseBasicParsing -OutFile $installer
+        if (-not (Test-Path -Path $installer -PathType Leaf)) {
+          throw "nsh: the installer was not written to $installer"
+        }
+        if ((Get-Item $installer).Length -eq 0) {
+          throw "nsh: the installer downloaded empty"
+        }
+        & $installer
         $dir = if ($env:NSH_INSTALL_DIR) { $env:NSH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'nsh' }
         $bin = Join-Path $dir 'bin'
+        if (-not (Test-Path -Path (Join-Path $bin 'nsh.exe') -PathType Leaf)) {
+          throw "nsh: no nsh.exe under $bin after installing"
+        }
         Add-Content -Path $env:GITHUB_PATH -Value $bin
 
     # The version and the components are checked by the script the repository
