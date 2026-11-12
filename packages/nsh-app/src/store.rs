@@ -2081,18 +2081,16 @@ impl AppStore {
 
     /// Which shell this is, in the words the update check classifies on.
     ///
-    /// An NSH build is one binary that changes shape with the window it is in, so NSH's own
-    /// idiom answers rather than a prop passed in by each entry point. It stays
-    /// "Desktop"/"Mobile" rather than naming the operating system, because
-    /// `api::update::AppUpdateRequest` maps that value onto a `ReleaseKind` and a desktop app
-    /// is what a desktop archive is for; the core's own build string already says which OS is
-    /// behind it.
+    /// Which release asset this build should be offered.
+    ///
+    /// The decision itself is `domain::update_channel_label`, which is where the three
+    /// answers are pinned against the vocabulary the update check reads; this only feeds
+    /// it the two facts. `cfg!(target_arch = "wasm32")` is the web arm because a page
+    /// compiled to WebAssembly is the only build that cannot load the Go core, and it
+    /// has to be asked before NSH's `is_desktop()`, which is true of a browser on a
+    /// desktop idiom. The same string is what the about card prints.
     pub fn platform_label(&self) -> &'static str {
-        if is_desktop() {
-            "Desktop"
-        } else {
-            "Mobile"
-        }
+        crate::domain::update_channel_label(cfg!(target_arch = "wasm32"), is_desktop())
     }
 
     /// The state the about card reports, read from the signals it is shown next to.

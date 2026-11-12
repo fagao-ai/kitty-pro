@@ -17,8 +17,9 @@ pub const PROXY_PORT: u16 = 7890;
 /// This build's version, as the about card and the diagnostic text name it.
 ///
 /// Read from the crate rather than written down: the release workflow stamps this crate's
-/// `version` from the git tag (`scripts/set-package-version.sh`), so a build can only report the
-/// version it really is. A hardcoded literal here would outlive its own release.
+/// `version` from the git tag, through the workspace's `[workspace.package]`
+/// (`scripts/set-package-version.sh`), so a build can only report the version it really is.
+/// A hardcoded literal here would outlive its own release.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Two-letter protocol marks for the node row's badge.
@@ -1193,6 +1194,29 @@ pub fn about_build_label(
         None => format!("sing-box {}", crate::i18n::translate(lang, "未就绪")),
     };
     format!("v{app_version} · {core} · {platform}")
+}
+
+/// Which release channel this build belongs to, in the words the update check
+/// classifies on.
+///
+/// A free function taking the two facts rather than reading them, because the whole
+/// value of it is that its three answers are the vocabulary
+/// `proxy_core::ReleaseKind::from_platform` understands, and that pairing can
+/// only be pinned by a test that can reach all three arms. `cfg!(target_arch)` and
+/// NSH's `is_desktop()` cannot both be true in one test binary, so they arrive as
+/// arguments and [`crate::store::AppStore::platform_label`] supplies them.
+///
+/// `is_web` wins outright: NSH's `is_desktop()` reports true for a browser on a
+/// desktop idiom, and a page is updated by replacing the server that serves it, never
+/// by installing a desktop archive on the machine that merely opened the tab.
+pub const fn update_channel_label(is_web: bool, is_desktop: bool) -> &'static str {
+    if is_web {
+        "Web Control"
+    } else if is_desktop {
+        "Desktop"
+    } else {
+        "Mobile"
+    }
 }
 
 /// Everything the diagnostic text reports, read off the store in one go.
@@ -2471,6 +2495,37 @@ mod diagnostics_tests {
         assert_eq!(
             about_build_label("0.1.0", None, "Mobile", ZH),
             "v0.1.0 · sing-box 未就绪 · Mobile"
+        );
+    }
+
+    /// The label this app prints is the only thing `proxy_core::update` has to decide
+    /// which asset a user is offered, and the two crates spell the channels
+    /// independently — nothing else would notice one of them renaming. The web arm is
+    /// the one that was already wrong: NSH's `is_desktop()` is true of a browser on a
+    /// desktop idiom, so a page reported "Desktop" and a self-hosted server was offered
+    /// the desktop `.zip`.
+    #[test]
+    fn every_channel_label_names_a_release_kind() {
+        use proxy_core::ReleaseKind;
+        let channels = [
+            (update_channel_label(true, true), ReleaseKind::WebServer),
+            (update_channel_label(true, false), ReleaseKind::WebServer),
+            (update_channel_label(false, true), ReleaseKind::Desktop),
+            (update_channel_label(false, false), ReleaseKind::Android),
+        ];
+        for (label, kind) in channels {
+            assert_eq!(
+                ReleaseKind::from_platform(label),
+                Some(kind),
+                "`{label}` is a label this crate prints"
+            );
+        }
+        // A browser on a desktop idiom is the pair that used to fall through to the
+        // desktop arm, so it is asserted once more on its own: `is_web` has to win.
+        assert_eq!(
+            update_channel_label(true, true),
+            "Web Control",
+            "a page must never be classified by its viewport"
         );
     }
 
