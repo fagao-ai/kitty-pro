@@ -202,11 +202,30 @@ done
 # version exists forever.
 version="$(cargo metadata --locked --no-deps --format-version 1 |
     jq -er '.packages[] | select(.name == "nsh-app-kitty") | .version')"
-# Android compares this one on upgrade, and it is an integer. `nsh.json`'s
-# `build` is the field NSH itself puts in the manifest's versionCode, so it is
-# used here too rather than derived from the version, which would let the two
-# manifests disagree about which build is newer.
-build_number="$(jq -er '.build' "$app/nsh.json")"
+# The integer Android compares on upgrade. Derived from the version rather than
+# read from `nsh.json`'s `build`, because that field is never stamped:
+# `set-package-version.sh` rewrites the crate, and the release workflow passes the
+# tag as `--app-version`, so a `build` of 1 would ship as versionCode 1 at v1.0.14,
+# at v1.1.0, and forever after — and Android refuses to install an update whose
+# versionCode is not higher, so the first user would never be able to leave the
+# first release. The weights keep it monotonic for any version the release
+# workflow accepts (major < 1000, minor and patch < 1000).
+#
+# KITTY_VERSION_CODE overrides, for a rebuild of a version already published: the
+# version is the release's, so bumping it is not an option, and this is the one
+# number that has to move.
+if [[ -n "${KITTY_VERSION_CODE:-}" ]]; then
+    build_number="$KITTY_VERSION_CODE"
+    [[ "$build_number" =~ ^[0-9]+$ ]] || die "KITTY_VERSION_CODE must be an integer"
+else
+    version_number="$(printf '%s' "$version" | sed 's/[-+].*//')"
+    IFS=. read -r v_major v_minor v_patch <<<"$version_number"
+    for part in "${v_major:-0}" "${v_minor:-0}" "${v_patch:-0}"; do
+        [[ "$part" =~ ^[0-9]{1,3}$ ]] ||
+            die "version $version does not fit the 1.2.3 shape versionCode is derived from"
+    done
+    build_number=$((10#${v_major:-0} * 1000000 + 10#${v_minor:-0} * 1000 + 10#${v_patch:-0}))
+fi
 app_name="$(jq -er '.name' "$app/nsh.json")"
 application_id="$(jq -er '.id' "$app/nsh.json")"
 
