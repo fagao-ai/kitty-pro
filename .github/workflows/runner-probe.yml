@@ -1,0 +1,13 @@
+name: Runner probe (temporary)
+"on":
+  workflow_dispatch:
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - run: echo "ok $(sw_vers -productVersion) $(uname -m)"
