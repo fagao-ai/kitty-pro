@@ -4123,3 +4123,94 @@ fn the_probe_row_fits_a_phone() {
         "the hint sits at y {hint_y} and the button at y {button_y}: they are no longer one row"
     );
 }
+
+/// A note that carries its recovery action has to keep both halves on a phone.
+///
+/// `controls::inline_note_with` is the app's one owner of "a sentence and the action that recovers
+/// from it", and 总览's stale-config banner now goes through it for exactly this reason. Measured
+/// through the sync card's failure, because that is the note the suite can actually reach: the
+/// banner needs a running core, and the suite starts none. Same control, so the frames are the
+/// same claim — and the state is a real one, a `sync.json` that will not parse.
+///
+/// English rather than Chinese on purpose. The 中文 sentence asks for 126pt of a 390pt screen, so
+/// the row lays out even built wrong — which is how 总览's banner came to ship broken and go
+/// unnoticed. The same sentence in English asks for 436pt, and the action sharing its row reached
+/// x 584 of 390 before this control owned the layout.
+#[test]
+fn a_note_with_its_action_fits_a_phone() {
+    let _profile = Profile::claim("a_note_with_its_action_fits_a_phone");
+    let dir = std::path::PathBuf::from(
+        std::env::var("KITTY_PROFILE_DIR").expect("the scratch directory"),
+    );
+    std::fs::write(dir.join("sync.json"), "{ not json").expect("an unreadable sync config");
+    let width = 390.0f32;
+    let (mut app, sink) = observing(
+        Headless::start(EngineConfig {
+            viewport: Size::new(px(width), px(2400.0)),
+            environment: Environment {
+                window: Size::new(px(width), px(2400.0)),
+                ..Environment::default()
+            },
+            ..EngineConfig::new(kitty_pro::app_root())
+        })
+        .expect("the app starts"),
+    );
+    app.wait_for("近一分钟流量").unwrap();
+    app.press("设置").unwrap();
+    app.wait_for("界面语言").unwrap();
+    // The language control is behind the page's own search, exactly as the other tests that
+    // switch language reach it.
+    app.type_text("搜索设置", "语言").unwrap();
+    app.wait_for("English").unwrap();
+    app.press("English").unwrap();
+    app.idle(std::time::Duration::from_millis(500)).unwrap();
+    let drawn = sink.lock().unwrap();
+
+    // The note's own sentence, and the one button that un-parks the card. The needle is the
+    // backend's error text rather than the app's sentence around it: that half is Chinese in both
+    // languages, so this measures one row whichever language the page is drawn in. Filtered to
+    // mounted nodes because `texts` keeps what has been destroyed — a label drawn before the
+    // language switch would otherwise be measured as though it were still on screen.
+    let message = drawn.only_mounted_node_with_text("同步配置损坏");
+    let button = drawn
+        .texts
+        .iter()
+        .find(|(id, text)| drawn.mounted.contains(*id) && (**text == "Retry" || **text == "重试"))
+        .map(|(id, _)| *id)
+        .expect("the failed sync card drew its retry");
+
+    let (message_x, message_y) = drawn.origin_in_root(message);
+    let message_width = drawn.frame(message).size.width.0;
+    let (button_x, button_y) = drawn.origin_in_root(button);
+    let button_right = button_x + drawn.frame(button).size.width.0;
+
+    // The action stays on the screen. This is the whole complaint, and the assertion that would
+    // have caught 总览's banner: 584pt of a 390pt phone.
+    assert!(
+        button_right <= width,
+        "the note's action reaches x {button_right} of a {width}pt phone screen"
+    );
+    // The sentence is given room to wrap rather than being squeezed to a fragment of itself — the
+    // half that a `button_right` check alone would miss, since a row can hold its button inside
+    // while crushing the words the button is there to explain.
+    assert!(
+        message_width > 100.0,
+        "the note's sentence was squeezed to {message_width}pt at x {message_x}"
+    );
+    // And the two are one row, side by side, not stacked and not overlapping.
+    assert!(
+        button_x >= message_x + message_width,
+        "the sentence ends at {} while the action starts at {button_x}",
+        message_x + message_width
+    );
+    // Still one row, and the row may be as tall as the sentence needs. The button is centred
+    // against a sentence that wraps to three lines here, so equality of `y` would be the wrong
+    // claim; what says "beside, not under" is that the two overlap vertically.
+    let message_bottom = message_y + drawn.frame(message).size.height.0;
+    let button_bottom = button_y + drawn.frame(button).size.height.0;
+    assert!(
+        button_y < message_bottom && message_y < button_bottom,
+        "the sentence spans y {message_y}..{message_bottom} and the action y \
+         {button_y}..{button_bottom}: one is below the other, not beside it"
+    );
+}

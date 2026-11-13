@@ -98,6 +98,17 @@ itself. `the_probe_row_fits_a_phone` measures both halves on the drawn frames at
 old layout still drew every word, which is what let it ship — the suite had been asserting the
 words.
 
+The stale-config banner beside it had the same row and was still broken, which says the guard is
+easy to leave out when a page assembles the row itself. It goes through `controls::inline_note_with`
+now — the control the sync card's failure and the subscription card's hint already use, and the one
+place that owns "a sentence and the action that recovers from it". Its English sentence asks for
+436pt where its Chinese asks for 126pt, so the row measured 重新连接 at x 584 of a 390pt screen:
+the one action that applies a pending change, off screen, in the language where the sentence needs
+the most room. `a_note_with_its_action_fits_a_phone` measures the control's frames at 390pt, in
+English, through the sync card — the only note of that shape the suite can reach, since the banner
+needs a running core and the suite starts none. Taking the guard out of the control fails it with
+the action at x 1199 of 390.
+
 The 登录时启动 switch follows the same rule for the same reason, and reads the operating system
 rather than the profile: a login item is a file an installer or a cleanup tool can delete while
 the app is closed. On a target with no per-user launch entry the row is absent, not disabled —
@@ -130,6 +141,20 @@ Three things are worth knowing about how they behave:
   turns on when the log page opens over a running core and off when either changes. The
   indicator reports the backend's answer rather than the app's wish, so a refusal parks the
   page on 已暂停 instead of claiming a live feed.
+- **The traffic poll survives a core that has not answered yet.** It reads once a second and
+  keeps 运行时长 off the clock rather than one tick per successful read, and only a disconnect or
+  a newer generation ends it — `domain::traffic_poll_tick` owns that decision. Ending on a failed
+  read is what froze a phone's 总览 at `00:00` and a flat chart beside a card saying 运行中:
+  `VpnService` reports the tunnel up before the core behind it answers, and on Android that
+  refusal comes back as the bridge's error *text*, which fails to parse as JSON, so the poll died
+  on its own first tick. Silence is not absence — which is the opposite of the log poll above, and
+  correctly so: that page parks its own indicator and says 已暂停, so silence there is explained.
+  The poll also holds a slot for the generation it is watching, the way the log poll holds
+  `log_poll`, because `refresh_status` starts one on every read that answers running without
+  bumping the generation. Two loops over one connection read twice a second, which halves every
+  rate the chart takes from a one-second difference, and each reset 运行时长 to zero on the way
+  in — so a press of 重新检测内核 on a healthy core used to zero the figure and leave a second
+  writer behind.
 
 ### 简体中文 and English, chosen on the settings page
 
@@ -739,3 +764,14 @@ against a running core is the path that avoids a restart, and the suite starts n
 is covered is the saved-and-reported branch, the guards, and the persistence; the
 switch-without-restart behaviour is reasoned from `api::select_proxy_group` and
 `singbox::select_outbound` rather than observed. It is worth watching once by hand.
+
+The frozen 运行时长 is the same shape again, and the diagnosis is the one thing here no test drove
+end to end. `domain::traffic_poll_tick` is tested directly, including the tick that used to kill
+the poll, and `domain::uptime_since` is tested against the clock. What is reasoned rather than
+observed is the Android half: that a read refused while `VpnService` is raising the tunnel comes
+back as the bridge's error *text* and fails to parse, so the poll died on its own first tick. That
+chain is read out of `KittyVpnBridge.traffic()`, `KittyVpnService.trafficPayload()`,
+`singbox::android::traffic` and `bridge/android_bridge.go`, and the screenshot — `00:00` under a
+card saying 运行中, with the chart flat — is the symptom it predicts exactly. No device or
+emulator is attached to this machine and the suite starts no core, so it was never reproduced
+here. It is worth confirming on the phone: 启动代理, then watch 运行时长 climb and the bars move.

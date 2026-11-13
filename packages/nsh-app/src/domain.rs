@@ -85,6 +85,64 @@ pub fn format_uptime(seconds: u64) -> String {
     }
 }
 
+/// How long the core has been connected, in whole seconds.
+///
+/// Off the distance between two instants rather than accumulated one per traffic sample, which is
+/// what let 运行时长 freeze beside a card saying 运行中: the figure used to be incremented once per
+/// *successful read*, so it measured how many samples arrived, not how long the user had been
+/// connected. Uptime is a claim about time; the poll only decides how often that claim is
+/// refreshed, and `TrafficPollTick::Silent` is why a tick can pass without one.
+///
+/// Saturating, because a clock that steps backwards should report the figure short rather than
+/// underflow it.
+pub fn uptime_since(started: std::time::Instant, now: std::time::Instant) -> u64 {
+    now.saturating_duration_since(started).as_secs()
+}
+
+/// What one tick of the traffic poll decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficPollTick {
+    /// The core answered. Record the sample and go on.
+    Sampled(api::CoreTraffic),
+    /// The core did not answer. Go on regardless.
+    ///
+    /// This variant is the fix. The poll used to treat a failed read as the end of itself, which
+    /// on a phone was its own first tick: `VpnService` reports the tunnel up before the core
+    /// behind it answers, and on Android a read refused while the tunnel is still coming up comes
+    /// back as the bridge's error *text*, which then fails to parse as JSON. One transient no at
+    /// the moment of 启动代理 ended the poll for the rest of the session, and 总览 went on saying
+    /// 运行中 above a `00:00` 运行时长 and a traffic chart that never moved again — with nothing on
+    /// screen to say the reading had stopped. A core that has not answered *yet* is not a core
+    /// that has gone away.
+    Silent,
+    /// This connection is no longer the poll's to watch.
+    Stop,
+}
+
+/// One second of the traffic poll, decided without a core, a window or a clock.
+///
+/// `sample` is the read's outcome, and only a poll that has been superseded or a core the app no
+/// longer believes is connected ends it. The two answers are deliberately different shapes: a
+/// restart must stop, so that two loops cannot write one set of signals, while a refused read must
+/// not, so that a slow tunnel costs one missing bar rather than the page's whole view of the
+/// connection.
+///
+/// `poll_logs` ends on a failure and is right to — that page parks its own indicator and says it
+/// is paused, so silence there is explained instead of sold as a live feed.
+pub fn traffic_poll_tick(
+    sample: Option<api::CoreTraffic>,
+    connected: bool,
+    current_generation: bool,
+) -> TrafficPollTick {
+    if !connected || !current_generation {
+        return TrafficPollTick::Stop;
+    }
+    match sample {
+        Some(traffic) => TrafficPollTick::Sampled(traffic),
+        None => TrafficPollTick::Silent,
+    }
+}
+
 pub fn format_data_amount(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -146,6 +204,59 @@ mod tests {
         assert_eq!(format_uptime(0), "00:00");
         assert_eq!(format_uptime(65), "01:05");
         assert_eq!(format_uptime(3_661), "1:01:01");
+    }
+
+    /// 运行时长 is a claim about time, not about how many traffic reads landed. Against the old
+    /// one-per-sample count, the second assertion is the one that fails: five seconds without a
+    /// single answer is five seconds the user was still connected.
+    #[test]
+    fn uptime_counts_the_clock_not_the_reads() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        assert_eq!(uptime_since(started, started), 0);
+        assert_eq!(uptime_since(started, started + Duration::from_secs(59)), 59);
+        assert_eq!(uptime_since(started, started + Duration::from_secs(60)), 60);
+        // Whole seconds, not rounded: the figure is read again a second later, and a second
+        // spent is a second the user was connected.
+        assert_eq!(
+            uptime_since(started, started + Duration::from_millis(1_999)),
+            1
+        );
+        // A clock that goes backwards cannot underflow the figure into a crash or a wrap.
+        assert_eq!(uptime_since(started + Duration::from_secs(9), started), 0);
+    }
+
+    /// A core that has not answered is not a core that has gone away.
+    ///
+    /// This is the defect the phone showed: 运行时长 frozen at `00:00` and the traffic chart flat,
+    /// beside a card claiming 运行中. The poll ended itself on the first failed read, and on
+    /// Android the read after 启动代理 fails because the tunnel is still coming up. Put the old
+    /// rule back — end the poll when the read fails — and the second assertion here is the one
+    /// that says so.
+    #[test]
+    fn a_silent_core_does_not_end_the_traffic_poll() {
+        let answered = Some(api::CoreTraffic::default());
+        // Alive, current, and it answered: take the sample.
+        assert_eq!(
+            traffic_poll_tick(answered, true, true),
+            TrafficPollTick::Sampled(api::CoreTraffic::default())
+        );
+        // Alive, current, and it did not answer. The tick the phone used to die on.
+        assert_eq!(traffic_poll_tick(None, true, true), TrafficPollTick::Silent);
+        // A core the app no longer believes is connected ends it, answer or no answer.
+        assert_eq!(
+            traffic_poll_tick(answered, false, true),
+            TrafficPollTick::Stop
+        );
+        assert_eq!(traffic_poll_tick(None, false, true), TrafficPollTick::Stop);
+        // And so does a restart, which is what stops two loops writing one set of signals. The
+        // sample a superseded loop brings back is dropped rather than written.
+        assert_eq!(
+            traffic_poll_tick(answered, true, false),
+            TrafficPollTick::Stop
+        );
+        assert_eq!(traffic_poll_tick(None, true, false), TrafficPollTick::Stop);
     }
 
     #[test]

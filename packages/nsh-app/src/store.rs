@@ -345,6 +345,9 @@ pub struct AppStore {
     feedback: crate::feedback::Feedback,
     /// The poll generation: a restart or disconnect invalidates in-flight reads.
     poll_generation: Signal<u64>,
+    /// Which generation's traffic loop is live, so a status read cannot start a second one
+    /// beside it. The log poll keeps its own slot for the same reason — see `log_poll`.
+    traffic_poll: Signal<Option<u64>>,
     /// The owner every task this store starts belongs to.
     owner: Owner,
 }
@@ -450,6 +453,7 @@ impl AppStore {
             system_proxy_busy: signal(false),
             feedback: crate::feedback::Feedback::new(),
             poll_generation: signal(0),
+            traffic_poll: signal(None),
             owner: Owner::current(),
         }
     }
@@ -720,6 +724,9 @@ impl AppStore {
         self.connected.set(false);
         self.traffic.set(TrafficWindow::default());
         self.uptime_seconds.set(None);
+        // The loop notices `connected` on its own next tick and releases this; clearing it here
+        // just means a start that lands before that tick is not refused as already running.
+        self.traffic_poll.set(None);
     }
 
     /// Read the operating system's proxy setting. Called on boot, after a stop, and whenever
@@ -852,37 +859,77 @@ impl AppStore {
         self.poll_generation.update(|n| *n = n.wrapping_add(1));
     }
 
-    /// Poll traffic once a second while the core runs, and count uptime off the same tick.
-    /// Stops as soon as the generation changes or the core is no longer connected, so a
+    /// Poll traffic once a second while the core runs, and keep 运行时长 honest off the same
+    /// tick. Stops as soon as the generation changes or the core is no longer connected, so a
     /// restart cannot leave two loops writing the same signals.
     ///
     /// Uptime is counted here rather than read from the core: the control API reports byte
     /// counters and connection counts but no start time, so the app's own view of how long
     /// it has been connected is the honest one. It resets to zero on connect, which is what
     /// the user can verify against the moment they pressed the button.
+    ///
+    /// What one tick decides is `domain::traffic_poll_tick`'s, and the failure there is survived
+    /// rather than obeyed; why is written on `domain::TrafficPollTick::Silent`.
+    ///
+    /// Idempotent for the connection it is already watching, and that is what the slot decides
+    /// rather than the caller. `refresh_status` starts a poll on every read that answers running —
+    /// at boot, and on each press of 重新检测内核 — and none of those bumps the generation, so
+    /// without this they would stack a second loop over the first. Two loops read twice a second,
+    /// which halves every rate the chart derives from a one-second difference and fills a
+    /// sixty-sample window in thirty seconds, and both wrote 运行时长 from an anchor each set at a
+    /// different moment, so the figure stepped backwards on every status read.
     pub fn start_polling(self) {
         let generation = self.poll_generation.get_untracked();
+        if self.traffic_poll.get_untracked() == Some(generation) {
+            return;
+        }
+        self.traffic_poll.set(Some(generation));
+        // The moment this connection's counting starts from, and it moves with the same call that
+        // used to zero the figure: a reconnect bumps the generation, so it is a new uptime, which
+        // is what the user sees happen when 启动代理 is pressed again.
+        let started = std::time::Instant::now();
         self.uptime_seconds.set(Some(0));
         self.work(async move {
-            let mut seconds = 0_u64;
             loop {
-                if self.poll_generation.get_untracked() != generation
-                    || !self.connected.get_untracked()
-                {
-                    return;
+                // One decision per tick, and asked after the await rather than before it: a
+                // restart during the read is exactly what the generation exists to notice, and a
+                // sample belonging to a superseded connection must not be written. The cost is one
+                // read spent on a tick that turns out to be the last, which for a poll that is
+                // already over is a `try_lock` that answers a default.
+                let tick = crate::domain::traffic_poll_tick(
+                    backend::core_traffic().await.ok(),
+                    self.connected.get_untracked(),
+                    self.poll_generation.get_untracked() == generation,
+                );
+                match tick {
+                    // A silent tick leaves the last rates standing rather than recording a zero
+                    // the core never reported: we could not ask, which is not the same as none.
+                    crate::domain::TrafficPollTick::Sampled(traffic) => self.push_traffic(traffic),
+                    crate::domain::TrafficPollTick::Silent => {}
+                    crate::domain::TrafficPollTick::Stop => {
+                        self.release_traffic_poll(generation);
+                        return;
+                    }
                 }
-                let Ok(traffic) = backend::core_traffic().await else {
-                    return;
-                };
-                if self.poll_generation.get_untracked() != generation {
-                    return;
-                }
-                self.push_traffic(traffic);
-                seconds = seconds.saturating_add(1);
-                self.uptime_seconds.set(Some(seconds));
+                // From the clock every tick, not accumulated once per sample: 运行时长 is a claim
+                // about how long the user has been connected, so it moves whether or not this
+                // particular read landed.
+                self.uptime_seconds.set(Some(crate::domain::uptime_since(
+                    started,
+                    std::time::Instant::now(),
+                )));
                 timer(Duration::from_secs(1)).await;
             }
         });
+    }
+
+    /// Give up the traffic poll's slot, but only if this loop still holds it. A loop that has been
+    /// superseded must not clear the flag that marks its replacement live, which would let a third
+    /// start alongside it — the same reason `release_log_poll` exists.
+    fn release_traffic_poll(self, generation: u64) {
+        if self.traffic_poll.get_untracked() == Some(generation) {
+            self.traffic_poll.set(None);
+        }
     }
 
     /// Turn the core's cumulative counters into one per-second sample.

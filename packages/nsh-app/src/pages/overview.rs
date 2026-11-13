@@ -275,22 +275,25 @@ fn unavailable_note(store: AppStore) -> impl IntoElement {
 /// Local edits the running core has not taken yet. Naming the gap is what makes
 /// "connected" trustworthy: the chip alone would overstate it.
 fn pending_banner(store: AppStore) -> impl IntoElement {
-    view()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .p_3()
-        .rounded(theme::radius_tile())
-        .bg(move || theme::Tint::Warning.wash())
-        .child(
-            text(move || i18n::tr("本地配置已改动，运行中的内核还是旧的。"))
-                .text_xs()
-                .text_color(move || theme::Tint::Warning.foreground()),
-        )
-        .child(controls::secondary_button("重新连接", move || {
+    // The shared note, which is the app's one owner of "a sentence and the action that recovers
+    // from it" — the sync card's failure above and the subscription card's hint already use it,
+    // and it gives the sentence `flex_1` with a zero floor, which is the guard `probe_row` below
+    // carries by hand. Assembled here instead, this row was a bare `justify_between` of the two:
+    // a flex item's floor is its content size, so the sentence kept its intrinsic width and the
+    // row laid 重新连接 off the right edge. Measured at 390pt in English — where the sentence asks
+    // for 436pt against the 126pt it asks for in Chinese — the button reached x 584 of 390, so
+    // the one action that applies the pending change was both unreadable and unreachable. The
+    // note's frames are what `a_note_with_its_action_fits_a_phone` measures, which is why this
+    // went to the control rather than to a third copy of that guard: this row needs a running
+    // core, and the suite starts none.
+    controls::inline_note_with(
+        theme::Tint::Warning,
+        Icon::CircleAlert,
+        "本地配置已改动，运行中的内核还是旧的。",
+        Some(controls::secondary_button("重新连接", move || {
             store.restart_core()
-        }))
+        })),
+    )
 }
 
 /// The four figures worth a glance. Each is a plain label over a value; none is
