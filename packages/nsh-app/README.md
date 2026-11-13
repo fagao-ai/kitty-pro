@@ -402,9 +402,22 @@ Three things about the Java half are worth knowing before touching it:
   `nsh_core::text::font_data` before any platform sees them (`core/mod.rs:1683`), so Android's
   `ttf_parser`, which cannot read woff2, is handed a TrueType collection it can.
 
-`extractNativeLibs` is true and the libraries are stored uncompressed and page-aligned. That is
-what lets the loader resolve `libkitty_singbox.so` out of the archive; NSH's own template turns it
-off, and can, because it ships a single library loaded by name.
+`extractNativeLibs` is true, so the installer unpacks the native libraries into the app's `lib/`
+directory and the archive deflates them. It used to store them raw, on the belief that the loader
+had to resolve `libkitty_singbox.so` out of the APK: that rule is real but belongs to
+`extractNativeLibs=false`, which is the case Android rejects a compressed library in
+(`NativeLibraryHelper.cpp`, which checks `kCompressStored` only when the flag is false and calls
+`uncompressEntry` otherwise). Storing cost 57% of the arm64 pair's size and bought nothing:
+v1.0.16 went out at 184,740,225 bytes, and the same two ABIs rebuilt with `-s -w` on the core and
+`-9` on the archive come to 61,569,409. What is paid instead is disk: the libraries land unpacked.
+`build-android.sh`'s `verify` step now refuses a stored `lib/` entry or a missing `-s -w`, since
+both mistakes build, sign and install happily.
+
+Reinstalled on the same emulator after that change: `adb install` accepted the deflated
+archive, the two libraries appeared under `lib/arm64/` at their full uncompressed sizes, and
+the stripped core ran — 设置 read back `kitty-pro-embedded/1.13.14`, a string only
+`kitty_singbox_version` can return, and connecting built `tun0` at 172.19.0.1/30 with
+连通正常：出口可用（HTTP 204）.
 
 **Verified on an Android 15 emulator** (API 35, `google_apis/arm64-v8a`, installed with
 `adb install -g` and driven with `adb shell input`): the app launches, `libnsh.so` loads

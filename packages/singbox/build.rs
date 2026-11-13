@@ -119,7 +119,15 @@ fn main() {
             "-tags",
             "with_dhcp,with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0",
             "-ldflags",
-            "-checklinkname=0 -X internal/godebug.defaultGODEBUG=multipathtcp=0 -X github.com/sagernet/sing-box/constant.Version=kitty-pro-embedded/1.13.14",
+            // `-s -w` drop the symbol table and the DWARF, on every target. On
+            // the arm64 Android library those sections were 16,710,716 of the
+            // 55,982,528 bytes the APK carried — 29.7% of the largest file in
+            // it, and nothing the core reads at run time. A Go panic's stack
+            // comes from the pclntab, which `-w` leaves alone, so a crash still
+            // reports where it was; `scripts/build-android.sh` checks the
+            // sections stay gone. sing-box builds its own binary the same way —
+            // line 10 of sagernet/sing-box@v1.13.14/Makefile.
+            "-checklinkname=0 -s -w -X internal/godebug.defaultGODEBUG=multipathtcp=0 -X github.com/sagernet/sing-box/constant.Version=kitty-pro-embedded/1.13.14",
             "-o",
         ])
         .arg(&artifact)

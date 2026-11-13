@@ -396,11 +396,17 @@ rm -f "$unsigned"
 cp "$work/base.apk" "$unsigned"
 chmod u+w "$unsigned"
 (cd "$stage" && zip -q "$unsigned" classes.dex assets/nsh/app.json)
-# Stored, not deflated, and aligned to 4096 by zipalign -p below: the manifest
-# asks for extractNativeLibs because the loader has to resolve
-# libkitty_singbox.so out of the archive, and Android refuses to install a
-# native library that is compressed in an APK that claims otherwise.
-(cd "$stage" && find lib -type f -print0 | xargs -0 zip -q -X -0 "$unsigned")
+# Deflated, because the manifest asks for `extractNativeLibs`: the installer
+# then copies every library out of the archive and into the app's `lib/`
+# directory, so the loader never reads them from the APK and there is nothing
+# to keep uncompressed. The rule this used to cite is real but backwards — it
+# is `extractNativeLibs=false` that refuses a compressed library, in
+# frameworks/base core/jni/com_android_internal_content_NativeLibraryHelper.cpp,
+# which rejects anything but `kCompressStored` in that branch and calls
+# `uncompressEntry` in the other one. Storing cost 57% of the arm64 pair's
+# size for nothing; `verify` below now checks the archive and the manifest
+# agree rather than trusting this comment.
+(cd "$stage" && find lib -type f -print0 | xargs -0 zip -q -X -9 "$unsigned")
 
 aligned="$work/aligned.apk"
 "$bt/zipalign" -f -p 4 "$unsigned" "$aligned"
@@ -458,5 +464,37 @@ for abi in "${abis[@]}"; do
         grep NEEDED |
         sed 's/^.*\[/'" $abi"' libnsh.so needs [/'
 done
+
+# Two checks, because the size now rests on two claims nothing else in the build
+# would notice breaking. Both mistakes below yield an APK that builds, signs and
+# installs: the stored one shipped unnoticed in v1.0.14 through v1.0.16, at 184 MB.
+for abi in "${abis[@]}"; do
+    # packages/singbox/build.rs passes `-s -w`. If that ever goes missing the
+    # core grows by a third again with nothing visibly broken — 16 MB per ABI
+    # of DWARF and symbol table the core never reads — so look instead of
+    # trusting the flag line.
+    if "$llvm/llvm-readelf" -S "$stage/lib/$abi/libkitty_singbox.so" |
+        awk '$2 ~ /^(\.debug|\.symtab|\.strtab)/ {found = 1} END {exit !found}'; then
+        die "the $abi core still carries its debug sections or symbol table; -s -w is missing from packages/singbox/build.rs"
+    fi
+done
+# The archive and the manifest must say the same thing. `extractNativeLibs=true`
+# is what makes a deflated library installable; a stored one is the wasted 57%,
+# and a deflated one in an APK that says `false` is an install refused on every
+# device. Neither shows up as a broken app, because both build and sign fine.
+# Both sides read their whole input before deciding: under `pipefail`, a `grep -q`
+# here would close the pipe on its first match, leave aapt2 dead of SIGPIPE, and
+# fail the build over an APK that was fine. The value is captured rather than
+# searched for: the same dump goes on to list `usesCleartextTraffic(…)=true`, so
+# any pattern wide enough to reach an `=true` after the attribute name would also
+# pass an APK that declares `false`. The attribute is declared once, so the whole
+# capture is the value.
+manifest_dump="$("$bt/aapt2" dump xmltree --file AndroidManifest.xml "$signed")"
+native_libs_flag="$(sed -n 's/.*extractNativeLibs([^)]*)=\([a-z]*\).*/\1/p' <<<"$manifest_dump")"
+[[ $native_libs_flag == true ]] ||
+    die "the signed APK declares extractNativeLibs=${native_libs_flag:-nothing}, but its libraries are deflated"
+stored="$(unzip -v "$signed" | awk '$2 == "Stored" && $8 ~ /^lib\// {print $8}')"
+[[ -z $stored ]] ||
+    die "these native libraries went into the archive uncompressed: $(tr '\n' ' ' <<<"$stored")"
 
 printf '\n\033[32m%s\033[0m (%s)\n' "$signed" "$(du -h "$signed" | cut -f1)"
