@@ -945,14 +945,11 @@ fn dns_row(
             },
         ))
         .child(
-            // Wrapped exactly as the routing row wraps its action badge, and the wrapper is the
-            // whole reason the pill sits level here. `controls::badge` carries `.self_start()`,
-            // which is load-bearing where a badge is a child of a *column* — the log row gives one
-            // a fixed 52pt width and the pill must not stretch to fill it — and reads as a bug
-            // anywhere else: inside a row it overrides that row's `items_center` and pins the pill
-            // to the top edge, so a two-line row shows it floating. NSH has no `items_start` to
-            // undo it from the parent, so a caller that wants a centred badge supplies a wrapper the
-            // height of one line, which is what the routing row has always done.
+            // The routing row's wrapper, kept here so the two lists share one column geometry. It
+            // holds only the pill on this row — the delete button is the row's own child, unlike
+            // the routing row, which groups its trailing controls — so what it actually supplies
+            // is `flex_shrink_0`: a long domain must not squeeze the resolver down to nothing.
+            // Alignment is the row's business, not the wrapper's and not the pill's.
             view()
                 .flex_row()
                 .items_center()

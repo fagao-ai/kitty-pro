@@ -442,6 +442,20 @@ from `domain::SwitchGeometry` (the same numbers the old `app.css` gave `.switch`
 with the thumb's travel derived so it cannot stop matching the inset), and the box paints
 nothing at all.
 
+The same lesson in a smaller place: `controls::badge` sets no cross-axis alignment of its own, so a
+pill sits wherever the row holding it puts one — which for every row in this app is centred. It used
+to carry `.self_start()`, and inside a row that silently overrode the row's `items_center` and
+pinned the pill to the top edge: the action pill on a two-line rule row drew 8.5pt above the row's
+centre. `the_routing_badge_sits_level_with_its_row` measures that in points, and it is the case that
+pins the fix; the DNS row's identical-looking pill sits inside a grouping wrapper that absorbs a bad
+`align_self`, so its test cannot see this bug and says so.
+
+One caller does have to know something: a pill's natural cross-axis size is *stretch*, so dropped
+into a fixed-width **column** it fills it. The log row's 52pt decision lane is the only such slot,
+and it writes `.items_start()` — measured on the engine, the pill is 36pt wide with it and 52pt
+without. No test covers that lane, because a log entry only arrives from a core that is really
+running; the line is deliberate, not the leftover of the bug.
+
 The three variable faces (Space Grotesk, Inter, JetBrains Mono) are the woff2 bytes this crate
 serves from `assets/fonts/`, the same faces the deleted Dioxus stylesheet inlined. CJK falls
 through to the system font.

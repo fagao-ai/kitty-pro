@@ -524,6 +524,16 @@ pub fn section_header(
 }
 
 /// A status pill: colored wash, matching foreground, one line of text.
+///
+/// The pill takes its cross-axis placement from whatever holds it and never sets `align_self`,
+/// which is what lets one control sit level in every row of the app. It used to carry
+/// `.self_start()`, and inside a row that overrode the row's own `items_center` and pinned the
+/// pill to the top edge — visible as a badge floating high beside a two-line rule.
+///
+/// The one thing a caller does have to know: the pill's natural cross-axis size is *stretch*, so
+/// dropped into a fixed-width **column** it fills the column. The log row's 52pt lane is that
+/// case, and it says so with `.items_start()` at the call site rather than with a width on the
+/// pill, which would have to be kept in step with the text.
 pub fn badge(
     label: impl IntoReactive<SharedString> + 'static,
     tint: impl IntoReactive<Tint> + 'static,
@@ -538,7 +548,6 @@ pub fn badge(
         .gap_1()
         .px_2()
         .py_0p5()
-        .self_start()
         .rounded(theme::radius_tile())
         .bg(move || tint_bg.get().wash())
         .child(

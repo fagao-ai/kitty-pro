@@ -411,18 +411,28 @@ fn log_row(entry: Memo<Option<CoreLogEntry>>) -> impl IntoElement {
         .child(when(
             move || route().is_some(),
             move || {
-                view().w(px(52.0)).flex_shrink_0().child(controls::badge(
-                    move || {
-                        route()
-                            .map(|route| domain::route_decision_label(route.decision).to_owned())
-                            .unwrap_or_default()
-                    },
-                    move || {
-                        route().map_or(theme::Tint::Neutral, |route| {
-                            domain::route_decision_tint(route.decision)
-                        })
-                    },
-                ))
+                // `.items_start()` is the lane's own business, not the pill's: this wrapper is a
+                // column, so its cross axis is the 52pt width, and the default stretch would fill
+                // the lane and turn a three-character decision into a block of colour. Every
+                // other badge in the app hangs directly off a row, which centres it for free.
+                view()
+                    .w(px(52.0))
+                    .flex_shrink_0()
+                    .items_start()
+                    .child(controls::badge(
+                        move || {
+                            route()
+                                .map(|route| {
+                                    domain::route_decision_label(route.decision).to_owned()
+                                })
+                                .unwrap_or_default()
+                        },
+                        move || {
+                            route().map_or(theme::Tint::Neutral, |route| {
+                                domain::route_decision_tint(route.decision)
+                            })
+                        },
+                    ))
             },
         ))
         .child(when(

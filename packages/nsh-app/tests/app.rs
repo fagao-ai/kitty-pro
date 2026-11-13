@@ -596,6 +596,32 @@ impl Drawn {
             .map(|(id, _)| *id)
     }
 
+    /// The one mounted node drawing `needle`.
+    ///
+    /// A claim about *where* something is drawn is only evidence while the check can name the
+    /// thing it measured. [`Drawn::node_with_text`] returns the first match and keeps nodes that
+    /// have been destroyed, so a label drawn twice — a pill and a form's option of the same words
+    /// — would be compared against whichever happened to be built first, and a geometry test
+    /// would pass or fail on construction order. This panics instead of guessing.
+    fn only_mounted_node_with_text(&self, needle: &str) -> u32 {
+        let hits: Vec<u32> = self
+            .texts
+            .iter()
+            .filter(|(id, text)| self.mounted.contains(*id) && text.contains(needle))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected one mounted node drawing {needle:?}, found {}: {:?}",
+            hits.len(),
+            hits.iter()
+                .filter_map(|id| self.texts.get(id))
+                .collect::<Vec<_>>()
+        );
+        hits[0]
+    }
+
     /// The parts inside `id`, in tree order.
     fn children(&self, id: u32) -> &[u32] {
         self.children.get(&id).map(Vec::as_slice).unwrap_or(&[])
@@ -1900,15 +1926,77 @@ fn the_dns_list_draws_like_the_routing_list() {
     );
 }
 
+/// Asserted on frames rather than on strings because this class of bug is invisible to a text
+/// sweep: every word was present, correctly translated, in the right row, and drawn too high.
+///
+/// The row is found by walking up from the pill until an ancestor holds the value's column, so the
+/// claim is measured against the row itself. Comparing the pill with the value column instead — as
+/// the first version of this check did — only holds while that column happens to be the tallest
+/// child of a centred row, which is a fact about the row's contents rather than about the
+/// alignment, and one neither list promises. Walking to the row also follows the pill into the
+/// grouping wrapper the DNS list puts it in, so one helper means the same thing on both lists.
+fn assert_badge_level_with_row(drawn: &Arc<Mutex<Drawn>>, badge_text: &str, row_value: &str) {
+    let record = drawn.lock().expect("the observer's record");
+    let badge = record.only_mounted_node_with_text(badge_text);
+    let value = record.only_mounted_node_with_text(row_value);
+    let column = record.parent[&value];
+    let mut row = record.parent[&badge];
+    for _ in 0..16 {
+        if record.children(row).contains(&column) {
+            break;
+        }
+        let Some(parent) = record.parent.get(&row).copied() else {
+            panic!("the `{badge_text}` pill is never in the row of `{row_value}`");
+        };
+        row = parent;
+    }
+    assert!(
+        record.children(row).contains(&column),
+        "no ancestor of the `{badge_text}` pill holds the row of `{row_value}`"
+    );
+    let (_, badge_y) = record.center_in_root(badge);
+    let (_, row_y) = record.center_in_root(row);
+    drop(record);
+    // Two points, not zero: the pill is an odd number of pixels tall and the row's centre is not,
+    // so the two land on neighbouring half-points when they agree perfectly. What this rules out is
+    // the reported bug — a pill pinned to the top of a 34pt row sits about 13pt high, which no
+    // tolerance worth having would let through.
+    assert!(
+        (badge_y - row_y).abs() < 2.0,
+        "the `{badge_text}` badge centres at {badge_y} and the row it is drawn in at \
+         {row_y}: the badge sits {}",
+        if badge_y < row_y { "high" } else { "low" }
+    );
+}
+
+/// The routing row's action pill is vertically centred, not pinned to the top of the row.
+///
+/// Same defect as the DNS row's, reported from a screenshot of this list: the `直连` pill sat
+/// about 8pt above the row's centre. `controls::badge` carried a `.self_start()`, which inside a
+/// row overrides that row's `items_center`. The first fix only wrapped the DNS row's call site and
+/// left the shared control alone, so every row that drops a badge into a two-line row — this one —
+/// kept floating. The control is fixed at its owner now; this is the case that proves it.
+#[test]
+fn the_routing_badge_sits_level_with_its_row() {
+    let (app, _profile) = seeded_test(
+        "the_routing_badge_sits_level_with_its_row",
+        PROFILE_WITH_RULE,
+    );
+    let (mut app, drawn) = observing(app);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("规则").unwrap();
+    app.wait_for("ad.example.com").unwrap();
+
+    assert_badge_level_with_row(&drawn, "拦截", "ad.example.com");
+}
+
 /// The DNS row's badge is vertically centred, not pinned to the top of the row.
 ///
-/// Reported from a screenshot: the resolver pill sat high beside a two-line row. The cause was in
-/// `controls::badge` — a `.self_start()` that is load-bearing where a badge is a child of a column
-/// (the log row gives one a 52pt width and it must not stretch) and wrong everywhere else, since
-/// inside a row it overrides that row's `items_center`.
-///
-/// Asserted on frames rather than on strings because the bug is exactly the kind a text sweep
-/// cannot see: every word was present, correctly translated, in the right row, and drawn too high.
+/// The report that found the cause. It does not guard the shared control: the pill here sits
+/// inside a grouping wrapper whose own height is the pill's, so a bad `align_self` on the pill has
+/// nowhere to show and this case stays green with the bug put back. That is why the routing row —
+/// where the pill and the row are close enough to disagree — carries the assertion that actually
+/// pins the fix. See [`the_routing_badge_sits_level_with_its_row`].
 #[test]
 fn the_dns_badge_sits_level_with_its_row() {
     let (app, _profile) = seeded_test("the_dns_badge_sits_level_with_its_row", PROFILE_TWO_DNS);
@@ -1918,30 +2006,7 @@ fn the_dns_badge_sits_level_with_its_row() {
     app.press("专用 DNS").unwrap();
     app.wait_for("et.net").unwrap();
 
-    let badge = drawn
-        .lock()
-        .expect("the observer's record")
-        .node_with_text("100.100.100.101")
-        .expect("the resolver badge is drawn");
-    let record = drawn.lock().expect("the observer's record");
-    let (_, badge_y) = record.center_in_root(badge);
-    // The two-line column beside it, whose own centre *is* the row's: it is the tallest child of a
-    // row that centres its children, so whatever is level with the row is level with this.
-    let value = record
-        .node_with_text("et.net")
-        .expect("the row's value is drawn");
-    let column = record.parent[&value];
-    let (_, column_y) = record.center_in_root(column);
-    // Two points, not zero: the badge is an odd number of pixels tall and the row's centre is not,
-    // so the two land on neighbouring half-points when they agree perfectly. What this rules out is
-    // the reported bug — a pill pinned to the top of a 34pt row sits about 13pt high, which no
-    // tolerance worth having would let through.
-    assert!(
-        (badge_y - column_y).abs() < 2.0,
-        "the resolver badge centres at {badge_y} and the row it belongs to at {column_y}: \
-         the badge sits {}",
-        if badge_y < column_y { "high" } else { "low" }
-    );
+    assert_badge_level_with_row(&drawn, "100.100.100.101", "et.net");
 }
 
 /// A subscription's nodes go with it and cannot be recovered without the provider, so the
