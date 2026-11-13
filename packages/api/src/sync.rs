@@ -1400,6 +1400,18 @@ mod tests {
                 while !server_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // Back to blocking, on purpose. The listener is nonblocking so
+                            // this loop can poll `stop`, and on macOS the flag reaches every
+                            // socket it accepts — measured here, and Linux's `accept(2)` says
+                            // the flag does not carry over there and tells portable code to
+                            // set what it wants explicitly. Left inherited, a handler's `read`
+                            // answers `WouldBlock` the moment a request arrives in pieces
+                            // instead of waiting for the rest, and the read timeout in
+                            // `read_http_request` becomes a lie: a nonblocking socket is
+                            // answered at once and never consults `SO_RCVTIMEO`.
+                            stream
+                                .set_nonblocking(false)
+                                .expect("accepted connection should block");
                             let (files, writes, requests, reject) = (
                                 Arc::clone(&server_files),
                                 Arc::clone(&server_writes),
@@ -1579,6 +1591,66 @@ mod tests {
     fn aws_timestamp_uses_utc_calendar_date() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+    }
+
+    /// The fake remote waits for a request that arrives in pieces.
+    ///
+    /// Its listener is nonblocking so the accept loop can notice `stop`, and macOS hands
+    /// that flag to every socket `accept` returns — measured here, and Linux's `accept(2)`
+    /// says it does not carry over there — so a `read` that should block for the rest of the
+    /// request instead returns `WouldBlock`. The handler used to take that as a failed
+    /// assertion and die, closing the connection on the client. Under load, where the
+    /// client's headers and body do not land in one read, a push then failed with `Error
+    /// sending request`; the same flag also quietly defeated the read timeout, since a
+    /// nonblocking socket ignores `SO_RCVTIMEO` entirely.
+    ///
+    /// Written as a slow two-part client rather than as a unit test of the flag, because
+    /// what matters is the promise every other test in here makes: one request in, one
+    /// response out, however the bytes are split across the wire.
+    #[test]
+    fn the_fake_remote_reads_a_request_split_across_packets() {
+        let remote = FakeRemote::start();
+        let address = remote
+            .endpoint
+            .strip_prefix("http://")
+            .expect("the fake remote serves http");
+        let mut stream = TcpStream::connect(address).expect("the fake remote accepts");
+
+        let body = "{}";
+        stream
+            .write_all(
+                format!(
+                    "PUT /split.json HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("head should reach the fake remote");
+        stream.flush().expect("head should flush");
+        // The gap is the whole test: the header block is complete, the body is not, and
+        // the next read can only be answered by waiting.
+        std::thread::sleep(Duration::from_millis(50));
+        stream
+            .write_all(format!("\r\n{body}").as_bytes())
+            .expect("body should reach the fake remote");
+        stream.flush().expect("body should flush");
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout should set");
+        let mut reply = String::new();
+        stream
+            .read_to_string(&mut reply)
+            .expect("the reply should arrive");
+        assert!(
+            reply.contains("201"),
+            "a split request was not served: {reply:?}"
+        );
+        assert_eq!(
+            remote.writes().as_slice(),
+            ["/split.json".to_string()],
+            "the request was answered but not recorded"
+        );
     }
 
     #[test]

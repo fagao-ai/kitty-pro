@@ -602,6 +602,13 @@ round trip itself, the conflict panel's two buttons and the pre-pull backup are 
 `packages/api/src/sync.rs` rather than observed, the same way the live group switch is (see
 Unverified). It is worth running once against a real WebDAV host.
 
+The fake remote's listener is nonblocking so its accept loop can notice `stop`, and on macOS that
+flag reaches every socket it accepts, so the handler reads `WouldBlock` instead of waiting for a
+request that arrives in pieces. Each accepted socket is therefore put back to blocking where it is
+handed to a handler — in the fake remote and in the TUN helper alike, which fails the same way and
+is why 启动 TUN was intermittently reporting 连接失败. `accept(2)` says the flag does not carry over
+on Linux and tells portable code to set what it wants either way; nothing here assumes it does.
+
 ### App updates
 
 The card reads the same state file the deleted Dioxus shell wrote, from the same three calls, and the

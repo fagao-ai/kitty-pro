@@ -164,6 +164,14 @@ impl PrivilegedCore {
             if self.lease.is_none() {
                 match listener.accept() {
                     Ok((mut lease, peer)) if peer.ip().is_loopback() => {
+                        // The lease listener is nonblocking so this loop can keep watching
+                        // the child, and `accept(2)` tells portable code never to assume
+                        // whether that flag reaches the accepted socket. It is wanted
+                        // blocking here — the read timeout below is only honoured on a
+                        // blocking socket — so say so rather than inherit whatever arrives.
+                        lease.set_nonblocking(false).map_err(|error| {
+                            helper_error(format!("配置 helper 租约失败: {error}"))
+                        })?;
                         lease
                             .set_read_timeout(Some(HELPER_REQUEST_TIMEOUT))
                             .map_err(|error| {
@@ -452,7 +460,13 @@ fn handle_helper_connection(
     core: &mut EmbeddedCore,
 ) -> Result<bool, String> {
     stream
-        .set_read_timeout(Some(HELPER_REQUEST_TIMEOUT))
+        // Same reason as the lease socket: the RPC listener is nonblocking so the accept
+        // loop can poll the lease, and a request that has not finished arriving would
+        // otherwise be answered with `WouldBlock` instead of waiting. The timeouts below
+        // cannot help: a nonblocking socket is answered by the kernel at once and never
+        // consults `SO_RCVTIMEO`.
+        .set_nonblocking(false)
+        .and_then(|_| stream.set_read_timeout(Some(HELPER_REQUEST_TIMEOUT)))
         .and_then(|_| stream.set_write_timeout(Some(HELPER_REQUEST_TIMEOUT)))
         .map_err(|error| format!("configure TUN helper request: {error}"))?;
     let mut payload = Vec::new();

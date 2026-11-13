@@ -796,6 +796,18 @@ fn handle_helper_connection(
     state: &mut HelperState,
 ) -> Result<bool, String> {
     validate_peer_identity(&stream, expected_uid, expected_pid)?;
+    // Back to blocking, and it has to be said here rather than at the listener: `run_helper`
+    // makes its listener nonblocking so the accept loop can poll the lease, and macOS hands
+    // that flag to every socket its `accept` returns — measured on this machine, over AF_UNIX
+    // (and over loopback TCP too, which is where api's fake remote hit it). Left inherited, the
+    // read below returns `WouldBlock` whenever the parent has not written yet, and the
+    // `set_read_timeout` immediately after it cannot help: a nonblocking socket is answered
+    // by the kernel at once and never consults `SO_RCVTIMEO`. The request then fails with
+    // `连接失败` for no reason the user can see, and it passes whenever the bytes happen to
+    // arrive first — which is how it survived review.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("configure TUN helper request: {error}"))?;
     stream
         .set_read_timeout(Some(HELPER_REQUEST_TIMEOUT))
         .and_then(|_| stream.set_write_timeout(Some(HELPER_REQUEST_TIMEOUT)))
@@ -1140,6 +1152,94 @@ mod tests {
         assert!(!exit);
         assert!(!state.core.is_running());
         assert!(state.dns_resolver.is_none());
+    }
+
+    /// The helper serves a request whose bytes arrive after the connection was accepted.
+    ///
+    /// `run_helper`'s listener is nonblocking so its accept loop can poll the lease, and macOS
+    /// hands that flag to every socket `accept` returns. So `handle_helper_connection` reads a
+    /// nonblocking socket and gets `WouldBlock` back unless the parent's bytes happened to land
+    /// first. The `set_read_timeout` it sets right before reading cannot save it either: a
+    /// nonblocking socket is answered by the kernel immediately and never consults
+    /// `SO_RCVTIMEO`.
+    ///
+    /// The gap is not theoretical. The parent validates the peer's identity and serialises
+    /// the request before it writes, and measured with those two steps in place the helper
+    /// failed every run at a 40ms gap, and this test fails 5 times out of 5 at its own 60ms
+    /// gap with the flag left inherited — checked by putting the bug back. Every TUN action
+    /// goes down this socket, so the intermittent form of "连接失败" in 启动 TUN lives here.
+    #[test]
+    fn helper_serves_a_request_that_arrives_after_accept() {
+        // `kt-` rather than a descriptive name: a unix socket path must fit `sun_path`, and
+        // this suite's temp directory is already 56 bytes resolved, which leaves little room.
+        // The nonce keeps it clear of a leftover from an earlier run.
+        let socket = fs::canonicalize(std::env::temp_dir())
+            .expect("temporary directory should resolve")
+            .join(format!(
+                "kt-{}-{}.sock",
+                std::process::id(),
+                &random_nonce().expect("nonce should be generated")[..12]
+            ));
+        let _ = fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind the helper's socket");
+        // As `run_helper` sets it up: nonblocking so the accept loop can poll the lease.
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking accept loop");
+
+        let parent = UnixStream::connect(&socket).expect("parent connects");
+        let (helper_side, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("accept the parent connection: {error}"),
+            }
+        };
+
+        // The parent does its own work before writing, which is what leaves the helper
+        // reading an empty socket. Its identity is this process's, as it would be for a
+        // real parent, so the helper's check passes and the read is what is under test.
+        let uid = unsafe { libc::getuid() };
+        let pid = std::process::id();
+        // The write's outcome travels back rather than being unwrapped in the thread: when
+        // the bug is present the helper gives up and closes the socket, and a panic inside
+        // the spawned thread would report `BrokenPipe` — true, but a symptom of a dead
+        // handler rather than the reason for it.
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            let mut parent = parent;
+            let sent = parent.write_all(b"{\"action\":\"ping\"}").and_then(|()| {
+                // The helper reads to EOF, so the write half has to close to be answered.
+                parent.shutdown(std::net::Shutdown::Write)
+            });
+            (sent, parent)
+        });
+
+        let mut state = HelperState::new(uid, unsafe { libc::getgid() });
+        let outcome = handle_helper_connection(helper_side, uid, pid, &mut state);
+
+        let (sent, mut parent) = writer.join().expect("the parent's thread finishes");
+        let mut reply = String::new();
+        let read = parent.read_to_string(&mut reply);
+        let _ = fs::remove_file(&socket);
+
+        // The handler's own verdict comes first on purpose. With the bug present it gives
+        // up on its first read and closes the socket, so the parent's write would fail with
+        // `BrokenPipe` — true, and useless, because it names the consequence of a dead
+        // handler instead of the reason for it.
+        outcome.expect("a request that arrives after accept is still the helper's to serve");
+        sent.expect("the parent's request should reach the helper");
+        read.expect("the parent reads the reply");
+        // `error` is the field that carries a failure, and it is present in every reply
+        // (`"error":null` when the action worked), so a substring test would always fail.
+        let response: HelperResponse =
+            serde_json::from_str(&reply).expect("the helper's reply is a HelperResponse");
+        assert!(
+            response.error.is_none(),
+            "the helper answered with an error: {reply}"
+        );
     }
 
     #[test]
