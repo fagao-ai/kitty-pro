@@ -630,13 +630,22 @@ mod tests {
     #[test]
     fn the_published_asset_set_answers_every_platform() {
         let names = [
+            // macOS publishes both halves of the same bundle: the archive this
+            // workflow has always had to write around NSH's bare `.app`, and the image
+            // a person drags onto Applications. The zip is deliberately listed first:
+            // `select_asset` breaks a tie by order, so an expectation of the dmg can
+            // only be met by `asset_priority` ranking an installer above an archive.
+            // With the dmg in front this would assert nothing but which string happens
+            // to be first in this array, and it did just that until it was swapped.
             "Kitty-Pro-macos-aarch64.zip",
+            "Kitty-Pro-macos-aarch64.dmg",
             "Kitty-Pro-windows-x86_64.zip",
             "Kitty-Pro-linux-x86_64.tar.gz",
             "Kitty-Pro-web-linux-x86_64.tar.gz",
             "Kitty-Pro-web-macos-aarch64.tar.gz",
             "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.15.apk",
             // The sidecars ride along on the release page and must never be chosen.
+            "Kitty-Pro-macos-aarch64.dmg.sha256",
             "Kitty-Pro-macos-aarch64.zip.sha256",
             "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.15.apk.sha256",
         ];
@@ -645,7 +654,7 @@ mod tests {
                 ReleaseKind::Desktop,
                 "macos",
                 "aarch64",
-                "Kitty-Pro-macos-aarch64.zip",
+                "Kitty-Pro-macos-aarch64.dmg",
             ),
             (
                 ReleaseKind::Desktop,

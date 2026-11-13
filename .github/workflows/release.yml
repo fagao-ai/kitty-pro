@@ -267,10 +267,25 @@ jobs:
           archive="Kitty-Pro-${{ matrix.id }}-${arch}"
           case "${{ matrix.id }}" in
             macos)
-              # NSH leaves an ad hoc signed `.app` here; zip it, keeping the
-              # bundle's own top-level entry so `ditto`/Finder restore it whole.
+              # NSH leaves an ad hoc signed `.app` here and packages nothing else —
+              # its own `package --help` names the macOS target as the `.app`, with no
+              # archive and no image. Two packages come out of that bundle.
+              #
+              # The zip is what this workflow has always published and what the
+              # unpack-and-look check below still consumes. The dmg is the one a
+              # person installs by hand: mount, drag, done. `proxy_core::update`
+              # ranks an installer above a portable archive, so publishing it is also
+              # what makes a Mac's update check name the image rather than the zip;
+              # the card itself links to the release page either way.
+              #
+              # Built by the script rather than one `hdiutil` line here, because the
+              # image has to be mounted and the bundle's signature read back out of it
+              # for the build to mean anything, and that belongs with the tool that
+              # makes it. It fails on a volume that comes out empty or unsigned, the
+              # way the check below fails on a zip with no executable in it.
               bundle="$(find . -maxdepth 1 -type d -name '*.app' -print -quit)"
               test -n "$bundle"
+              "$GITHUB_WORKSPACE/scripts/build-dmg.sh" -o "$archive.dmg" "$bundle"
               ditto -c -k --keepParent "$bundle" "$archive.zip"
               rm -rf "$bundle"
               ;;
@@ -295,6 +310,13 @@ jobs:
         run: |
           set -euo pipefail
           cd "dist/${{ matrix.id }}"
+          # The portable archive only, and deliberately: the macOS dmg is in this
+          # directory too, and `scripts/build-dmg.sh` already mounted its own output,
+          # read the executable back out of the volume and verified the signature.
+          # Mounting it a second time here would check the same bytes through a
+          # different tool, and letting this `find` answer with the dmg instead of
+          # the zip would fall through the `case` below into an empty check_dir,
+          # failing a build whose packages are both fine.
           archive="$(find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -quit)"
           check_dir="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-verify"
           mkdir -p "$check_dir"
@@ -329,7 +351,7 @@ jobs:
             checksum() { sha256sum "$1"; }
           fi
           find "dist/${{ matrix.id }}" -maxdepth 1 -type f \
-              \( -name '*.zip' -o -name '*.tar.gz' \) \
+              \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.dmg' \) \
             -print0 | while IFS= read -r -d '' artifact; do
               if [[ -f "$artifact.sha256" ]]; then continue; fi
               name="$(basename "$artifact")"
@@ -817,14 +839,19 @@ jobs:
         with:
           body_path: release-body.md
           fail_on_unmatched_files: true
-          # One glob per channel the workflow builds. A channel missing from here
+          # One glob per package the workflow builds. A package missing from here
           # still reports a green run: the artifact is simply absent from the release
           # page, and `proxy_core::update` reads that page's asset list, so a release
           # without its `.apk` tells every phone there is nothing to install. The
-          # desktop's `.dmg`/`.msi`/`.deb`/`.AppImage` globs went with the shells that
-          # produced them; NSH ships one archive per platform.
+          # desktop's `.msi`/`.deb`/`.AppImage` globs went with the shells that
+          # produced them, which left NSH publishing one archive per platform; the
+          # `.dmg` is back because no NSH version makes a macOS image at all —
+          # `nsh package` builds an `.app` and stops — so `scripts/build-dmg.sh`
+          # wraps it, and this list has to carry the result out or every Mac is
+          # offered a zip.
           files: |
             release-assets/**/*.zip
             release-assets/**/*.tar.gz
+            release-assets/**/*.dmg
             release-assets/**/*.apk
             release-assets/**/*.sha256

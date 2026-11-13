@@ -103,8 +103,9 @@ fi
 install_en="$(cat <<EOF
 ### Install
 
-- **macOS (Apple Silicon):** \`Kitty-Pro-macos-aarch64.zip\` — unzip and move
-  \`Kitty Pro.app\` to Applications
+- **macOS (Apple Silicon):** \`Kitty-Pro-macos-aarch64.dmg\` — open it and drag
+  \`Kitty Pro.app\` onto \`Applications\`. \`Kitty-Pro-macos-aarch64.zip\` is the
+  same bundle for anyone unpacking it from a script
 - **Windows (x86_64):** \`Kitty-Pro-windows-x86_64.zip\`
 - **Linux (x86_64):** \`Kitty-Pro-linux-x86_64.tar.gz\`
 - **Android (arm64 + armv7):** \`Kitty-Pro-arm64-v8a-armeabi-v7a-${version}.apk\`
@@ -113,16 +114,17 @@ install_en="$(cat <<EOF
   \`./kitty-pro-web-server\`, open \`http://127.0.0.1:7897/\`
 - **Web server (macOS Apple Silicon):** \`Kitty-Pro-web-macos-aarch64.tar.gz\`
 
-Every archive has a matching \`.sha256\` sidecar; verify it before the first run.
-Unzip and run the app from wherever you keep it: macOS builds are ad hoc signed
-and not notarized, so the first launch needs a right-click → Open.
+Every package has a matching \`.sha256\` sidecar; verify it before the first run.
+macOS builds are ad hoc signed and not notarized, so the first launch needs a
+right-click → Open, from a dmg or a zip alike.
 EOF
 )"
 install_zh="$(cat <<EOF
 ### 安装
 
-- **macOS（Apple 芯片）：** \`Kitty-Pro-macos-aarch64.zip\` —— 解压后把
-  \`Kitty Pro.app\` 拖进「应用程序」
+- **macOS（Apple 芯片）：** \`Kitty-Pro-macos-aarch64.dmg\` —— 打开后把
+  \`Kitty Pro.app\` 拖进「应用程序」。\`Kitty-Pro-macos-aarch64.zip\` 是同一个 app，
+  供脚本解压使用
 - **Windows（x86_64）：** \`Kitty-Pro-windows-x86_64.zip\`
 - **Linux（x86_64）：** \`Kitty-Pro-linux-x86_64.tar.gz\`
 - **Android（arm64 + armv7）：** \`Kitty-Pro-arm64-v8a-armeabi-v7a-${version}.apk\`
@@ -131,8 +133,8 @@ install_zh="$(cat <<EOF
   浏览器打开 \`http://127.0.0.1:7897/\`
 - **Web 服务端（macOS Apple 芯片）：** \`Kitty-Pro-web-macos-aarch64.tar.gz\`
 
-每个压缩包都附带同名 \`.sha256\` 校验文件，首次运行前请先校验。macOS 构建仅做
-ad-hoc 签名、未公证，首次打开请右键选择「打开」。
+每个安装包都附带同名 \`.sha256\` 校验文件，首次运行前请先校验。macOS 构建仅做
+ad-hoc 签名、未公证，无论 dmg 还是 zip，首次打开请右键选择「打开」。
 EOF
 )"
 

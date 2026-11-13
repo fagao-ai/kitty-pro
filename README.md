@@ -209,8 +209,12 @@ The `Build release packages` workflow publishes three channels, all from the one
 NSH crate, each with a `.sha256` sidecar:
 
 - **Desktop**, built on that operating system's own runner:
-  `Kitty-Pro-macos-aarch64.zip` (the ad hoc signed `Kitty Pro.app`),
-  `Kitty-Pro-windows-x86_64.zip`, `Kitty-Pro-linux-x86_64.tar.gz`
+  `Kitty-Pro-macos-aarch64.dmg` and `Kitty-Pro-macos-aarch64.zip` — the same ad
+  hoc signed `Kitty Pro.app`, in a drag-to-Applications image for a person and an
+  archive for a script — plus `Kitty-Pro-windows-x86_64.zip` and
+  `Kitty-Pro-linux-x86_64.tar.gz`. NSH builds an `.app` and stops, so the dmg comes
+  from `scripts/build-dmg.sh`, which mounts what it wrote and verifies the bundle's
+  signature inside it before the release sees it
 - **Android**: `Kitty-Pro-arm64-v8a-armeabi-v7a-<version>.apk`, one archive
   carrying both ARM ABIs, built by `scripts/build-android.sh` and signed with the
   release keystore in the repository's `ANDROID_KEYSTORE_*` secrets
@@ -225,10 +229,12 @@ archives. A manual run is not a release, so it has to be given a `test_version`
 rather than inheriting the newest published one: an unsigned throwaway that
 reports a real version tells its installer there is nothing to update, forever.
 
-Every asset name is load-bearing. `proxy_core::update` chooses the one archive a
+Every asset name is load-bearing. `proxy_core::update` chooses the one package a
 device may install out of the file name alone — its channel, its operating system,
 and the CPU groups it lists — so a name that drops a token silently stops that
-platform being updatable. `the_published_asset_set_answers_every_platform` in
+platform being updatable. Where a platform publishes two, it prefers an installer
+to an archive, which is why a Mac is sent the dmg and the zip stays on the page.
+`the_published_asset_set_answers_every_platform` in
 `packages/proxy-core/src/update.rs` pins the whole set against that matcher; an
 edit to a name in the workflow is an edit to that test.
 
