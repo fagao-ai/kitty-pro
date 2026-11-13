@@ -643,11 +643,11 @@ mod tests {
             "Kitty-Pro-linux-x86_64.tar.gz",
             "Kitty-Pro-web-linux-x86_64.tar.gz",
             "Kitty-Pro-web-macos-aarch64.tar.gz",
-            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.15.apk",
+            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.16.apk",
             // The sidecars ride along on the release page and must never be chosen.
             "Kitty-Pro-macos-aarch64.dmg.sha256",
             "Kitty-Pro-macos-aarch64.zip.sha256",
-            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.15.apk.sha256",
+            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.16.apk.sha256",
         ];
         for (kind, os, arch, expected) in [
             (
@@ -684,7 +684,7 @@ mod tests {
                 ReleaseKind::Android,
                 "android",
                 "aarch64",
-                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.15.apk",
+                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.16.apk",
             ),
             // `std::env::consts::ARCH` on a 32-bit Android build is `arm`, which is
             // why ARCH_ALIASES exists at all.
@@ -692,7 +692,7 @@ mod tests {
                 ReleaseKind::Android,
                 "android",
                 "arm",
-                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.15.apk",
+                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.16.apk",
             ),
         ] {
             assert_eq!(
