@@ -803,8 +803,12 @@ pub(crate) use atomic_write::*;
 #[cfg(test)]
 mod tests;
 
-// 进程入口（桌面 runner）直接调用这三个，必须保持 crate 根公开；
+// 进程入口（桌面 runner）直接调用这几个，必须保持 crate 根公开；
 // 它们只在桌面平台存在，因此 re-export 也要跟平台 cfg 保持一致。
+// 第四个是退出清理单独要的那半个：只清代理、不碰 core_slot，
+// 见 core.rs 里对锁顺序的说明。
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub use core::disable_managed_system_proxy_before_core_outage;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub use platform::{
     cleanup_stale_system_proxy_sentinel, run_tun_helper_from_args, shutdown_native_runtime,

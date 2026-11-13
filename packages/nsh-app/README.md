@@ -469,7 +469,7 @@ Checked by reading both, not by assumption. What is left:
 | Tray, close-to-tray | The menu-bar item and the "closing the window keeps the core running" behaviour. The deleted Dioxus desktop shell had both; this crate has neither. It is now purely app-side work: NSH 0.5 added `set_tray`/`tray()` (`nsh-core`'s `element::desktop`) with `.icon`, `.tooltip`, `.menu` and `.on_click`, backed by a real `NSStatusItem` in `nsh_platform_macos::tray`, and it binds the menu callbacks to the calling component's `Owner` itself — so the hop this row used to say had to be hand-built (AppKit's main thread into the engine thread, over a reactive graph that is not `Send`) is NSH's problem now, not ours. `AppOptions::keep_alive_on_close` still supplies the other half: it hides the window and keeps the engine, which the Dock restores. What is left is the decisions and the wiring — what the menu offers (it wants `AppStore::copy_proxy_environment`, and a quit that runs `api::shutdown_native_runtime`), whether a close hides or quits by default, and where the tray is declared so it exists for the app's life rather than one screen's. |
 | 复制代理环境变量 | The user asked this off the settings page ("只需要在托盘中有就行"), so it is on no screen now: `AppStore::copy_proxy_environment` exists and nothing calls it until the tray does. Kept as its own row so a reader looking for the button finds the reason rather than an absence. |
 | iOS | No build, and nothing to compare the reason against. `packages/singbox/build.rs:30` panics for any target OS outside `{android, macos, linux, windows}`, so the core cannot be compiled, and NetworkExtension — the only way an app that is not a `VpnService` may carry traffic on iOS, since Apple gives third-party apps no TUN — was never implemented. Android got a build without a Gradle shell; iOS needs a Swift one, which is a larger question than a build script. |
-| Exit cleanup in a **packaged** build | `nsh package` uses a runner of its own, and NSH gives that runner no exit hook, so a packaged build never calls `api::shutdown_native_runtime`. The TUN helper's lifecycle lease still stops the core and removes routes when the parent dies; what can be left behind is a system proxy pointing at a dead core. [Why the other two entry-point calls are fixed and this one is not](#process-entry-points-in-a-packaged-build). |
+| Exit cleanup in a **packaged** build | Fixed for a quit, still open for a crash. NSH 0.5 added `on_app_quit`, which `process::register_exit_cleanup` takes from the root component — the one thing every runner mounts, `nsh package`'s generated one included — so 退出 now clears the system proxy in a release build. What no hook can reach is a process that never quits: `kill -9`, a crash, a power loss. That case still falls to the sentinel, which is why the next start runs `cleanup_stale_system_proxy_sentinel` rather than trusting the last exit. [Why the other two entry-point calls are fixed and this one is not](#process-entry-points-in-a-packaged-build). |
 
 ### Process entry points in a packaged build
 
@@ -506,12 +506,27 @@ Two things the hook forces:
 - The helper dispatch has to `process::exit` from a function whose stated job is registering
   components, which is why it is `boot()` and not three calls inline in `native()`.
 
-Exit cleanup has **no** hook: `AppOptions` carries no callback field (`trace`, `asset_base`,
-`chunks`, `app_id`, `title`, `size`, `display`, `keep_size`, …). Either the helper's
-lifecycle lease is trusted to cover it — it does stop the core and remove routes when the
-parent dies, but it does not restore a system proxy — or the app owns its binary instead of
-using `nsh package`, which also settles the tray question above. `process::shut_down` is
-already public for the day that trade is made.
+Exit cleanup found its hook, but not at the runner: `AppOptions` still carries no callback
+field (`trace`, `asset_base`, `chunks`, `app_id`, `title`, `size`, `display`, `keep_size`, …),
+so `nsh package`'s `main` remains a place this crate cannot put code. NSH 0.5 put the hook
+inside the app instead — `nsh_core::element::desktop::on_app_quit` — and it belongs to the
+owner that registers it, which makes the root component the only thing every runner is
+guaranteed to mount. `process::register_exit_cleanup` registers there.
+
+Two things the hook's budget forced. It clears the proxy through
+`api::disable_managed_system_proxy_before_core_outage` and does **not** call
+`api::shutdown_native_runtime`: that one takes `core_slot`, `restart_native_core` holds that
+lock across the bind retry window and the helper authorization wait, and `Engine::drop`
+joins the engine thread with no deadline once the quit budget is spent — quitting during a
+restart would have hung the app instead of cleaning it up. And the work is synchronous,
+because the engine waits only `QUIT_TIMEOUT` (200ms) and quits regardless: nine
+`networksetup` spawns measured at 110–140ms fit, but with under 100ms to spare, which is
+why the sentinel stays as the fallback for a run cut off mid-write. Stopping the core is
+not lost by leaving it out — the core is embedded, so process exit stops it either way.
+
+`process::shut_down` is kept for `src/main.rs`, which is still the only entry point NSH lets
+this crate write. The guard that keeps both off a test run is `cleanup_is_ours`, the same
+predicate, for the same reason: what the cleanup writes is the machine's real proxy.
 
 Every screen is ported and every settings card has a home here. The rows above are what still
 separates this app from what the deleted shells shipped, and none of them is a decision this

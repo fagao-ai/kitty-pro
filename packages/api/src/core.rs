@@ -801,8 +801,20 @@ where
     }
 }
 
+/// Disable the system proxy when this app manages one, ahead of a core that is about to
+/// stop. Takes only the proxy operation lock, never the core slot.
+///
+/// Public because the desktop launchers' teardown is not its only caller: a packaged app's
+/// quit listener calls it too (`process::register_exit_cleanup` in the app crate, which
+/// this one cannot name), and it must not do the rest of [`shutdown_native_runtime`]. That
+/// takes `core_slot`, which the restart transaction holds across the bind retry window and
+/// the helper authorization wait; a quit listener that blocked on it would block the engine
+/// thread, and NSH joins that thread with no deadline once its 200ms quit budget is spent,
+/// so quitting mid-restart would make the app wait out a transaction the cleanup never
+/// needed. Stopping the embedded core is what process exit does by itself anyway, so the
+/// proxy is the only part that has to be cleared before it.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-pub(crate) fn disable_managed_system_proxy_before_core_outage() -> Result<(), String> {
+pub fn disable_managed_system_proxy_before_core_outage() -> Result<(), String> {
     let status = match native_system_proxy_status() {
         Ok(status) => status,
         // A transient read failure must not block shutting the core down.

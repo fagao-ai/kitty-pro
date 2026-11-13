@@ -84,5 +84,9 @@ pub fn app_root() -> Root {
 #[component]
 pub fn App() -> impl IntoElement {
     provide_context(store::AppStore::new());
+    // Registered here rather than at the runner because this is the one thing every
+    // runner mounts, `nsh package`'s generated one included, and the quit hook belongs to
+    // the owner that registers it. See [`process::register_exit_cleanup`].
+    process::register_exit_cleanup();
     shell::root()
 }
