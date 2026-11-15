@@ -312,6 +312,21 @@ pub fn connect_label(store: AppStore) -> String {
 /// padding (`content_column`), which is why the gap existed and simply was in the wrong place:
 /// the header overlapped the status bar and the first card began a status bar's height below
 /// where it should.
+///
+/// Windows draws the caption buttons (minimize, maximize, close) over the window's
+/// top-right corner, a strip 32pt tall that ends exactly where the header's own top
+/// padding puts its toggle and connection chip — so those two begin a sliver under
+/// the close button. The clearance drops just that right-hand row below the strip:
+/// the title keeps its position, and with it its alignment with the rail. macOS
+/// hangs its traffic lights top-left over the rail, where nothing else sits, so it
+/// needs none of this. NSH's safe area does not report the strip, so the clearance
+/// is a constant.
+const CAPTION_CLEARANCE_PX: f32 = if cfg!(target_os = "windows") {
+    12.0
+} else {
+    0.0
+};
+
 fn page_header(store: AppStore) -> impl IntoElement {
     view()
         .flex_row()
@@ -343,14 +358,26 @@ fn page_header(store: AppStore) -> impl IntoElement {
                         .text_color(theme::text_faint()),
                 ),
         )
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(theme_toggle(store))
-                .child(controls::connection_chip(store)),
-        )
+        .child(header_controls(store))
+}
+
+/// The header's right side: the appearance toggle and the connection chip.
+///
+/// Top-aligned and dropped by [`CAPTION_CLEARANCE_PX`] on Windows, so the pair lands
+/// below the caption strip; other platforms keep the vertically centred position
+/// beside the title.
+fn header_controls(store: AppStore) -> impl IntoElement {
+    let controls = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(theme_toggle(store))
+        .child(controls::connection_chip(store));
+    if CAPTION_CLEARANCE_PX > 0.0 {
+        controls.self_start().mt(px(CAPTION_CLEARANCE_PX))
+    } else {
+        controls
+    }
 }
 
 /// The appearance toggle in the header, where the original keeps it: one press, and its

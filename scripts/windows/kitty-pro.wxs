@@ -1,0 +1,77 @@
+<!--
+    The Windows MSI: installs the runner and the sing-box core beside it into
+    Program Files, adds a Start Menu shortcut, and upgrades in place over any
+    earlier build.
+
+    `wix build` fills in the two Source paths and the version; the release
+    workflow passes them as `-d` variables, read back out of the portable zip it
+    has already verified, so the installer can never carry a different pair of
+    files than the archive does.
+
+    Build (WiX v5 as a dotnet tool, as the release workflow does; XML forbids
+    a double hyphen in this comment, so the flags are spelled loosely here):
+
+        dotnet tool install wix (pinned to 5.0.2 via the version option)
+        wix extension add WixToolset.UI.wixext/5.0.2
+        wix build -arch x64 -ext WixToolset.UI.wixext \
+            -d AppVersion=1.0.16 \
+            -d ExePath=path/to/Kitty Pro.exe \
+            -d DllPath=path/to/kitty_singbox.dll \
+            -out Kitty-Pro-windows-x86_64.msi scripts/windows/kitty-pro.wxs
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <!-- UpgradeCode is the installer's identity: one fixed GUID for every build,
+       so a newer MSI removes the older one instead of installing alongside it. -->
+  <Package
+      Name="Kitty Pro"
+      Manufacturer="Kitty Pro"
+      Version="$(var.AppVersion)"
+      UpgradeCode="{C9A63B47-4F0E-4B18-9D74-3A5C1E8F2B60}"
+      Scope="perMachine"
+      Language="1033">
+
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of Kitty Pro is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- The standard wizard with a browsable install directory. -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Kitty Pro" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="KittyMenuFolder" Name="Kitty Pro" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AppComponents">
+      <!-- The exe is the component's key path, so removing the feature removes
+           exactly the file the shortcut launches. -->
+      <Component Directory="INSTALLFOLDER" Id="KittyExe">
+        <File Id="KittyExeFile" Source="$(var.ExePath)">
+          <Shortcut
+              Id="KittyStartMenuShortcut"
+              Directory="KittyMenuFolder"
+              Name="Kitty Pro"
+              Description="Kitty Pro"
+              WorkingDirectory="INSTALLFOLDER"
+              Advertise="no" />
+        </File>
+        <RemoveFolder
+            Id="KittyMenuFolderCleanup"
+            Directory="KittyMenuFolder"
+            On="uninstall" />
+      </Component>
+      <!-- The core: the runner loads kitty_singbox.dll from its own directory,
+           so the pair must land side by side. -->
+      <Component Directory="INSTALLFOLDER" Id="KittyCoreDll">
+        <File Id="KittyDllFile" Source="$(var.DllPath)" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Kitty Pro" Level="1">
+      <ComponentGroupRef Id="AppComponents" />
+    </Feature>
+  </Package>
+</Wix>

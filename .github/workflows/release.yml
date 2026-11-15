@@ -46,7 +46,7 @@ env:
   # what a tag builds: `scripts/setup-nsh.sh` compares the two versions and fails
   # the job rather than publishing an artifact whose runtime and Rust half disagree.
   # Bumping this means bumping the crates in the same commit.
-  NSH_VERSION: "v0.5.0"
+  NSH_VERSION: "v0.5.1"
 
 jobs:
   desktop:
@@ -252,6 +252,86 @@ jobs:
             exit 1
           fi
 
+      # On MSVC the embedded core is not linked into the exe: it is
+      # kitty_singbox.dll in the build output, and the runner loads it from its
+      # own directory at start-up (packages/singbox/src/windows_bridge.rs). NSH's
+      # packaging knows nothing of that pairing, so without this step the zip
+      # ships the exe alone, the app opens, and the core it exists to run reports
+      # itself unavailable — the macOS and Android archives never see this,
+      # because there the core is linked or bundled into what ships.
+      - name: Add the core DLL to the Windows archive
+        if: matrix.id == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $roots = @($env:GITHUB_WORKSPACE)
+          if ($env:CARGO_TARGET_DIR) { $roots += $env:CARGO_TARGET_DIR }
+          $dll = $roots |
+            Where-Object { Test-Path $_ } |
+            ForEach-Object {
+              Get-ChildItem $_ -Recurse -Filter kitty_singbox.dll `
+                -ErrorAction SilentlyContinue
+            } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $dll) {
+            throw "kitty_singbox.dll was not found in the build output; without it the packaged app has no core"
+          }
+          $zip = Get-ChildItem "$env:GITHUB_WORKSPACE/dist/windows" -Filter '*.zip' |
+            Select-Object -First 1
+          if (-not $zip) { throw "the Windows packaging step left no zip in dist/windows" }
+          $stage = Join-Path $env:RUNNER_TEMP 'kitty-pro-windows-dll-stage'
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          Expand-Archive $zip.FullName -DestinationPath $stage
+          $exe = Get-ChildItem $stage -Recurse -Filter '*.exe' | Select-Object -First 1
+          if (-not $exe) { throw "$($zip.Name) holds no executable to place the core beside" }
+          Copy-Item $dll.FullName -Destination $exe.DirectoryName
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip.FullName -Force
+          Write-Host "added $($dll.Name) beside $($exe.Name) in $($zip.Name)"
+
+      - name: Build the Windows MSI installer
+        if: matrix.id == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Both pinned: an unpinned pair can resolve the tool to one major and
+          # the extension to another, which fails with "expected package root
+          # folder wixext5" before building anything.
+          dotnet tool install --global wix --version "5.0.2"
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          # The installer's payload is unpacked from the zip this job just
+          # populated and verified, so the MSI can never carry a different exe
+          # or core than the portable archive does.
+          $stage = Join-Path $env:RUNNER_TEMP 'kitty-pro-windows-msi-stage'
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          $zip = Get-ChildItem "$env:GITHUB_WORKSPACE/dist/windows" -Filter '*.zip' |
+            Select-Object -First 1
+          if (-not $zip) { throw "no zip in dist/windows to build the installer from" }
+          Expand-Archive $zip.FullName -DestinationPath $stage
+          $exe = Get-ChildItem $stage -Recurse -Filter '*.exe' | Select-Object -First 1
+          $dll = Get-ChildItem $stage -Recurse -Filter kitty_singbox.dll |
+            Select-Object -First 1
+          if (-not $exe) { throw "$($zip.Name) holds no executable" }
+          if (-not $dll) { throw "$($zip.Name) holds no kitty_singbox.dll" }
+          $version = (& cargo metadata --locked --no-deps --format-version 1 |
+            ConvertFrom-Json).packages |
+            Where-Object name -eq 'kitty-pro' |
+            Select-Object -ExpandProperty version
+          # The in-app update check reads the CPU out of the asset name, so the
+          # MSI is named by the machine that built it, like every other asset.
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x86_64' }
+          $wixArch = if ($arch -eq 'arm64') { 'arm64' } else { 'x64' }
+          $msi = "$env:GITHUB_WORKSPACE/dist/windows/Kitty-Pro-windows-$arch.msi"
+          wix build -arch $wixArch `
+            -ext WixToolset.UI.wixext `
+            -d "AppVersion=$version" `
+            -d "ExePath=$($exe.FullName)" `
+            -d "DllPath=$($dll.FullName)" `
+            -out $msi `
+            "$env:GITHUB_WORKSPACE/scripts/windows/kitty-pro.wxs"
+          if (-not (Test-Path $msi)) { throw "wix produced no $msi" }
+          Write-Host "built $(Split-Path $msi -Leaf)"
+
       - name: Publish ${{ matrix.name }} archive
         shell: bash
         run: |
@@ -340,6 +420,12 @@ jobs:
               \( -iname 'kittypro*' -o -iname 'kitty-pro*' -o -name '*.exe' \) \
               -print -quit
           )"
+          # On Windows the engine is a DLL beside the exe, not bytes inside it —
+          # the exact gap that once shipped a Windows build whose app opened and
+          # whose core never appeared.
+          if [[ "${{ matrix.id }}" == windows ]]; then
+            test -n "$(find "$check_dir" -type f -name 'kitty_singbox.dll' -print -quit)"
+          fi
 
       # The macOS runner is the only one without GNU sha256sum.
       - name: Create desktop checksums
@@ -351,7 +437,7 @@ jobs:
             checksum() { sha256sum "$1"; }
           fi
           find "dist/${{ matrix.id }}" -maxdepth 1 -type f \
-              \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.dmg' \) \
+              \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.dmg' -o -name '*.msi' \) \
             -print0 | while IFS= read -r -d '' artifact; do
               if [[ -f "$artifact.sha256" ]]; then continue; fi
               name="$(basename "$artifact")"
@@ -843,15 +929,17 @@ jobs:
           # still reports a green run: the artifact is simply absent from the release
           # page, and `proxy_core::update` reads that page's asset list, so a release
           # without its `.apk` tells every phone there is nothing to install. The
-          # desktop's `.msi`/`.deb`/`.AppImage` globs went with the shells that
-          # produced them, which left NSH publishing one archive per platform; the
-          # `.dmg` is back because no NSH version makes a macOS image at all —
-          # `nsh package` builds an `.app` and stops — so `scripts/build-dmg.sh`
-          # wraps it, and this list has to carry the result out or every Mac is
-          # offered a zip.
+          # desktop's `.deb`/`.AppImage` globs went with the shells that produced
+          # them, which left NSH publishing one archive per platform; the `.dmg` is
+          # back because no NSH version makes a macOS image at all — `nsh package`
+          # builds an `.app` and stops — so `scripts/build-dmg.sh` wraps it, and the
+          # `.msi` comes from `scripts/windows/kitty-pro.wxs`. Without their globs
+          # here every Mac is offered a zip and `proxy_core::update` — which ranks
+          # an installer above a portable archive — never names a Windows installer.
           files: |
             release-assets/**/*.zip
             release-assets/**/*.tar.gz
             release-assets/**/*.dmg
+            release-assets/**/*.msi
             release-assets/**/*.apk
             release-assets/**/*.sha256

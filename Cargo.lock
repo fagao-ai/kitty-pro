@@ -116,7 +116,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "api"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "auto-launch",
  "directories",
@@ -2729,7 +2729,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kitty-pro"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "api",
  "nsh-base",
@@ -2745,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-server"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "api",
  "axum",
@@ -3114,9 +3114,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-base"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7bae08ed29b11f2595cf5b4ce406430b14493d24f07f2f4a9f068188fb35079"
+checksum = "2cadcf71a3a758271ee9ab5d4768de9054d1a97091eece01fa1a174b394ef53e"
 dependencies = [
  "chrono",
  "html5ever",
@@ -3145,9 +3145,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-core"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f93e2fa3cc4e18b393b7935d5551deba8330968f69f2a1b2ff1928cb125782a"
+checksum = "7283cdcd0a6703ecdcd2fc9f621705a3f4efbd3c88376219a6194a2f126b7573"
 dependencies = [
  "cap-std",
  "crc32fast",
@@ -3187,9 +3187,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-engine"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c0dda64a09a18ae35ba04be534f140d6f3cbcdb30a81b1926dc4718fefaefd2"
+checksum = "24a7d05151d74e2c1c24800c009016ea17d82268c5ccb821118a06188456db89"
 dependencies = [
  "block2",
  "crossbeam-channel",
@@ -3215,15 +3215,15 @@ dependencies = [
 
 [[package]]
 name = "nsh-i18n"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4570770dee21d88d2c364e091aa64a53af38480a39d75ee0feec0811a2c0dec"
+checksum = "f8452a60c20035f87e8003cb6daf98c01294b8d886e9a90503669a0c67e19ca9"
 
 [[package]]
 name = "nsh-js"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fda1d0dd5fff1c92ce576cae439317a0d30116a3d260c862eeeccb1dd6a3e713"
+checksum = "b10bc11cccccc4dc5d1be5f853e927bb5326028f2bd53c5a805d42178cc0b2d8"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -3245,9 +3245,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-macros"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eefb6467662ffb652997c7c252919488aa4723807e3a0f17fff3a8c01c29b22f"
+checksum = "db9d9d6eaf1942d10ccb5e328cbff1aeb7f0e27f945d3d0226c5943714a2e50e"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",
@@ -3259,9 +3259,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-package"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e292d17debb97b13445c7861dbeb8d39ea424d82426a1b11f60b2703f49b261"
+checksum = "612a2e3e9811992a5671443cbeeef7cfaac3e5530f5a6da40a8be19827215fda"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3275,9 +3275,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-platform-apple"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c21f951bd6b8b53be180f15c9405bd4a952c9ff731d5776a754871e9169de1cf"
+checksum = "5ea5c1a4ab9cb63f2acaabd802bcfc153cd2bba7b94f303638a0eaa0d640fd34"
 dependencies = [
  "block2",
  "cc",
@@ -3295,9 +3295,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-platform-linux"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef580b093e688cf9d7f4b072b220c77eb69b08686a346ca97280b11a2b51028a"
+checksum = "15b15f61efed36fbc29d3359f7a857700def24db96b31eb6eb5e17f2dd1e9b1f"
 dependencies = [
  "crossbeam-channel",
  "gstreamer",
@@ -3318,9 +3318,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-platform-macos"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "552bfc935c49f1f3fa72f7ad264f5794f65f73c972d943ec28eaa7d824a653ad"
+checksum = "274ad01eb629fd822560ae40695af1b181baa44febdd2931b7749cc6f25d3b81"
 dependencies = [
  "block2",
  "crossbeam-channel",
@@ -3347,9 +3347,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-testing"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ac8c9e9d8205b03748bf3485689b3ea3bd1f8f1b8fbc0b6f66ff19c67d655f"
+checksum = "ef76812dd35b2020574b8ef0f74835984329e758c37ed1f6f40db5f11f1bb441"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -3360,9 +3360,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-updater"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6df81dce14aadfd08fd2aaf9d6754e922e8537d360bc69dcb28a6e478921bd"
+checksum = "0a3598aa7721a64222c75d6c5948e720595d11916ec28a620e5ccec175221334"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -4218,7 +4218,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "proxy-core"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -5403,7 +5403,7 @@ dependencies = [
 
 [[package]]
 name = "singbox"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "core-foundation 0.9.4",
  "getrandom 0.3.4",

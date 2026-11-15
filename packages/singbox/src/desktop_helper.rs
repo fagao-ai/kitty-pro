@@ -693,7 +693,7 @@ fn read_session_token(path: &std::path::Path, owner_id: u32) -> Result<String, S
         return Err("unsafe TUN helper session token file (symlink)".to_string());
     }
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)

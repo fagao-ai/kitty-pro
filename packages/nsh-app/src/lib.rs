@@ -19,6 +19,7 @@ mod pages;
 pub mod process;
 pub(crate) mod shell;
 mod store;
+pub(crate) mod tray;
 pub mod ui;
 
 /// The band the window's traffic lights occupy once the title bar is hidden. Re-exported because
@@ -53,6 +54,10 @@ pub const FONTS: &[&[u8]] = &[
 #[native_module("kitty/native")]
 fn native(registry: &mut Registry) {
     process::boot();
+    // The crate's images and fonts: `asset!` refers to one of these, and the
+    // tray icon is one. Without the listing, `nsh run` has nothing to serve
+    // and `nsh package` nothing to copy.
+    registry.assets(&assets!());
     registry.register::<App>();
 }
 
@@ -88,5 +93,9 @@ pub fn App() -> impl IntoElement {
     // runner mounts, `nsh package`'s generated one included, and the quit hook belongs to
     // the owner that registers it. See [`process::register_exit_cleanup`].
     process::register_exit_cleanup();
+    // The tray, and with it the close-to-hide behaviour: the window's ✕
+    // hides the app and the core keeps running, and the tray's quit is the
+    // exit. Mounted here so its effects live under the root's owner.
+    tray::mount();
     shell::root()
 }
