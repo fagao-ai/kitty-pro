@@ -1215,41 +1215,51 @@ impl AppStore {
                         name.trim().to_owned()
                     };
                     if let Some(id) = editing {
-                        let mut outcome = None;
-                        self.subscriptions.update(|stored| {
-                            outcome = Some(
-                                match stored.iter_mut().find(|subscription| subscription.id == id) {
-                                    Some(subscription) => {
-                                        subscription.name = display.clone();
-                                        subscription.source = source.clone();
-                                        crate::domain::apply_subscription_report(stored, id, report)
-                                    }
-                                    None => Err(i18n::tr("订阅已不在列表中")),
-                                },
-                            );
-                        });
-                        match outcome {
-                            Some(Ok(updated)) => {
-                                self.after_refresh();
-                                let mut message =
-                                    i18n::fill("已更新 {}，共 {} 个节点", &[&display, &updated]);
-                                if rejected > 0 {
-                                    message.push_str(&i18n::fill("，{} 个无法解析", &[&rejected]));
-                                }
-                                if self.connected.get_untracked() {
-                                    message.push_str("，重新连接后生效");
-                                }
-                                self.feedback.success(message);
-                            }
-                            // The row vanished while the fetch was running; the dialog
-                            // keeps its fields and the reason, like a failed parse.
-                            Some(Err(reason)) => {
-                                self.import_error
-                                    .set(Some(i18n::fill("订阅解析失败：{}", &[&reason])));
-                                return;
-                            }
-                            None => return,
+                        // The row may have been deleted while the fetch was in flight.
+                        // The dialog would then be saving into nothing, so close it and
+                        // say what happened instead of reporting a parse failure that
+                        // never happened.
+                        if self
+                            .subscriptions
+                            .get_untracked()
+                            .iter()
+                            .all(|subscription| subscription.id != id)
+                        {
+                            self.feedback.error(i18n::tr("订阅已不在列表中"));
+                            self.import_name.set(String::new());
+                            self.import_source.set(String::new());
+                            self.import_error.set(None);
+                            self.import_editing_id.set(None);
+                            self.import_open.set(false);
+                            return;
                         }
+                        let mut updated = None;
+                        self.subscriptions.update(|stored| {
+                            if let Some(subscription) =
+                                stored.iter_mut().find(|subscription| subscription.id == id)
+                            {
+                                subscription.name = display.clone();
+                                subscription.source = source.clone();
+                                // The nodes are non-empty (the match arm guaranteed it)
+                                // and the row is present, so this cannot fail.
+                                updated = crate::domain::apply_report_to_subscription(
+                                    subscription,
+                                    report,
+                                )
+                                .ok();
+                            }
+                        });
+                        let Some(updated) = updated else { return };
+                        self.after_refresh();
+                        let mut message =
+                            i18n::fill("已更新 {}，共 {} 个节点", &[&display, &updated]);
+                        if rejected > 0 {
+                            message.push_str(&i18n::fill("，{} 个无法解析", &[&rejected]));
+                        }
+                        if self.connected.get_untracked() {
+                            message.push_str(&i18n::tr("，重新连接后生效"));
+                        }
+                        self.feedback.success(message);
                     } else {
                         let id = crate::domain::next_subscription_id(
                             &self.subscriptions.get_untracked(),
@@ -1276,7 +1286,7 @@ impl AppStore {
                             message.push_str(&i18n::fill("，{} 个无法解析", &[&rejected]));
                         }
                         if self.connected.get_untracked() {
-                            message.push_str("，重新连接后生效");
+                            message.push_str(&i18n::tr("，重新连接后生效"));
                             self.mark_config_dirty();
                         }
                         self.feedback.success(message);

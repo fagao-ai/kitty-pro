@@ -736,15 +736,25 @@ pub fn apply_subscription_report(
             .map(|issue| issue.reason.clone())
             .unwrap_or_else(|| "没有找到可用节点".to_string()));
     }
-    let count = report.nodes.len();
-    let rejected_count = report.rejected.len();
     let subscription = subscriptions
         .iter_mut()
         .find(|subscription| subscription.id == subscription_id)
         .ok_or_else(|| "订阅已不存在".to_string())?;
-    subscription.nodes = namespace_nodes(subscription_id, report.nodes);
+    apply_report_to_subscription(subscription, report)
+}
+
+/// Fold a fresh parse into one already-found subscription. The by-id wrapper above owns
+/// the find and its error, so a caller that has already located the row — the store's
+/// edit path, which also rewrites name and source in the same pass — can share this
+/// without a second search or a second wording for the same not-found case.
+pub(crate) fn apply_report_to_subscription(
+    subscription: &mut Subscription,
+    report: ParseReport,
+) -> Result<usize, String> {
+    let count = report.nodes.len();
+    subscription.nodes = namespace_nodes(subscription.id, report.nodes);
     subscription.proxy_server_nameservers = report.proxy_server_nameservers;
-    subscription.rejected_count = rejected_count;
+    subscription.rejected_count = report.rejected.len();
     Ok(count)
 }
 
