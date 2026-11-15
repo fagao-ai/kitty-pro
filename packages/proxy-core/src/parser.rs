@@ -183,7 +183,7 @@ fn parse_standard_url(
         ),
         up_mbps: query_u32(&query, &["upmbps", "up"]),
         down_mbps: query_u32(&query, &["downmbps", "down"]),
-        server_ports: server_ports_from_query(&query),
+        server_ports: query.get("mport").cloned().and_then(normalize_server_ports),
     });
 
     Ok(ProxyNode {
@@ -641,8 +641,9 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
         obfs_password: non_empty(yaml_string(mapping, "obfs-password")),
         up_mbps: yaml_u32(mapping, "up").or_else(|| yaml_u32(mapping, "up-mbps")),
         down_mbps: yaml_u32(mapping, "down").or_else(|| yaml_u32(mapping, "down-mbps")),
-        // Clash-style yaml has no port-hopping field the URI's mport maps to.
-        server_ports: None,
+        // mihomo's hysteria2 proxies carry the hop range as `ports:`, the same
+        // start-end shape the URI's mport uses.
+        server_ports: yaml_string(mapping, "ports").and_then(normalize_server_ports),
     });
 
     Ok(ProxyNode {
@@ -764,21 +765,24 @@ fn query_u32(query: &HashMap<String, String>, keys: &[&str]) -> Option<u32> {
     })
 }
 
-/// The `mport` port-hopping range, kept in the URI's own `start-end` shape; the sing-box
-/// config layer converts it to the colon form the core expects. Providers use either one
-/// range or a comma-separated list. A malformed value is dropped the same way a bad
-/// `upmbps` is — the node survives without hopping rather than being rejected outright —
-/// because a wrong range must not stop the rest of the subscription from connecting.
-fn server_ports_from_query(query: &HashMap<String, String>) -> Option<String> {
-    let raw = non_empty(query.get("mport").cloned())?;
+/// The port-hopping range, normalized to the URI's own `start-end` shape; the sing-box
+/// config layer converts it to the colon form the core expects. Providers write either
+/// one range or a comma-separated list, and panels occasionally emit the colon form,
+/// which is normalized here. A value naming no legal port — out of u16 range, inverted,
+/// zero, or not numbers at all — is dropped the same way a bad `upmbps` is: the node
+/// survives without hopping rather than failing the subscription, and the core never
+/// sees a range it would refuse to build.
+fn normalize_server_ports(raw: String) -> Option<String> {
+    let raw = non_empty(Some(raw))?.replace(':', "-");
     let well_formed = raw.split(',').all(|piece| {
         let piece = piece.trim();
-        let (start, end) = match piece.split_once('-') {
-            Some((start, end)) => (start, Some(end)),
-            None => (piece, None),
+        let Some((start, end)) = piece.split_once('-') else {
+            return matches!(piece.parse::<u16>(), Ok(port) if port >= 1);
         };
-        let digits = |value: &str| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit());
-        digits(start) && end.is_none_or(digits)
+        match (start.parse::<u16>(), end.parse::<u16>()) {
+            (Ok(start), Ok(end)) => start >= 1 && start <= end,
+            _ => false,
+        }
     });
     well_formed.then_some(raw)
 }
@@ -1046,10 +1050,13 @@ trojan://password@tr.example.com:443?type=ws&path=%2Fedge&host=cdn.example.com&s
     #[test]
     fn parses_hysteria2_port_hopping_range() {
         let source = "hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=20000-50000,80-90#Hop\n\
-hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=abc#Broken";
+hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=abc#Broken\n\
+hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=1-99999#Overflow\n\
+hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=50000-20000#Inverted\n\
+hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=20000:50000#ColonForm";
         let report = parse_subscription(source);
 
-        assert_eq!(report.nodes.len(), 2);
+        assert_eq!(report.nodes.len(), 5);
         assert_eq!(
             report.nodes[0]
                 .hysteria2
@@ -1060,10 +1067,30 @@ hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=abc#Br
             Some("20000-50000,80-90")
         );
         // A malformed range is dropped the way a bad `upmbps` is: the node survives
-        // without hopping rather than being rejected outright.
+        // without hopping rather than being rejected outright. Out of u16 range and
+        // inverted ranges count as malformed — the core would refuse to build them,
+        // and one bad node must not stop the rest of the subscription.
         assert_eq!(
             report.nodes[1].hysteria2.as_ref().unwrap().server_ports,
             None
+        );
+        assert_eq!(
+            report.nodes[2].hysteria2.as_ref().unwrap().server_ports,
+            None
+        );
+        assert_eq!(
+            report.nodes[3].hysteria2.as_ref().unwrap().server_ports,
+            None
+        );
+        // The colon form some panels emit is normalized to the dash form.
+        assert_eq!(
+            report.nodes[4]
+                .hysteria2
+                .as_ref()
+                .unwrap()
+                .server_ports
+                .as_deref(),
+            Some("20000-50000")
         );
     }
 
@@ -1104,6 +1131,7 @@ proxies:
     password: secret
     sni: hk.example.com
     skip-cert-verify: true
+    ports: 20000-50000
   - name: DE-VLESS
     type: vless
     server: de.example.com
@@ -1123,6 +1151,16 @@ proxies:
         assert_eq!(
             report.proxy_server_nameservers,
             vec!["https://cdn.ookkzz.com/message-chat/hello-cn"]
+        );
+        // mihomo carries the hop range as `ports:`, same shape as the URI's mport.
+        assert_eq!(
+            report.nodes[0]
+                .hysteria2
+                .as_ref()
+                .unwrap()
+                .server_ports
+                .as_deref(),
+            Some("20000-50000")
         );
         assert_eq!(
             report.nodes[1].transport.host.as_deref(),
