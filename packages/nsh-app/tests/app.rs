@@ -2056,6 +2056,52 @@ fn cancelling_a_delete_keeps_the_subscription() {
     assert!(!app.shows("已删除 实验室"));
 }
 
+/// The pencil opens the import form in its edit shape: titled 编辑订阅, saving with 保存.
+/// Closing it lands back on the untouched list.
+#[test]
+fn the_edit_dialog_opens_titled_for_editing() {
+    let (mut app, _profile) =
+        seeded_test("the_edit_dialog_opens_titled_for_editing", SEEDED_PROFILE);
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("订阅").unwrap();
+    app.wait_for("实验室").unwrap();
+    app.press("role:button[编辑 实验室]").unwrap();
+    app.wait_for("编辑订阅").unwrap();
+    assert!(
+        app.screen().enabled("role:button[保存]").unwrap(),
+        "the edit form confirms with 保存, not 导入"
+    );
+    app.press("role:button[取消]").unwrap();
+    app.wait_for("实验室").unwrap();
+    assert!(
+        !app.shows("编辑订阅"),
+        "closing the edit dialog returns to the list"
+    );
+}
+
+/// Saving submits what the fields already hold — the seeded source is unreachable, so the
+/// parser's reason surfaces and the dialog stays open. That is the proof an edit acts on the
+/// row's own source rather than an empty form. The wait is on the full error node: the
+/// driver matches text exactly, and the string is stable because a .test host can never
+/// resolve, on any platform.
+#[test]
+fn saving_an_edit_feeds_the_rows_own_source_to_the_parser() {
+    let (mut app, _profile) = seeded_test(
+        "saving_an_edit_feeds_the_rows_own_source_to_the_parser",
+        SEEDED_PROFILE,
+    );
+    app.wait_for("Kitty Pro").unwrap();
+    app.press("订阅").unwrap();
+    app.wait_for("实验室").unwrap();
+    app.press("role:button[编辑 实验室]").unwrap();
+    app.wait_for("编辑订阅").unwrap();
+    app.press("role:button[保存]").unwrap();
+    app.wait_for(
+        "订阅解析失败：[E1004] 订阅下载失败: error sending request for url (https://example.test/sub)",
+    )
+    .unwrap();
+}
+
 /// Every new page on a phone. The bottom bar sits inside the content column, and a layout
 /// that moved it beside the page would squeeze these to nothing, which a text check sees
 /// because a clipped view reports no text.

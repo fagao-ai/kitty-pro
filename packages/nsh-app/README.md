@@ -66,7 +66,7 @@ All six destinations are ported: Overview, Nodes, Subscriptions, Rules, Logs and
 | --- | --- |
 | 总览 | The system-proxy switch (desktops only), the exit probe, four figures, the last minute of traffic |
 | 节点 | The core's proxy groups and their members, searchable, with latency and one chosen exit |
-| 订阅 | Import from a URL or pasted links, refresh one or all, switch the active one, delete |
+| 订阅 | Import from a URL or pasted links, refresh one or all, switch the active one, edit a row's name and source in place, delete |
 | 规则 | Custom routing rules and per-domain DNS, on two tabs, with the process picker, plus the QuickJS override on Settings |
 | 日志 | The routed connections and the core's own lines, filtered by tally and search |
 | 设置 | Appearance and language, where traffic goes, how the machine hands it over, login item, cloud sync, app updates, the config script, the diagnostic report — the last of those cards' rows belong to a desktop, so the cards are withheld elsewhere (see [The same screens on a phone](#the-same-screens-on-a-phone)) |
@@ -132,11 +132,20 @@ Three things are worth knowing about how they behave:
   fault. `a_stale_group_choice_overrides_the_selection_the_engine_builds` pins the engine's
   ordering, so the fix can be recognised as unnecessary if that ever changes, and
   `a_choice_written_by_another_shell_is_reconciled_on_load` pins the repair.
+- **Editing a subscription keeps its id.** The pencil opens the import dialog prefilled, and
+  saving updates the row in place — name, source and nodes — instead of deleting and re-adding,
+  which would have moved the row, dropped it out of active and forced a re-selection. Node
+  replacement goes through the same `apply_subscription_report` + `after_refresh` pipeline a
+  refresh uses, so a chosen node that disappeared under the new source falls back exactly the
+  way a refresh's does. The dialog's title and confirm label (编辑订阅/保存 against 添加订阅/导入)
+  carry the mode; `import_editing_id` is reset on every open and close so a form can never save
+  into a row the user did not pick this time.
 - **Edits say when they are not live.** Rules, DNS overrides, the config script and switching
   a subscription all reach the engine only through a fresh config, so each one reports
   "重新连接后生效" while the core is running and the overview keeps its reconnect banner up.
   Choosing a node is the exception, and deliberately so: it goes through the live
-  `select_proxy_group` call, which needs no restart.
+  `select_proxy_group` call, which needs no restart. Saving an edited subscription behaves
+  like the switch it resembles: same suffix, same dirty flag through `after_refresh`.
 - **Log collection follows the page.** The core streams logs only while asked, so collection
   turns on when the log page opens over a running core and off when either changes. The
   indicator reports the backend's answer rather than the app's wish, so a refusal parks the

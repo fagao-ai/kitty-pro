@@ -273,6 +273,16 @@ fn row(store: AppStore, item: ReadSignal<Subscription>) -> impl IntoElement {
             },
         ))
         .child(controls::icon_button(
+            move || Icon::Pencil,
+            move || i18n::fill("编辑 {}", &[&(subscription().name)]).into(),
+            move || {
+                if busy() {
+                    return;
+                }
+                store.open_edit(id());
+            },
+        ))
+        .child(controls::icon_button(
             move || Icon::Trash2,
             move || i18n::fill("删除 {}", &[&(subscription().name)]).into(),
             move || confirm_delete(store, id(), subscription().name),
@@ -299,11 +309,16 @@ fn confirm_delete(store: AppStore, id: u64, name: String) {
     });
 }
 
-/// The import form. A dialog rather than a native alert because it collects two fields,
-/// and it is dismissed by leaving the tree, which is what `when` does with the store's flag.
+/// The import form, which doubles as the edit form: opened from a row's pencil it comes
+/// prefilled and saving updates that subscription in place. The dialog title and confirm
+/// label carry the mode, because the fields themselves cannot — the edit's look exactly
+/// like an add until they say otherwise. A dialog rather than a native alert because it
+/// collects two fields, and it is dismissed by leaving the tree, which is what `when` does
+/// with the store's flag.
 fn import_dialog(store: AppStore) -> impl IntoElement {
     let (name, source) = store.import_fields();
     let busy = move || store.import_busy();
+    let editing = move || store.import_editing_id().is_some();
     dialog()
         .presentation(ModalPresentation::PageSheet)
         .on_cancel(move || store.close_import())
@@ -331,10 +346,16 @@ fn import_dialog(store: AppStore) -> impl IntoElement {
                 .bg(move || base_theme().card)
                 .shadow_lg()
                 .child(
-                    text(move || i18n::tr("添加订阅"))
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(move || base_theme().card_foreground),
+                    text(move || {
+                        if editing() {
+                            i18n::tr("编辑订阅")
+                        } else {
+                            i18n::tr("添加订阅")
+                        }
+                    })
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(move || base_theme().card_foreground),
                 )
                 .child(controls::text_field("名称（可选）", name, || {
                     "我的订阅"
@@ -360,7 +381,19 @@ fn import_dialog(store: AppStore) -> impl IntoElement {
                             store.close_import();
                         }))
                         .child(controls::primary_button(
-                            move || if busy() { "正在解析" } else { "导入" },
+                            move || {
+                                if editing() {
+                                    if busy() {
+                                        "正在保存"
+                                    } else {
+                                        "保存"
+                                    }
+                                } else if busy() {
+                                    "正在解析"
+                                } else {
+                                    "导入"
+                                }
+                            },
                             move || {
                                 if busy() {
                                     return;

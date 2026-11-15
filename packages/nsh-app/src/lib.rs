@@ -57,7 +57,7 @@ fn native(registry: &mut Registry) {
     // The crate's images and fonts: `asset!` refers to one of these, and the
     // tray icon is one. Without the listing, `nsh run` has nothing to serve
     // and `nsh package` nothing to copy.
-    registry.assets(&assets!());
+    registry.assets(assets!());
     registry.register::<App>();
 }
 

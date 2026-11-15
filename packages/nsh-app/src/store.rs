@@ -261,6 +261,9 @@ pub struct AppStore {
     import_name: Signal<String>,
     import_source: Signal<String>,
     import_busy: Signal<bool>,
+    /// The subscription the open dialog edits, `None` while it adds. Reset on every close
+    /// and open so a dialog can never save into a row the user did not pick this time.
+    import_editing_id: Signal<Option<u64>>,
     /// Why the last import failed, shown inside the dialog rather than only in a notice: a
     /// notice ages out while the mistyped URL stays in the field.
     import_error: Signal<Option<String>>,
@@ -410,6 +413,7 @@ impl AppStore {
             import_name: signal(String::new()),
             import_source: signal(String::new()),
             import_busy: signal(false),
+            import_editing_id: signal(None),
             import_error: signal(None),
             import_generation: signal(0),
             refresh_busy: signal(None),
@@ -1173,12 +1177,16 @@ impl AppStore {
     }
 
     /// Parse a subscription URL or pasted node list and, if it yields nodes, add it and
-    /// switch to it.
+    /// switch to it — or, when the dialog was opened over an existing subscription, update
+    /// that subscription in place.
     ///
     /// Switching on import is deliberate: the overview's reconnect banner only reflects the
     /// active subscription, so an import that left the old one active would appear to do
     /// nothing. A parse that yields no nodes is reported with the parser's own reason,
-    /// which is usually the useful one ("unsupported protocol", "missing password").
+    /// which is usually the useful one ("unsupported protocol", "missing password"). An
+    /// update keeps the subscription's id, so its row and active state survive a source
+    /// that now points somewhere else; its nodes go through the same pipeline a refresh
+    /// uses.
     pub fn import_subscription(self, name: String, source: String) {
         let source = source.trim().to_owned();
         if source.is_empty() {
@@ -1186,6 +1194,7 @@ impl AppStore {
             return;
         }
         let generation = self.import_generation.get_untracked();
+        let editing = self.import_editing_id.get_untracked();
         self.import_busy.set(true);
         self.import_error.set(None);
         self.work(async move {
@@ -1198,8 +1207,6 @@ impl AppStore {
             self.import_busy.set(false);
             match result {
                 Ok(report) if !report.nodes.is_empty() => {
-                    let id =
-                        crate::domain::next_subscription_id(&self.subscriptions.get_untracked());
                     let count = report.nodes.len();
                     let rejected = report.rejected.len();
                     let display = if name.trim().is_empty() {
@@ -1207,38 +1214,80 @@ impl AppStore {
                     } else {
                         name.trim().to_owned()
                     };
-                    let nodes = crate::domain::namespace_nodes(id, report.nodes);
-                    let subscription = proxy_core::Subscription {
-                        id,
-                        name: display.clone(),
-                        source,
-                        nodes: nodes.clone(),
-                        proxy_server_nameservers: report.proxy_server_nameservers,
-                        rejected_count: rejected,
-                    };
-                    self.subscriptions
-                        .update(|stored| stored.push(subscription));
-                    self.activate_nodes(id, nodes);
-                    if let Err(error) = self.save().await {
-                        self.feedback
-                            .error(i18n::fill("配置保存失败：{}", &[&error]));
+                    if let Some(id) = editing {
+                        let mut outcome = None;
+                        self.subscriptions.update(|stored| {
+                            outcome = Some(
+                                match stored.iter_mut().find(|subscription| subscription.id == id) {
+                                    Some(subscription) => {
+                                        subscription.name = display.clone();
+                                        subscription.source = source.clone();
+                                        crate::domain::apply_subscription_report(stored, id, report)
+                                    }
+                                    None => Err(i18n::tr("订阅已不在列表中")),
+                                },
+                            );
+                        });
+                        match outcome {
+                            Some(Ok(updated)) => {
+                                self.after_refresh();
+                                let mut message =
+                                    i18n::fill("已更新 {}，共 {} 个节点", &[&display, &updated]);
+                                if rejected > 0 {
+                                    message.push_str(&i18n::fill("，{} 个无法解析", &[&rejected]));
+                                }
+                                if self.connected.get_untracked() {
+                                    message.push_str("，重新连接后生效");
+                                }
+                                self.feedback.success(message);
+                            }
+                            // The row vanished while the fetch was running; the dialog
+                            // keeps its fields and the reason, like a failed parse.
+                            Some(Err(reason)) => {
+                                self.import_error
+                                    .set(Some(i18n::fill("订阅解析失败：{}", &[&reason])));
+                                return;
+                            }
+                            None => return,
+                        }
+                    } else {
+                        let id = crate::domain::next_subscription_id(
+                            &self.subscriptions.get_untracked(),
+                        );
+                        let nodes = crate::domain::namespace_nodes(id, report.nodes);
+                        let subscription = proxy_core::Subscription {
+                            id,
+                            name: display.clone(),
+                            source,
+                            nodes: nodes.clone(),
+                            proxy_server_nameservers: report.proxy_server_nameservers,
+                            rejected_count: rejected,
+                        };
+                        self.subscriptions
+                            .update(|stored| stored.push(subscription));
+                        self.activate_nodes(id, nodes);
+                        if let Err(error) = self.save().await {
+                            self.feedback
+                                .error(i18n::fill("配置保存失败：{}", &[&error]));
+                        }
+                        let mut message =
+                            i18n::fill("已导入并切换到 {}，共 {} 个节点", &[&display, &count]);
+                        if rejected > 0 {
+                            message.push_str(&i18n::fill("，{} 个无法解析", &[&rejected]));
+                        }
+                        if self.connected.get_untracked() {
+                            message.push_str("，重新连接后生效");
+                            self.mark_config_dirty();
+                        }
+                        self.feedback.success(message);
                     }
-                    let mut message =
-                        i18n::fill("已导入并切换到 {}，共 {} 个节点", &[&display, &count]);
-                    if rejected > 0 {
-                        message.push_str(&i18n::fill("，{} 个无法解析", &[&rejected]));
-                    }
-                    if self.connected.get_untracked() {
-                        message.push_str("，重新连接后生效");
-                        self.mark_config_dirty();
-                    }
-                    self.feedback.success(message);
                     // Closed and emptied, not left open holding the link that was just
                     // imported: an open form invites a second press, which would add the
                     // same provider twice under a different id.
                     self.import_name.set(String::new());
                     self.import_source.set(String::new());
                     self.import_error.set(None);
+                    self.import_editing_id.set(None);
                     self.import_open.set(false);
                 }
                 // Kept open with the text intact and the reason under the field it came
@@ -1266,6 +1315,7 @@ impl AppStore {
         self.import_generation.update(|n| *n = n.wrapping_add(1));
         self.import_busy.set(false);
         self.import_error.set(None);
+        self.import_editing_id.set(None);
         self.import_open.set(false);
     }
 
@@ -1277,9 +1327,34 @@ impl AppStore {
         self.import_open.get()
     }
 
+    /// The subscription the open dialog edits, if any. `None` means the dialog adds.
+    pub fn import_editing_id(&self) -> Option<u64> {
+        self.import_editing_id.get()
+    }
+
+    /// Open the dialog over an existing subscription, the fields holding what it already
+    /// has. Saving keeps the subscription's id and replaces its nodes in place, so a
+    /// provider that moved its URL keeps its row, its id and its active state.
+    pub fn open_edit(self, id: u64) {
+        let Some(subscription) = self
+            .subscriptions
+            .get_untracked()
+            .into_iter()
+            .find(|subscription| subscription.id == id)
+        else {
+            return;
+        };
+        self.import_name.set(subscription.name);
+        self.import_source.set(subscription.source);
+        self.import_error.set(None);
+        self.import_editing_id.set(Some(id));
+        self.import_open.set(true);
+    }
+
     /// Open the dialog with empty fields. A stale draft from an abandoned import would
     /// otherwise be submitted again under a name the user has forgotten typing.
     pub fn open_import(self) {
+        self.import_editing_id.set(None);
         self.import_name.set(String::new());
         self.import_source.set(String::new());
         self.import_error.set(None);

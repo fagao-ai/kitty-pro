@@ -416,6 +416,21 @@ const ENGLISH: &[(&str, &str)] = &[
         "已设置 macOS 系统代理 127.0.0.1:7890",
         "macOS system proxy set to 127.0.0.1:7890",
     ),
+    // The api composes the same sentence per platform name; a row per platform keeps the
+    // exact-match lookup working wherever the machine's proxy is currently Kitty's.
+    (
+        "已设置 Windows 系统代理 127.0.0.1:7890",
+        "Windows system proxy set to 127.0.0.1:7890",
+    ),
+    (
+        "已设置 Linux 系统代理 127.0.0.1:7890",
+        "Linux system proxy set to 127.0.0.1:7890",
+    ),
+    (
+        "系统当前使用其他代理，Kitty Pro 未接管",
+        "The system uses another proxy; Kitty Pro is not in charge",
+    ),
+    ("未启用系统代理", "No system proxy"),
     ("每天一次 · 启动时检查", "Daily · checked at launch"),
     ("每天一次", "Daily"),
     ("未启动", "Not started"),
@@ -616,6 +631,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("{} 已切换，无需重新连接", "{} switched; no reconnect needed"),
     ("{}（未连接，启动后生效）", "{} (not connected; applies once you connect)"),
     ("{}：订阅已不在列表中", "{}: that subscription is no longer listed"),
+    ("订阅已不在列表中", "That subscription is no longer listed"),
     ("关闭 TUN 失败：{}", "Could not turn TUN off: {}"),
     ("准备 TUN 权限失败，内核未启动：{}", "Could not get TUN permission; the core did not start: {}"),
     // The web client's only window onto a server that answered something other than
@@ -629,6 +645,9 @@ const ENGLISH: &[(&str, &str)] = &[
     ("已刷新 {} 个订阅，{} 个失败：{}", "Refreshed {} subscriptions, {} failed: {}"),
     ("已存在 {} 的专用 DNS", "Dedicated DNS for {} already exists"),
     ("已导入并切换到 {}，共 {} 个节点", "Imported and switched to {}, {} nodes"),
+    ("已更新 {}，共 {} 个节点", "Updated {}, {} nodes"),
+    ("编辑订阅", "Edit subscription"),
+    ("编辑 {}", "Edit {}"),
     ("，{} 个无法解析", ", {} could not be parsed"),
     ("忽略失败：{}", "Could not ignore the release: {}"),
     ("更新设置保存失败：{}", "Could not save the update settings: {}"),
