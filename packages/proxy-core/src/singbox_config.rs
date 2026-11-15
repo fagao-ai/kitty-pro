@@ -614,6 +614,19 @@ fn node_to_outbound(node: &ProxyNode, dns_overrides: &[DnsOverride]) -> Value {
                     json!({ "type": kind, "password": password }),
                 );
             }
+            // The URI carries hysteria's `start-end` ranges; the core's `server_ports`
+            // wants the same list with colon separators.
+            if let Some(server_ports) = &options.server_ports {
+                let ranges: Vec<String> = server_ports
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|piece| !piece.is_empty())
+                    .map(|piece| piece.replace('-', ":"))
+                    .collect();
+                if !ranges.is_empty() {
+                    object.insert("server_ports".to_string(), json!(ranges));
+                }
+            }
         }
     }
 
@@ -1135,6 +1148,34 @@ vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?type=ws&security
 
         assert_eq!(config["route"]["default_domain_resolver"], "dns-bootstrap");
         assert_eq!(config["dns"]["servers"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn hysteria2_port_hopping_reaches_the_core_config() {
+        let nodes = parse_subscription(
+            "hysteria2://secret@203.0.113.66:10086?sni=bing.com&insecure=1&mport=20000-50000,80-90#HY2",
+        )
+        .nodes;
+        let request = ConnectionRequest {
+            selected_tag: nodes[0].tag.clone(),
+            nodes,
+            proxy_server_nameservers: Vec::new(),
+            mode: TunnelMode::Rule,
+            tun: false,
+            allow_lan: false,
+            custom_rules: Vec::new(),
+            dns_overrides: Vec::new(),
+            config_script: None,
+            group_selections: HashMap::new(),
+        };
+
+        let config = build_singbox_config(&request, &SingBoxOptions::default());
+
+        // The URI's dash ranges become the core's colon entries.
+        assert_eq!(
+            config["outbounds"][0]["server_ports"],
+            serde_json::json!(["20000:50000", "80:90"])
+        );
     }
 
     #[test]

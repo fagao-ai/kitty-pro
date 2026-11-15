@@ -183,6 +183,7 @@ fn parse_standard_url(
         ),
         up_mbps: query_u32(&query, &["upmbps", "up"]),
         down_mbps: query_u32(&query, &["downmbps", "down"]),
+        server_ports: server_ports_from_query(&query),
     });
 
     Ok(ProxyNode {
@@ -640,6 +641,8 @@ fn clash_proxy_to_node(value: &YamlValue, index: usize) -> Result<ProxyNode, Par
         obfs_password: non_empty(yaml_string(mapping, "obfs-password")),
         up_mbps: yaml_u32(mapping, "up").or_else(|| yaml_u32(mapping, "up-mbps")),
         down_mbps: yaml_u32(mapping, "down").or_else(|| yaml_u32(mapping, "down-mbps")),
+        // Clash-style yaml has no port-hopping field the URI's mport maps to.
+        server_ports: None,
     });
 
     Ok(ProxyNode {
@@ -759,6 +762,25 @@ fn query_u32(query: &HashMap<String, String>, keys: &[&str]) -> Option<u32> {
                 .ok()
         })
     })
+}
+
+/// The `mport` port-hopping range, kept in the URI's own `start-end` shape; the sing-box
+/// config layer converts it to the colon form the core expects. Providers use either one
+/// range or a comma-separated list. A malformed value is dropped the same way a bad
+/// `upmbps` is — the node survives without hopping rather than being rejected outright —
+/// because a wrong range must not stop the rest of the subscription from connecting.
+fn server_ports_from_query(query: &HashMap<String, String>) -> Option<String> {
+    let raw = non_empty(query.get("mport").cloned())?;
+    let well_formed = raw.split(',').all(|piece| {
+        let piece = piece.trim();
+        let (start, end) = match piece.split_once('-') {
+            Some((start, end)) => (start, Some(end)),
+            None => (piece, None),
+        };
+        let digits = |value: &str| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit());
+        digits(start) && end.is_none_or(digits)
+    });
+    well_formed.then_some(raw)
 }
 
 fn json_string(value: Option<&JsonValue>) -> Option<String> {
@@ -1019,6 +1041,30 @@ trojan://password@tr.example.com:443?type=ws&path=%2Fedge&host=cdn.example.com&s
             Some(100)
         );
         assert_eq!(report.nodes[1].transport.path.as_deref(), Some("/edge"));
+    }
+
+    #[test]
+    fn parses_hysteria2_port_hopping_range() {
+        let source = "hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=20000-50000,80-90#Hop\n\
+hysteria2://secret@hy.example.com:443?sni=hy.example.com&insecure=1&mport=abc#Broken";
+        let report = parse_subscription(source);
+
+        assert_eq!(report.nodes.len(), 2);
+        assert_eq!(
+            report.nodes[0]
+                .hysteria2
+                .as_ref()
+                .unwrap()
+                .server_ports
+                .as_deref(),
+            Some("20000-50000,80-90")
+        );
+        // A malformed range is dropped the way a bad `upmbps` is: the node survives
+        // without hopping rather than being rejected outright.
+        assert_eq!(
+            report.nodes[1].hysteria2.as_ref().unwrap().server_ports,
+            None
+        );
     }
 
     #[test]

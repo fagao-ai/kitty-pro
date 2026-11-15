@@ -125,6 +125,11 @@ pub struct Hysteria2Options {
     pub up_mbps: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down_mbps: Option<u32>,
+    /// The port-hopping range in the URI's own `mport` shape (`start-end`, comma
+    /// separated). The sing-box config layer converts it to the core's colon form;
+    /// kept verbatim here so the profile still shows what the provider wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ports: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
