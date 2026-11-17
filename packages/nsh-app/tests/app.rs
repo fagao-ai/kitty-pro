@@ -184,11 +184,18 @@ const STATUS_BAR: f32 = 28.0;
 /// reports a zero safe area, so a header that ignores the inset still lands at the top of
 /// the screen and reads as correct.
 fn phoned(profile: &Profile, inset: f32) -> Headless {
+    phoned_at(profile, 412.0, inset)
+}
+
+/// The same phone surface at a chosen width, for layout checks that need the narrowest
+/// Android screens as well as the default one.
+fn phoned_at(profile: &Profile, width: f32, inset: f32) -> Headless {
     let _ = profile;
+    let size = Size::new(px(width), px(1800.0));
     Headless::start(EngineConfig {
-        viewport: Size::new(px(412.0), px(1800.0)),
+        viewport: size,
         environment: Environment {
-            window: Size::new(px(412.0), px(1800.0)),
+            window: size,
             os: Os::Android,
             idiom: Idiom::Phone,
             color_scheme: ColorScheme::Light,
@@ -339,6 +346,91 @@ fn rules_page_with_form(app: &mut Headless) {
     open_rule_form(app);
 }
 
+/// A phone's rule form is a modal sheet, so adding cannot take height away from the list.
+///
+/// The old inline card sat above a virtual list inside one bounded column: both were asked to
+/// share the page's height, and the form pushed the list out of view. This measures the sheet's
+/// submit action against the phone's width, because a present-but-offscreen button still appears
+/// in `texts`.
+#[test]
+fn the_rule_form_action_fits_a_phone() {
+    let profile = Profile::claim("the_rule_form_action_fits_a_phone");
+    for width in [360.0, 390.0, 412.0] {
+        let app = phoned_at(&profile, width, STATUS_BAR);
+        let (mut app, sink) = observing(app);
+        app.wait_for("总览").unwrap();
+        app.press("规则").unwrap();
+        app.wait_for("分流规则").unwrap();
+        open_rule_form(&mut app);
+        app.wait_for("添加").unwrap();
+
+        let drawn = sink.lock().unwrap();
+        let action_node = drawn
+            .texts
+            .iter()
+            .find(|(id, text)| drawn.mounted.contains(*id) && text.as_str() == "添加")
+            .map(|(id, _)| *id)
+            .expect("the sheet drew no 添加 action");
+        let (action_x, _) = drawn.origin_in_root(action_node);
+        let action = action_x + drawn.frame(action_node).size.width.0;
+        assert!(
+            action <= width,
+            "the rule form's action reaches x {action} of a {width}pt phone sheet"
+        );
+    }
+}
+
+/// A phone rule row cannot spend four action buttons, a switch and a long value on one line.
+///
+/// It wraps into two lanes: identity and effect above, switch and actions below. This reads the
+/// drawn frames for every lane, so an offscreen trash icon fails even though its accessibility
+/// label is present.
+#[test]
+fn a_phone_rule_row_keeps_its_actions_on_screen() {
+    let profile = Profile::claim("a_phone_rule_row_keeps_its_actions_on_screen");
+    profile.seed(PROFILE_WITH_RULE);
+    for width in [360.0, 390.0, 412.0] {
+        let app = phoned_at(&profile, width, STATUS_BAR);
+        let (mut app, sink) = observing(app);
+        app.wait_for("总览").unwrap();
+        app.press("规则").unwrap();
+        app.wait_for("ad.example.com").unwrap();
+
+        let actions: Vec<u32> = ["上移", "下移", "编辑这条规则", "删除这条规则"]
+            .into_iter()
+            .map(|action| {
+                app.screen()
+                    .press_target(&format!("role:button[{action}]"))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("the row has no `{action}` action"))
+            })
+            .collect();
+        let drawn = sink.lock().unwrap();
+        let right = |node: u32| {
+            let (x, _) = drawn.origin_in_root(node);
+            x + drawn.frame(node).size.width.0
+        };
+        for (action, node) in ["上移", "下移", "编辑这条规则", "删除这条规则"]
+            .into_iter()
+            .zip(&actions)
+        {
+            assert!(
+                right(*node) <= width,
+                "`{action}` reaches x {} of a {width}pt phone row",
+                right(*node)
+            );
+        }
+        let value_node = drawn.only_mounted_node_with_text("ad.example.com");
+        let action_node = *actions.last().expect("the delete action");
+        let (_, value_y) = drawn.origin_in_root(value_node);
+        let (_, actions_y) = drawn.origin_in_root(action_node);
+        assert!(
+            actions_y > value_y,
+            "the actions at y {actions_y} are not below the value at y {value_y}"
+        );
+    }
+}
+
 #[test]
 fn the_rules_page_lists_nothing_and_keeps_its_form_closed() {
     let (mut app, _profile) =
@@ -372,10 +464,10 @@ fn the_rules_page_lists_nothing_and_keeps_its_form_closed() {
     // A draft rule cannot be added, so the page does not pretend otherwise.
     assert!(!app.screen().enabled("添加").unwrap());
 
-    // The same disc closes it again, and its glyph says which the next press does.
-    app.press("role:button[收起规则表单]").unwrap();
+    // The sheet owns its own dismissal; the disc is under its backdrop.
+    app.press("取消").unwrap();
     app.wait_for_gone("匹配内容", std::time::Duration::from_secs(2))
-        .expect("the disc closed the form and its own label");
+        .expect("cancel closed the form");
 }
 
 /// Switching tabs swaps the subject and its fields, and the other tab's own text has to
@@ -418,7 +510,7 @@ fn the_rules_tabs_swap_their_subjects() {
         "label:匹配内容 matches nothing even with the form open, so the check above proves \
          nothing"
     );
-    app.press("role:button[收起规则表单]").unwrap();
+    app.press("取消").unwrap();
     app.wait_for_gone("匹配内容", std::time::Duration::from_secs(2))
         .unwrap();
     assert_eq!(
@@ -1242,7 +1334,7 @@ fn the_floating_action_is_a_disc_at_the_bottom_right() {
     );
 }
 
-/// The disc owns the form's life: one press opens it, the next closes it, and closing discards
+/// The disc opens the form; the sheet's cancel closes it, and closing discards
 /// what was typed — a draft left behind would be submitted against the next rule by accident.
 #[test]
 fn the_floating_action_opens_and_closes_the_rule_form() {
@@ -1261,10 +1353,9 @@ fn the_floating_action_opens_and_closes_the_rule_form() {
         "nothing was typed into the opened form"
     );
 
-    // The glyph flipped with the state, so the second press is the one that closes.
-    app.press("role:button[收起规则表单]").unwrap();
+    app.press("取消").unwrap();
     app.wait_for_gone("匹配内容", std::time::Duration::from_secs(2))
-        .expect("the form stayed open after the disc closed it");
+        .expect("the form stayed open after cancel");
 
     open_rule_form(&mut app);
     assert_eq!(
@@ -3164,6 +3255,10 @@ fn english_holds_in_the_surfaces_a_page_sweep_cannot_open() {
         look(&mut app, "rule picker popup");
         app.press(&format!("role:combobox[{picker}]")).unwrap();
     }
+    // The routing form is a modal sheet now, so the tab bar is under its backdrop.
+    app.press("Cancel").unwrap();
+    app.wait_for_gone("Match", std::time::Duration::from_secs(2))
+        .expect("the rule sheet stayed open over the tab bar");
     // The DNS tab, its summary line and its own form.
     app.press("Dedicated DNS").unwrap();
     look(&mut app, "DNS tab");

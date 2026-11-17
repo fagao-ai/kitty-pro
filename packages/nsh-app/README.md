@@ -283,8 +283,15 @@ Both forms on 规则 are hidden until its disc is pressed; they used to sit perm
 their lists, which made each tab read as a form with some rows under it. The page has one disc,
 so its name follows the visible tab — 添加规则 on one, 添加专用 DNS on the other — because a
 button that names the hidden tab's form would be lying about what the press does. `编辑` on a
-rule row opens that form, filled. Pressing the disc again closes it and discards the draft, and
-the glyph changes to say which the next press does.
+rule row opens that form, filled.
+
+The routing form is a `PageSheet`, not a card above the list. Its three fields, helper sentence
+and submit row needed more height than a phone had left once the list took its own; the form and
+the list were sharing one fixed column, and the action at the bottom was pushed off screen.
+Cancel and add/save now belong to the sheet and close it, discarding the draft. On a phone a
+routing row uses two lanes: value, kind and action first, then the switch and row actions. Four
+icon buttons plus a switch do not fit beside a readable value at 360–412pt, which is why the
+trailing icons used to leave the card. The desktop keeps the original one-line row.
 
 Notices appear at the top of the window and centred across its whole width, including over the
 rail. Placement is asserted through the drawn frames (`a_notice_lands_top_centre`) because a

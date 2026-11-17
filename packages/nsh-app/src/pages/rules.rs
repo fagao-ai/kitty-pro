@@ -33,6 +33,7 @@ pub fn rules(store: AppStore) -> impl IntoElement {
     // Both drafts live here rather than in their tab's function because the page has one
     // floating action, and it has to open whichever form the visible tab owns.
     let draft = rule_draft();
+    let picker_open = signal(false);
     let dns_draft = dns_draft();
     view()
         .flex_1()
@@ -72,15 +73,22 @@ pub fn rules(store: AppStore) -> impl IntoElement {
         .child(controls::floating_layer(add_rule_action(
             store, tab, draft, dns_draft,
         )))
+        .child(when(draft.open, move || {
+            rule_editor(store, draft, picker_open)
+        }))
+        // A second native layer rather than a child of the rule card: the process list is
+        // long enough to warrant its own sheet, and it has to sit above the rule form.
+        .child(when(picker_open, move || {
+            process_picker(store, draft, picker_open)
+        }))
 }
 
-/// 规则's one action: open the current tab's form, or put it away again.
+/// 规则's one action: open the current tab's form. The routing form is a sheet and closes
+/// through its own cancel; the DNS form is still inline and the same disc puts it away.
 ///
 /// Both tabs used to carry a permanently visible form, which made each read as a form with
-/// some rows under it; the user asked for it to appear when the + is pressed. Pressing again
-/// closes it and clears what was typed — half-finished text is discarded, but the control that
-/// discarded it is the same one that opened it, and its glyph changed to say so. `编辑` on a
-/// rule row opens that form too, filled.
+/// some rows under it; the user asked for it to appear when the + is pressed. Closing discards
+/// what was typed. `编辑` on a rule row opens that form too, filled.
 ///
 /// One disc for two tabs means its name follows the tab: a button called 添加规则 while the DNS
 /// list is showing would be a lie, and the tests press by that name.
@@ -176,13 +184,11 @@ fn tab_bar(tab: Signal<Tab>) -> impl IntoElement {
 fn routing(store: AppStore, draft: RuleDraft) -> impl IntoElement {
     let armed = signal(None::<u64>);
     let arm_generation = signal(0u64);
-    let picker_open = signal(false);
     view()
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
         .gap_3()
-        .child(when(picker_open, move || process_picker(store, draft, picker_open)))
         .child(summary_row(store, Tab::Routing))
         .child(when(
             move || store.config_script_active(),
@@ -223,11 +229,6 @@ fn routing(store: AppStore, draft: RuleDraft) -> impl IntoElement {
                 )
             },
         ))
-        // The form is hidden until the floating + opens it, so the page reads as a list with
-        // one action rather than as a form with some rows under it.
-        .child(when(draft.open, move || {
-            editor(store, draft, picker_open)
-        }))
         .child(rule_list(store, draft, armed, arm_generation))
 }
 
@@ -289,11 +290,10 @@ fn update_rules_button(store: AppStore) -> impl IntoElement {
 #[derive(Clone, Copy)]
 struct RuleDraft {
     editing: Signal<Option<u64>>,
-    /// Whether the form is on screen at all. It used to be permanently open, which put three
+    /// Whether the form's sheet is presented. It used to be permanently open, which put three
     /// fields and an 添加 button above every list and made the page read as a form with some
-    /// rows under it; the user asked for the form to appear when the floating + is pressed.
-    /// `编辑` on a row opens it too, and `reset` closes it, so nothing can leave it showing an
-    /// empty draft behind a list.
+    /// rows under it; the user asked for it to appear when the floating + is pressed.
+    /// `编辑` on a row opens it too, and `reset` closes it.
     open: Signal<bool>,
     match_type: Signal<SharedString>,
     action: Signal<SharedString>,
@@ -349,103 +349,112 @@ fn reset_dns(draft: DnsDraft) {
     draft.error.set(None);
 }
 
-fn editor(store: AppStore, draft: RuleDraft, picker_open: Signal<bool>) -> impl IntoElement {
+fn rule_editor(store: AppStore, draft: RuleDraft, picker_open: Signal<bool>) -> impl IntoElement {
+    dialog()
+        .presentation(ModalPresentation::PageSheet)
+        .on_cancel(move || reset(draft, store))
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .pb_keyboard()
+        .bg(move || base_theme().background.opacity(0.6))
+        .child(
+            view()
+                .w_full()
+                .max_w(px(520.0))
+                .flex_col()
+                .gap_3()
+                .m_5()
+                .p_5()
+                .rounded(theme::radius_card())
+                .border_1()
+                .border_color(move || base_theme().border)
+                .bg(move || base_theme().card)
+                .shadow_lg()
+                .child(rule_editor_body(store, draft, picker_open)),
+        )
+}
+
+fn rule_editor_body(
+    store: AppStore,
+    draft: RuleDraft,
+    picker_open: Signal<bool>,
+) -> impl IntoElement {
     let (match_type, action, value, error) =
         (draft.match_type, draft.action, draft.value, draft.error);
     let editing = draft.editing;
-    controls::card(
-        view()
-            .flex_col()
-            .gap_3()
-            .child(
-                text(move || {
-                    i18n::tr(if editing.get().is_some() {
-                        "编辑规则"
-                    } else {
-                        "添加规则"
-                    })
+    view()
+        .flex_col()
+        .gap_3()
+        .child(
+            text(move || {
+                i18n::tr(if editing.get().is_some() {
+                    "编辑规则"
+                } else {
+                    "添加规则"
                 })
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(move || base_theme().card_foreground),
-            )
-            .child(
-                view()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_end()
-                    .gap_3()
-                    .child(
-                        view()
-                            .w(px(150.0))
-                            .flex_shrink_0()
-                            .child(controls::choice_field(
-                                "匹配类型",
-                                match_type,
-                                match_options,
-                                move |next| {
-                                    match_type.set(next);
-                                    error.set(None);
-                                },
-                            )),
-                    )
-                    .child(value_field(store, draft, picker_open))
-                    .child(
-                        view()
-                            .w(px(120.0))
-                            .flex_shrink_0()
-                            .child(controls::choice_field(
-                                "动作",
-                                action,
-                                action_options,
-                                move |next| {
-                                    action.set(next);
-                                    error.set(None);
-                                },
-                            )),
-                    ),
-            )
-            .child(controls::field_error(error))
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        text(move || i18n::tr("此处指单条规则的匹配动作，与全局分流模式不同"))
-                            .text_xs()
-                            .text_color(theme::text_faint()),
-                    )
-                    .child(
-                        view()
-                            .flex_row()
-                            .gap_2()
-                            .child(when(
-                                move || editing.get().is_some(),
-                                move || {
-                                    controls::secondary_button("取消", move || {
-                                        reset(draft, store)
-                                    })
-                                },
-                            ))
-                            .child(controls::primary_button_state(
-                                move || {
-                                    if editing.get().is_some() {
-                                        "保存"
-                                    } else {
-                                        "添加"
-                                    }
-                                },
-                                // Nothing to match on yet. The select beside it always holds
-                                // a value, so an empty content field is the one thing that
-                                // makes this press do nothing.
-                                move || value.get().trim().is_empty(),
-                                move || commit(store, draft),
-                            )),
-                    ),
-            ),
-    )
+            })
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(move || base_theme().card_foreground),
+        )
+        .child(
+            view()
+                .flex_col()
+                .gap_3()
+                .child(controls::choice_field(
+                    "匹配类型",
+                    match_type,
+                    match_options,
+                    move |next| {
+                        match_type.set(next);
+                        error.set(None);
+                    },
+                ))
+                .child(value_field(store, draft, picker_open))
+                .child(controls::choice_field(
+                    "动作",
+                    action,
+                    action_options,
+                    move |next| {
+                        action.set(next);
+                        error.set(None);
+                    },
+                )),
+        )
+        .child(controls::field_error(error))
+        .child(
+            view()
+                .flex_col()
+                .gap_3()
+                .child(
+                    text(move || i18n::tr("此处指单条规则的匹配动作，与全局分流模式不同"))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_xs()
+                        .text_color(theme::text_faint()),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .justify_end()
+                        .gap_2()
+                        .child(controls::secondary_button("取消", move || {
+                            reset(draft, store)
+                        }))
+                        .child(controls::primary_button_state(
+                            move || {
+                                if editing.get().is_some() {
+                                    "保存"
+                                } else {
+                                    "添加"
+                                }
+                            },
+                            move || value.get().trim().is_empty(),
+                            move || commit(store, draft),
+                        )),
+                ),
+        )
 }
 
 fn commit(store: AppStore, draft: RuleDraft) {
@@ -540,7 +549,10 @@ fn rule_list(
                     .map(|id| id.to_string())
                     .collect::<Vec<_>>()
             })
-            .estimated_item_size(px(76.0))
+            // This is a surface question rather than a platform capability: a narrow window
+            // and an Android phone both need the taller row, while a desktop keeps its
+            // existing one-line geometry.
+            .estimated_item_size(if is_desktop() { px(76.0) } else { px(124.0) })
             .separator(|| {
                 view()
                     .h(px(1.0))
@@ -577,9 +589,30 @@ fn rule_row(
     arm_generation: Signal<u64>,
     rule: Memo<Option<CustomRule>>,
     position: Memo<usize>,
-) -> impl IntoElement {
+) -> AnyElement {
     let id = move || rule.with(|rule| rule.as_ref().map(|rule| rule.id));
     let armed_here = move || id().is_some() && armed.get() == id();
+    let enable_label = move || {
+        let value = rule.with(|rule| {
+            rule.as_ref()
+                .map(|rule| rule.value.clone())
+                .unwrap_or_default()
+        });
+        i18n::fill("启用规则 {}", &[&value])
+    };
+    if !is_desktop() {
+        return phone_rule_row(
+            store,
+            draft,
+            armed,
+            arm_generation,
+            rule,
+            position,
+            enable_label,
+        )
+        .into_element();
+    }
+
     view()
         .w_full()
         .flex_row()
@@ -734,6 +767,199 @@ fn rule_row(
                     },
                 )),
         )
+        .into_element()
+}
+
+/// A routing row on a touch-width surface. The identity lane keeps the value readable while
+/// the switch and four actions move to a second lane; all five fitted on one row only by
+/// squeezing the value to nothing and leaving the last button past the card edge.
+fn phone_rule_row(
+    store: AppStore,
+    draft: RuleDraft,
+    armed: Signal<Option<u64>>,
+    arm_generation: Signal<u64>,
+    rule: Memo<Option<CustomRule>>,
+    position: Memo<usize>,
+    enable_label: impl Fn() -> String + 'static,
+) -> impl IntoElement {
+    let id = move || rule.with(|rule| rule.as_ref().map(|rule| rule.id));
+    let armed_here = move || id().is_some() && armed.get() == id();
+    view()
+        .w_full()
+        .flex_col()
+        .gap_3()
+        .px_5()
+        .py_3()
+        .child(
+            view()
+                .w_full()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(
+                    text(move || (position.get() + 1).to_string())
+                        .text_xs()
+                        .font_family(theme::font_mono())
+                        .w(px(24.0))
+                        .flex_shrink_0()
+                        .text_color(theme::text_faint()),
+                )
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            text(move || {
+                                rule.with(|rule| {
+                                    rule.as_ref()
+                                        .map(|rule| rule.value.clone())
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .text_sm()
+                            .font_family(theme::font_mono())
+                            .number_of_lines(1)
+                            .text_color(move || base_theme().card_foreground),
+                        )
+                        .child(
+                            text(move || {
+                                rule.with(|rule| {
+                                    rule.as_ref()
+                                        .map(|rule| {
+                                            i18n::tr(domain::custom_rule_match_label(
+                                                rule.match_type,
+                                            ))
+                                        })
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .text_xs()
+                            .text_color(theme::text_faint()),
+                        ),
+                )
+                .child(controls::badge(
+                    move || {
+                        rule.with(|rule| {
+                            domain::custom_rule_action_label(
+                                rule.as_ref()
+                                    .map_or(CustomRuleAction::Proxy, |rule| rule.action),
+                            )
+                            .to_owned()
+                        })
+                    },
+                    move || {
+                        rule.with(|rule| {
+                            domain::custom_rule_action_tint(
+                                rule.as_ref()
+                                    .map_or(CustomRuleAction::Proxy, |rule| rule.action),
+                            )
+                        })
+                    },
+                )),
+        )
+        .child(
+            view()
+                .w_full()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(controls::switch_state(
+                    move || Some(i18n::fill("启用规则 {}", &[&enable_label()]).into()),
+                    move || rule.with(|rule| rule.as_ref().is_some_and(|rule| rule.enabled)),
+                    || false,
+                    move |_: bool| {
+                        if let Some(id) = id() {
+                            store.toggle_custom_rule(id);
+                        }
+                    },
+                ))
+                .child(rule_actions(
+                    store,
+                    draft,
+                    armed,
+                    arm_generation,
+                    armed_here,
+                    rule,
+                )),
+        )
+}
+
+/// The phone row's four actions, in one fixed-width lane below the value. Shared by every
+/// phone row so the order, labels and armed-delete timer cannot drift between them.
+#[allow(clippy::too_many_arguments)]
+fn rule_actions(
+    store: AppStore,
+    draft: RuleDraft,
+    armed: Signal<Option<u64>>,
+    arm_generation: Signal<u64>,
+    armed_here: impl Fn() -> bool + 'static,
+    rule: Memo<Option<CustomRule>>,
+) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_0p5()
+        .flex_shrink_0()
+        .child(controls::icon_button(
+            || Icon::ArrowUpRight,
+            || "上移".into(),
+            move || {
+                if let Some(id) = rule.with(|rule| rule.as_ref().map(|rule| rule.id)) {
+                    store.move_custom_rule(id, -1);
+                }
+            },
+        ))
+        .child(controls::icon_button(
+            || Icon::ChevronDown,
+            || "下移".into(),
+            move || {
+                if let Some(id) = rule.with(|rule| rule.as_ref().map(|rule| rule.id)) {
+                    store.move_custom_rule(id, 1);
+                }
+            },
+        ))
+        .child(controls::icon_button(
+            || Icon::Pencil,
+            || "编辑这条规则".into(),
+            move || {
+                if let Some(rule) = rule.get_untracked() {
+                    fill(draft, rule);
+                }
+            },
+        ))
+        .child(controls::icon_button(
+            || Icon::Trash2,
+            move || {
+                if armed_here() {
+                    "再次点击确认删除这条规则".into()
+                } else {
+                    "删除这条规则".into()
+                }
+            },
+            move || {
+                let Some(id) = rule.with(|rule| rule.as_ref().map(|rule| rule.id)) else {
+                    return;
+                };
+                if armed.get_untracked() == Some(id) {
+                    arm_generation.update(|n| *n = n.wrapping_add(1));
+                    armed.set(None);
+                    store.delete_custom_rule(id);
+                    return;
+                }
+                let generation = arm_generation.get_untracked().wrapping_add(1);
+                arm_generation.set(generation);
+                armed.set(Some(id));
+                spawn(async move {
+                    timer(Duration::from_secs(CONFIRM_SECONDS)).await;
+                    if arm_generation.get_untracked() == generation {
+                        armed.set(None);
+                    }
+                });
+            },
+        ))
 }
 
 /// DNS overrides: which names, resolved by which server, and nothing else, so the rows stay one
@@ -1058,9 +1284,8 @@ fn process_pick_offered(match_type: CustomRuleMatch) -> bool {
 ///
 /// A dialog rather than an inline dropdown because the list is long — a working machine runs a
 /// couple of hundred processes — and because it is a tool for finishing one field rather than a
-/// subject of its own. It mounts as a sibling of the list rather than inside the editor card,
-/// which is the same reason the original keeps it out of the card: a card that scrolls takes a
-/// centred overlay out of reach with it.
+/// subject of its own. It mounts as a sibling of the rule sheet at page level, so it can cover
+/// that sheet without becoming part of its layout.
 fn process_picker(store: AppStore, draft: RuleDraft, picker: Signal<bool>) -> impl IntoElement {
     let query = signal(String::new());
     // The close handler captures only a `Copy` signal, so the same one goes to the sheet's
