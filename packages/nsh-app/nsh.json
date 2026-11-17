@@ -1,8 +1,8 @@
 {
   "name": "Kitty Pro",
   "id": "com.kitty.pro",
-  "version": "1.0.18",
-  "build": 1000018,
+  "version": "1.0.19",
+  "build": 1000019,
   "rust": ".",
   "root": "App",
   "theme": "theme.json",
