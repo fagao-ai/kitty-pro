@@ -334,6 +334,10 @@ pub struct AppStore {
     /// The remembered update settings, `None` until read.
     update_settings: Signal<Option<api::update::UpdateSettings>>,
     update_busy: Signal<bool>,
+    /// A download or install is in flight. Kept apart from `update_busy`, which
+    /// means "a release check is in flight": the card's check button and its
+    /// install button name different work and their labels must not swap.
+    update_install_busy: Signal<bool>,
     update_error: Signal<Option<String>>,
     /// The version the launch notice already gave, so a re-check that finds the same release
     /// cannot stack a second one.
@@ -437,6 +441,7 @@ impl AppStore {
             update_status: signal(None),
             update_settings: signal(None),
             update_busy: signal(false),
+            update_install_busy: signal(false),
             update_error: signal(None),
             update_announced: signal(None),
             groups: watch_groups(WatchInputs {
@@ -2687,7 +2692,7 @@ impl AppStore {
     }
 
     fn run_update_check(self, force: bool) {
-        if self.update_busy.get_untracked() {
+        if self.update_busy.get_untracked() || self.update_install_busy.get_untracked() {
             return;
         }
         self.update_busy.set(true);
@@ -2744,6 +2749,19 @@ impl AppStore {
         self.update_busy.get()
     }
 
+    pub fn update_install_busy(&self) -> bool {
+        self.update_install_busy.get()
+    }
+
+    /// Whether this installation can replace itself. The backend decides from
+    /// the packaged `app.json`/`nsh-updater.json` pair and a writable directory,
+    /// not from the release.
+    pub fn update_can_install(&self) -> bool {
+        self.update_status
+            .get()
+            .is_some_and(|status| status.can_install)
+    }
+
     pub fn update_error(&self) -> Option<String> {
         self.update_error.get()
     }
@@ -2765,9 +2783,66 @@ impl AppStore {
         crate::domain::update_is_actionable(self.update_status.get().as_ref())
     }
 
+    /// Download the release and swap it in, then restart into it.
+    ///
+    /// `remember_program` runs before the swap: after it the old executable is
+    /// gone on Linux, and a restart that asked `current_exe()` again would start a
+    /// path that no longer exists.
+    pub fn install_update(self) {
+        if self.update_install_busy.get_untracked() || self.update_busy.get_untracked() {
+            return;
+        }
+        self.update_install_busy.set(true);
+        self.update_error.set(None);
+        nsh_core::restart::remember_program();
+        self.work(async move {
+            let result = backend::install_app_update().await;
+            self.update_install_busy.set(false);
+            match result {
+                Ok(api::update::AppUpdateInstall::Installed { version }) => {
+                    self.feedback
+                        .success(i18n::fill("已安装 v{}，正在重启", &[&version]));
+                    nsh_core::element::desktop::restart();
+                }
+                Ok(api::update::AppUpdateInstall::Manual { reason, url, .. }) => {
+                    self.update_error.set(Some(reason));
+                    let _ = nsh_core::element::open_url(url).await;
+                }
+                Ok(api::update::AppUpdateInstall::UpToDate) => {
+                    self.feedback
+                        .info("更新清单还没有可安装的版本，正在打开发布页".to_owned());
+                    if let Some(url) = self
+                        .update_status
+                        .get_untracked()
+                        .and_then(|status| status.latest)
+                        .map(|release| release.url)
+                    {
+                        let _ = nsh_core::element::open_url(url).await;
+                    }
+                }
+                Err(error) => self.update_error.set(Some(error.to_string())),
+            }
+        });
+    }
+
+    /// Open the release page the check named, for a manual install.
+    pub fn open_release_page(self) {
+        let Some(url) = self
+            .update_status
+            .get_untracked()
+            .and_then(|status| status.latest)
+            .map(|release| release.url)
+        else {
+            return;
+        };
+        self.work(async move {
+            let _ = nsh_core::element::open_url(url).await;
+        });
+    }
+
     /// Turn the daily check on or off.
     pub fn set_update_auto_check(self, auto_check: bool) {
-        if self.update_busy.get_untracked() {
+        if self.update_busy.get_untracked() || self.update_install_busy.get_untracked() {
             return;
         }
         let Some(settings) = self.update_settings.get_untracked() else {

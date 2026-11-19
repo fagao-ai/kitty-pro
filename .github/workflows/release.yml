@@ -9,7 +9,9 @@ name: Build release packages
 # `.apk`, or a named operating system), its OS, and the CPU groups it lists. A name
 # that drops a token silently stops that platform being updatable, so the names here
 # are the ones `packages/proxy-core/src/update.rs` asserts in its tests, and an edit
-# to one must be an edit to the other.
+# to one must be an edit to the other. Desktop archives also carry the version
+# (`<name>-<version>-<os>-<arch>`) because `nsh update-manifest` reads it when it
+# builds the self-update feed.
 #
 # NOT YET EXERCISED: this file was rewritten when the desktop packaging moved off
 # `dx bundle`, and the web and Android jobs are new since. Run it from a throwaway
@@ -227,6 +229,9 @@ jobs:
             cargo metadata --locked --no-deps --format-version 1 \
               | jq -er '.packages[] | select(.name == "kitty-pro") | .version'
           )"
+          # The update manifest names archives `<name>-<version>-<os>-<arch>`, and
+          # this is the same version the registry stamps into the bundle.
+          echo "KITTY_VERSION=$app_version" >> "$GITHUB_ENV"
           mkdir -p "dist/${{ matrix.id }}"
           if ! (cd packages/nsh-app && nsh package \
               --target "${{ matrix.target }}" \
@@ -277,17 +282,24 @@ jobs:
           if (-not $dll) {
             throw "kitty_singbox.dll was not found in the build output; without it the packaged app has no core"
           }
-          $zip = Get-ChildItem "$env:GITHUB_WORKSPACE/dist/windows" -Filter '*.zip' |
-            Select-Object -First 1
-          if (-not $zip) { throw "the Windows packaging step left no zip in dist/windows" }
+          # `nsh package` writes both `<Name>.zip` and the release-named
+          # `Kitty-Pro-<version>-windows-<arch>.zip` when nsh.json has an
+          # updater. Only the latter is published, so the DLL must go into that
+          # exact file: a `-First 1` search could patch one and leave the other
+          # without the core.
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $zip = Join-Path $env:GITHUB_WORKSPACE "dist/windows/Kitty-Pro-$env:KITTY_VERSION-windows-$arch.zip"
+          if (-not (Test-Path $zip)) {
+            throw "the Windows packaging step left no $(Split-Path $zip -Leaf)"
+          }
           $stage = Join-Path $env:RUNNER_TEMP 'kitty-pro-windows-dll-stage'
           if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-          Expand-Archive $zip.FullName -DestinationPath $stage
+          Expand-Archive $zip -DestinationPath $stage
           $exe = Get-ChildItem $stage -Recurse -Filter '*.exe' | Select-Object -First 1
-          if (-not $exe) { throw "$($zip.Name) holds no executable to place the core beside" }
+          if (-not $exe) { throw "$(Split-Path $zip -Leaf) holds no executable to place the core beside" }
           Copy-Item $dll.FullName -Destination $exe.DirectoryName
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip.FullName -Force
-          Write-Host "added $($dll.Name) beside $($exe.Name) in $($zip.Name)"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+          Write-Host "added $($dll.Name) beside $($exe.Name) in $(Split-Path $zip -Leaf)"
 
       - name: Build the Windows MSI installer
         if: matrix.id == 'windows'
@@ -304,24 +316,25 @@ jobs:
           # or core than the portable archive does.
           $stage = Join-Path $env:RUNNER_TEMP 'kitty-pro-windows-msi-stage'
           if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-          $zip = Get-ChildItem "$env:GITHUB_WORKSPACE/dist/windows" -Filter '*.zip' |
-            Select-Object -First 1
-          if (-not $zip) { throw "no zip in dist/windows to build the installer from" }
-          Expand-Archive $zip.FullName -DestinationPath $stage
-          $exe = Get-ChildItem $stage -Recurse -Filter '*.exe' | Select-Object -First 1
-          $dll = Get-ChildItem $stage -Recurse -Filter kitty_singbox.dll |
-            Select-Object -First 1
-          if (-not $exe) { throw "$($zip.Name) holds no executable" }
-          if (-not $dll) { throw "$($zip.Name) holds no kitty_singbox.dll" }
           $version = (& cargo metadata --locked --no-deps --format-version 1 |
             ConvertFrom-Json).packages |
             Where-Object name -eq 'kitty-pro' |
             Select-Object -ExpandProperty version
-          # The in-app update check reads the CPU out of the asset name, so the
-          # MSI is named by the machine that built it, like every other asset.
-          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x86_64' }
-          $wixArch = if ($arch -eq 'arm64') { 'arm64' } else { 'x64' }
-          $msi = "$env:GITHUB_WORKSPACE/dist/windows/Kitty-Pro-windows-$arch.msi"
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $wixArch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+          # The same release-named zip the DLL step patched, not whichever zip
+          # the directory happens to list first.
+          $zip = Join-Path $env:GITHUB_WORKSPACE "dist/windows/Kitty-Pro-$version-windows-$arch.zip"
+          if (-not (Test-Path $zip)) { throw "no $(Split-Path $zip -Leaf) to build the installer from" }
+          Expand-Archive $zip -DestinationPath $stage
+          $exe = Get-ChildItem $stage -Recurse -Filter '*.exe' | Select-Object -First 1
+          $dll = Get-ChildItem $stage -Recurse -Filter kitty_singbox.dll |
+            Select-Object -First 1
+          if (-not $exe) { throw "$(Split-Path $zip -Leaf) holds no executable" }
+          if (-not $dll) { throw "$(Split-Path $zip -Leaf) holds no kitty_singbox.dll" }
+          # The in-app update check reads the CPU out of the asset name, and the
+          # MSI carries the same version triplet as the portable archive beside it.
+          $msi = "$env:GITHUB_WORKSPACE/dist/windows/Kitty-Pro-$version-windows-$arch.msi"
           wix build -arch $wixArch `
             -ext WixToolset.UI.wixext `
             -d "AppVersion=$version" `
@@ -344,16 +357,23 @@ jobs:
             arm64) arch="aarch64" ;;
             *) arch="$(uname -m)" ;;
           esac
-          archive="Kitty-Pro-${{ matrix.id }}-${arch}"
+          # The version is part of the name because `nsh update-manifest` reads
+          # `<name>-<version>-<os>-<arch>` when it writes the self-update feed.
+          archive="Kitty-Pro-${KITTY_VERSION}-${{ matrix.id }}-${arch}"
+          # `nsh package` leaves an unversioned archive beside the release-named
+          # one on Linux and Windows. Renaming with `find -print -quit` could
+          # pick either (and `mv same same` fails with GNU mv), so name the
+          # release asset exactly and drop everything else below.
           case "${{ matrix.id }}" in
             macos)
-              # NSH leaves an ad hoc signed `.app` here and packages nothing else —
-              # its own `package --help` names the macOS target as the `.app`, with no
-              # archive and no image. Two packages come out of that bundle.
+              # NSH leaves an ad hoc signed `.app` and a `.tar.gz` here. The tar
+              # is the self-update archive: NSH's extractor preserves its
+              # signature, and its AppleDouble skipping keeps `._*` files out of
+              # the bundle. The zip and dmg are what a person downloads by hand.
               #
-              # The zip is what this workflow has always published and what the
-              # unpack-and-look check below still consumes. The dmg is the one a
-              # person installs by hand: mount, drag, done. `proxy_core::update`
+              # The zip stays on the release page for scripts that already use
+              # it. The dmg is the one a person installs by hand: mount, drag,
+              # done. `proxy_core::update`
               # ranks an installer above a portable archive, so publishing it is also
               # what makes a Mac's update check name the image rather than the zip;
               # the card itself links to the release page either way.
@@ -362,42 +382,46 @@ jobs:
               # image has to be mounted and the bundle's signature read back out of it
               # for the build to mean anything, and that belongs with the tool that
               # makes it. It fails on a volume that comes out empty or unsigned, the
-              # way the check below fails on a zip with no executable in it.
+              # way the check below fails on an archive with no executable in it.
               bundle="$(find . -maxdepth 1 -type d -name '*.app' -print -quit)"
               test -n "$bundle"
+              test -f "$archive.tar.gz"
               "$GITHUB_WORKSPACE/scripts/build-dmg.sh" -o "$archive.dmg" "$bundle"
-              ditto -c -k --keepParent "$bundle" "$archive.zip"
+              # Keep `._*` AppleDouble files out of the zip too: Finder can merge
+              # them back, but `unzip` and NSH's installer leave them inside the
+              # bundle, where they invalidate the signature.
+              ditto -c -k --keepParent --norsrc --noextattr "$bundle" "$archive.zip"
               rm -rf "$bundle"
               ;;
             windows)
-              # `nsh package` writes `<Name>.zip` beside `<Name>/`.
-              produced="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
-              test -n "$produced"
-              mv "$produced" "$archive.zip"
-              rm -rf -- "$(basename "$produced" .zip)"
+              test -f "$archive.zip"
               ;;
             linux)
-              produced="$(find . -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-              test -n "$produced"
-              mv "$produced" "$archive.tar.gz"
+              test -f "$archive.tar.gz"
               ;;
           esac
-          archive="$(find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -quit)"
-          test -n "$archive"
+          # One archive per platform reaches the release page and its checksum
+          # list. The unversioned copy `nsh package` also writes would otherwise
+          # be uploaded as a second, unlabeled asset.
+          find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) \
+            ! -name "$archive.*" -delete
+          # The unpacked directory is not an artifact; only the archives are.
+          find . -mindepth 1 -maxdepth 1 -type d -exec rm -rf -- {} +
+          echo "KITTY_ARCH=$arch" >> "$GITHUB_ENV"
 
       - name: Verify desktop packages
         shell: bash
         run: |
           set -euo pipefail
           cd "dist/${{ matrix.id }}"
-          # The portable archive only, and deliberately: the macOS dmg is in this
-          # directory too, and `scripts/build-dmg.sh` already mounted its own output,
-          # read the executable back out of the volume and verified the signature.
-          # Mounting it a second time here would check the same bytes through a
-          # different tool, and letting this `find` answer with the dmg instead of
-          # the zip would fall through the `case` below into an empty check_dir,
-          # failing a build whose packages are both fine.
-          archive="$(find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -quit)"
+          # Check the exact archive `latest.json` will name, not just any package
+          # in the directory: on macOS that is the `.tar.gz`, whose extraction
+          # keeps the app's signature valid. The dmg and zip are manual downloads.
+          case "${{ matrix.id }}" in
+            windows) archive="Kitty-Pro-${KITTY_VERSION}-windows-${KITTY_ARCH}.zip" ;;
+            *) archive="Kitty-Pro-${KITTY_VERSION}-${{ matrix.id }}-${KITTY_ARCH}.tar.gz" ;;
+          esac
+          test -f "$archive"
           check_dir="$RUNNER_TEMP/kitty-pro-${{ matrix.id }}-verify"
           mkdir -p "$check_dir"
           case "$archive" in
@@ -425,6 +449,13 @@ jobs:
           # whose core never appeared.
           if [[ "${{ matrix.id }}" == windows ]]; then
             test -n "$(find "$check_dir" -type f -name 'kitty_singbox.dll' -print -quit)"
+          fi
+          # NSH's installer refuses a bundle whose signature does not verify.
+          # Catch that here rather than in every user's update.
+          if [[ "${{ matrix.id }}" == macos ]]; then
+            bundle="$(find "$check_dir" -maxdepth 1 -type d -name '*.app' -print -quit)"
+            test -n "$bundle"
+            /usr/bin/codesign --verify --deep --strict "$bundle"
           fi
 
       # The macOS runner is the only one without GNU sha256sum.
@@ -916,9 +947,61 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      # `scripts/setup-nsh.sh` reads the workspace's NSH crate requirements
+      # through `cargo metadata`; the hosted runner's preinstalled Rust is not
+      # the pinned toolchain the artifacts were built with.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Set up NSH
+        uses: ./.github/actions/setup-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+
       - name: Build release notes
         shell: bash
         run: ./scripts/build-release-notes.sh --out release-body.md "$GITHUB_REF_NAME"
+
+      # `nsh update-manifest` names the app's version from `nsh.json`. The
+      # archives were stamped by each build job; this is the same tag's version,
+      # written into the manifest the app downloads next to them. Only that file
+      # is touched: the release job builds nothing, and a full
+      # `set-package-version.sh` would rewrite Cargo.lock for no artifact.
+      - name: Stamp the update manifest's version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          jq --arg version "$version" '.version = $version' \
+            packages/nsh-app/nsh.json > packages/nsh-app/nsh.json.tmp
+          mv packages/nsh-app/nsh.json.tmp packages/nsh-app/nsh.json
+
+      # The self-updater reads this manifest from
+      # `releases/latest/download/latest.json`. It is unsigned because the app
+      # names a GitHub repository rather than a host of its own; the archive's
+      # SHA-256 is still in the manifest, and NSH verifies it before installing.
+      # Adding `updater.publicKey` and `--key` here would sign it too.
+      - name: Generate the update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          archives=()
+          while IFS= read -r -d '' archive; do
+            archives+=("$archive")
+          done < <(
+            find release-assets -type f \
+              \( -name 'Kitty-Pro-[0-9]*-macos-*.tar.gz' \
+                 -o -name 'Kitty-Pro-[0-9]*-windows-*.zip' \
+                 -o -name 'Kitty-Pro-[0-9]*-linux-*.tar.gz' \) -print0
+          )
+          test "${#archives[@]}" -eq 3
+          nsh update-manifest \
+            --entry packages/nsh-app \
+            --notes release-body.md \
+            -o release-manifest \
+            "${archives[@]}"
 
       - name: Publish tagged release
         uses: softprops/action-gh-release@v2
@@ -943,3 +1026,4 @@ jobs:
             release-assets/**/*.msi
             release-assets/**/*.apk
             release-assets/**/*.sha256
+            release-manifest/latest.json

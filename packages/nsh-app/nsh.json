@@ -3,6 +3,7 @@
   "id": "com.kitty.pro",
   "version": "1.0.19",
   "build": 1000019,
+  "updater": { "github": "fagao-ai/kitty-pro" },
   "rust": ".",
   "root": "App",
   "theme": "theme.json",

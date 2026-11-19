@@ -676,6 +676,28 @@ const ENGLISH: &[(&str, &str)] = &[
     // the agreed envelope; the status is the one clue worth showing.
     ("服务端返回了无法理解的内容（HTTP {}）", "The server replied with something unreadable (HTTP {})"),
     ("发现新版本 v{}", "A new version is available: v{}"),
+    ("下载并安装", "Download and install"),
+    ("正在下载并安装", "Downloading and installing"),
+    ("安装中", "Installing"),
+    ("打开发布页", "Open the release page"),
+    ("已安装 v{}，正在重启", "Installed v{}; restarting"),
+    (
+        "下载完成后会自动重启；订阅、规则和设置都会保留",
+        "The app restarts when the download finishes; subscriptions, rules and settings are kept",
+    ),
+    (
+        "正在下载并安装，完成后会自动重启；订阅、规则和设置都会保留",
+        "Downloading and installing; the app restarts when it finishes, with subscriptions, rules and settings kept",
+    ),
+    (
+        "当前安装不能应用内升级，请从发布页下载新版",
+        "This installation cannot update in place; download the new version from the release page",
+    ),
+    (
+        "更新清单还没有可安装的版本，正在打开发布页",
+        "The update manifest has no installable version yet; opening the release page",
+    ),
+    ("浏览器端不能安装应用更新", "The browser build cannot install app updates"),
     ("已切换到 {}", "Switched to {}"),
     ("已删除 {}", "Deleted {}"),
     ("已删除 {}，重新连接后生效", "Deleted {}; applies after reconnecting"),

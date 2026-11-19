@@ -685,6 +685,15 @@ card is usually not on screen when the launch check fails, so a notice would be 
 read it. 忽略这个版本 and the daily-check switch are both tested through to `update.json` and back
 after a relaunch, since a switch that does not survive a restart is decoration.
 
+The check names a release; the install path is separate. A packaged desktop app reads the
+`latest.json` published by `nsh update-manifest`, downloads the archive named for its platform,
+checks its size and SHA-256, and hands it to `nsh-updater`'s installer before restarting. The card
+only offers 下载并安装 when the running bundle has that updater configuration and its directory is
+writable. A browser, a phone, a development run and an install under a system-only directory keep
+the release-page link instead, as does 1.0.19, whose bundle predates `nsh-updater.json`. The
+installed 1.0.19 binary also contains no install path at all: the first release with this code
+still has to be installed by hand.
+
 The waiting update also reaches the navigation, as it does in the original: once as a notice
 (发现新版本 v…, at most one per release — the daily re-check would otherwise repeat it every
 launch), and after that as a mark on 设置. `controls::NavMark` is one type covering the rail's two

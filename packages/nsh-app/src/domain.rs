@@ -3429,6 +3429,7 @@ mod update_tests {
             snoozed,
             target: "desktop · macos · aarch64".to_owned(),
             error: None,
+            can_install: true,
             server_time: 1_700_000_060,
         }
     }

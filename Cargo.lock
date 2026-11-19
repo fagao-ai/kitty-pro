@@ -120,6 +120,7 @@ version = "1.0.19"
 dependencies = [
  "directories",
  "getrandom 0.3.4",
+ "nsh-updater",
  "proxy-core",
  "reqwest",
  "serde",

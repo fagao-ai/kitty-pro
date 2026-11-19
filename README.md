@@ -209,12 +209,17 @@ The `Build release packages` workflow publishes three channels, all from the one
 NSH crate, each with a `.sha256` sidecar:
 
 - **Desktop**, built on that operating system's own runner:
-  `Kitty-Pro-macos-aarch64.dmg` and `Kitty-Pro-macos-aarch64.zip` — the same ad
-  hoc signed `Kitty Pro.app`, in a drag-to-Applications image for a person and an
-  archive for a script — plus `Kitty-Pro-windows-x86_64.zip` and
-  `Kitty-Pro-linux-x86_64.tar.gz`. NSH builds an `.app` and stops, so the dmg comes
-  from `scripts/build-dmg.sh`, which mounts what it wrote and verifies the bundle's
-  signature inside it before the release sees it
+  `Kitty-Pro-<version>-macos-aarch64.dmg` and
+  `Kitty-Pro-<version>-macos-aarch64.zip` — the same ad hoc signed `Kitty Pro.app`,
+  in a drag-to-Applications image for a person and a zip for a script — plus the
+  updater's `Kitty-Pro-<version>-macos-aarch64.tar.gz`,
+  `Kitty-Pro-<version>-windows-x86_64.zip`, its `.msi`, and
+  `Kitty-Pro-<version>-linux-x86_64.tar.gz`. The version in every desktop name is
+  what `nsh update-manifest` reads when it writes `latest.json`. The macOS tar is
+  the in-app update archive; the zip is written without resource forks so
+  `unzip` also leaves a valid signature. The dmg comes from
+  `scripts/build-dmg.sh`, which mounts what it wrote and verifies the bundle's
+  signature inside it before the release sees it.
 - **Android**: `Kitty-Pro-arm64-v8a-armeabi-v7a-<version>.apk`, one archive
   carrying both ARM ABIs, built by `scripts/build-android.sh` and signed with the
   release keystore in the repository's `ANDROID_KEYSTORE_*` secrets
@@ -233,7 +238,8 @@ Every asset name is load-bearing. `proxy_core::update` chooses the one package a
 device may install out of the file name alone — its channel, its operating system,
 and the CPU groups it lists — so a name that drops a token silently stops that
 platform being updatable. Where a platform publishes two, it prefers an installer
-to an archive, which is why a Mac is sent the dmg and the zip stays on the page.
+to an archive, which is why a Mac is sent the dmg while `latest.json` names the
+macOS tar for in-app installation.
 `the_published_asset_set_answers_every_platform` in
 `packages/proxy-core/src/update.rs` pins the whole set against that matcher; an
 edit to a name in the workflow is an edit to that test.
@@ -246,16 +252,26 @@ certificates and should be added before public distribution.
 
 ## Checking for updates
 
-The Settings page asks GitHub for the newest release of the repository, compares
-it against the running shell's package version, and offers the release page when
-something newer exists. Checks run at startup and at most once a day, remembered
-in `<data dir>/update.json` beside `profile.json`, and can be switched off; the
-button on the card ignores the throttle.
+The Settings page asks GitHub for the newest release of the repository and
+compares it against the running shell's package version. Checks run at startup
+and at most once a day, remembered in `<data dir>/update.json` beside
+`profile.json`, and can be switched off; the button on the card ignores the
+throttle.
 
-The check reads only GitHub's own API and never downloads or installs anything.
-Each platform ships an archive that the user opens themselves, so the last step
-is a link - which is also where the `.sha256` file published next to every
-asset stays useful.
+On a packaged desktop app the card can download and install the release in
+place, then restart into it. That step does not read the GitHub API response:
+it reads the `latest.json` that `nsh update-manifest` publishes beside the
+archives, verifies the archive's declared size and SHA-256, and lets NSH's
+installer replace the app directory. A development run, a phone or the browser
+still ends at the release page; so does an install in a directory the user
+cannot write, and so does 1.0.19, whose bundle predates the updater config. The
+1.0.19 binary itself has no install code either: moving to the first release
+with this feature is one manual download. A Windows MSI install, which puts
+only the executable and core in Program Files, keeps the installer path for
+the same reason: there is no updater config or writable app directory there.
+
+The release page remains where the `.sha256` files published next to every
+asset stay useful, and it is the fallback whenever the self-updater declines.
 
 Which asset belongs to which install is decided from the file names the release
 workflow produces, so a renamed package breaks the match and shows up in the

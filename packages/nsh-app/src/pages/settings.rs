@@ -1267,12 +1267,13 @@ fn conflict_panel(store: AppStore) -> impl IntoElement {
 
 // ------------------------------------------------------------------- updates
 
-/// The update card: what the release feed said, and the two things the user can do about it.
+/// The update card: what the release feed said, and what this installation can do about it.
 ///
-/// The card is mostly a report rather than a control, because the download itself belongs to the
-/// release page — the notes and the checksums are one click from the asset, and an app that
-/// fetched its own replacement could not verify what it got. The one state that offers a press
-/// is a release the user has not yet declined.
+/// A packaged desktop app offers 下载并安装: the backend reads the release's
+/// `latest.json`, verifies the archive's size and SHA-256, and restarts into the
+/// replacement. Every other install keeps the release-page link, which is also
+/// where the notes and per-asset checksums live. The install press appears only
+/// for a release the user has not declined.
 fn updates_card(store: AppStore) -> impl IntoElement {
     controls::card(
         view()
@@ -1293,7 +1294,7 @@ fn updates_card(store: AppStore) -> impl IntoElement {
                         .update_settings()
                         .is_some_and(|settings| settings.auto_check)
                 },
-                move || !store.update_ready() || store.update_busy(),
+                move || !store.update_ready() || store.update_busy() || store.update_install_busy(),
                 move |enabled| store.set_update_auto_check(enabled),
             ))
             .child(when(
@@ -1341,19 +1342,59 @@ fn updates_card(store: AppStore) -> impl IntoElement {
                                 "检查更新"
                             }
                         },
-                        move || store.update_busy() || !store.update_ready(),
+                        move || {
+                            store.update_busy()
+                                || store.update_install_busy()
+                                || !store.update_ready()
+                        },
                         move || store.check_for_update(),
+                    ))
+                    .child(when(
+                        move || store.update_is_actionable() && store.update_can_install(),
+                        move || {
+                            controls::primary_button_state(
+                                move || {
+                                    if store.update_install_busy() {
+                                        "正在下载并安装"
+                                    } else {
+                                        "下载并安装"
+                                    }
+                                },
+                                move || store.update_install_busy() || store.update_busy(),
+                                move || store.install_update(),
+                            )
+                        },
                     ))
                     .child(when(
                         move || store.update_is_actionable(),
                         move || {
-                            view().flex_row().gap_2().child(controls::secondary_button(
-                                "忽略这个版本",
-                                move || store.dismiss_update(),
-                            ))
+                            controls::secondary_button("打开发布页", move || {
+                                store.open_release_page()
+                            })
+                        },
+                    ))
+                    .child(when(
+                        move || store.update_is_actionable(),
+                        move || {
+                            view()
+                                .flex_row()
+                                .gap_2()
+                                .child(controls::secondary_button_state(
+                                    "忽略这个版本",
+                                    move || store.update_install_busy(),
+                                    move || store.dismiss_update(),
+                                ))
                         },
                     )),
             )
+            .child(when(
+                move || store.update_install_busy() || store.update_is_actionable(),
+                move || {
+                    text(move || i18n::tr(&install_note(store)))
+                        .text_xs()
+                        .text_color(theme::text_faint())
+                },
+            ))
             .child(
                 text(move || i18n::tr(&(check_note(store))))
                     .text_xs()
@@ -1363,12 +1404,26 @@ fn updates_card(store: AppStore) -> impl IntoElement {
 }
 
 fn update_badge(store: AppStore) -> &'static str {
+    if store.update_install_busy() {
+        return "安装中";
+    }
     domain::update_badge_label(
         store.update_display_state(),
         store.update_busy(),
         store.update_ready(),
         store.update_status().is_some_and(|status| status.snoozed),
     )
+}
+
+/// What the install action will do, or why it is not offered.
+fn install_note(store: AppStore) -> String {
+    if store.update_install_busy() {
+        return "正在下载并安装，完成后会自动重启；订阅、规则和设置都会保留".to_owned();
+    }
+    if store.update_is_actionable() && !store.update_can_install() {
+        return "当前安装不能应用内升级，请从发布页下载新版".to_owned();
+    }
+    "下载完成后会自动重启；订阅、规则和设置都会保留".to_owned()
 }
 
 fn update_tint(store: AppStore) -> theme::Tint {

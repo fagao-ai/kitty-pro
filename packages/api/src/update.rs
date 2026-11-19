@@ -13,13 +13,15 @@
 //!   reported as "nothing to install", never as an invitation to fetch a binary
 //!   that cannot run.
 //!
-//! What is deliberately *not* copied: Magpie downloads the new archive and
-//! launches a helper that replaces the installation in place. Kitty Pro ships a
-//! signed installer per platform (`.dmg`, `.msi`, `.deb`, an APK behind Android's
-//! own installer), each with its own privilege requirements, so the check ends at
-//! "here is the release, take it from GitHub" and hands the user a link. The
-//! release page is also where the checksums live, which keeps verification with
-//! the installer instead of duplicating an installer here.
+//! The check and the install answer different questions. The check reads
+//! GitHub's release API and always ends at "here is the release"; whether that
+//! release can be installed in place is decided by the package shipped next to
+//! this executable ([`nsh_updater`]). A packaged desktop app with an
+//! `nsh-updater.json` downloads the manifest's archive, verifies its size and
+//! SHA-256, replaces itself and restarts. An installation that predates that
+//! file - or runs where its directory is not writable - gets the release link
+//! instead. Phones and the browser keep the link: a store owns installation
+//! there.
 //!
 //! Requests go out from the app process, never from a browser, so a page served
 //! over LAN cannot be pointed at a third-party host by anything in a profile.
@@ -29,6 +31,8 @@ use proxy_core::{select_asset, GitHubRelease, ReleaseTarget};
 use serde::{Deserialize, Serialize};
 // Only the throttle reads this, and the throttle exists only where a check can
 // reach GitHub: importing it unconditionally warns on the `wasm32` client.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+use nsh_updater::{Available, Config, Download};
 #[cfg(not(target_arch = "wasm32"))]
 use proxy_core::UPDATE_CHECK_INTERVAL_SECS;
 
@@ -48,6 +52,17 @@ const UPDATE_REPO: &str = match option_env!("KITTY_UPDATE_REPO") {
 /// misconfigured redirect cannot make the app allocate freely.
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_RELEASE_BYTES: usize = 1024 * 1024;
+
+/// An update manifest is small; the cap keeps a hostile redirect from making
+/// the app allocate freely.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+const MAX_UPDATE_MANIFEST_BYTES: usize = 256 * 1024;
+
+/// The largest archive this app will download. `nsh update-manifest` records the
+/// exact size, and [`Download`] enforces it; this is the fallback for a manifest
+/// that omits it.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+const MAX_UPDATE_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Settings the update card shows and edits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +148,11 @@ pub struct AppUpdateStatus {
     pub target: String,
     #[serde(default)]
     pub error: Option<String>,
+    /// Whether this installation can replace itself in place: a packaged desktop
+    /// app carrying both `nsh-updater.json` and `app.json`, in a directory the
+    /// user can write.
+    #[serde(default)]
+    pub can_install: bool,
     /// Unix seconds on the machine that produced this answer.
     ///
     /// Ages are rendered from this rather than from the reader's own clock: a
@@ -141,6 +161,23 @@ pub struct AppUpdateStatus {
     /// "three hours ago" is worth showing.
     #[serde(default)]
     pub server_time: u64,
+}
+
+/// What a press on 下载并安装 did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppUpdateInstall {
+    /// The new app is in place; the caller restarts into it.
+    Installed { version: String },
+    /// This installation cannot replace itself. `url` is where the user can get
+    /// the release by hand, and `reason` says why.
+    Manual {
+        version: Option<String>,
+        url: String,
+        reason: String,
+    },
+    /// The update manifest has nothing newer than the running build.
+    UpToDate,
 }
 
 /// Arguments of [`check_app_update`].
@@ -214,6 +251,7 @@ pub async fn check_app_update(request: AppUpdateRequest) -> Result<AppUpdateStat
                 snoozed: false,
                 target: request.platform,
                 error: None,
+                can_install: false,
                 server_time: now,
             });
         };
@@ -257,6 +295,278 @@ pub async fn check_app_update(request: AppUpdateRequest) -> Result<AppUpdateStat
         let _ = request;
         Err(api_err(ApiErrorCode::Internal, "浏览器端不能直接检查更新"))
     }
+}
+
+/// Download and install a newer release in place.
+///
+/// The check that fills the card reads GitHub's release API; this reads the
+/// package's own `latest.json`, verifies the archive's declared size and
+/// SHA-256, and hands the file to `nsh-updater`'s installer. They answer
+/// different questions: the card can name a release before its manifest exists,
+/// so a missing or older manifest is reported rather than guessed at.
+pub async fn install_app_update() -> Result<AppUpdateInstall, ApiError> {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        install_packaged_update().await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Err(api_err(
+            ApiErrorCode::Update,
+            "此平台不能在应用内安装更新，请从发布页下载",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+async fn install_packaged_update() -> Result<AppUpdateInstall, ApiError> {
+    let Some((config, installation)) = update_installation() else {
+        return Ok(AppUpdateInstall::Manual {
+            version: None,
+            url: github_release_page(UPDATE_REPO),
+            reason: "当前安装没有应用内升级配置，请从发布页下载".to_owned(),
+        });
+    };
+
+    let manifest = fetch_update_document(&config.manifest_url(), MAX_UPDATE_MANIFEST_BYTES).await?;
+    let signature = match config.signature_url() {
+        Some(url) => Some(fetch_update_document(&url, MAX_UPDATE_MANIFEST_BYTES).await?),
+        None => None,
+    };
+    let available = config
+        .check(&manifest, signature.as_deref(), &nsh_updater::platform())
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("更新清单不可用：{error}")))?;
+    let Some(available) = available else {
+        return Ok(AppUpdateInstall::UpToDate);
+    };
+    let Some(sha256) = available.sha256.clone() else {
+        return Ok(AppUpdateInstall::Manual {
+            version: Some(available.version),
+            url: available.url,
+            reason: "这个版本没有提供可直接安装的压缩包，请从发布页下载".to_owned(),
+        });
+    };
+    if !installation.can_install() {
+        let url = manual_release_url(&config, &available);
+        return Ok(AppUpdateInstall::Manual {
+            version: Some(available.version),
+            url,
+            reason: "应用所在目录不可写，请从发布页手动安装".to_owned(),
+        });
+    }
+
+    let archive = download_update_archive(&available, &sha256).await?;
+    let install_path = archive.clone();
+    let installed = super::run_native_blocking("安装更新失败", move || {
+        installation
+            .install(&install_path)
+            .map_err(|error| api_err(ApiErrorCode::Update, format!("安装更新失败：{error}")))
+    })
+    .await;
+    let _ = std::fs::remove_file(&archive);
+    installed?;
+    Ok(AppUpdateInstall::Installed {
+        version: available.version,
+    })
+}
+
+/// Where a person installs by hand when the in-app path declines.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn github_release_page(repo: &str) -> String {
+    format!("https://github.com/{repo}/releases/latest")
+}
+
+/// A GitHub app has a release page; a custom host's manifest names the archive
+/// itself, so that is the best manual destination it can offer.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn manual_release_url(config: &Config, available: &Available) -> String {
+    config
+        .github
+        .as_deref()
+        .map_or_else(|| available.url.clone(), github_release_page)
+}
+
+/// The package's shipped update configuration and the installation it belongs to.
+///
+/// `nsh package` writes `nsh-updater.json` and `app.json` into `resources/nsh`,
+/// and `nsh-updater`'s installer reads the same pair to decide what it may
+/// replace. A development run, or a bundle packaged before the app declared an
+/// updater, has no config asset: that is a manual update rather than an error.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn update_installation() -> Option<(Config, nsh_updater::install::Installation)> {
+    update_installation_at(&running_executable()?)
+}
+
+/// This process' executable, without Linux's ` (deleted)` marker.
+///
+/// Once an update has swapped the app but before the restart, `current_exe()`
+/// names the path the user knows plus that suffix. `nsh-updater` strips it
+/// before deciding which installation it is looking at; a second install in
+/// that window has to resolve the same one.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn running_executable() -> Option<std::path::PathBuf> {
+    let path = std::env::current_exe().ok()?.to_string_lossy().into_owned();
+    Some(std::path::PathBuf::from(
+        path.strip_suffix(" (deleted)").unwrap_or(&path),
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn update_installation_at(
+    executable: &std::path::Path,
+) -> Option<(Config, nsh_updater::install::Installation)> {
+    let root = if cfg!(target_os = "macos") {
+        let root = executable.parent()?.parent()?.parent()?.to_path_buf();
+        root.extension().filter(|extension| *extension == "app")?;
+        root
+    } else {
+        executable.parent()?.to_path_buf()
+    };
+    let resources = if cfg!(target_os = "macos") {
+        root.join("Contents/Resources/nsh")
+    } else {
+        root.join("nsh")
+    };
+    let config_bytes =
+        std::fs::read(resources.join("assets").join(nsh_updater::CONFIG_ASSET)).ok()?;
+    let config = Config::parse(&config_bytes).ok()?;
+    // `of`, not `current`: this helper already resolved `executable`, and
+    // `current` would silently go back to `current_exe()`. The package id and
+    // config bytes still have to match the bundle's own copies.
+    let installation =
+        nsh_updater::install::Installation::of(executable, &config.id, &config_bytes)?;
+    installation.remove_leftovers();
+    Some((config, installation))
+}
+
+/// Fetch a manifest or its signature, with the same size cap as the release
+/// check. A 404 is the honest answer for a release whose manifest has not been
+/// published yet, so it is not folded into "up to date".
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+async fn fetch_update_document(url: &str, max: usize) -> Result<Vec<u8>, ApiError> {
+    let response = update_client()?
+        .get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("读取更新清单失败：{error}")))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(api_err(
+            ApiErrorCode::Update,
+            "这个版本还没有应用内更新清单，请从发布页下载",
+        ));
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("更新服务返回错误：{error}")))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > max as u64)
+    {
+        return Err(api_err(ApiErrorCode::Update, "更新清单超过大小限制"));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("读取更新清单失败：{error}")))?;
+    if bytes.len() > max {
+        return Err(api_err(ApiErrorCode::Update, "更新清单超过大小限制"));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Download the archive to a temporary file, checking its size and SHA-256 as
+/// it arrives. The installer unpacks this file; a failed download or check
+/// removes it instead of leaving a half-written package in the temp directory.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+async fn download_update_archive(
+    available: &Available,
+    sha256: &str,
+) -> Result<std::path::PathBuf, ApiError> {
+    let response = update_client()?
+        .get(&available.url)
+        .send()
+        .await
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("下载更新失败：{error}")))?;
+    let response = response
+        .error_for_status()
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("下载更新失败：{error}")))?;
+    if let (Some(expected), Some(actual)) = (available.size, response.content_length()) {
+        if expected != actual {
+            return Err(api_err(
+                ApiErrorCode::Update,
+                format!("更新包大小不符：清单为 {expected} 字节，服务端为 {actual} 字节"),
+            ));
+        }
+    }
+    let suffix = if available.url.ends_with(".tar.gz") {
+        "tar.gz"
+    } else {
+        "zip"
+    };
+    let path = std::env::temp_dir().join(format!(
+        "kitty-pro-update-{}-{}.{suffix}",
+        std::process::id(),
+        unix_now()
+    ));
+    let written = write_update_archive(response, &path, sha256, available.size).await;
+    if written.is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
+    written.map(|()| path)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+async fn write_update_archive(
+    mut response: reqwest::Response,
+    path: &std::path::Path,
+    sha256: &str,
+    size: Option<u64>,
+) -> Result<(), ApiError> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::File::create(path).map_err(|error| {
+        api_err(
+            ApiErrorCode::Storage,
+            format!("创建更新临时文件失败：{error}"),
+        )
+    })?;
+    let mut download = Download::new(sha256, size);
+    let mut received = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("下载更新失败：{error}")))?
+    {
+        received = received.saturating_add(chunk.len() as u64);
+        if received > MAX_UPDATE_ARCHIVE_BYTES {
+            return Err(api_err(ApiErrorCode::Update, "更新包超过大小限制"));
+        }
+        download
+            .update(&chunk)
+            .map_err(|error| api_err(ApiErrorCode::Update, format!("校验更新包失败：{error}")))?;
+        file.write_all(&chunk)
+            .map_err(|error| api_err(ApiErrorCode::Storage, format!("写入更新包失败：{error}")))?;
+    }
+    download
+        .finish()
+        .map_err(|error| api_err(ApiErrorCode::Update, format!("校验更新包失败：{error}")))?;
+    file.flush()
+        .map_err(|error| api_err(ApiErrorCode::Storage, format!("写入更新包失败：{error}")))?;
+    file.sync_all()
+        .map_err(|error| api_err(ApiErrorCode::Storage, format!("写入更新包失败：{error}")))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn update_client() -> Result<reqwest::Client, ApiError> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10 * 60))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("kitty-pro-updater")
+        .build()
+        .map_err(|error| api_err(ApiErrorCode::Update, error.to_string()))
 }
 
 /// Stop presenting one version as an update until a newer release appears.
@@ -343,9 +653,30 @@ fn status_for(
         snoozed,
         target: target.label(),
         error,
+        // The request names the shell the person is using; only a desktop shell
+        // can replace itself. A browser talking to a packaged server must not
+        // inherit the server process's writable directory as an install offer.
+        can_install: target.kind == proxy_core::ReleaseKind::Desktop
+            && can_install_packaged_update(),
         // Stamped here: this function only exists on the native side, which is
         // the only side that has a clock.
         server_time: unix_now(),
+    }
+}
+
+/// Whether this process is a packaged desktop app that may replace itself.
+///
+/// Reads only local files: the release feed decides whether there is an update,
+/// while this decides whether the installation is one the updater can swap.
+#[cfg(not(target_arch = "wasm32"))]
+fn can_install_packaged_update() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        update_installation().is_some_and(|(_, installation)| installation.can_install())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        false
     }
 }
 

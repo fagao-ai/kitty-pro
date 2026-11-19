@@ -181,3 +181,20 @@ backend! {
     "POST" "/api/update/check" => check_app_update(request: api::update::AppUpdateRequest) -> api::update::AppUpdateStatus = api::update::check_app_update;
     "POST" "/api/update/dismiss" => dismiss_app_update(version: String) -> api::update::UpdateSettings = api::update::dismiss_app_update;
 }
+
+/// Install a downloaded update in place.
+///
+/// Not in the table above: a browser cannot replace itself, and the self-hosted
+/// server must not try. Only the native app has an installation to swap, so the
+/// web arm refuses locally instead of becoming an endpoint the server has to
+/// answer.
+pub async fn install_app_update() -> Result<api::update::AppUpdateInstall, ApiError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        api::update::install_app_update().await
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Err(ApiError::new("浏览器端不能安装应用更新"))
+    }
+}
