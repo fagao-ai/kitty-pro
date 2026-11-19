@@ -53,7 +53,7 @@ archive.
 | `src/ui/` | The styled layer: `theme.rs` token accessors, `controls.rs`, `icons.rs` |
 | `src/pages/` | One module per screen |
 | `src/domain.rs` | Copy and units, and the platform's rules — each one a free function taking the platform as an argument, so a desktop test asserts a phone's answer |
-| `src/autostart.rs` | The one platform gate a login item needs, in the shape `packages/api` uses |
+| `src/autostart.rs` | Start-at-login through NSH's login item, plus the one-time cleanup of the entry older builds wrote |
 
 `nsh_base` supplies behavior and no appearance, so nothing styles a base control at a call
 site: a screen composes `controls::`, and a missing variant is added there.
@@ -110,9 +110,16 @@ needs a running core and the suite starts none. Taking the guard out of the cont
 the action at x 1199 of 390.
 
 The 登录时启动 switch follows the same rule for the same reason, and reads the operating system
-rather than the profile: a login item is a file an installer or a cleanup tool can delete while
-the app is closed. On a target with no per-user launch entry the row is absent, not disabled —
-`src/autostart.rs` is where that is decided.
+rather than the profile through NSH's own `launch_at_login`: macOS's `SMAppService.mainApp`, the
+current user's `Run` value on Windows and an XDG autostart entry on Linux. The runner owns that
+registration, so the app and the system's settings page agree on the same item. On a target with
+no login item the row is absent, not disabled — `src/autostart.rs` is where that is decided.
+
+Older builds wrote `com.kitty-pro.autostart` themselves. Upgrading without removing it would
+start two copies at login, so `src/autostart.rs` hands the old registration over on the first
+start: it enables NSH's item first, and removes the old one only once the system reports the new
+one on. A macOS registration waiting for the user's approval keeps the old entry until they allow
+it, so an upgrade never turns autostart off in the meantime.
 
 Three things are worth knowing about how they behave:
 

@@ -62,10 +62,10 @@ pub fn root() -> impl IntoElement {
         // does not own it: a previous session, or another program, may have set it. Read it
         // before offering a switch about it.
         store.refresh_system_proxy();
-        // The same argument applies to the login item, which is a file an installer or a
-        // cleanup tool can delete while the app is closed. Both reads are here for the same
-        // reason: a switch that shows the last value this app wrote is a claim about the
-        // operating system, and the operating system was not asked.
+        // The same argument applies to the login item, which is a registration an installer
+        // or a cleanup tool can remove while the app is closed. Both reads are here for the
+        // same reason: a switch that shows the last value this app wrote is a claim about
+        // the operating system, and the operating system was not asked.
         store.refresh_autostart();
         // The sync card is the one place the app can overwrite its own settings with a blank,
         // so it waits for this read rather than offering a form: until it lands every control is

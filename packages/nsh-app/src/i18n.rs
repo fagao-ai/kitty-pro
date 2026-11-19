@@ -609,6 +609,44 @@ const ENGLISH: &[(&str, &str)] = &[
     ("已移出登录启动项", "Removed from login items"),
     ("登录后自动启动，不自动连接", "Opens at login, connects when you do"),
     ("当前平台没有登录启动项", "This platform has no login item"),
+    (
+        "系统已登记登录项，但仍需你在系统设置的“登录项”中允许后才会生效",
+        "The login item is registered, but it will not work until you allow it in System Settings → Login Items",
+    ),
+    (
+        "迁移登录启动项失败：{}",
+        "Could not migrate the login item: {}",
+    ),
+    (
+        "清理旧版登录启动项失败：{}",
+        "Could not remove the old login item: {}",
+    ),
+    ("launchctl 失败：{}", "launchctl failed: {}"),
+    (
+        "launchctl 禁用状态格式无效",
+        "launchctl reported an invalid disabled state",
+    ),
+    (
+        "launchctl 输出格式无效",
+        "launchctl returned output this app could not read",
+    ),
+    ("当前用户 UID 无效", "The current user's UID is invalid"),
+    (
+        "无法读取当前用户 UID",
+        "Could not read the current user's UID",
+    ),
+    (
+        "开发运行或嵌入环境不写入登录项，请使用安装后的 Kitty Pro",
+        "A development or embedded run cannot register a login item; use the installed Kitty Pro",
+    ),
+    (
+        "登录启动项未获授权：请在 nsh.json 的 capabilities 中加入 “application”: true",
+        "The login item is not granted: add “application”: true to capabilities in nsh.json",
+    ),
+    (
+        "系统拒绝了登录项修改：{}",
+        "The system refused the login-item change: {}",
+    ),
     ("系统代理已启用", "System proxy enabled"),
     ("系统代理已关闭", "System proxy disabled"),
     ("配置脚本已保存", "Config script saved"),

@@ -145,9 +145,9 @@ pub enum SyncAction {
 
 /// What the operating system says about starting at login.
 ///
-/// Read from the OS rather than remembered in the profile: the launch agent or Run key is a
-/// file the user or an installer can remove at any time, and a switch holding the last value
-/// the app wrote would claim a login item that no longer exists.
+/// Read from the OS rather than remembered in the profile: a login-item registration is
+/// something the user or an installer can remove at any time, and a switch holding the last
+/// value the app wrote would claim a login item that no longer exists.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Autostart {
     /// Not read yet.
@@ -2145,7 +2145,7 @@ impl AppStore {
     }
 
     /// What the operating system says about starting at login. Called on boot and after a
-    /// refused write, since the login item is a file outside the app's control.
+    /// refused write, since the login item is a registration outside the app's control.
     pub fn refresh_autostart(self) {
         if !crate::autostart::SUPPORTED {
             self.autostart.set(Autostart::Unsupported);
@@ -2169,9 +2169,9 @@ impl AppStore {
 
     /// Register or unregister the app as a login item, then read the answer back.
     ///
-    /// The write is followed by a read because the backend itself does this: a login item that
-    /// the OS did not accept is a different fact from one it refused to remove, and a switch
-    /// left on the pressed value would claim a login item that does not exist.
+    /// The write is followed by a read through NSH: a login item that the OS did not accept is
+    /// a different fact from one it refused to remove, and a switch left on the pressed value
+    /// would claim a login item that does not exist.
     pub fn set_autostart(self, enable: bool) {
         if self.autostart_busy.get_untracked() {
             return;

@@ -4,11 +4,6 @@
 //! be Dioxus server functions, which is why the module names and error wording
 //! still speak of endpoints; there is no HTTP layer left.
 
-#[cfg(all(
-    feature = "native-desktop",
-    any(target_os = "macos", target_os = "windows", target_os = "linux")
-))]
-pub mod autostart;
 use proxy_core::{
     AppProfile, ConnectionRequest, ParseReport, ProxyGroup, ProxyNode, RuleSetCachePaths,
     SyncSnapshot,
