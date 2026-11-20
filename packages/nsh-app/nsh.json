@@ -1,8 +1,8 @@
 {
   "name": "Kitty Pro",
   "id": "com.kitty.pro",
-  "version": "1.0.19",
-  "build": 1000019,
+  "version": "1.0.20",
+  "build": 1000020,
   "updater": { "github": "fagao-ai/kitty-pro" },
   "rust": ".",
   "root": "App",
