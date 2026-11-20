@@ -117,7 +117,10 @@ KITTY_WEB_DIR="/tmp/kitty-web/Kitty Pro" ./target/debug/kitty-pro-web-server
 web server had them: binding a non-loopback address needs `--allow-lan` (or
 `KITTY_PRO_ALLOW_LAN=1`), and hostnames beyond IP-literal access need
 `KITTY_PRO_ALLOWED_HOSTS` as an exact-match list. The session cookie is generated
-per process, so restarting the server signs out every page.
+per process, so restarting the server signs out every page; a page that is still
+open renews the cookie and retries once, rather than needing a manual reload.
+Behind a reverse proxy, preserve the incoming `Host` header and list the public
+hostname in `KITTY_PRO_ALLOWED_HOSTS`, or `/api/*` will answer 403.
 
 The page reaches this process through `packages/nsh-app/src/backend.rs`: one table
 of endpoints with two arms, so a native build calls `api` directly and a browser

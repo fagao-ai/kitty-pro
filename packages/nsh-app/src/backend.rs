@@ -82,6 +82,29 @@ async fn request<T: serde::de::DeserializeOwned>(
     path: &str,
     arguments: serde_json::Value,
 ) -> Result<T, ApiError> {
+    let first = send(method, path, &arguments).await?;
+    // The session token is minted per server process. A page left open across a
+    // restart — an upgrade, `--daemon` coming back — still sends the old cookie,
+    // and the guard answers every API call, GET included, with a plain-text 403.
+    // Loading the page is what issues the current cookie, so renew and retry once
+    // instead of leaving the user to discover that a reload fixes it.
+    if is_control_refusal(first.status(), &first.body) {
+        renew_control_session().await;
+        let second = send(method, path, &arguments).await?;
+        if is_control_refusal(second.status(), &second.body) {
+            return Err(control_refusal(second.status()));
+        }
+        return decode(&second);
+    }
+    decode(&first)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn send(
+    method: &str,
+    path: &str,
+    arguments: &serde_json::Value,
+) -> Result<nsh_core::prelude::HttpResponse, ApiError> {
     use nsh_core::platform::{HttpBody, HttpRequest};
 
     let mut request = HttpRequest::new(method, path);
@@ -95,10 +118,52 @@ async fn request<T: serde::de::DeserializeOwned>(
         request.body = HttpBody::Bytes(arguments.to_string().into_bytes());
     }
 
-    let response = nsh_core::prelude::fetch(request)
+    nsh_core::prelude::fetch(request)
         .await
-        .map_err(ApiError::new)?;
+        .map_err(ApiError::new)
+}
 
+/// Take the cookie the page's own bootstrap answers with.
+///
+/// The guard demands a session only under `/api/`, and every other `GET` replies
+/// with a fresh `Set-Cookie`; `/` is the one every deployment has. `no-cache` keeps
+/// a browser from replaying an old reply.
+#[cfg(target_arch = "wasm32")]
+async fn renew_control_session() {
+    use nsh_core::platform::HttpRequest;
+
+    let request = HttpRequest::new("GET", "/").header("cache-control", "no-cache");
+    let _ = nsh_core::prelude::fetch(request).await;
+}
+
+/// Whether a reply is the guard's refusal rather than an endpoint's answer.
+///
+/// The guard writes plain text; every API answer and error is JSON. An endpoint's
+/// own 403 (`E1006`, a privilege problem) must therefore not trigger a renewal,
+/// while the guard's must. The body is compared rather than merely requiring
+/// non-JSON: a proxy's HTML 403 is not a stale session, and loading the page again
+/// would not change it.
+#[cfg(any(target_arch = "wasm32", test))]
+fn is_control_refusal(status: u16, body: &[u8]) -> bool {
+    status == 403 && body.trim_ascii() == b"invalid local control session"
+}
+
+/// Why a renewed session was refused anyway: the cookie is still wrong, or the
+/// request's `Origin` does not match the `Host` the server saw (a reverse proxy
+/// that rewrites `Host` is the usual cause).
+#[cfg(target_arch = "wasm32")]
+fn control_refusal(status: u16) -> ApiError {
+    ApiError::new(crate::i18n::fill_at(
+        crate::i18n::lang_untracked(),
+        "控制面拒绝了请求（HTTP {}）：会话可能已过期，或请求来源与 Host 不一致。请刷新页面；经反向代理访问时需保留 Host 头，并把访问域名加入 KITTY_PRO_ALLOWED_HOSTS。",
+        &[&status],
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode<T: serde::de::DeserializeOwned>(
+    response: &nsh_core::prelude::HttpResponse,
+) -> Result<T, ApiError> {
     let text = String::from_utf8_lossy(&response.body).into_owned();
     if let Ok(value) = serde_json::from_str::<T>(&text) {
         return Ok(value);
@@ -114,6 +179,24 @@ async fn request<T: serde::de::DeserializeOwned>(
                 &[&response.status()],
             ))
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_control_refusal;
+
+    #[test]
+    fn only_the_guards_plain_403_triggers_a_renewal() {
+        assert!(is_control_refusal(403, b"invalid local control session"));
+        assert!(is_control_refusal(403, b"invalid local control session\n"));
+        assert!(!is_control_refusal(403, b"<html>403 Forbidden</html>"));
+        assert!(!is_control_refusal(
+            403,
+            r#"{"error":{"code":"E1006","message":"privilege"}}"#.as_bytes()
+        ));
+        assert!(!is_control_refusal(421, b"host not allowed"));
+        assert!(!is_control_refusal(200, b"not json"));
+    }
 }
 
 /// The server's error reply.

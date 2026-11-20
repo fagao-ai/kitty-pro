@@ -675,6 +675,10 @@ const ENGLISH: &[(&str, &str)] = &[
     // The web client's only window onto a server that answered something other than
     // the agreed envelope; the status is the one clue worth showing.
     ("服务端返回了无法理解的内容（HTTP {}）", "The server replied with something unreadable (HTTP {})"),
+    (
+        "控制面拒绝了请求（HTTP {}）：会话可能已过期，或请求来源与 Host 不一致。请刷新页面；经反向代理访问时需保留 Host 头，并把访问域名加入 KITTY_PRO_ALLOWED_HOSTS。",
+        "The control surface refused the request (HTTP {}): the session may have expired, or the request's Origin does not match its Host. Reload the page; behind a reverse proxy, preserve the Host header and add the public hostname to KITTY_PRO_ALLOWED_HOSTS.",
+    ),
     ("发现新版本 v{}", "A new version is available: v{}"),
     ("下载并安装", "Download and install"),
     ("正在下载并安装", "Downloading and installing"),
