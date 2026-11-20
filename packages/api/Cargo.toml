@@ -17,7 +17,7 @@ singbox = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
-nsh-updater = "0.6.0"
+nsh-updater = "0.6.1"
 sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs", branch = "main" }
 sysinfo = "0.38"
 

@@ -592,14 +592,14 @@ mod tests {
     #[test]
     fn the_native_shell_package_names_select_their_own_platform() {
         let names = [
-            "Kitty-Pro-1.0.20-macos-aarch64.zip",
-            "Kitty-Pro-1.0.20-windows-x86_64.zip",
-            "Kitty-Pro-1.0.20-linux-x86_64.tar.gz",
+            "Kitty-Pro-1.0.21-macos-aarch64.zip",
+            "Kitty-Pro-1.0.21-windows-x86_64.zip",
+            "Kitty-Pro-1.0.21-linux-x86_64.tar.gz",
         ];
         for (os, arch, expected) in [
-            ("macos", "aarch64", "Kitty-Pro-1.0.20-macos-aarch64.zip"),
-            ("windows", "x86_64", "Kitty-Pro-1.0.20-windows-x86_64.zip"),
-            ("linux", "x86_64", "Kitty-Pro-1.0.20-linux-x86_64.tar.gz"),
+            ("macos", "aarch64", "Kitty-Pro-1.0.21-macos-aarch64.zip"),
+            ("windows", "x86_64", "Kitty-Pro-1.0.21-windows-x86_64.zip"),
+            ("linux", "x86_64", "Kitty-Pro-1.0.21-linux-x86_64.tar.gz"),
         ] {
             assert_eq!(
                 select_from(ReleaseKind::Desktop, os, arch, &names).as_deref(),
@@ -637,38 +637,38 @@ mod tests {
             // only be met by `asset_priority` ranking an installer above an archive.
             // With the dmg in front this would assert nothing but which string happens
             // to be first in this array, and it did just that until it was swapped.
-            "Kitty-Pro-1.0.20-macos-aarch64.zip",
-            "Kitty-Pro-1.0.20-macos-aarch64.dmg",
-            "Kitty-Pro-1.0.20-windows-x86_64.msi",
-            "Kitty-Pro-1.0.20-windows-x86_64.zip",
-            "Kitty-Pro-1.0.20-linux-x86_64.tar.gz",
+            "Kitty-Pro-1.0.21-macos-aarch64.zip",
+            "Kitty-Pro-1.0.21-macos-aarch64.dmg",
+            "Kitty-Pro-1.0.21-windows-x86_64.msi",
+            "Kitty-Pro-1.0.21-windows-x86_64.zip",
+            "Kitty-Pro-1.0.21-linux-x86_64.tar.gz",
             "Kitty-Pro-web-linux-x86_64.tar.gz",
             "Kitty-Pro-web-macos-aarch64.tar.gz",
-            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.20.apk",
+            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.21.apk",
             // The sidecars ride along on the release page and must never be chosen.
-            "Kitty-Pro-1.0.20-macos-aarch64.dmg.sha256",
-            "Kitty-Pro-1.0.20-macos-aarch64.zip.sha256",
-            "Kitty-Pro-1.0.20-windows-x86_64.msi.sha256",
-            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.20.apk.sha256",
+            "Kitty-Pro-1.0.21-macos-aarch64.dmg.sha256",
+            "Kitty-Pro-1.0.21-macos-aarch64.zip.sha256",
+            "Kitty-Pro-1.0.21-windows-x86_64.msi.sha256",
+            "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.21.apk.sha256",
         ];
         for (kind, os, arch, expected) in [
             (
                 ReleaseKind::Desktop,
                 "macos",
                 "aarch64",
-                "Kitty-Pro-1.0.20-macos-aarch64.dmg",
+                "Kitty-Pro-1.0.21-macos-aarch64.dmg",
             ),
             (
                 ReleaseKind::Desktop,
                 "windows",
                 "x86_64",
-                "Kitty-Pro-1.0.20-windows-x86_64.msi",
+                "Kitty-Pro-1.0.21-windows-x86_64.msi",
             ),
             (
                 ReleaseKind::Desktop,
                 "linux",
                 "x86_64",
-                "Kitty-Pro-1.0.20-linux-x86_64.tar.gz",
+                "Kitty-Pro-1.0.21-linux-x86_64.tar.gz",
             ),
             (
                 ReleaseKind::WebServer,
@@ -686,7 +686,7 @@ mod tests {
                 ReleaseKind::Android,
                 "android",
                 "aarch64",
-                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.20.apk",
+                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.21.apk",
             ),
             // `std::env::consts::ARCH` on a 32-bit Android build is `arm`, which is
             // why ARCH_ALIASES exists at all.
@@ -694,7 +694,7 @@ mod tests {
                 ReleaseKind::Android,
                 "android",
                 "arm",
-                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.20.apk",
+                "Kitty-Pro-arm64-v8a-armeabi-v7a-1.0.21.apk",
             ),
         ] {
             assert_eq!(
@@ -759,9 +759,9 @@ mod tests {
     #[test]
     fn a_release_without_an_apk_offers_a_phone_nothing() {
         let desktop_only = [
-            "Kitty-Pro-1.0.20-macos-aarch64.zip",
-            "Kitty-Pro-1.0.20-windows-x86_64.zip",
-            "Kitty-Pro-1.0.20-linux-x86_64.tar.gz",
+            "Kitty-Pro-1.0.21-macos-aarch64.zip",
+            "Kitty-Pro-1.0.21-windows-x86_64.zip",
+            "Kitty-Pro-1.0.21-linux-x86_64.tar.gz",
         ];
         for arch in ["aarch64", "arm", "x86_64"] {
             assert_eq!(

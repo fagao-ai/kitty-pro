@@ -48,7 +48,7 @@ env:
   # what a tag builds: `scripts/setup-nsh.sh` compares the two versions and fails
   # the job rather than publishing an artifact whose runtime and Rust half disagree.
   # Bumping this means bumping the crates in the same commit.
-  NSH_VERSION: "v0.6.0"
+  NSH_VERSION: "v0.6.1"
 
 jobs:
   desktop:
